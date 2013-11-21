@@ -22,11 +22,6 @@ import org.jacoco.core.runtime.OfflineInstrumentationAccessGenerator;
  * Task for offline instrumentation of class files.
  */
 public class InstrumentClasses {
-	//./build/linux-x86_64-normal-server-release/images/lib/rt.jar
-	//private File destdir = new File("/home/joliver/workspace/jdk8/build/linux-x86_64-normal-server-release/jdk/classes");
-	//private File destdir = new File("/home/joliver/workspace/jdk8/build/linux-x86_64-normal-server-release/images/symbols/META-INF/sym/rt.jar/");
-	//private File destdir = new File("/tmp/rt");
-
 	private List<String> exclude = Arrays.asList("NoClassDefFoundError",
 			"Throwable", "Thread", "Object", "Long", "Number",
 			"NullPointerException", "RuntimeException", "Exception",
@@ -35,7 +30,6 @@ public class InstrumentClasses {
 			"List", "ArrayList", "Class", "System", "Properties", "Hashtable", "Math", "Map",
 			"Objects", "InetAddress");
 
-	//private List<String> regexexclude = Arrays.asList( ".*java/util/Collection[^/]*$", ".*java/util/Enum[^/]*$", ".*java/util/Abstract[^/]*$");//,".*java/lang/[A-Ma-m][^/]*$");
 	private List<String> regexexclude = Arrays
 			.asList(
 //					".*",
@@ -104,10 +98,8 @@ public class InstrumentClasses {
 			}
 			
 			if(include == false) {
-	
 				for (String regex : regexexclude) {
 					if (file.toAbsolutePath().toString().matches(regex)) {
-						//System.out.println(file.toAbsolutePath().toString());
 						return FileVisitResult.CONTINUE;
 					}
 				}
@@ -115,13 +107,6 @@ public class InstrumentClasses {
 
 			if (!file.getFileName().toString().endsWith(".class")) {
 				return FileVisitResult.CONTINUE;
-			}
-				
-
-			count++;
-			if (count > 3000 && count < 13000) {
-			//if (count < 13000) {
-			//	return FileVisitResult.CONTINUE;
 			}
 
 			System.out.println("Instrumenting: "+file.getFileName());
