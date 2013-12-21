@@ -1,0 +1,2144 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>SSLEngineImpl.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.ssl</a> &gt; <span class="el_source">SSLEngineImpl.java</span></div><h1>SSLEngineImpl.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2003, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.security.ssl;
+
+import java.io.*;
+import java.nio.*;
+import java.util.*;
+import java.security.*;
+
+import javax.crypto.BadPaddingException;
+
+import javax.net.ssl.*;
+import javax.net.ssl.SSLEngineResult.*;
+
+/**
+ * Implementation of an non-blocking SSLEngine.
+ *
+ * *Currently*, the SSLEngine code exists in parallel with the current
+ * SSLSocket.  As such, the current implementation is using legacy code
+ * with many of the same abstractions.  However, it varies in many
+ * areas, most dramatically in the IO handling.
+ *
+ * There are three main I/O threads that can be existing in parallel:
+ * wrap(), unwrap(), and beginHandshake().  We are encouraging users to
+ * not call multiple instances of wrap or unwrap, because the data could
+ * appear to flow out of the SSLEngine in a non-sequential order.  We
+ * take all steps we can to at least make sure the ordering remains
+ * consistent, but once the calls returns, anything can happen.  For
+ * example, thread1 and thread2 both call wrap, thread1 gets the first
+ * packet, thread2 gets the second packet, but thread2 gets control back
+ * before thread1, and sends the data.  The receiving side would see an
+ * out-of-order error.
+ *
+ * Handshaking is still done the same way as SSLSocket using the normal
+ * InputStream/OutputStream abstactions.  We create
+ * ClientHandshakers/ServerHandshakers, which produce/consume the
+ * handshaking data.  The transfer of the data is largely handled by the
+ * HandshakeInStream/HandshakeOutStreams.  Lastly, the
+ * InputRecord/OutputRecords still have the same functionality, except
+ * that they are overridden with EngineInputRecord/EngineOutputRecord,
+ * which provide SSLEngine-specific functionality.
+ *
+ * Some of the major differences are:
+ *
+ * EngineInputRecord/EngineOutputRecord/EngineWriter:
+ *
+ *      In order to avoid writing whole new control flows for
+ *      handshaking, and to reuse most of the same code, we kept most
+ *      of the actual handshake code the same.  As usual, reading
+ *      handshake data may trigger output of more handshake data, so
+ *      what we do is write this data to internal buffers, and wait for
+ *      wrap() to be called to give that data a ride.
+ *
+ *      All data is routed through
+ *      EngineInputRecord/EngineOutputRecord.  However, all handshake
+ *      data (ct_alert/ct_change_cipher_spec/ct_handshake) are passed
+ *      through to the the underlying InputRecord/OutputRecord, and
+ *      the data uses the internal buffers.
+ *
+ *      Application data is handled slightly different, we copy the data
+ *      directly from the src to the dst buffers, and do all operations
+ *      on those buffers, saving the overhead of multiple copies.
+ *
+ *      In the case of an inbound record, unwrap passes the inbound
+ *      ByteBuffer to the InputRecord.  If the data is handshake data,
+ *      the data is read into the InputRecord's internal buffer.  If
+ *      the data is application data, the data is decoded directly into
+ *      the dst buffer.
+ *
+ *      In the case of an outbound record, when the write to the
+ *      &quot;real&quot; OutputStream's would normally take place, instead we
+ *      call back up to the EngineOutputRecord's version of
+ *      writeBuffer, at which time we capture the resulting output in a
+ *      ByteBuffer, and send that back to the EngineWriter for internal
+ *      storage.
+ *
+ *      EngineWriter is responsible for &quot;handling&quot; all outbound
+ *      data, be it handshake or app data, and for returning the data
+ *      to wrap() in the proper order.
+ *
+ * ClientHandshaker/ServerHandshaker/Handshaker:
+ *      Methods which relied on SSLSocket now have work on either
+ *      SSLSockets or SSLEngines.
+ *
+ * @author Brad Wetmore
+ */
+<span class="nc bnc" id="L110" title="All 2 branches missed.">final public class SSLEngineImpl extends SSLEngine {</span>
+
+    //
+    // Fields and global comments
+    //
+
+    /*
+     * There's a state machine associated with each connection, which
+     * among other roles serves to negotiate session changes.
+     *
+     * - START with constructor, until the TCP connection's around.
+     * - HANDSHAKE picks session parameters before allowing traffic.
+     *          There are many substates due to sequencing requirements
+     *          for handshake messages.
+     * - DATA may be transmitted.
+     * - RENEGOTIATE state allows concurrent data and handshaking
+     *          traffic (&quot;same&quot; substates as HANDSHAKE), and terminates
+     *          in selection of new session (and connection) parameters
+     * - ERROR state immediately precedes abortive disconnect.
+     * - CLOSED when one side closes down, used to start the shutdown
+     *          process.  SSL connection objects are not reused.
+     *
+     * State affects what SSL record types may legally be sent:
+     *
+     * - Handshake ... only in HANDSHAKE and RENEGOTIATE states
+     * - App Data ... only in DATA and RENEGOTIATE states
+     * - Alert ... in HANDSHAKE, DATA, RENEGOTIATE
+     *
+     * Re what may be received:  same as what may be sent, except that
+     * HandshakeRequest handshaking messages can come from servers even
+     * in the application data state, to request entry to RENEGOTIATE.
+     *
+     * The state machine within HANDSHAKE and RENEGOTIATE states controls
+     * the pending session, not the connection state, until the change
+     * cipher spec and &quot;Finished&quot; handshake messages are processed and
+     * make the &quot;new&quot; session become the current one.
+     *
+     * NOTE: details of the SMs always need to be nailed down better.
+     * The text above illustrates the core ideas.
+     *
+     *                +----&gt;-------+------&gt;---------&gt;-------+
+     *                |            |                        |
+     *     &lt;-----&lt;    ^            ^  &lt;-----&lt;               |
+     *START&gt;-----&gt;HANDSHAKE&gt;-----&gt;DATA&gt;-----&gt;RENEGOTIATE    |
+     *                v            v               v        |
+     *                |            |               |        |
+     *                +------------+---------------+        |
+     *                |                                     |
+     *                v                                     |
+     *               ERROR&gt;------&gt;-----&gt;CLOSED&lt;--------&lt;----+
+     *
+     * ALSO, note that the the purpose of handshaking (renegotiation is
+     * included) is to assign a different, and perhaps new, session to
+     * the connection.  The SSLv3 spec is a bit confusing on that new
+     * protocol feature.
+     */
+    private int                 connectionState;
+
+    private static final int    cs_START = 0;
+    private static final int    cs_HANDSHAKE = 1;
+    private static final int    cs_DATA = 2;
+    private static final int    cs_RENEGOTIATE = 3;
+    private static final int    cs_ERROR = 4;
+    private static final int    cs_CLOSED = 6;
+
+    /*
+     * Once we're in state cs_CLOSED, we can continue to
+     * wrap/unwrap until we finish sending/receiving the messages
+     * for close_notify.  EngineWriter handles outboundDone.
+     */
+<span class="nc" id="L180">    private boolean             inboundDone = false;</span>
+
+    EngineWriter                writer;
+
+    /*
+     * The authentication context holds all information used to establish
+     * who this end of the connection is (certificate chains, private keys,
+     * etc) and who is trusted (e.g. as CAs or websites).
+     */
+    private SSLContextImpl      sslContext;
+
+    /*
+     * This connection is one of (potentially) many associated with
+     * any given session.  The output of the handshake protocol is a
+     * new session ... although all the protocol description talks
+     * about changing the cipher spec (and it does change), in fact
+     * that's incidental since it's done by changing everything that
+     * is associated with a session at the same time.  (TLS/IETF may
+     * change that to add client authentication w/o new key exchg.)
+     */
+    private Handshaker                  handshaker;
+    private SSLSessionImpl              sess;
+    private volatile SSLSessionImpl     handshakeSession;
+
+
+    /*
+     * Client authentication be off, requested, or required.
+     *
+     * This will be used by both this class and SSLSocket's variants.
+     */
+    static final byte           clauth_none = 0;
+    static final byte           clauth_requested = 1;
+    static final byte           clauth_required = 2;
+
+    /*
+     * Flag indicating if the next record we receive MUST be a Finished
+     * message. Temporarily set during the handshake to ensure that
+     * a change cipher spec message is followed by a finished message.
+     */
+    private boolean             expectingFinished;
+
+
+    /*
+     * If someone tries to closeInbound() (say at End-Of-Stream)
+     * our engine having received a close_notify, we need to
+     * notify the app that we may have a truncation attack underway.
+     */
+    private boolean             recvCN;
+
+    /*
+     * For improved diagnostics, we detail connection closure
+     * If the engine is closed (connectionState &gt;= cs_ERROR),
+     * closeReason != null indicates if the engine was closed
+     * because of an error or because or normal shutdown.
+     */
+    private SSLException        closeReason;
+
+    /*
+     * Per-connection private state that doesn't change when the
+     * session is changed.
+     */
+    private byte                        doClientAuth;
+<span class="nc" id="L242">    private boolean                     enableSessionCreation = true;</span>
+    EngineInputRecord                   inputRecord;
+    EngineOutputRecord                  outputRecord;
+    private AccessControlContext        acc;
+
+    // The cipher suites enabled for use on this connection.
+    private CipherSuiteList             enabledCipherSuites;
+
+    // the endpoint identification protocol
+<span class="nc" id="L251">    private String                      identificationProtocol = null;</span>
+
+    // The cryptographic algorithm constraints
+<span class="nc" id="L254">    private AlgorithmConstraints        algorithmConstraints = null;</span>
+
+    // The server name indication and matchers
+<span class="nc" id="L257">    List&lt;SNIServerName&gt;         serverNames =</span>
+<span class="nc" id="L258">                                    Collections.&lt;SNIServerName&gt;emptyList();</span>
+<span class="nc" id="L259">    Collection&lt;SNIMatcher&gt;      sniMatchers =</span>
+<span class="nc" id="L260">                                    Collections.&lt;SNIMatcher&gt;emptyList();</span>
+
+    // Have we been told whether we're client or server?
+<span class="nc" id="L263">    private boolean                     serverModeSet = false;</span>
+    private boolean                     roleIsServer;
+
+    /*
+     * The protocol versions enabled for use on this connection.
+     *
+     * Note: we support a pseudo protocol called SSLv2Hello which when
+     * set will result in an SSL v2 Hello being sent with SSL (version 3.0)
+     * or TLS (version 3.1, 3.2, etc.) version info.
+     */
+    private ProtocolList        enabledProtocols;
+
+    /*
+     * The SSL version associated with this connection.
+     */
+<span class="nc" id="L278">    private ProtocolVersion     protocolVersion = ProtocolVersion.DEFAULT;</span>
+
+    /*
+     * Crypto state that's reinitialized when the session changes.
+     */
+    private Authenticator       readAuthenticator, writeAuthenticator;
+    private CipherBox           readCipher, writeCipher;
+    // NOTE: compression state would be saved here
+
+    /*
+     * security parameters for secure renegotiation.
+     */
+    private boolean             secureRenegotiation;
+    private byte[]              clientVerifyData;
+    private byte[]              serverVerifyData;
+
+    /*
+     * READ ME * READ ME * READ ME * READ ME * READ ME * READ ME *
+     * IMPORTANT STUFF TO UNDERSTANDING THE SYNCHRONIZATION ISSUES.
+     * READ ME * READ ME * READ ME * READ ME * READ ME * READ ME *
+     *
+     * There are several locks here.
+     *
+     * The primary lock is the per-instance lock used by
+     * synchronized(this) and the synchronized methods.  It controls all
+     * access to things such as the connection state and variables which
+     * affect handshaking.  If we are inside a synchronized method, we
+     * can access the state directly, otherwise, we must use the
+     * synchronized equivalents.
+     *
+     * Note that we must never acquire the &lt;code&gt;this&lt;/code&gt; lock after
+     * &lt;code&gt;writeLock&lt;/code&gt; or run the risk of deadlock.
+     *
+     * Grab some coffee, and be careful with any code changes.
+     */
+    private Object              wrapLock;
+    private Object              unwrapLock;
+    Object                      writeLock;
+
+    /*
+     * Is it the first application record to write?
+     */
+<span class="nc" id="L320">    private boolean isFirstAppOutputRecord = true;</span>
+
+    /*
+     * Whether local cipher suites preference in server side should be
+     * honored during handshaking?
+     */
+<span class="nc" id="L326">    private boolean preferLocalCipherSuites = false;</span>
+
+    /*
+     * Class and subclass dynamic debugging support
+     */
+<span class="nc" id="L331">    private static final Debug debug = Debug.getInstance(&quot;ssl&quot;);</span>
+
+    //
+    // Initialization/Constructors
+    //
+
+    /**
+     * Constructor for an SSLEngine from SSLContext, without
+     * host/port hints.  This Engine will not be able to cache
+     * sessions, but must renegotiate everything by hand.
+     */
+    SSLEngineImpl(SSLContextImpl ctx) {
+<span class="nc" id="L343">        super();</span>
+<span class="nc" id="L344">        init(ctx);</span>
+<span class="nc" id="L345">    }</span>
+
+    /**
+     * Constructor for an SSLEngine from SSLContext.
+     */
+    SSLEngineImpl(SSLContextImpl ctx, String host, int port) {
+<span class="nc" id="L351">        super(host, port);</span>
+<span class="nc" id="L352">        init(ctx);</span>
+<span class="nc" id="L353">    }</span>
+
+    /**
+     * Initializes the Engine
+     */
+    private void init(SSLContextImpl ctx) {
+<span class="nc bnc" id="L359" title="All 4 branches missed.">        if (debug != null &amp;&amp; Debug.isOn(&quot;ssl&quot;)) {</span>
+<span class="nc" id="L360">            System.out.println(&quot;Using SSLEngineImpl.&quot;);</span>
+        }
+
+<span class="nc" id="L363">        sslContext = ctx;</span>
+<span class="nc" id="L364">        sess = SSLSessionImpl.nullSession;</span>
+<span class="nc" id="L365">        handshakeSession = null;</span>
+
+        /*
+         * State is cs_START until we initialize the handshaker.
+         *
+         * Apps using SSLEngine are probably going to be server.
+         * Somewhat arbitrary choice.
+         */
+<span class="nc" id="L373">        roleIsServer = true;</span>
+<span class="nc" id="L374">        connectionState = cs_START;</span>
+
+        // default server name indication
+<span class="nc" id="L377">        serverNames =</span>
+<span class="nc" id="L378">            Utilities.addToSNIServerNameList(serverNames, getPeerHost());</span>
+
+        /*
+         * default read and write side cipher and MAC support
+         *
+         * Note:  compression support would go here too
+         */
+<span class="nc" id="L385">        readCipher = CipherBox.NULL;</span>
+<span class="nc" id="L386">        readAuthenticator = MAC.NULL;</span>
+<span class="nc" id="L387">        writeCipher = CipherBox.NULL;</span>
+<span class="nc" id="L388">        writeAuthenticator = MAC.NULL;</span>
+
+        // default security parameters for secure renegotiation
+<span class="nc" id="L391">        secureRenegotiation = false;</span>
+<span class="nc" id="L392">        clientVerifyData = new byte[0];</span>
+<span class="nc" id="L393">        serverVerifyData = new byte[0];</span>
+
+<span class="nc" id="L395">        enabledCipherSuites =</span>
+<span class="nc" id="L396">                sslContext.getDefaultCipherSuiteList(roleIsServer);</span>
+<span class="nc" id="L397">        enabledProtocols =</span>
+<span class="nc" id="L398">                sslContext.getDefaultProtocolList(roleIsServer);</span>
+
+<span class="nc" id="L400">        wrapLock = new Object();</span>
+<span class="nc" id="L401">        unwrapLock = new Object();</span>
+<span class="nc" id="L402">        writeLock = new Object();</span>
+
+        /*
+         * Save the Access Control Context.  This will be used later
+         * for a couple of things, including providing a context to
+         * run tasks in, and for determining which credentials
+         * to use for Subject based (JAAS) decisions
+         */
+<span class="nc" id="L410">        acc = AccessController.getContext();</span>
+
+        /*
+         * All outbound application data goes through this OutputRecord,
+         * other data goes through their respective records created
+         * elsewhere.  All inbound data goes through this one
+         * input record.
+         */
+<span class="nc" id="L418">        outputRecord =</span>
+            new EngineOutputRecord(Record.ct_application_data, this);
+<span class="nc" id="L420">        inputRecord = new EngineInputRecord(this);</span>
+<span class="nc" id="L421">        inputRecord.enableFormatChecks();</span>
+
+<span class="nc" id="L423">        writer = new EngineWriter();</span>
+<span class="nc" id="L424">    }</span>
+
+    /**
+     * Initialize the handshaker object. This means:
+     *
+     *  . if a handshake is already in progress (state is cs_HANDSHAKE
+     *    or cs_RENEGOTIATE), do nothing and return
+     *
+     *  . if the engine is already closed, throw an Exception (internal error)
+     *
+     *  . otherwise (cs_START or cs_DATA), create the appropriate handshaker
+     *    object and advance the connection state (to cs_HANDSHAKE or
+     *    cs_RENEGOTIATE, respectively).
+     *
+     * This method is called right after a new engine is created, when
+     * starting renegotiation, or when changing client/server mode of the
+     * engine.
+     */
+    private void initHandshaker() {
+<span class="nc bnc" id="L443" title="All 3 branches missed.">        switch (connectionState) {</span>
+
+        //
+        // Starting a new handshake.
+        //
+        case cs_START:
+        case cs_DATA:
+<span class="nc" id="L450">            break;</span>
+
+        //
+        // We're already in the middle of a handshake.
+        //
+        case cs_HANDSHAKE:
+        case cs_RENEGOTIATE:
+<span class="nc" id="L457">            return;</span>
+
+        //
+        // Anyone allowed to call this routine is required to
+        // do so ONLY if the connection state is reasonable...
+        //
+        default:
+<span class="nc" id="L464">            throw new IllegalStateException(&quot;Internal error&quot;);</span>
+        }
+
+        // state is either cs_START or cs_DATA
+<span class="nc bnc" id="L468" title="All 2 branches missed.">        if (connectionState == cs_START) {</span>
+<span class="nc" id="L469">            connectionState = cs_HANDSHAKE;</span>
+        } else { // cs_DATA
+<span class="nc" id="L471">            connectionState = cs_RENEGOTIATE;</span>
+        }
+<span class="nc bnc" id="L473" title="All 2 branches missed.">        if (roleIsServer) {</span>
+<span class="nc bnc" id="L474" title="All 2 branches missed.">            handshaker = new ServerHandshaker(this, sslContext,</span>
+                    enabledProtocols, doClientAuth,
+                    protocolVersion, connectionState == cs_HANDSHAKE,
+                    secureRenegotiation, clientVerifyData, serverVerifyData);
+<span class="nc" id="L478">            handshaker.setSNIMatchers(sniMatchers);</span>
+<span class="nc" id="L479">            handshaker.setUseCipherSuitesOrder(preferLocalCipherSuites);</span>
+        } else {
+<span class="nc bnc" id="L481" title="All 2 branches missed.">            handshaker = new ClientHandshaker(this, sslContext,</span>
+                    enabledProtocols,
+                    protocolVersion, connectionState == cs_HANDSHAKE,
+                    secureRenegotiation, clientVerifyData, serverVerifyData);
+<span class="nc" id="L485">            handshaker.setSNIServerNames(serverNames);</span>
+        }
+<span class="nc" id="L487">        handshaker.setEnabledCipherSuites(enabledCipherSuites);</span>
+<span class="nc" id="L488">        handshaker.setEnableSessionCreation(enableSessionCreation);</span>
+<span class="nc" id="L489">    }</span>
+
+    /*
+     * Report the current status of the Handshaker
+     */
+    private HandshakeStatus getHSStatus(HandshakeStatus hss) {
+
+<span class="nc bnc" id="L496" title="All 2 branches missed.">        if (hss != null) {</span>
+<span class="nc" id="L497">            return hss;</span>
+        }
+
+<span class="nc" id="L500">        synchronized (this) {</span>
+<span class="nc bnc" id="L501" title="All 2 branches missed.">            if (writer.hasOutboundData()) {</span>
+<span class="nc" id="L502">                return HandshakeStatus.NEED_WRAP;</span>
+<span class="nc bnc" id="L503" title="All 2 branches missed.">            } else if (handshaker != null) {</span>
+<span class="nc bnc" id="L504" title="All 2 branches missed.">                if (handshaker.taskOutstanding()) {</span>
+<span class="nc" id="L505">                    return HandshakeStatus.NEED_TASK;</span>
+                } else {
+<span class="nc" id="L507">                    return HandshakeStatus.NEED_UNWRAP;</span>
+                }
+<span class="nc bnc" id="L509" title="All 2 branches missed.">            } else if (connectionState == cs_CLOSED) {</span>
+                /*
+                 * Special case where we're closing, but
+                 * still need the close_notify before we
+                 * can officially be closed.
+                 *
+                 * Note isOutboundDone is taken care of by
+                 * hasOutboundData() above.
+                 */
+<span class="nc bnc" id="L518" title="All 2 branches missed.">                if (!isInboundDone()) {</span>
+<span class="nc" id="L519">                    return HandshakeStatus.NEED_UNWRAP;</span>
+                } // else not handshaking
+            }
+
+<span class="nc" id="L523">            return HandshakeStatus.NOT_HANDSHAKING;</span>
+<span class="nc" id="L524">        }</span>
+    }
+
+    synchronized private void checkTaskThrown() throws SSLException {
+<span class="nc bnc" id="L528" title="All 2 branches missed.">        if (handshaker != null) {</span>
+<span class="nc" id="L529">            handshaker.checkThrown();</span>
+        }
+<span class="nc" id="L531">    }</span>
+
+    //
+    // Handshaking and connection state code
+    //
+
+    /*
+     * Provides &quot;this&quot; synchronization for connection state.
+     * Otherwise, you can access it directly.
+     */
+    synchronized private int getConnectionState() {
+<span class="nc" id="L542">        return connectionState;</span>
+    }
+
+    synchronized private void setConnectionState(int state) {
+<span class="nc" id="L546">        connectionState = state;</span>
+<span class="nc" id="L547">    }</span>
+
+    /*
+     * Get the Access Control Context.
+     *
+     * Used for a known context to
+     * run tasks in, and for determining which credentials
+     * to use for Subject-based (JAAS) decisions.
+     */
+    AccessControlContext getAcc() {
+<span class="nc" id="L557">        return acc;</span>
+    }
+
+    /*
+     * Is a handshake currently underway?
+     */
+    @Override
+    public SSLEngineResult.HandshakeStatus getHandshakeStatus() {
+<span class="nc" id="L565">        return getHSStatus(null);</span>
+    }
+
+    /*
+     * When a connection finishes handshaking by enabling use of a newly
+     * negotiated session, each end learns about it in two halves (read,
+     * and write).  When both read and write ciphers have changed, and the
+     * last handshake message has been read, the connection has joined
+     * (rejoined) the new session.
+     *
+     * NOTE:  The SSLv3 spec is rather unclear on the concepts here.
+     * Sessions don't change once they're established (including cipher
+     * suite and master secret) but connections can join them (and leave
+     * them).  They're created by handshaking, though sometime handshaking
+     * causes connections to join up with pre-established sessions.
+     *
+     * Synchronized on &quot;this&quot; from readRecord.
+     */
+    private void changeReadCiphers() throws SSLException {
+<span class="nc bnc" id="L584" title="All 4 branches missed.">        if (connectionState != cs_HANDSHAKE</span>
+                &amp;&amp; connectionState != cs_RENEGOTIATE) {
+<span class="nc" id="L586">            throw new SSLProtocolException(</span>
+                &quot;State error, change cipher specs&quot;);
+        }
+
+        // ... create decompressor
+
+<span class="nc" id="L592">        CipherBox oldCipher = readCipher;</span>
+
+        try {
+<span class="nc" id="L595">            readCipher = handshaker.newReadCipher();</span>
+<span class="nc" id="L596">            readAuthenticator = handshaker.newReadAuthenticator();</span>
+<span class="nc" id="L597">        } catch (GeneralSecurityException e) {</span>
+            // &quot;can't happen&quot;
+<span class="nc" id="L599">            throw new SSLException(&quot;Algorithm missing:  &quot;, e);</span>
+<span class="nc" id="L600">        }</span>
+
+        /*
+         * Dispose of any intermediate state in the underlying cipher.
+         * For PKCS11 ciphers, this will release any attached sessions,
+         * and thus make finalization faster.
+         *
+         * Since MAC's doFinal() is called for every SSL/TLS packet, it's
+         * not necessary to do the same with MAC's.
+         */
+<span class="nc" id="L610">        oldCipher.dispose();</span>
+<span class="nc" id="L611">    }</span>
+
+    /*
+     * used by Handshaker to change the active write cipher, follows
+     * the output of the CCS message.
+     *
+     * Also synchronized on &quot;this&quot; from readRecord/delegatedTask.
+     */
+    void changeWriteCiphers() throws SSLException {
+<span class="nc bnc" id="L620" title="All 4 branches missed.">        if (connectionState != cs_HANDSHAKE</span>
+                &amp;&amp; connectionState != cs_RENEGOTIATE) {
+<span class="nc" id="L622">            throw new SSLProtocolException(</span>
+                &quot;State error, change cipher specs&quot;);
+        }
+
+        // ... create compressor
+
+<span class="nc" id="L628">        CipherBox oldCipher = writeCipher;</span>
+
+        try {
+<span class="nc" id="L631">            writeCipher = handshaker.newWriteCipher();</span>
+<span class="nc" id="L632">            writeAuthenticator = handshaker.newWriteAuthenticator();</span>
+<span class="nc" id="L633">        } catch (GeneralSecurityException e) {</span>
+            // &quot;can't happen&quot;
+<span class="nc" id="L635">            throw new SSLException(&quot;Algorithm missing:  &quot;, e);</span>
+<span class="nc" id="L636">        }</span>
+
+        // See comment above.
+<span class="nc" id="L639">        oldCipher.dispose();</span>
+
+        // reset the flag of the first application record
+<span class="nc" id="L642">        isFirstAppOutputRecord = true;</span>
+<span class="nc" id="L643">    }</span>
+
+    /*
+     * Updates the SSL version associated with this connection.
+     * Called from Handshaker once it has determined the negotiated version.
+     */
+    synchronized void setVersion(ProtocolVersion protocolVersion) {
+<span class="nc" id="L650">        this.protocolVersion = protocolVersion;</span>
+<span class="nc" id="L651">        outputRecord.setVersion(protocolVersion);</span>
+<span class="nc" id="L652">    }</span>
+
+
+    /**
+     * Kickstart the handshake if it is not already in progress.
+     * This means:
+     *
+     *  . if handshaking is already underway, do nothing and return
+     *
+     *  . if the engine is not connected or already closed, throw an
+     *    Exception.
+     *
+     *  . otherwise, call initHandshake() to initialize the handshaker
+     *    object and progress the state. Then, send the initial
+     *    handshaking message if appropriate (always on clients and
+     *    on servers when renegotiating).
+     */
+    private synchronized void kickstartHandshake() throws IOException {
+<span class="nc bnc" id="L670" title="All 5 branches missed.">        switch (connectionState) {</span>
+
+        case cs_START:
+<span class="nc bnc" id="L673" title="All 2 branches missed.">            if (!serverModeSet) {</span>
+<span class="nc" id="L674">                throw new IllegalStateException(</span>
+                    &quot;Client/Server mode not yet set.&quot;);
+            }
+<span class="nc" id="L677">            initHandshaker();</span>
+<span class="nc" id="L678">            break;</span>
+
+        case cs_HANDSHAKE:
+            // handshaker already setup, proceed
+<span class="nc" id="L682">            break;</span>
+
+        case cs_DATA:
+<span class="nc bnc" id="L685" title="All 4 branches missed.">            if (!secureRenegotiation &amp;&amp; !Handshaker.allowUnsafeRenegotiation) {</span>
+<span class="nc" id="L686">                throw new SSLHandshakeException(</span>
+                        &quot;Insecure renegotiation is not allowed&quot;);
+            }
+
+<span class="nc bnc" id="L690" title="All 2 branches missed.">            if (!secureRenegotiation) {</span>
+<span class="nc bnc" id="L691" title="All 4 branches missed.">                if (debug != null &amp;&amp; Debug.isOn(&quot;handshake&quot;)) {</span>
+<span class="nc" id="L692">                    System.out.println(</span>
+                        &quot;Warning: Using insecure renegotiation&quot;);
+                }
+            }
+
+            // initialize the handshaker, move to cs_RENEGOTIATE
+<span class="nc" id="L698">            initHandshaker();</span>
+<span class="nc" id="L699">            break;</span>
+
+        case cs_RENEGOTIATE:
+            // handshaking already in progress, return
+<span class="nc" id="L703">            return;</span>
+
+        default:
+            // cs_ERROR/cs_CLOSED
+<span class="nc" id="L707">            throw new SSLException(&quot;SSLEngine is closing/closed&quot;);</span>
+        }
+
+        //
+        // Kickstart handshake state machine if we need to ...
+        //
+        // Note that handshaker.kickstart() writes the message
+        // to its HandshakeOutStream, which calls back into
+        // SSLSocketImpl.writeRecord() to send it.
+        //
+<span class="nc bnc" id="L717" title="All 2 branches missed.">        if (!handshaker.activated()) {</span>
+             // prior to handshaking, activate the handshake
+<span class="nc bnc" id="L719" title="All 2 branches missed.">            if (connectionState == cs_RENEGOTIATE) {</span>
+                // don't use SSLv2Hello when renegotiating
+<span class="nc" id="L721">                handshaker.activate(protocolVersion);</span>
+            } else {
+<span class="nc" id="L723">                handshaker.activate(null);</span>
+            }
+
+<span class="nc bnc" id="L726" title="All 2 branches missed.">            if (handshaker instanceof ClientHandshaker) {</span>
+                // send client hello
+<span class="nc" id="L728">                handshaker.kickstart();</span>
+            } else {    // instanceof ServerHandshaker
+<span class="nc bnc" id="L730" title="All 2 branches missed.">                if (connectionState == cs_HANDSHAKE) {</span>
+                    // initial handshake, no kickstart message to send
+                } else {
+                    // we want to renegotiate, send hello request
+<span class="nc" id="L734">                    handshaker.kickstart();</span>
+
+                    // hello request is not included in the handshake
+                    // hashes, reset them
+<span class="nc" id="L738">                    handshaker.handshakeHash.reset();</span>
+                }
+            }
+        }
+<span class="nc" id="L742">    }</span>
+
+    /*
+     * Start a SSLEngine handshake
+     */
+    @Override
+    public void beginHandshake() throws SSLException {
+        try {
+<span class="nc" id="L750">            kickstartHandshake();</span>
+<span class="nc" id="L751">        } catch (Exception e) {</span>
+<span class="nc" id="L752">            fatal(Alerts.alert_handshake_failure,</span>
+                &quot;Couldn't kickstart handshaking&quot;, e);
+<span class="nc" id="L754">        }</span>
+<span class="nc" id="L755">    }</span>
+
+
+    //
+    // Read/unwrap side
+    //
+
+
+    /**
+     * Unwraps a buffer.  Does a variety of checks before grabbing
+     * the unwrapLock, which blocks multiple unwraps from occurring.
+     */
+    @Override
+    public SSLEngineResult unwrap(ByteBuffer netData, ByteBuffer [] appData,
+            int offset, int length) throws SSLException {
+
+<span class="nc" id="L771">        EngineArgs ea = new EngineArgs(netData, appData, offset, length);</span>
+
+        try {
+<span class="nc" id="L774">            synchronized (unwrapLock) {</span>
+<span class="nc" id="L775">                return readNetRecord(ea);</span>
+<span class="nc" id="L776">            }</span>
+<span class="nc" id="L777">        } catch (Exception e) {</span>
+            /*
+             * Don't reset position so it looks like we didn't
+             * consume anything.  We did consume something, and it
+             * got us into this situation, so report that much back.
+             * Our days of consuming are now over anyway.
+             */
+<span class="nc" id="L784">            fatal(Alerts.alert_internal_error,</span>
+                &quot;problem unwrapping net record&quot;, e);
+<span class="nc" id="L786">            return null;  // make compiler happy</span>
+        } finally {
+            /*
+             * Just in case something failed to reset limits properly.
+             */
+<span class="nc" id="L791">            ea.resetLim();</span>
+        }
+    }
+
+    /*
+     * Makes additional checks for unwrap, but this time more
+     * specific to this packet and the current state of the machine.
+     */
+    private SSLEngineResult readNetRecord(EngineArgs ea) throws IOException {
+
+<span class="nc" id="L801">        Status status = null;</span>
+<span class="nc" id="L802">        HandshakeStatus hsStatus = null;</span>
+
+        /*
+         * See if the handshaker needs to report back some SSLException.
+         */
+<span class="nc" id="L807">        checkTaskThrown();</span>
+
+        /*
+         * Check if we are closing/closed.
+         */
+<span class="nc bnc" id="L812" title="All 2 branches missed.">        if (isInboundDone()) {</span>
+<span class="nc" id="L813">            return new SSLEngineResult(Status.CLOSED, getHSStatus(null), 0, 0);</span>
+        }
+
+        /*
+         * If we're still in cs_HANDSHAKE, make sure it's been
+         * started.
+         */
+<span class="nc" id="L820">        synchronized (this) {</span>
+<span class="nc bnc" id="L821" title="All 4 branches missed.">            if ((connectionState == cs_HANDSHAKE) ||</span>
+                    (connectionState == cs_START)) {
+<span class="nc" id="L823">                kickstartHandshake();</span>
+
+                /*
+                 * If there's still outbound data to flush, we
+                 * can return without trying to unwrap anything.
+                 */
+<span class="nc" id="L829">                hsStatus = getHSStatus(null);</span>
+
+<span class="nc bnc" id="L831" title="All 2 branches missed.">                if (hsStatus == HandshakeStatus.NEED_WRAP) {</span>
+<span class="nc" id="L832">                    return new SSLEngineResult(Status.OK, hsStatus, 0, 0);</span>
+                }
+            }
+<span class="nc" id="L835">        }</span>
+
+        /*
+         * Grab a copy of this if it doesn't already exist,
+         * and we can use it several places before anything major
+         * happens on this side.  Races aren't critical
+         * here.
+         */
+<span class="nc bnc" id="L843" title="All 2 branches missed.">        if (hsStatus == null) {</span>
+<span class="nc" id="L844">            hsStatus = getHSStatus(null);</span>
+        }
+
+        /*
+         * If we have a task outstanding, this *MUST* be done before
+         * doing any more unwrapping, because we could be in the middle
+         * of receiving a handshake message, for example, a finished
+         * message which would change the ciphers.
+         */
+<span class="nc bnc" id="L853" title="All 2 branches missed.">        if (hsStatus == HandshakeStatus.NEED_TASK) {</span>
+<span class="nc" id="L854">            return new SSLEngineResult(</span>
+                Status.OK, hsStatus, 0, 0);
+        }
+
+        /*
+         * Check the packet to make sure enough is here.
+         * This will also indirectly check for 0 len packets.
+         */
+<span class="nc" id="L862">        int packetLen = inputRecord.bytesInCompletePacket(ea.netData);</span>
+
+        // Is this packet bigger than SSL/TLS normally allows?
+<span class="nc bnc" id="L865" title="All 2 branches missed.">        if (packetLen &gt; sess.getPacketBufferSize()) {</span>
+<span class="nc bnc" id="L866" title="All 2 branches missed.">            if (packetLen &gt; Record.maxLargeRecordSize) {</span>
+<span class="nc" id="L867">                throw new SSLProtocolException(</span>
+                    &quot;Input SSL/TLS record too big: max = &quot; +
+                    Record.maxLargeRecordSize +
+                    &quot; len = &quot; + packetLen);
+            } else {
+                // Expand the expected maximum packet/application buffer
+                // sizes.
+<span class="nc" id="L874">                sess.expandBufferSizes();</span>
+            }
+        }
+
+        /*
+         * Check for OVERFLOW.
+         *
+         * To be considered: We could delay enforcing the application buffer
+         * free space requirement until after the initial handshaking.
+         */
+<span class="nc bnc" id="L884" title="All 2 branches missed.">        if ((packetLen - Record.headerSize) &gt; ea.getAppRemaining()) {</span>
+<span class="nc" id="L885">            return new SSLEngineResult(Status.BUFFER_OVERFLOW, hsStatus, 0, 0);</span>
+        }
+
+        // check for UNDERFLOW.
+<span class="nc bnc" id="L889" title="All 4 branches missed.">        if ((packetLen == -1) || (ea.netData.remaining() &lt; packetLen)) {</span>
+<span class="nc" id="L890">            return new SSLEngineResult(</span>
+                Status.BUFFER_UNDERFLOW, hsStatus, 0, 0);
+        }
+
+        /*
+         * We're now ready to actually do the read.
+         * The only result code we really need to be exactly
+         * right is the HS finished, for signaling to
+         * HandshakeCompletedListeners.
+         */
+        try {
+<span class="nc" id="L901">            hsStatus = readRecord(ea);</span>
+<span class="nc" id="L902">        } catch (SSLException e) {</span>
+<span class="nc" id="L903">            throw e;</span>
+<span class="nc" id="L904">        } catch (IOException e) {</span>
+<span class="nc" id="L905">            throw new SSLException(&quot;readRecord&quot;, e);</span>
+<span class="nc" id="L906">        }</span>
+
+        /*
+         * Check the various condition that we could be reporting.
+         *
+         * It's *possible* something might have happened between the
+         * above and now, but it was better to minimally lock &quot;this&quot;
+         * during the read process.  We'll return the current
+         * status, which is more representative of the current state.
+         *
+         * status above should cover:  FINISHED, NEED_TASK
+         */
+<span class="nc bnc" id="L918" title="All 2 branches missed.">        status = (isInboundDone() ? Status.CLOSED : Status.OK);</span>
+<span class="nc" id="L919">        hsStatus = getHSStatus(hsStatus);</span>
+
+<span class="nc" id="L921">        return new SSLEngineResult(status, hsStatus,</span>
+<span class="nc" id="L922">            ea.deltaNet(), ea.deltaApp());</span>
+    }
+
+    /*
+     * Actually do the read record processing.
+     *
+     * Returns a Status if it can make specific determinations
+     * of the engine state.  In particular, we need to signal
+     * that a handshake just completed.
+     *
+     * It would be nice to be symmetrical with the write side and move
+     * the majority of this to EngineInputRecord, but there's too much
+     * SSLEngine state to do that cleanly.  It must still live here.
+     */
+    private HandshakeStatus readRecord(EngineArgs ea) throws IOException {
+
+<span class="nc" id="L938">        HandshakeStatus hsStatus = null;</span>
+
+        /*
+         * The various operations will return new sliced BB's,
+         * this will avoid having to worry about positions and
+         * limits in the netBB.
+         */
+<span class="nc" id="L945">        ByteBuffer readBB = null;</span>
+<span class="nc" id="L946">        ByteBuffer decryptedBB = null;</span>
+
+<span class="nc bnc" id="L948" title="All 2 branches missed.">        if (getConnectionState() != cs_ERROR) {</span>
+
+            /*
+             * Read a record ... maybe emitting an alert if we get a
+             * comprehensible but unsupported &quot;hello&quot; message during
+             * format checking (e.g. V2).
+             */
+            try {
+<span class="nc" id="L956">                readBB = inputRecord.read(ea.netData);</span>
+<span class="nc" id="L957">            } catch (IOException e) {</span>
+<span class="nc" id="L958">                fatal(Alerts.alert_unexpected_message, e);</span>
+<span class="nc" id="L959">            }</span>
+
+            /*
+             * The basic SSLv3 record protection involves (optional)
+             * encryption for privacy, and an integrity check ensuring
+             * data origin authentication.  We do them both here, and
+             * throw a fatal alert if the integrity check fails.
+             */
+            try {
+<span class="nc" id="L968">                decryptedBB = inputRecord.decrypt(</span>
+                                    readAuthenticator, readCipher, readBB);
+<span class="nc" id="L970">            } catch (BadPaddingException e) {</span>
+<span class="nc bnc" id="L971" title="All 2 branches missed.">                byte alertType = (inputRecord.contentType() ==</span>
+                    Record.ct_handshake) ?
+                        Alerts.alert_handshake_failure :
+                        Alerts.alert_bad_record_mac;
+<span class="nc" id="L975">                fatal(alertType, e.getMessage(), e);</span>
+<span class="nc" id="L976">            }</span>
+
+            // if (!inputRecord.decompress(c))
+            //     fatal(Alerts.alert_decompression_failure,
+            //     &quot;decompression failure&quot;);
+
+
+            /*
+             * Process the record.
+             */
+
+<span class="nc" id="L987">            synchronized (this) {</span>
+<span class="nc bnc" id="L988" title="All 5 branches missed.">                switch (inputRecord.contentType()) {</span>
+                case Record.ct_handshake:
+                    /*
+                     * Handshake messages always go to a pending session
+                     * handshaker ... if there isn't one, create one.  This
+                     * must work asynchronously, for renegotiation.
+                     *
+                     * NOTE that handshaking will either resume a session
+                     * which was in the cache (and which might have other
+                     * connections in it already), or else will start a new
+                     * session (new keys exchanged) with just this connection
+                     * in it.
+                     */
+<span class="nc" id="L1001">                    initHandshaker();</span>
+<span class="nc bnc" id="L1002" title="All 2 branches missed.">                    if (!handshaker.activated()) {</span>
+                        // prior to handshaking, activate the handshake
+<span class="nc bnc" id="L1004" title="All 2 branches missed.">                        if (connectionState == cs_RENEGOTIATE) {</span>
+                            // don't use SSLv2Hello when renegotiating
+<span class="nc" id="L1006">                            handshaker.activate(protocolVersion);</span>
+                        } else {
+<span class="nc" id="L1008">                            handshaker.activate(null);</span>
+                        }
+                    }
+
+                    /*
+                     * process the handshake record ... may contain just
+                     * a partial handshake message or multiple messages.
+                     *
+                     * The handshaker state machine will ensure that it's
+                     * a finished message.
+                     */
+<span class="nc" id="L1019">                    handshaker.process_record(inputRecord, expectingFinished);</span>
+<span class="nc" id="L1020">                    expectingFinished = false;</span>
+
+<span class="nc bnc" id="L1022" title="All 2 branches missed.">                    if (handshaker.invalidated) {</span>
+<span class="nc" id="L1023">                        handshaker = null;</span>
+                        // if state is cs_RENEGOTIATE, revert it to cs_DATA
+<span class="nc bnc" id="L1025" title="All 2 branches missed.">                        if (connectionState == cs_RENEGOTIATE) {</span>
+<span class="nc" id="L1026">                            connectionState = cs_DATA;</span>
+                        }
+<span class="nc bnc" id="L1028" title="All 2 branches missed.">                    } else if (handshaker.isDone()) {</span>
+                        // reset the parameters for secure renegotiation.
+<span class="nc" id="L1030">                        secureRenegotiation =</span>
+<span class="nc" id="L1031">                                        handshaker.isSecureRenegotiation();</span>
+<span class="nc" id="L1032">                        clientVerifyData = handshaker.getClientVerifyData();</span>
+<span class="nc" id="L1033">                        serverVerifyData = handshaker.getServerVerifyData();</span>
+
+<span class="nc" id="L1035">                        sess = handshaker.getSession();</span>
+<span class="nc" id="L1036">                        handshakeSession = null;</span>
+<span class="nc bnc" id="L1037" title="All 2 branches missed.">                        if (!writer.hasOutboundData()) {</span>
+<span class="nc" id="L1038">                            hsStatus = HandshakeStatus.FINISHED;</span>
+                        }
+<span class="nc" id="L1040">                        handshaker = null;</span>
+<span class="nc" id="L1041">                        connectionState = cs_DATA;</span>
+
+                        // No handshakeListeners here.  That's a
+                        // SSLSocket thing.
+<span class="nc bnc" id="L1045" title="All 2 branches missed.">                    } else if (handshaker.taskOutstanding()) {</span>
+<span class="nc" id="L1046">                        hsStatus = HandshakeStatus.NEED_TASK;</span>
+                    }
+                    break;
+
+                case Record.ct_application_data:
+                    // Pass this right back up to the application.
+<span class="nc bnc" id="L1052" title="All 6 branches missed.">                    if ((connectionState != cs_DATA)</span>
+                            &amp;&amp; (connectionState != cs_RENEGOTIATE)
+                            &amp;&amp; (connectionState != cs_CLOSED)) {
+<span class="nc" id="L1055">                        throw new SSLProtocolException(</span>
+                            &quot;Data received in non-data state: &quot; +
+                            connectionState);
+                    }
+
+<span class="nc bnc" id="L1060" title="All 2 branches missed.">                    if (expectingFinished) {</span>
+<span class="nc" id="L1061">                        throw new SSLProtocolException</span>
+                                (&quot;Expecting finished message, received data&quot;);
+                    }
+
+                    /*
+                     * Don't return data once the inbound side is
+                     * closed.
+                     */
+<span class="nc bnc" id="L1069" title="All 2 branches missed.">                    if (!inboundDone) {</span>
+<span class="nc" id="L1070">                        ea.scatter(decryptedBB.slice());</span>
+                    }
+                    break;
+
+                case Record.ct_alert:
+<span class="nc" id="L1075">                    recvAlert();</span>
+<span class="nc" id="L1076">                    break;</span>
+
+                case Record.ct_change_cipher_spec:
+<span class="nc bnc" id="L1079" title="All 4 branches missed.">                    if ((connectionState != cs_HANDSHAKE</span>
+                                &amp;&amp; connectionState != cs_RENEGOTIATE)
+<span class="nc bnc" id="L1081" title="All 2 branches missed.">                            || inputRecord.available() != 1</span>
+<span class="nc bnc" id="L1082" title="All 2 branches missed.">                            || inputRecord.read() != 1) {</span>
+<span class="nc" id="L1083">                        fatal(Alerts.alert_unexpected_message,</span>
+                            &quot;illegal change cipher spec msg, state = &quot;
+                            + connectionState);
+                    }
+
+                    //
+                    // The first message after a change_cipher_spec
+                    // record MUST be a &quot;Finished&quot; handshake record,
+                    // else it's a protocol violation.  We force this
+                    // to be checked by a minor tweak to the state
+                    // machine.
+                    //
+<span class="nc" id="L1095">                    changeReadCiphers();</span>
+                    // next message MUST be a finished message
+<span class="nc" id="L1097">                    expectingFinished = true;</span>
+<span class="nc" id="L1098">                    break;</span>
+
+                default:
+                    //
+                    // TLS requires that unrecognized records be ignored.
+                    //
+<span class="nc bnc" id="L1104" title="All 4 branches missed.">                    if (debug != null &amp;&amp; Debug.isOn(&quot;ssl&quot;)) {</span>
+<span class="nc" id="L1105">                        System.out.println(Thread.currentThread().getName() +</span>
+                            &quot;, Received record type: &quot;
+<span class="nc" id="L1107">                            + inputRecord.contentType());</span>
+                    }
+                    break;
+                } // switch
+
+                /*
+                 * We only need to check the sequence number state for
+                 * non-handshaking record.
+                 *
+                 * Note that in order to maintain the handshake status
+                 * properly, we check the sequence number after the last
+                 * record reading process. As we request renegotiation
+                 * or close the connection for wrapped sequence number
+                 * when there is enough sequence number space left to
+                 * handle a few more records, so the sequence number
+                 * of the last record cannot be wrapped.
+                 */
+<span class="nc" id="L1124">                hsStatus = getHSStatus(hsStatus);</span>
+<span class="nc bnc" id="L1125" title="All 6 branches missed.">                if (connectionState &lt; cs_ERROR &amp;&amp; !isInboundDone() &amp;&amp;</span>
+                        (hsStatus == HandshakeStatus.NOT_HANDSHAKING)) {
+<span class="nc bnc" id="L1127" title="All 2 branches missed.">                    if (checkSequenceNumber(readAuthenticator,</span>
+<span class="nc" id="L1128">                            inputRecord.contentType())) {</span>
+<span class="nc" id="L1129">                        hsStatus = getHSStatus(null);</span>
+                    }
+                }
+<span class="nc" id="L1132">            } // synchronized (this)</span>
+        }
+
+<span class="nc" id="L1135">        return hsStatus;</span>
+    }
+
+
+    //
+    // write/wrap side
+    //
+
+
+    /**
+     * Wraps a buffer.  Does a variety of checks before grabbing
+     * the wrapLock, which blocks multiple wraps from occurring.
+     */
+    @Override
+    public SSLEngineResult wrap(ByteBuffer [] appData,
+            int offset, int length, ByteBuffer netData) throws SSLException {
+
+<span class="nc" id="L1152">        EngineArgs ea = new EngineArgs(appData, offset, length, netData);</span>
+
+        /*
+         * We can be smarter about using smaller buffer sizes later.
+         * For now, force it to be large enough to handle any
+         * valid SSL/TLS record.
+         */
+<span class="nc bnc" id="L1159" title="All 2 branches missed.">        if (netData.remaining() &lt; EngineOutputRecord.maxRecordSize) {</span>
+<span class="nc" id="L1160">            return new SSLEngineResult(</span>
+<span class="nc" id="L1161">                Status.BUFFER_OVERFLOW, getHSStatus(null), 0, 0);</span>
+        }
+
+        try {
+<span class="nc" id="L1165">            synchronized (wrapLock) {</span>
+<span class="nc" id="L1166">                return writeAppRecord(ea);</span>
+<span class="nc" id="L1167">            }</span>
+<span class="nc" id="L1168">        } catch (Exception e) {</span>
+<span class="nc" id="L1169">            ea.resetPos();</span>
+
+<span class="nc" id="L1171">            fatal(Alerts.alert_internal_error,</span>
+                &quot;problem wrapping app data&quot;, e);
+<span class="nc" id="L1173">            return null;  // make compiler happy</span>
+        } finally {
+            /*
+             * Just in case something didn't reset limits properly.
+             */
+<span class="nc" id="L1178">            ea.resetLim();</span>
+        }
+    }
+
+    /*
+     * Makes additional checks for unwrap, but this time more
+     * specific to this packet and the current state of the machine.
+     */
+    private SSLEngineResult writeAppRecord(EngineArgs ea) throws IOException {
+
+<span class="nc" id="L1188">        Status status = null;</span>
+<span class="nc" id="L1189">        HandshakeStatus hsStatus = null;</span>
+
+        /*
+         * See if the handshaker needs to report back some SSLException.
+         */
+<span class="nc" id="L1194">        checkTaskThrown();</span>
+
+        /*
+         * short circuit if we're closed/closing.
+         */
+<span class="nc bnc" id="L1199" title="All 2 branches missed.">        if (writer.isOutboundDone()) {</span>
+<span class="nc" id="L1200">            return new SSLEngineResult(Status.CLOSED, getHSStatus(null), 0, 0);</span>
+        }
+
+        /*
+         * If we're still in cs_HANDSHAKE, make sure it's been
+         * started.
+         */
+<span class="nc" id="L1207">        synchronized (this) {</span>
+<span class="nc bnc" id="L1208" title="All 4 branches missed.">            if ((connectionState == cs_HANDSHAKE) ||</span>
+                    (connectionState == cs_START)) {
+<span class="nc" id="L1210">                kickstartHandshake();</span>
+
+                /*
+                 * If there's no HS data available to write, we can return
+                 * without trying to wrap anything.
+                 */
+<span class="nc" id="L1216">                hsStatus = getHSStatus(null);</span>
+
+<span class="nc bnc" id="L1218" title="All 2 branches missed.">                if (hsStatus == HandshakeStatus.NEED_UNWRAP) {</span>
+<span class="nc" id="L1219">                    return new SSLEngineResult(Status.OK, hsStatus, 0, 0);</span>
+                }
+            }
+<span class="nc" id="L1222">        }</span>
+
+        /*
+         * Grab a copy of this if it doesn't already exist,
+         * and we can use it several places before anything major
+         * happens on this side.  Races aren't critical
+         * here.
+         */
+<span class="nc bnc" id="L1230" title="All 2 branches missed.">        if (hsStatus == null) {</span>
+<span class="nc" id="L1231">            hsStatus = getHSStatus(null);</span>
+        }
+
+        /*
+         * If we have a task outstanding, this *MUST* be done before
+         * doing any more wrapping, because we could be in the middle
+         * of receiving a handshake message, for example, a finished
+         * message which would change the ciphers.
+         */
+<span class="nc bnc" id="L1240" title="All 2 branches missed.">        if (hsStatus == HandshakeStatus.NEED_TASK) {</span>
+<span class="nc" id="L1241">            return new SSLEngineResult(</span>
+                Status.OK, hsStatus, 0, 0);
+        }
+
+        /*
+         * This will obtain any waiting outbound data, or will
+         * process the outbound appData.
+         */
+        try {
+<span class="nc" id="L1250">            synchronized (writeLock) {</span>
+<span class="nc" id="L1251">                hsStatus = writeRecord(outputRecord, ea);</span>
+<span class="nc" id="L1252">            }</span>
+<span class="nc" id="L1253">        } catch (SSLException e) {</span>
+<span class="nc" id="L1254">            throw e;</span>
+<span class="nc" id="L1255">        } catch (IOException e) {</span>
+<span class="nc" id="L1256">            throw new SSLException(&quot;Write problems&quot;, e);</span>
+<span class="nc" id="L1257">        }</span>
+
+        /*
+         * writeRecord might have reported some status.
+         * Now check for the remaining cases.
+         *
+         * status above should cover:  NEED_WRAP/FINISHED
+         */
+<span class="nc bnc" id="L1265" title="All 2 branches missed.">        status = (isOutboundDone() ? Status.CLOSED : Status.OK);</span>
+<span class="nc" id="L1266">        hsStatus = getHSStatus(hsStatus);</span>
+
+<span class="nc" id="L1268">        return new SSLEngineResult(status, hsStatus,</span>
+<span class="nc" id="L1269">            ea.deltaApp(), ea.deltaNet());</span>
+    }
+
+    /*
+     * Central point to write/get all of the outgoing data.
+     */
+    private HandshakeStatus writeRecord(EngineOutputRecord eor,
+            EngineArgs ea) throws IOException {
+
+        // eventually compress as well.
+<span class="nc" id="L1279">        HandshakeStatus hsStatus =</span>
+<span class="nc" id="L1280">                writer.writeRecord(eor, ea, writeAuthenticator, writeCipher);</span>
+
+        /*
+         * We only need to check the sequence number state for
+         * non-handshaking record.
+         *
+         * Note that in order to maintain the handshake status
+         * properly, we check the sequence number after the last
+         * record writing process. As we request renegotiation
+         * or close the connection for wrapped sequence number
+         * when there is enough sequence number space left to
+         * handle a few more records, so the sequence number
+         * of the last record cannot be wrapped.
+         */
+<span class="nc" id="L1294">        hsStatus = getHSStatus(hsStatus);</span>
+<span class="nc bnc" id="L1295" title="All 6 branches missed.">        if (connectionState &lt; cs_ERROR &amp;&amp; !isOutboundDone() &amp;&amp;</span>
+                (hsStatus == HandshakeStatus.NOT_HANDSHAKING)) {
+<span class="nc bnc" id="L1297" title="All 2 branches missed.">            if (checkSequenceNumber(writeAuthenticator, eor.contentType())) {</span>
+<span class="nc" id="L1298">                hsStatus = getHSStatus(null);</span>
+            }
+        }
+
+        /*
+         * turn off the flag of the first application record if we really
+         * consumed at least byte.
+         */
+<span class="nc bnc" id="L1306" title="All 4 branches missed.">        if (isFirstAppOutputRecord &amp;&amp; ea.deltaApp() &gt; 0) {</span>
+<span class="nc" id="L1307">            isFirstAppOutputRecord = false;</span>
+        }
+
+<span class="nc" id="L1310">        return hsStatus;</span>
+    }
+
+    /*
+     * Need to split the payload except the following cases:
+     *
+     * 1. protocol version is TLS 1.1 or later;
+     * 2. bulk cipher does not use CBC mode, including null bulk cipher suites.
+     * 3. the payload is the first application record of a freshly
+     *    negotiated TLS session.
+     * 4. the CBC protection is disabled;
+     *
+     * More details, please refer to
+     * EngineOutputRecord.write(EngineArgs, MAC, CipherBox).
+     */
+    boolean needToSplitPayload(CipherBox cipher, ProtocolVersion protocol) {
+<span class="nc bnc" id="L1326" title="All 2 branches missed.">        return (protocol.v &lt;= ProtocolVersion.TLS10.v) &amp;&amp;</span>
+<span class="nc bnc" id="L1327" title="All 6 branches missed.">                cipher.isCBCMode() &amp;&amp; !isFirstAppOutputRecord &amp;&amp;</span>
+                Record.enableCBCProtection;
+    }
+
+    /*
+     * Non-application OutputRecords go through here.
+     */
+    void writeRecord(EngineOutputRecord eor) throws IOException {
+        // eventually compress as well.
+<span class="nc" id="L1336">        writer.writeRecord(eor, writeAuthenticator, writeCipher);</span>
+
+        /*
+         * Check the sequence number state
+         *
+         * Note that in order to maintain the connection I/O
+         * properly, we check the sequence number after the last
+         * record writing process. As we request renegotiation
+         * or close the connection for wrapped sequence number
+         * when there is enough sequence number space left to
+         * handle a few more records, so the sequence number
+         * of the last record cannot be wrapped.
+         */
+<span class="nc bnc" id="L1349" title="All 4 branches missed.">        if ((connectionState &lt; cs_ERROR) &amp;&amp; !isOutboundDone()) {</span>
+<span class="nc" id="L1350">            checkSequenceNumber(writeAuthenticator, eor.contentType());</span>
+        }
+<span class="nc" id="L1352">    }</span>
+
+    //
+    // Close code
+    //
+
+    /**
+     * Check the sequence number state
+     *
+     * RFC 4346 states that, &quot;Sequence numbers are of type uint64 and
+     * may not exceed 2^64-1.  Sequence numbers do not wrap. If a TLS
+     * implementation would need to wrap a sequence number, it must
+     * renegotiate instead.&quot;
+     *
+     * Return true if the handshake status may be changed.
+     */
+    private boolean checkSequenceNumber(Authenticator authenticator, byte type)
+            throws IOException {
+
+        /*
+         * Don't bother to check the sequence number for error or
+         * closed connections, or NULL MAC
+         */
+<span class="nc bnc" id="L1375" title="All 4 branches missed.">        if (connectionState &gt;= cs_ERROR || authenticator == MAC.NULL) {</span>
+<span class="nc" id="L1376">            return false;</span>
+        }
+
+        /*
+         * Conservatively, close the connection immediately when the
+         * sequence number is close to overflow
+         */
+<span class="nc bnc" id="L1383" title="All 2 branches missed.">        if (authenticator.seqNumOverflow()) {</span>
+            /*
+             * TLS protocols do not define a error alert for sequence
+             * number overflow. We use handshake_failure error alert
+             * for handshaking and bad_record_mac for other records.
+             */
+<span class="nc bnc" id="L1389" title="All 4 branches missed.">            if (debug != null &amp;&amp; Debug.isOn(&quot;ssl&quot;)) {</span>
+<span class="nc" id="L1390">                System.out.println(Thread.currentThread().getName() +</span>
+                    &quot;, sequence number extremely close to overflow &quot; +
+                    &quot;(2^64-1 packets). Closing connection.&quot;);
+            }
+
+<span class="nc" id="L1395">            fatal(Alerts.alert_handshake_failure, &quot;sequence number overflow&quot;);</span>
+
+<span class="nc" id="L1397">            return true; // make the compiler happy</span>
+        }
+
+        /*
+         * Ask for renegotiation when need to renew sequence number.
+         *
+         * Don't bother to kickstart the renegotiation when the local is
+         * asking for it.
+         */
+<span class="nc bnc" id="L1406" title="All 4 branches missed.">        if ((type != Record.ct_handshake) &amp;&amp; authenticator.seqNumIsHuge()) {</span>
+<span class="nc bnc" id="L1407" title="All 4 branches missed.">            if (debug != null &amp;&amp; Debug.isOn(&quot;ssl&quot;)) {</span>
+<span class="nc" id="L1408">                System.out.println(Thread.currentThread().getName() +</span>
+                        &quot;, request renegotiation &quot; +
+                        &quot;to avoid sequence number overflow&quot;);
+            }
+
+<span class="nc" id="L1413">            beginHandshake();</span>
+<span class="nc" id="L1414">            return true;</span>
+        }
+
+<span class="nc" id="L1417">        return false;</span>
+    }
+
+    /**
+     * Signals that no more outbound application data will be sent
+     * on this &lt;code&gt;SSLEngine&lt;/code&gt;.
+     */
+    private void closeOutboundInternal() {
+
+<span class="nc bnc" id="L1426" title="All 4 branches missed.">        if ((debug != null) &amp;&amp; Debug.isOn(&quot;ssl&quot;)) {</span>
+<span class="nc" id="L1427">            System.out.println(Thread.currentThread().getName() +</span>
+                                    &quot;, closeOutboundInternal()&quot;);
+        }
+
+        /*
+         * Already closed, ignore
+         */
+<span class="nc bnc" id="L1434" title="All 2 branches missed.">        if (writer.isOutboundDone()) {</span>
+<span class="nc" id="L1435">            return;</span>
+        }
+
+<span class="nc bnc" id="L1438" title="All 3 branches missed.">        switch (connectionState) {</span>
+
+        /*
+         * If we haven't even started yet, don't bother reading inbound.
+         */
+        case cs_START:
+<span class="nc" id="L1444">            writer.closeOutbound();</span>
+<span class="nc" id="L1445">            inboundDone = true;</span>
+<span class="nc" id="L1446">            break;</span>
+
+        case cs_ERROR:
+        case cs_CLOSED:
+<span class="nc" id="L1450">            break;</span>
+
+        /*
+         * Otherwise we indicate clean termination.
+         */
+        // case cs_HANDSHAKE:
+        // case cs_DATA:
+        // case cs_RENEGOTIATE:
+        default:
+<span class="nc" id="L1459">            warning(Alerts.alert_close_notify);</span>
+<span class="nc" id="L1460">            writer.closeOutbound();</span>
+            break;
+        }
+
+        // See comment in changeReadCiphers()
+<span class="nc" id="L1465">        writeCipher.dispose();</span>
+
+<span class="nc" id="L1467">        connectionState = cs_CLOSED;</span>
+<span class="nc" id="L1468">    }</span>
+
+    @Override
+    synchronized public void closeOutbound() {
+        /*
+         * Dump out a close_notify to the remote side
+         */
+<span class="nc bnc" id="L1475" title="All 4 branches missed.">        if ((debug != null) &amp;&amp; Debug.isOn(&quot;ssl&quot;)) {</span>
+<span class="nc" id="L1476">            System.out.println(Thread.currentThread().getName() +</span>
+                                    &quot;, called closeOutbound()&quot;);
+        }
+
+<span class="nc" id="L1480">        closeOutboundInternal();</span>
+<span class="nc" id="L1481">    }</span>
+
+    /**
+     * Returns the outbound application data closure state
+     */
+    @Override
+    public boolean isOutboundDone() {
+<span class="nc" id="L1488">        return writer.isOutboundDone();</span>
+    }
+
+    /**
+     * Signals that no more inbound network data will be sent
+     * to this &lt;code&gt;SSLEngine&lt;/code&gt;.
+     */
+    private void closeInboundInternal() {
+
+<span class="nc bnc" id="L1497" title="All 4 branches missed.">        if ((debug != null) &amp;&amp; Debug.isOn(&quot;ssl&quot;)) {</span>
+<span class="nc" id="L1498">            System.out.println(Thread.currentThread().getName() +</span>
+                                    &quot;, closeInboundInternal()&quot;);
+        }
+
+        /*
+         * Already closed, ignore
+         */
+<span class="nc bnc" id="L1505" title="All 2 branches missed.">        if (inboundDone) {</span>
+<span class="nc" id="L1506">            return;</span>
+        }
+
+<span class="nc" id="L1509">        closeOutboundInternal();</span>
+<span class="nc" id="L1510">        inboundDone = true;</span>
+
+        // See comment in changeReadCiphers()
+<span class="nc" id="L1513">        readCipher.dispose();</span>
+
+<span class="nc" id="L1515">        connectionState = cs_CLOSED;</span>
+<span class="nc" id="L1516">    }</span>
+
+    /*
+     * Close the inbound side of the connection.  We grab the
+     * lock here, and do the real work in the internal verison.
+     * We do check for truncation attacks.
+     */
+    @Override
+    synchronized public void closeInbound() throws SSLException {
+        /*
+         * Currently closes the outbound side as well.  The IETF TLS
+         * working group has expressed the opinion that 1/2 open
+         * connections are not allowed by the spec.  May change
+         * someday in the future.
+         */
+<span class="nc bnc" id="L1531" title="All 4 branches missed.">        if ((debug != null) &amp;&amp; Debug.isOn(&quot;ssl&quot;)) {</span>
+<span class="nc" id="L1532">            System.out.println(Thread.currentThread().getName() +</span>
+                                    &quot;, called closeInbound()&quot;);
+        }
+
+        /*
+         * No need to throw an Exception if we haven't even started yet.
+         */
+<span class="nc bnc" id="L1539" title="All 4 branches missed.">        if ((connectionState != cs_START) &amp;&amp; !recvCN) {</span>
+<span class="nc" id="L1540">            recvCN = true;  // Only receive the Exception once</span>
+<span class="nc" id="L1541">            fatal(Alerts.alert_internal_error,</span>
+                &quot;Inbound closed before receiving peer's close_notify: &quot; +
+                &quot;possible truncation attack?&quot;);
+        } else {
+            /*
+             * Currently, this is a no-op, but in case we change
+             * the close inbound code later.
+             */
+<span class="nc" id="L1549">            closeInboundInternal();</span>
+        }
+<span class="nc" id="L1551">    }</span>
+
+    /**
+     * Returns the network inbound data closure state
+     */
+    @Override
+    synchronized public boolean isInboundDone() {
+<span class="nc" id="L1558">        return inboundDone;</span>
+    }
+
+
+    //
+    // Misc stuff
+    //
+
+
+    /**
+     * Returns the current &lt;code&gt;SSLSession&lt;/code&gt; for this
+     * &lt;code&gt;SSLEngine&lt;/code&gt;
+     * &lt;P&gt;
+     * These can be long lived, and frequently correspond to an
+     * entire login session for some user.
+     */
+    @Override
+    synchronized public SSLSession getSession() {
+<span class="nc" id="L1576">        return sess;</span>
+    }
+
+    @Override
+    synchronized public SSLSession getHandshakeSession() {
+<span class="nc" id="L1581">        return handshakeSession;</span>
+    }
+
+    synchronized void setHandshakeSession(SSLSessionImpl session) {
+<span class="nc" id="L1585">        handshakeSession = session;</span>
+<span class="nc" id="L1586">    }</span>
+
+    /**
+     * Returns a delegated &lt;code&gt;Runnable&lt;/code&gt; task for
+     * this &lt;code&gt;SSLEngine&lt;/code&gt;.
+     */
+    @Override
+    synchronized public Runnable getDelegatedTask() {
+<span class="nc bnc" id="L1594" title="All 2 branches missed.">        if (handshaker != null) {</span>
+<span class="nc" id="L1595">            return handshaker.getTask();</span>
+        }
+<span class="nc" id="L1597">        return null;</span>
+    }
+
+
+    //
+    // EXCEPTION AND ALERT HANDLING
+    //
+
+    /*
+     * Send a warning alert.
+     */
+    void warning(byte description) {
+<span class="nc" id="L1609">        sendAlert(Alerts.alert_warning, description);</span>
+<span class="nc" id="L1610">    }</span>
+
+    synchronized void fatal(byte description, String diagnostic)
+            throws SSLException {
+<span class="nc" id="L1614">        fatal(description, diagnostic, null);</span>
+<span class="nc" id="L1615">    }</span>
+
+    synchronized void fatal(byte description, Throwable cause)
+            throws SSLException {
+<span class="nc" id="L1619">        fatal(description, null, cause);</span>
+<span class="nc" id="L1620">    }</span>
+
+    /*
+     * We've got a fatal error here, so start the shutdown process.
+     *
+     * Because of the way the code was written, we have some code
+     * calling fatal directly when the &quot;description&quot; is known
+     * and some throwing Exceptions which are then caught by higher
+     * levels which then call here.  This code needs to determine
+     * if one of the lower levels has already started the process.
+     *
+     * We won't worry about Error's, if we have one of those,
+     * we're in worse trouble.  Note:  the networking code doesn't
+     * deal with Errors either.
+     */
+    synchronized void fatal(byte description, String diagnostic,
+            Throwable cause) throws SSLException {
+
+        /*
+         * If we have no further information, make a general-purpose
+         * message for folks to see.  We generally have one or the other.
+         */
+<span class="nc bnc" id="L1642" title="All 2 branches missed.">        if (diagnostic == null) {</span>
+<span class="nc" id="L1643">            diagnostic = &quot;General SSLEngine problem&quot;;</span>
+        }
+<span class="nc bnc" id="L1645" title="All 2 branches missed.">        if (cause == null) {</span>
+<span class="nc" id="L1646">            cause = Alerts.getSSLException(description, cause, diagnostic);</span>
+        }
+
+        /*
+         * If we've already shutdown because of an error,
+         * there is nothing we can do except rethrow the exception.
+         *
+         * Most exceptions seen here will be SSLExceptions.
+         * We may find the occasional Exception which hasn't been
+         * converted to a SSLException, so we'll do it here.
+         */
+<span class="nc bnc" id="L1657" title="All 2 branches missed.">        if (closeReason != null) {</span>
+<span class="nc bnc" id="L1658" title="All 4 branches missed.">            if ((debug != null) &amp;&amp; Debug.isOn(&quot;ssl&quot;)) {</span>
+<span class="nc" id="L1659">                System.out.println(Thread.currentThread().getName() +</span>
+                    &quot;, fatal: engine already closed.  Rethrowing &quot; +
+<span class="nc" id="L1661">                    cause.toString());</span>
+            }
+<span class="nc bnc" id="L1663" title="All 2 branches missed.">            if (cause instanceof RuntimeException) {</span>
+<span class="nc" id="L1664">                throw (RuntimeException)cause;</span>
+<span class="nc bnc" id="L1665" title="All 2 branches missed.">            } else if (cause instanceof SSLException) {</span>
+<span class="nc" id="L1666">                throw (SSLException)cause;</span>
+<span class="nc bnc" id="L1667" title="All 2 branches missed.">            } else if (cause instanceof Exception) {</span>
+<span class="nc" id="L1668">                throw new SSLException(&quot;fatal SSLEngine condition&quot;, cause);</span>
+            }
+        }
+
+<span class="nc bnc" id="L1672" title="All 4 branches missed.">        if ((debug != null) &amp;&amp; Debug.isOn(&quot;ssl&quot;)) {</span>
+<span class="nc" id="L1673">            System.out.println(Thread.currentThread().getName()</span>
+                        + &quot;, fatal error: &quot; + description +
+<span class="nc" id="L1675">                        &quot;: &quot; + diagnostic + &quot;\n&quot; + cause.toString());</span>
+        }
+
+        /*
+         * Ok, this engine's going down.
+         */
+<span class="nc" id="L1681">        int oldState = connectionState;</span>
+<span class="nc" id="L1682">        connectionState = cs_ERROR;</span>
+
+<span class="nc" id="L1684">        inboundDone = true;</span>
+
+<span class="nc" id="L1686">        sess.invalidate();</span>
+<span class="nc bnc" id="L1687" title="All 2 branches missed.">        if (handshakeSession != null) {</span>
+<span class="nc" id="L1688">            handshakeSession.invalidate();</span>
+        }
+
+        /*
+         * If we haven't even started handshaking yet, no need
+         * to generate the fatal close alert.
+         */
+<span class="nc bnc" id="L1695" title="All 2 branches missed.">        if (oldState != cs_START) {</span>
+<span class="nc" id="L1696">            sendAlert(Alerts.alert_fatal, description);</span>
+        }
+
+<span class="nc bnc" id="L1699" title="All 2 branches missed.">        if (cause instanceof SSLException) { // only true if != null</span>
+<span class="nc" id="L1700">            closeReason = (SSLException)cause;</span>
+        } else {
+            /*
+             * Including RuntimeExceptions, but we'll throw those
+             * down below.  The closeReason isn't used again,
+             * except for null checks.
+             */
+<span class="nc" id="L1707">            closeReason =</span>
+<span class="nc" id="L1708">                Alerts.getSSLException(description, cause, diagnostic);</span>
+        }
+
+<span class="nc" id="L1711">        writer.closeOutbound();</span>
+
+<span class="nc" id="L1713">        connectionState = cs_CLOSED;</span>
+
+        // See comment in changeReadCiphers()
+<span class="nc" id="L1716">        readCipher.dispose();</span>
+<span class="nc" id="L1717">        writeCipher.dispose();</span>
+
+<span class="nc bnc" id="L1719" title="All 2 branches missed.">        if (cause instanceof RuntimeException) {</span>
+<span class="nc" id="L1720">            throw (RuntimeException)cause;</span>
+        } else {
+<span class="nc" id="L1722">            throw closeReason;</span>
+        }
+    }
+
+    /*
+     * Process an incoming alert ... caller must already have synchronized
+     * access to &quot;this&quot;.
+     */
+    private void recvAlert() throws IOException {
+<span class="nc" id="L1731">        byte level = (byte)inputRecord.read();</span>
+<span class="nc" id="L1732">        byte description = (byte)inputRecord.read();</span>
+<span class="nc bnc" id="L1733" title="All 2 branches missed.">        if (description == -1) { // check for short message</span>
+<span class="nc" id="L1734">            fatal(Alerts.alert_illegal_parameter, &quot;Short alert message&quot;);</span>
+        }
+
+<span class="nc bnc" id="L1737" title="All 4 branches missed.">        if (debug != null &amp;&amp; (Debug.isOn(&quot;record&quot;) ||</span>
+<span class="nc bnc" id="L1738" title="All 2 branches missed.">                Debug.isOn(&quot;handshake&quot;))) {</span>
+<span class="nc" id="L1739">            synchronized (System.out) {</span>
+<span class="nc" id="L1740">                System.out.print(Thread.currentThread().getName());</span>
+<span class="nc" id="L1741">                System.out.print(&quot;, RECV &quot; + protocolVersion + &quot; ALERT:  &quot;);</span>
+<span class="nc bnc" id="L1742" title="All 2 branches missed.">                if (level == Alerts.alert_fatal) {</span>
+<span class="nc" id="L1743">                    System.out.print(&quot;fatal, &quot;);</span>
+<span class="nc bnc" id="L1744" title="All 2 branches missed.">                } else if (level == Alerts.alert_warning) {</span>
+<span class="nc" id="L1745">                    System.out.print(&quot;warning, &quot;);</span>
+                } else {
+<span class="nc" id="L1747">                    System.out.print(&quot;&lt;level &quot; + (0x0ff &amp; level) + &quot;&gt;, &quot;);</span>
+                }
+<span class="nc" id="L1749">                System.out.println(Alerts.alertDescription(description));</span>
+<span class="nc" id="L1750">            }</span>
+        }
+
+<span class="nc bnc" id="L1753" title="All 2 branches missed.">        if (level == Alerts.alert_warning) {</span>
+<span class="nc bnc" id="L1754" title="All 2 branches missed.">            if (description == Alerts.alert_close_notify) {</span>
+<span class="nc bnc" id="L1755" title="All 2 branches missed.">                if (connectionState == cs_HANDSHAKE) {</span>
+<span class="nc" id="L1756">                    fatal(Alerts.alert_unexpected_message,</span>
+                                &quot;Received close_notify during handshake&quot;);
+                } else {
+<span class="nc" id="L1759">                    recvCN = true;</span>
+<span class="nc" id="L1760">                    closeInboundInternal();  // reply to close</span>
+                }
+            } else {
+
+                //
+                // The other legal warnings relate to certificates,
+                // e.g. no_certificate, bad_certificate, etc; these
+                // are important to the handshaking code, which can
+                // also handle illegal protocol alerts if needed.
+                //
+<span class="nc bnc" id="L1770" title="All 2 branches missed.">                if (handshaker != null) {</span>
+<span class="nc" id="L1771">                    handshaker.handshakeAlert(description);</span>
+                }
+            }
+        } else { // fatal or unknown level
+<span class="nc" id="L1775">            String reason = &quot;Received fatal alert: &quot;</span>
+<span class="nc" id="L1776">                + Alerts.alertDescription(description);</span>
+<span class="nc bnc" id="L1777" title="All 2 branches missed.">            if (closeReason == null) {</span>
+<span class="nc" id="L1778">                closeReason = Alerts.getSSLException(description, reason);</span>
+            }
+<span class="nc" id="L1780">            fatal(Alerts.alert_unexpected_message, reason);</span>
+        }
+<span class="nc" id="L1782">    }</span>
+
+
+    /*
+     * Emit alerts.  Caller must have synchronized with &quot;this&quot;.
+     */
+    private void sendAlert(byte level, byte description) {
+        // the connectionState cannot be cs_START
+<span class="nc bnc" id="L1790" title="All 2 branches missed.">        if (connectionState &gt;= cs_CLOSED) {</span>
+<span class="nc" id="L1791">            return;</span>
+        }
+
+        // For initial handshaking, don't send alert message to peer if
+        // handshaker has not started.
+<span class="nc bnc" id="L1796" title="All 4 branches missed.">        if (connectionState == cs_HANDSHAKE &amp;&amp;</span>
+<span class="nc bnc" id="L1797" title="All 2 branches missed.">            (handshaker == null || !handshaker.started())) {</span>
+<span class="nc" id="L1798">            return;</span>
+        }
+
+<span class="nc" id="L1801">        EngineOutputRecord r = new EngineOutputRecord(Record.ct_alert, this);</span>
+<span class="nc" id="L1802">        r.setVersion(protocolVersion);</span>
+
+<span class="nc bnc" id="L1804" title="All 4 branches missed.">        boolean useDebug = debug != null &amp;&amp; Debug.isOn(&quot;ssl&quot;);</span>
+<span class="nc bnc" id="L1805" title="All 2 branches missed.">        if (useDebug) {</span>
+<span class="nc" id="L1806">            synchronized (System.out) {</span>
+<span class="nc" id="L1807">                System.out.print(Thread.currentThread().getName());</span>
+<span class="nc" id="L1808">                System.out.print(&quot;, SEND &quot; + protocolVersion + &quot; ALERT:  &quot;);</span>
+<span class="nc bnc" id="L1809" title="All 2 branches missed.">                if (level == Alerts.alert_fatal) {</span>
+<span class="nc" id="L1810">                    System.out.print(&quot;fatal, &quot;);</span>
+<span class="nc bnc" id="L1811" title="All 2 branches missed.">                } else if (level == Alerts.alert_warning) {</span>
+<span class="nc" id="L1812">                    System.out.print(&quot;warning, &quot;);</span>
+                } else {
+<span class="nc" id="L1814">                    System.out.print(&quot;&lt;level = &quot; + (0x0ff &amp; level) + &quot;&gt;, &quot;);</span>
+                }
+<span class="nc" id="L1816">                System.out.println(&quot;description = &quot;</span>
+<span class="nc" id="L1817">                        + Alerts.alertDescription(description));</span>
+<span class="nc" id="L1818">            }</span>
+        }
+
+<span class="nc" id="L1821">        r.write(level);</span>
+<span class="nc" id="L1822">        r.write(description);</span>
+        try {
+<span class="nc" id="L1824">            writeRecord(r);</span>
+<span class="nc" id="L1825">        } catch (IOException e) {</span>
+<span class="nc bnc" id="L1826" title="All 2 branches missed.">            if (useDebug) {</span>
+<span class="nc" id="L1827">                System.out.println(Thread.currentThread().getName() +</span>
+                    &quot;, Exception sending alert: &quot; + e);
+            }
+<span class="nc" id="L1830">        }</span>
+<span class="nc" id="L1831">    }</span>
+
+
+    //
+    // VARIOUS OTHER METHODS (COMMON TO SSLSocket)
+    //
+
+
+    /**
+     * Controls whether new connections may cause creation of new SSL
+     * sessions.
+     *
+     * As long as handshaking has not started, we can change
+     * whether we enable session creations.  Otherwise,
+     * we will need to wait for the next handshake.
+     */
+    @Override
+    synchronized public void setEnableSessionCreation(boolean flag) {
+<span class="nc" id="L1849">        enableSessionCreation = flag;</span>
+
+<span class="nc bnc" id="L1851" title="All 4 branches missed.">        if ((handshaker != null) &amp;&amp; !handshaker.activated()) {</span>
+<span class="nc" id="L1852">            handshaker.setEnableSessionCreation(enableSessionCreation);</span>
+        }
+<span class="nc" id="L1854">    }</span>
+
+    /**
+     * Returns true if new connections may cause creation of new SSL
+     * sessions.
+     */
+    @Override
+    synchronized public boolean getEnableSessionCreation() {
+<span class="nc" id="L1862">        return enableSessionCreation;</span>
+    }
+
+
+    /**
+     * Sets the flag controlling whether a server mode engine
+     * *REQUIRES* SSL client authentication.
+     *
+     * As long as handshaking has not started, we can change
+     * whether client authentication is needed.  Otherwise,
+     * we will need to wait for the next handshake.
+     */
+    @Override
+    synchronized public void setNeedClientAuth(boolean flag) {
+<span class="nc bnc" id="L1876" title="All 2 branches missed.">        doClientAuth = (flag ?</span>
+            SSLEngineImpl.clauth_required : SSLEngineImpl.clauth_none);
+
+<span class="nc bnc" id="L1879" title="All 4 branches missed.">        if ((handshaker != null) &amp;&amp;</span>
+                (handshaker instanceof ServerHandshaker) &amp;&amp;
+<span class="nc bnc" id="L1881" title="All 2 branches missed.">                !handshaker.activated()) {</span>
+<span class="nc" id="L1882">            ((ServerHandshaker) handshaker).setClientAuth(doClientAuth);</span>
+        }
+<span class="nc" id="L1884">    }</span>
+
+    @Override
+    synchronized public boolean getNeedClientAuth() {
+<span class="nc bnc" id="L1888" title="All 2 branches missed.">        return (doClientAuth == SSLEngineImpl.clauth_required);</span>
+    }
+
+    /**
+     * Sets the flag controlling whether a server mode engine
+     * *REQUESTS* SSL client authentication.
+     *
+     * As long as handshaking has not started, we can change
+     * whether client authentication is requested.  Otherwise,
+     * we will need to wait for the next handshake.
+     */
+    @Override
+    synchronized public void setWantClientAuth(boolean flag) {
+<span class="nc bnc" id="L1901" title="All 2 branches missed.">        doClientAuth = (flag ?</span>
+            SSLEngineImpl.clauth_requested : SSLEngineImpl.clauth_none);
+
+<span class="nc bnc" id="L1904" title="All 4 branches missed.">        if ((handshaker != null) &amp;&amp;</span>
+                (handshaker instanceof ServerHandshaker) &amp;&amp;
+<span class="nc bnc" id="L1906" title="All 2 branches missed.">                !handshaker.activated()) {</span>
+<span class="nc" id="L1907">            ((ServerHandshaker) handshaker).setClientAuth(doClientAuth);</span>
+        }
+<span class="nc" id="L1909">    }</span>
+
+    @Override
+    synchronized public boolean getWantClientAuth() {
+<span class="nc bnc" id="L1913" title="All 2 branches missed.">        return (doClientAuth == SSLEngineImpl.clauth_requested);</span>
+    }
+
+
+    /**
+     * Sets the flag controlling whether the engine is in SSL
+     * client or server mode.  Must be called before any SSL
+     * traffic has started.
+     */
+    @Override
+    @SuppressWarnings(&quot;fallthrough&quot;)
+    synchronized public void setUseClientMode(boolean flag) {
+<span class="nc bnc" id="L1925" title="All 3 branches missed.">        switch (connectionState) {</span>
+
+        case cs_START:
+            /*
+             * If we need to change the engine mode and the enabled
+             * protocols haven't specifically been set by the user,
+             * change them to the corresponding default ones.
+             */
+<span class="nc bnc" id="L1933" title="All 4 branches missed.">            if (roleIsServer != (!flag) &amp;&amp;</span>
+<span class="nc bnc" id="L1934" title="All 2 branches missed.">                    sslContext.isDefaultProtocolList(enabledProtocols)) {</span>
+<span class="nc bnc" id="L1935" title="All 2 branches missed.">                enabledProtocols = sslContext.getDefaultProtocolList(!flag);</span>
+            }
+
+<span class="nc bnc" id="L1938" title="All 2 branches missed.">            roleIsServer = !flag;</span>
+<span class="nc" id="L1939">            serverModeSet = true;</span>
+<span class="nc" id="L1940">            break;</span>
+
+        case cs_HANDSHAKE:
+            /*
+             * If we have a handshaker, but haven't started
+             * SSL traffic, we can throw away our current
+             * handshaker, and start from scratch.  Don't
+             * need to call doneConnect() again, we already
+             * have the streams.
+             */
+<span class="nc bnc" id="L1950" title="All 4 branches missed.">            assert(handshaker != null);</span>
+<span class="nc bnc" id="L1951" title="All 2 branches missed.">            if (!handshaker.activated()) {</span>
+                /*
+                 * If we need to change the engine mode and the enabled
+                 * protocols haven't specifically been set by the user,
+                 * change them to the corresponding default ones.
+                 */
+<span class="nc bnc" id="L1957" title="All 4 branches missed.">                if (roleIsServer != (!flag) &amp;&amp;</span>
+<span class="nc bnc" id="L1958" title="All 2 branches missed.">                        sslContext.isDefaultProtocolList(enabledProtocols)) {</span>
+<span class="nc bnc" id="L1959" title="All 2 branches missed.">                    enabledProtocols = sslContext.getDefaultProtocolList(!flag);</span>
+                }
+
+<span class="nc bnc" id="L1962" title="All 2 branches missed.">                roleIsServer = !flag;</span>
+<span class="nc" id="L1963">                connectionState = cs_START;</span>
+<span class="nc" id="L1964">                initHandshaker();</span>
+<span class="nc" id="L1965">                break;</span>
+            }
+
+            // If handshake has started, that's an error.  Fall through...
+
+        default:
+<span class="nc bnc" id="L1971" title="All 4 branches missed.">            if (debug != null &amp;&amp; Debug.isOn(&quot;ssl&quot;)) {</span>
+<span class="nc" id="L1972">                System.out.println(Thread.currentThread().getName() +</span>
+                    &quot;, setUseClientMode() invoked in state = &quot; +
+                    connectionState);
+            }
+
+            /*
+             * We can let them continue if they catch this correctly,
+             * we don't need to shut this down.
+             */
+<span class="nc" id="L1981">            throw new IllegalArgumentException(</span>
+                &quot;Cannot change mode after SSL traffic has started&quot;);
+        }
+<span class="nc" id="L1984">    }</span>
+
+    @Override
+    synchronized public boolean getUseClientMode() {
+<span class="nc bnc" id="L1988" title="All 2 branches missed.">        return !roleIsServer;</span>
+    }
+
+
+    /**
+     * Returns the names of the cipher suites which could be enabled for use
+     * on an SSL connection.  Normally, only a subset of these will actually
+     * be enabled by default, since this list may include cipher suites which
+     * do not support the mutual authentication of servers and clients, or
+     * which do not protect data confidentiality.  Servers may also need
+     * certain kinds of certificates to use certain cipher suites.
+     *
+     * @return an array of cipher suite names
+     */
+    @Override
+    public String[] getSupportedCipherSuites() {
+<span class="nc" id="L2004">        return sslContext.getSupportedCipherSuiteList().toStringArray();</span>
+    }
+
+    /**
+     * Controls which particular cipher suites are enabled for use on
+     * this connection.  The cipher suites must have been listed by
+     * getCipherSuites() as being supported.  Even if a suite has been
+     * enabled, it might never be used if no peer supports it or the
+     * requisite certificates (and private keys) are not available.
+     *
+     * @param suites Names of all the cipher suites to enable.
+     */
+    @Override
+    synchronized public void setEnabledCipherSuites(String[] suites) {
+<span class="nc" id="L2018">        enabledCipherSuites = new CipherSuiteList(suites);</span>
+<span class="nc bnc" id="L2019" title="All 4 branches missed.">        if ((handshaker != null) &amp;&amp; !handshaker.activated()) {</span>
+<span class="nc" id="L2020">            handshaker.setEnabledCipherSuites(enabledCipherSuites);</span>
+        }
+<span class="nc" id="L2022">    }</span>
+
+    /**
+     * Returns the names of the SSL cipher suites which are currently enabled
+     * for use on this connection.  When an SSL engine is first created,
+     * all enabled cipher suites &lt;em&gt;(a)&lt;/em&gt; protect data confidentiality,
+     * by traffic encryption, and &lt;em&gt;(b)&lt;/em&gt; can mutually authenticate
+     * both clients and servers.  Thus, in some environments, this value
+     * might be empty.
+     *
+     * @return an array of cipher suite names
+     */
+    @Override
+    synchronized public String[] getEnabledCipherSuites() {
+<span class="nc" id="L2036">        return enabledCipherSuites.toStringArray();</span>
+    }
+
+
+    /**
+     * Returns the protocols that are supported by this implementation.
+     * A subset of the supported protocols may be enabled for this connection
+     * @return an array of protocol names.
+     */
+    @Override
+    public String[] getSupportedProtocols() {
+<span class="nc" id="L2047">        return sslContext.getSuportedProtocolList().toStringArray();</span>
+    }
+
+    /**
+     * Controls which protocols are enabled for use on
+     * this connection.  The protocols must have been listed by
+     * getSupportedProtocols() as being supported.
+     *
+     * @param protocols protocols to enable.
+     * @exception IllegalArgumentException when one of the protocols
+     *  named by the parameter is not supported.
+     */
+    @Override
+    synchronized public void setEnabledProtocols(String[] protocols) {
+<span class="nc" id="L2061">        enabledProtocols = new ProtocolList(protocols);</span>
+<span class="nc bnc" id="L2062" title="All 4 branches missed.">        if ((handshaker != null) &amp;&amp; !handshaker.activated()) {</span>
+<span class="nc" id="L2063">            handshaker.setEnabledProtocols(enabledProtocols);</span>
+        }
+<span class="nc" id="L2065">    }</span>
+
+    @Override
+    synchronized public String[] getEnabledProtocols() {
+<span class="nc" id="L2069">        return enabledProtocols.toStringArray();</span>
+    }
+
+    /**
+     * Returns the SSLParameters in effect for this SSLEngine.
+     */
+    @Override
+    synchronized public SSLParameters getSSLParameters() {
+<span class="nc" id="L2077">        SSLParameters params = super.getSSLParameters();</span>
+
+        // the super implementation does not handle the following parameters
+<span class="nc" id="L2080">        params.setEndpointIdentificationAlgorithm(identificationProtocol);</span>
+<span class="nc" id="L2081">        params.setAlgorithmConstraints(algorithmConstraints);</span>
+<span class="nc" id="L2082">        params.setSNIMatchers(sniMatchers);</span>
+<span class="nc" id="L2083">        params.setServerNames(serverNames);</span>
+<span class="nc" id="L2084">        params.setUseCipherSuitesOrder(preferLocalCipherSuites);</span>
+
+<span class="nc" id="L2086">        return params;</span>
+    }
+
+    /**
+     * Applies SSLParameters to this engine.
+     */
+    @Override
+    synchronized public void setSSLParameters(SSLParameters params) {
+<span class="nc" id="L2094">        super.setSSLParameters(params);</span>
+
+        // the super implementation does not handle the following parameters
+<span class="nc" id="L2097">        identificationProtocol = params.getEndpointIdentificationAlgorithm();</span>
+<span class="nc" id="L2098">        algorithmConstraints = params.getAlgorithmConstraints();</span>
+<span class="nc" id="L2099">        preferLocalCipherSuites = params.getUseCipherSuitesOrder();</span>
+
+<span class="nc" id="L2101">        List&lt;SNIServerName&gt; sniNames = params.getServerNames();</span>
+<span class="nc bnc" id="L2102" title="All 2 branches missed.">        if (sniNames != null) {</span>
+<span class="nc" id="L2103">            serverNames = sniNames;</span>
+        }
+
+<span class="nc" id="L2106">        Collection&lt;SNIMatcher&gt; matchers = params.getSNIMatchers();</span>
+<span class="nc bnc" id="L2107" title="All 2 branches missed.">        if (matchers != null) {</span>
+<span class="nc" id="L2108">            sniMatchers = matchers;</span>
+        }
+
+<span class="nc bnc" id="L2111" title="All 4 branches missed.">        if ((handshaker != null) &amp;&amp; !handshaker.started()) {</span>
+<span class="nc" id="L2112">            handshaker.setIdentificationProtocol(identificationProtocol);</span>
+<span class="nc" id="L2113">            handshaker.setAlgorithmConstraints(algorithmConstraints);</span>
+<span class="nc bnc" id="L2114" title="All 2 branches missed.">            if (roleIsServer) {</span>
+<span class="nc" id="L2115">                handshaker.setSNIMatchers(sniMatchers);</span>
+<span class="nc" id="L2116">                handshaker.setUseCipherSuitesOrder(preferLocalCipherSuites);</span>
+            } else {
+<span class="nc" id="L2118">                handshaker.setSNIServerNames(serverNames);</span>
+            }
+        }
+<span class="nc" id="L2121">    }</span>
+
+    /**
+     * Returns a printable representation of this end of the connection.
+     */
+    @Override
+    public String toString() {
+<span class="nc" id="L2128">        StringBuilder retval = new StringBuilder(80);</span>
+
+<span class="nc" id="L2130">        retval.append(Integer.toHexString(hashCode()));</span>
+<span class="nc" id="L2131">        retval.append(&quot;[&quot;);</span>
+<span class="nc" id="L2132">        retval.append(&quot;SSLEngine[hostname=&quot;);</span>
+<span class="nc" id="L2133">        String host = getPeerHost();</span>
+<span class="nc bnc" id="L2134" title="All 2 branches missed.">        retval.append((host == null) ? &quot;null&quot; : host);</span>
+<span class="nc" id="L2135">        retval.append(&quot; port=&quot;);</span>
+<span class="nc" id="L2136">        retval.append(Integer.toString(getPeerPort()));</span>
+<span class="nc" id="L2137">        retval.append(&quot;] &quot;);</span>
+<span class="nc" id="L2138">        retval.append(getSession().getCipherSuite());</span>
+<span class="nc" id="L2139">        retval.append(&quot;]&quot;);</span>
+
+<span class="nc" id="L2141">        return retval.toString();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

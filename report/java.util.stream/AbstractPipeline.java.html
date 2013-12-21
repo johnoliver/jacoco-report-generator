@@ -1,0 +1,738 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>AbstractPipeline.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">java.util.stream</a> &gt; <span class="el_source">AbstractPipeline.java</span></div><h1>AbstractPipeline.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2012, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package java.util.stream;
+
+import java.util.Objects;
+import java.util.Spliterator;
+import java.util.function.IntFunction;
+import java.util.function.Supplier;
+
+/**
+ * Abstract base class for &quot;pipeline&quot; classes, which are the core
+ * implementations of the Stream interface and its primitive specializations.
+ * Manages construction and evaluation of stream pipelines.
+ *
+ * &lt;p&gt;An {@code AbstractPipeline} represents an initial portion of a stream
+ * pipeline, encapsulating a stream source and zero or more intermediate
+ * operations.  The individual {@code AbstractPipeline} objects are often
+ * referred to as &lt;em&gt;stages&lt;/em&gt;, where each stage describes either the stream
+ * source or an intermediate operation.
+ *
+ * &lt;p&gt;A concrete intermediate stage is generally built from an
+ * {@code AbstractPipeline}, a shape-specific pipeline class which extends it
+ * (e.g., {@code IntPipeline}) which is also abstract, and an operation-specific
+ * concrete class which extends that.  {@code AbstractPipeline} contains most of
+ * the mechanics of evaluating the pipeline, and implements methods that will be
+ * used by the operation; the shape-specific classes add helper methods for
+ * dealing with collection of results into the appropriate shape-specific
+ * containers.
+ *
+ * &lt;p&gt;After chaining a new intermediate operation, or executing a terminal
+ * operation, the stream is considered to be consumed, and no more intermediate
+ * or terminal operations are permitted on this stream instance.
+ *
+ * @implNote
+ * &lt;p&gt;For sequential streams, and parallel streams without
+ * &lt;a href=&quot;package-summary.html#StreamOps&quot;&gt;stateful intermediate
+ * operations&lt;/a&gt;, parallel streams, pipeline evaluation is done in a single
+ * pass that &quot;jams&quot; all the operations together.  For parallel streams with
+ * stateful operations, execution is divided into segments, where each
+ * stateful operations marks the end of a segment, and each segment is
+ * evaluated separately and the result used as the input to the next
+ * segment.  In all cases, the source data is not consumed until a terminal
+ * operation begins.
+ *
+ * @param &lt;E_IN&gt;  type of input elements
+ * @param &lt;E_OUT&gt; type of output elements
+ * @param &lt;S&gt; type of the subclass implementing {@code BaseStream}
+ * @since 1.8
+ */
+<span class="pc bpc" id="L72" title="1 of 2 branches missed.">abstract class AbstractPipeline&lt;E_IN, E_OUT, S extends BaseStream&lt;E_OUT, S&gt;&gt;</span>
+        extends PipelineHelper&lt;E_OUT&gt; implements BaseStream&lt;E_OUT, S&gt; {
+    private static final String MSG_STREAM_LINKED = &quot;stream has already been operated upon or closed&quot;;
+    private static final String MSG_CONSUMED = &quot;source already consumed or closed&quot;;
+
+    /**
+     * Backlink to the head of the pipeline chain (self if this is the source
+     * stage).
+     */
+    @SuppressWarnings(&quot;rawtypes&quot;)
+    private final AbstractPipeline sourceStage;
+
+    /**
+     * The &quot;upstream&quot; pipeline, or null if this is the source stage.
+     */
+    @SuppressWarnings(&quot;rawtypes&quot;)
+    private final AbstractPipeline previousStage;
+
+    /**
+     * The operation flags for the intermediate operation represented by this
+     * pipeline object.
+     */
+    protected final int sourceOrOpFlags;
+
+    /**
+     * The next stage in the pipeline, or null if this is the last stage.
+     * Effectively final at the point of linking to the next pipeline.
+     */
+    @SuppressWarnings(&quot;rawtypes&quot;)
+    private AbstractPipeline nextStage;
+
+    /**
+     * The number of intermediate operations between this pipeline object
+     * and the stream source if sequential, or the previous stateful if parallel.
+     * Valid at the point of pipeline preparation for evaluation.
+     */
+    private int depth;
+
+    /**
+     * The combined source and operation flags for the source and all operations
+     * up to and including the operation represented by this pipeline object.
+     * Valid at the point of pipeline preparation for evaluation.
+     */
+    private int combinedFlags;
+
+    /**
+     * The source spliterator. Only valid for the head pipeline.
+     * Before the pipeline is consumed if non-null then {@code sourceSupplier}
+     * must be null. After the pipeline is consumed if non-null then is set to
+     * null.
+     */
+    private Spliterator&lt;?&gt; sourceSpliterator;
+
+    /**
+     * The source supplier. Only valid for the head pipeline. Before the
+     * pipeline is consumed if non-null then {@code sourceSpliterator} must be
+     * null. After the pipeline is consumed if non-null then is set to null.
+     */
+    private Supplier&lt;? extends Spliterator&lt;?&gt;&gt; sourceSupplier;
+
+    /**
+     * True if this pipeline has been linked or consumed
+     */
+    private boolean linkedOrConsumed;
+
+    /**
+     * True if there are any stateful ops in the pipeline; only valid for the
+     * source stage.
+     */
+    private boolean sourceAnyStateful;
+
+    private Runnable sourceCloseAction;
+
+    /**
+     * True if pipeline is parallel, otherwise the pipeline is sequential; only
+     * valid for the source stage.
+     */
+    private boolean parallel;
+
+    /**
+     * Constructor for the head of a stream pipeline.
+     *
+     * @param source {@code Supplier&lt;Spliterator&gt;} describing the stream source
+     * @param sourceFlags The source flags for the stream source, described in
+     * {@link StreamOpFlag}
+     * @param parallel True if the pipeline is parallel
+     */
+    AbstractPipeline(Supplier&lt;? extends Spliterator&lt;?&gt;&gt; source,
+<span class="fc" id="L160">                     int sourceFlags, boolean parallel) {</span>
+<span class="fc" id="L161">        this.previousStage = null;</span>
+<span class="fc" id="L162">        this.sourceSupplier = source;</span>
+<span class="fc" id="L163">        this.sourceStage = this;</span>
+<span class="fc" id="L164">        this.sourceOrOpFlags = sourceFlags &amp; StreamOpFlag.STREAM_MASK;</span>
+        // The following is an optimization of:
+        // StreamOpFlag.combineOpFlags(sourceOrOpFlags, StreamOpFlag.INITIAL_OPS_VALUE);
+<span class="fc" id="L167">        this.combinedFlags = (~(sourceOrOpFlags &lt;&lt; 1)) &amp; StreamOpFlag.INITIAL_OPS_VALUE;</span>
+<span class="fc" id="L168">        this.depth = 0;</span>
+<span class="fc" id="L169">        this.parallel = parallel;</span>
+<span class="fc" id="L170">    }</span>
+
+    /**
+     * Constructor for the head of a stream pipeline.
+     *
+     * @param source {@code Spliterator} describing the stream source
+     * @param sourceFlags the source flags for the stream source, described in
+     * {@link StreamOpFlag}
+     * @param parallel {@code true} if the pipeline is parallel
+     */
+    AbstractPipeline(Spliterator&lt;?&gt; source,
+<span class="fc" id="L181">                     int sourceFlags, boolean parallel) {</span>
+<span class="fc" id="L182">        this.previousStage = null;</span>
+<span class="fc" id="L183">        this.sourceSpliterator = source;</span>
+<span class="fc" id="L184">        this.sourceStage = this;</span>
+<span class="fc" id="L185">        this.sourceOrOpFlags = sourceFlags &amp; StreamOpFlag.STREAM_MASK;</span>
+        // The following is an optimization of:
+        // StreamOpFlag.combineOpFlags(sourceOrOpFlags, StreamOpFlag.INITIAL_OPS_VALUE);
+<span class="fc" id="L188">        this.combinedFlags = (~(sourceOrOpFlags &lt;&lt; 1)) &amp; StreamOpFlag.INITIAL_OPS_VALUE;</span>
+<span class="fc" id="L189">        this.depth = 0;</span>
+<span class="fc" id="L190">        this.parallel = parallel;</span>
+<span class="fc" id="L191">    }</span>
+
+    /**
+     * Constructor for appending an intermediate operation stage onto an
+     * existing pipeline.
+     *
+     * @param previousStage the upstream pipeline stage
+     * @param opFlags the operation flags for the new stage, described in
+     * {@link StreamOpFlag}
+     */
+<span class="fc" id="L201">    AbstractPipeline(AbstractPipeline&lt;?, E_IN, ?&gt; previousStage, int opFlags) {</span>
+<span class="fc bfc" id="L202" title="All 2 branches covered.">        if (previousStage.linkedOrConsumed)</span>
+<span class="fc" id="L203">            throw new IllegalStateException(MSG_STREAM_LINKED);</span>
+<span class="fc" id="L204">        previousStage.linkedOrConsumed = true;</span>
+<span class="fc" id="L205">        previousStage.nextStage = this;</span>
+
+<span class="fc" id="L207">        this.previousStage = previousStage;</span>
+<span class="fc" id="L208">        this.sourceOrOpFlags = opFlags &amp; StreamOpFlag.OP_MASK;</span>
+<span class="fc" id="L209">        this.combinedFlags = StreamOpFlag.combineOpFlags(opFlags, previousStage.combinedFlags);</span>
+<span class="fc" id="L210">        this.sourceStage = previousStage.sourceStage;</span>
+<span class="fc bfc" id="L211" title="All 2 branches covered.">        if (opIsStateful())</span>
+<span class="fc" id="L212">            sourceStage.sourceAnyStateful = true;</span>
+<span class="fc" id="L213">        this.depth = previousStage.depth + 1;</span>
+<span class="fc" id="L214">    }</span>
+
+
+    // Terminal evaluation methods
+
+    /**
+     * Evaluate the pipeline with a terminal operation to produce a result.
+     *
+     * @param &lt;R&gt; the type of result
+     * @param terminalOp the terminal operation to be applied to the pipeline.
+     * @return the result
+     */
+    final &lt;R&gt; R evaluate(TerminalOp&lt;E_OUT, R&gt; terminalOp) {
+<span class="pc bpc" id="L227" title="2 of 4 branches missed.">        assert getOutputShape() == terminalOp.inputShape();</span>
+<span class="pc bpc" id="L228" title="1 of 2 branches missed.">        if (linkedOrConsumed)</span>
+<span class="fc" id="L229">            throw new IllegalStateException(MSG_STREAM_LINKED);</span>
+<span class="nc" id="L230">        linkedOrConsumed = true;</span>
+
+<span class="nc bnc" id="L232" title="All 2 branches missed.">        return isParallel()</span>
+<span class="nc" id="L233">               ? terminalOp.evaluateParallel(this, sourceSpliterator(terminalOp.getOpFlags()))</span>
+<span class="nc" id="L234">               : terminalOp.evaluateSequential(this, sourceSpliterator(terminalOp.getOpFlags()));</span>
+    }
+
+    /**
+     * Collect the elements output from the pipeline stage.
+     *
+     * @param generator the array generator to be used to create array instances
+     * @return a flat array-backed Node that holds the collected output elements
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    final Node&lt;E_OUT&gt; evaluateToArrayNode(IntFunction&lt;E_OUT[]&gt; generator) {
+<span class="pc bpc" id="L245" title="1 of 2 branches missed.">        if (linkedOrConsumed)</span>
+<span class="nc" id="L246">            throw new IllegalStateException(MSG_STREAM_LINKED);</span>
+<span class="fc" id="L247">        linkedOrConsumed = true;</span>
+
+        // If the last intermediate operation is stateful then
+        // evaluate directly to avoid an extra collection step
+<span class="pc bpc" id="L251" title="1 of 6 branches missed.">        if (isParallel() &amp;&amp; previousStage != null &amp;&amp; opIsStateful()) {</span>
+<span class="nc" id="L252">            return opEvaluateParallel(previousStage, previousStage.sourceSpliterator(0), generator);</span>
+        }
+        else {
+<span class="nc" id="L255">            return evaluate(sourceSpliterator(0), true, generator);</span>
+        }
+    }
+
+    /**
+     * Gets the source stage spliterator if this pipeline stage is the source
+     * stage.  The pipeline is consumed after this method is called and
+     * returns successfully.
+     *
+     * @return the source stage spliterator
+     * @throws IllegalStateException if this pipeline stage is not the source
+     *         stage.
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    final Spliterator&lt;E_OUT&gt; sourceStageSpliterator() {
+<span class="pc bpc" id="L270" title="1 of 2 branches missed.">        if (this != sourceStage)</span>
+<span class="nc" id="L271">            throw new IllegalStateException();</span>
+
+<span class="pc bpc" id="L273" title="1 of 2 branches missed.">        if (linkedOrConsumed)</span>
+<span class="nc" id="L274">            throw new IllegalStateException(MSG_STREAM_LINKED);</span>
+<span class="fc" id="L275">        linkedOrConsumed = true;</span>
+
+<span class="pc bpc" id="L277" title="1 of 2 branches missed.">        if (sourceStage.sourceSpliterator != null) {</span>
+            @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L279">            Spliterator&lt;E_OUT&gt; s = sourceStage.sourceSpliterator;</span>
+<span class="fc" id="L280">            sourceStage.sourceSpliterator = null;</span>
+<span class="fc" id="L281">            return s;</span>
+        }
+<span class="nc bnc" id="L283" title="All 2 branches missed.">        else if (sourceStage.sourceSupplier != null) {</span>
+            @SuppressWarnings(&quot;unchecked&quot;)
+<span class="nc" id="L285">            Spliterator&lt;E_OUT&gt; s = (Spliterator&lt;E_OUT&gt;) sourceStage.sourceSupplier.get();</span>
+<span class="nc" id="L286">            sourceStage.sourceSupplier = null;</span>
+<span class="nc" id="L287">            return s;</span>
+        }
+        else {
+<span class="nc" id="L290">            throw new IllegalStateException(MSG_CONSUMED);</span>
+        }
+    }
+
+    // BaseStream
+
+    @Override
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public final S sequential() {
+<span class="fc" id="L299">        sourceStage.parallel = false;</span>
+<span class="fc" id="L300">        return (S) this;</span>
+    }
+
+    @Override
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public final S parallel() {
+<span class="fc" id="L306">        sourceStage.parallel = true;</span>
+<span class="fc" id="L307">        return (S) this;</span>
+    }
+
+    @Override
+    public void close() {
+<span class="nc" id="L312">        linkedOrConsumed = true;</span>
+<span class="nc" id="L313">        sourceSupplier = null;</span>
+<span class="nc" id="L314">        sourceSpliterator = null;</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">        if (sourceStage.sourceCloseAction != null) {</span>
+<span class="nc" id="L316">            Runnable closeAction = sourceStage.sourceCloseAction;</span>
+<span class="nc" id="L317">            sourceStage.sourceCloseAction = null;</span>
+<span class="nc" id="L318">            closeAction.run();</span>
+        }
+<span class="nc" id="L320">    }</span>
+
+    @Override
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public S onClose(Runnable closeHandler) {
+<span class="nc" id="L325">        Runnable existingHandler = sourceStage.sourceCloseAction;</span>
+<span class="nc bnc" id="L326" title="All 2 branches missed.">        sourceStage.sourceCloseAction =</span>
+                (existingHandler == null)
+                ? closeHandler
+<span class="nc" id="L329">                : Streams.composeWithExceptions(existingHandler, closeHandler);</span>
+<span class="nc" id="L330">        return (S) this;</span>
+    }
+
+    // Primitive specialization use co-variant overrides, hence is not final
+    @Override
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public Spliterator&lt;E_OUT&gt; spliterator() {
+<span class="fc bfc" id="L337" title="All 2 branches covered.">        if (linkedOrConsumed)</span>
+<span class="fc" id="L338">            throw new IllegalStateException(MSG_STREAM_LINKED);</span>
+<span class="fc" id="L339">        linkedOrConsumed = true;</span>
+
+<span class="fc bfc" id="L341" title="All 2 branches covered.">        if (this == sourceStage) {</span>
+<span class="pc bpc" id="L342" title="1 of 2 branches missed.">            if (sourceStage.sourceSpliterator != null) {</span>
+                @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L344">                Spliterator&lt;E_OUT&gt; s = (Spliterator&lt;E_OUT&gt;) sourceStage.sourceSpliterator;</span>
+<span class="fc" id="L345">                sourceStage.sourceSpliterator = null;</span>
+<span class="fc" id="L346">                return s;</span>
+            }
+<span class="nc bnc" id="L348" title="All 2 branches missed.">            else if (sourceStage.sourceSupplier != null) {</span>
+                @SuppressWarnings(&quot;unchecked&quot;)
+<span class="nc" id="L350">                Supplier&lt;Spliterator&lt;E_OUT&gt;&gt; s = (Supplier&lt;Spliterator&lt;E_OUT&gt;&gt;) sourceStage.sourceSupplier;</span>
+<span class="nc" id="L351">                sourceStage.sourceSupplier = null;</span>
+<span class="nc" id="L352">                return lazySpliterator(s);</span>
+            }
+            else {
+<span class="nc" id="L355">                throw new IllegalStateException(MSG_CONSUMED);</span>
+            }
+        }
+        else {
+<span class="fc" id="L359">            return wrap(this, () -&gt; sourceSpliterator(0), isParallel());</span>
+        }
+    }
+
+    @Override
+    public final boolean isParallel() {
+<span class="fc" id="L365">        return sourceStage.parallel;</span>
+    }
+
+
+    /**
+     * Returns the composition of stream flags of the stream source and all
+     * intermediate operations.
+     *
+     * @return the composition of stream flags of the stream source and all
+     *         intermediate operations
+     * @see StreamOpFlag
+     */
+    final int getStreamFlags() {
+<span class="fc" id="L378">        return StreamOpFlag.toStreamFlags(combinedFlags);</span>
+    }
+
+    /**
+     * Prepare the pipeline for a parallel execution.  As the pipeline is built,
+     * the flags and depth indicators are set up for a sequential execution.
+     * If the execution is parallel, and there are any stateful operations, then
+     * some of these need to be adjusted, as well as adjusting for flags from
+     * the terminal operation (such as back-propagating UNORDERED).
+     * Need not be called for a sequential execution.
+     *
+     * @param terminalFlags Operation flags for the terminal operation
+     */
+    private void parallelPrepare(int terminalFlags) {
+        @SuppressWarnings(&quot;rawtypes&quot;)
+<span class="fc" id="L393">        AbstractPipeline backPropagationHead = sourceStage;</span>
+<span class="fc bfc" id="L394" title="All 2 branches covered.">        if (sourceStage.sourceAnyStateful) {</span>
+<span class="fc" id="L395">            int depth = 1;</span>
+<span class="fc" id="L396">            for (  @SuppressWarnings(&quot;rawtypes&quot;) AbstractPipeline u = sourceStage, p = sourceStage.nextStage;</span>
+<span class="fc bfc" id="L397" title="All 2 branches covered.">                 p != null;</span>
+<span class="fc" id="L398">                 u = p, p = p.nextStage) {</span>
+<span class="fc" id="L399">                int thisOpFlags = p.sourceOrOpFlags;</span>
+<span class="fc bfc" id="L400" title="All 2 branches covered.">                if (p.opIsStateful()) {</span>
+                    // If the stateful operation is a short-circuit operation
+                    // then move the back propagation head forwards
+                    // NOTE: there are no size-injecting ops
+<span class="fc bfc" id="L404" title="All 2 branches covered.">                    if (StreamOpFlag.SHORT_CIRCUIT.isKnown(thisOpFlags)) {</span>
+<span class="fc" id="L405">                        backPropagationHead = p;</span>
+                        // Clear the short circuit flag for next pipeline stage
+                        // This stage encapsulates short-circuiting, the next
+                        // stage may not have any short-circuit operations, and
+                        // if so spliterator.forEachRemaining should be be used
+                        // for traversal
+<span class="fc" id="L411">                        thisOpFlags = thisOpFlags &amp; ~StreamOpFlag.IS_SHORT_CIRCUIT;</span>
+                    }
+
+<span class="fc" id="L414">                    depth = 0;</span>
+                    // The following injects size, it is equivalent to:
+                    // StreamOpFlag.combineOpFlags(StreamOpFlag.IS_SIZED, p.combinedFlags);
+<span class="fc" id="L417">                    thisOpFlags = (thisOpFlags &amp; ~StreamOpFlag.NOT_SIZED) | StreamOpFlag.IS_SIZED;</span>
+                }
+<span class="fc" id="L419">                p.depth = depth++;</span>
+<span class="fc" id="L420">                p.combinedFlags = StreamOpFlag.combineOpFlags(thisOpFlags, u.combinedFlags);</span>
+            }
+        }
+
+        // Apply the upstream terminal flags
+<span class="pc bpc" id="L425" title="1 of 2 branches missed.">        if (terminalFlags != 0) {</span>
+<span class="nc" id="L426">            int upstreamTerminalFlags = terminalFlags &amp; StreamOpFlag.UPSTREAM_TERMINAL_OP_MASK;</span>
+<span class="nc bnc" id="L427" title="All 2 branches missed.">            for ( @SuppressWarnings(&quot;rawtypes&quot;) AbstractPipeline p = backPropagationHead; p.nextStage != null; p = p.nextStage) {</span>
+<span class="nc" id="L428">                p.combinedFlags = StreamOpFlag.combineOpFlags(upstreamTerminalFlags, p.combinedFlags);</span>
+            }
+
+<span class="nc" id="L431">            combinedFlags = StreamOpFlag.combineOpFlags(terminalFlags, combinedFlags);</span>
+        }
+<span class="fc" id="L433">    }</span>
+
+    /**
+     * Get the source spliterator for this pipeline stage.  For a sequential or
+     * stateless parallel pipeline, this is the source spliterator.  For a
+     * stateful parallel pipeline, this is a spliterator describing the results
+     * of all computations up to and including the most recent stateful
+     * operation.
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private Spliterator&lt;?&gt; sourceSpliterator(int terminalFlags) {
+        // Get the source spliterator of the pipeline
+<span class="fc" id="L445">        Spliterator&lt;?&gt; spliterator = null;</span>
+<span class="fc bfc" id="L446" title="All 2 branches covered.">        if (sourceStage.sourceSpliterator != null) {</span>
+<span class="fc" id="L447">            spliterator = sourceStage.sourceSpliterator;</span>
+<span class="fc" id="L448">            sourceStage.sourceSpliterator = null;</span>
+        }
+<span class="pc bpc" id="L450" title="1 of 2 branches missed.">        else if (sourceStage.sourceSupplier != null) {</span>
+<span class="fc" id="L451">            spliterator = (Spliterator&lt;?&gt;) sourceStage.sourceSupplier.get();</span>
+<span class="fc" id="L452">            sourceStage.sourceSupplier = null;</span>
+        }
+        else {
+<span class="nc" id="L455">            throw new IllegalStateException(MSG_CONSUMED);</span>
+        }
+
+<span class="fc bfc" id="L458" title="All 2 branches covered.">        if (isParallel()) {</span>
+            // @@@ Merge parallelPrepare with the loop below and use the
+            //     spliterator characteristics to determine if SIZED
+            //     should be injected
+<span class="fc" id="L462">            parallelPrepare(terminalFlags);</span>
+
+            // Adapt the source spliterator, evaluating each stateful op
+            // in the pipeline up to and including this pipeline stage
+<span class="fc" id="L466">            for ( @SuppressWarnings(&quot;rawtypes&quot;) AbstractPipeline u = sourceStage, p = sourceStage.nextStage, e = this;</span>
+<span class="fc bfc" id="L467" title="All 2 branches covered.">                 u != e;</span>
+<span class="fc" id="L468">                 u = p, p = p.nextStage) {</span>
+
+<span class="pc bpc" id="L470" title="1 of 2 branches missed.">                if (p.opIsStateful()) {</span>
+<span class="nc" id="L471">                    spliterator = p.opEvaluateParallelLazy(u, spliterator);</span>
+                }
+            }
+        }
+<span class="fc bfc" id="L475" title="All 2 branches covered.">        else if (terminalFlags != 0)  {</span>
+<span class="fc" id="L476">            combinedFlags = StreamOpFlag.combineOpFlags(terminalFlags, combinedFlags);</span>
+        }
+
+<span class="fc" id="L479">        return spliterator;</span>
+    }
+
+
+    // PipelineHelper
+
+    @Override
+    final StreamShape getSourceShape() {
+        @SuppressWarnings(&quot;rawtypes&quot;)
+<span class="nc" id="L488">        AbstractPipeline p = AbstractPipeline.this;</span>
+<span class="nc bnc" id="L489" title="All 2 branches missed.">        while (p.depth &gt; 0) {</span>
+<span class="nc" id="L490">            p = p.previousStage;</span>
+        }
+<span class="nc" id="L492">        return p.getOutputShape();</span>
+    }
+
+    @Override
+    final &lt;P_IN&gt; long exactOutputSizeIfKnown(Spliterator&lt;P_IN&gt; spliterator) {
+<span class="pc bpc" id="L497" title="1 of 2 branches missed.">        return StreamOpFlag.SIZED.isKnown(getStreamAndOpFlags()) ? spliterator.getExactSizeIfKnown() : -1;</span>
+    }
+
+    @Override
+    final &lt;P_IN, S extends Sink&lt;E_OUT&gt;&gt; S wrapAndCopyInto(S sink, Spliterator&lt;P_IN&gt; spliterator) {
+<span class="nc" id="L502">        copyInto(wrapSink(Objects.requireNonNull(sink)), spliterator);</span>
+<span class="nc" id="L503">        return sink;</span>
+    }
+
+    @Override
+    final &lt;P_IN&gt; void copyInto(Sink&lt;P_IN&gt; wrappedSink, Spliterator&lt;P_IN&gt; spliterator) {
+<span class="nc" id="L508">        Objects.requireNonNull(wrappedSink);</span>
+
+<span class="nc bnc" id="L510" title="All 2 branches missed.">        if (!StreamOpFlag.SHORT_CIRCUIT.isKnown(getStreamAndOpFlags())) {</span>
+<span class="nc" id="L511">            wrappedSink.begin(spliterator.getExactSizeIfKnown());</span>
+<span class="nc" id="L512">            spliterator.forEachRemaining(wrappedSink);</span>
+<span class="nc" id="L513">            wrappedSink.end();</span>
+        }
+        else {
+<span class="nc" id="L516">            copyIntoWithCancel(wrappedSink, spliterator);</span>
+        }
+<span class="nc" id="L518">    }</span>
+
+    @Override
+    @SuppressWarnings(&quot;unchecked&quot;)
+    final &lt;P_IN&gt; void copyIntoWithCancel(Sink&lt;P_IN&gt; wrappedSink, Spliterator&lt;P_IN&gt; spliterator) {
+        @SuppressWarnings({&quot;rawtypes&quot;,&quot;unchecked&quot;})
+<span class="fc" id="L524">        AbstractPipeline p = AbstractPipeline.this;</span>
+<span class="pc bpc" id="L525" title="1 of 2 branches missed.">        while (p.depth &gt; 0) {</span>
+<span class="fc" id="L526">            p = p.previousStage;</span>
+        }
+<span class="nc" id="L528">        wrappedSink.begin(spliterator.getExactSizeIfKnown());</span>
+<span class="nc" id="L529">        p.forEachWithCancel(spliterator, wrappedSink);</span>
+<span class="nc" id="L530">        wrappedSink.end();</span>
+<span class="nc" id="L531">    }</span>
+
+    @Override
+    final int getStreamAndOpFlags() {
+<span class="fc" id="L535">        return combinedFlags;</span>
+    }
+
+    final boolean isOrdered() {
+<span class="nc" id="L539">        return StreamOpFlag.ORDERED.isKnown(combinedFlags);</span>
+    }
+
+    @Override
+    @SuppressWarnings(&quot;unchecked&quot;)
+    final &lt;P_IN&gt; Sink&lt;P_IN&gt; wrapSink(Sink&lt;E_OUT&gt; sink) {
+<span class="fc" id="L545">        Objects.requireNonNull(sink);</span>
+
+<span class="fc bfc" id="L547" title="All 2 branches covered.">        for ( @SuppressWarnings(&quot;rawtypes&quot;) AbstractPipeline p=AbstractPipeline.this; p.depth &gt; 0; p=p.previousStage) {</span>
+<span class="fc" id="L548">            sink = p.opWrapSink(p.previousStage.combinedFlags, sink);</span>
+        }
+<span class="fc" id="L550">        return (Sink&lt;P_IN&gt;) sink;</span>
+    }
+
+    @Override
+    @SuppressWarnings(&quot;unchecked&quot;)
+    final &lt;P_IN&gt; Spliterator&lt;E_OUT&gt; wrapSpliterator(Spliterator&lt;P_IN&gt; sourceSpliterator) {
+<span class="nc bnc" id="L556" title="All 2 branches missed.">        if (depth == 0) {</span>
+<span class="nc" id="L557">            return (Spliterator&lt;E_OUT&gt;) sourceSpliterator;</span>
+        }
+        else {
+<span class="nc" id="L560">            return wrap(this, () -&gt; sourceSpliterator, isParallel());</span>
+        }
+    }
+
+    @Override
+    @SuppressWarnings(&quot;unchecked&quot;)
+    final &lt;P_IN&gt; Node&lt;E_OUT&gt; evaluate(Spliterator&lt;P_IN&gt; spliterator,
+                                      boolean flatten,
+                                      IntFunction&lt;E_OUT[]&gt; generator) {
+<span class="nc bnc" id="L569" title="All 2 branches missed.">        if (isParallel()) {</span>
+            // @@@ Optimize if op of this pipeline stage is a stateful op
+<span class="nc" id="L571">            return evaluateToNode(this, spliterator, flatten, generator);</span>
+        }
+        else {
+<span class="nc" id="L574">            Node.Builder&lt;E_OUT&gt; nb = makeNodeBuilder(</span>
+<span class="nc" id="L575">                    exactOutputSizeIfKnown(spliterator), generator);</span>
+<span class="nc" id="L576">            return wrapAndCopyInto(nb, spliterator).build();</span>
+        }
+    }
+
+
+    // Shape-specific abstract methods, implemented by XxxPipeline classes
+
+    /**
+     * Get the output shape of the pipeline.  If the pipeline is the head,
+     * then it's output shape corresponds to the shape of the source.
+     * Otherwise, it's output shape corresponds to the output shape of the
+     * associated operation.
+     *
+     * @return the output shape
+     */
+    abstract StreamShape getOutputShape();
+
+    /**
+     * Collect elements output from a pipeline into a Node that holds elements
+     * of this shape.
+     *
+     * @param helper the pipeline helper describing the pipeline stages
+     * @param spliterator the source spliterator
+     * @param flattenTree true if the returned node should be flattened
+     * @param generator the array generator
+     * @return a Node holding the output of the pipeline
+     */
+    abstract &lt;P_IN&gt; Node&lt;E_OUT&gt; evaluateToNode(PipelineHelper&lt;E_OUT&gt; helper,
+                                               Spliterator&lt;P_IN&gt; spliterator,
+                                               boolean flattenTree,
+                                               IntFunction&lt;E_OUT[]&gt; generator);
+
+    /**
+     * Create a spliterator that wraps a source spliterator, compatible with
+     * this stream shape, and operations associated with a {@link
+     * PipelineHelper}.
+     *
+     * @param ph the pipeline helper describing the pipeline stages
+     * @param supplier the supplier of a spliterator
+     * @return a wrapping spliterator compatible with this shape
+     */
+    abstract &lt;P_IN&gt; Spliterator&lt;E_OUT&gt; wrap(PipelineHelper&lt;E_OUT&gt; ph,
+                                            Supplier&lt;Spliterator&lt;P_IN&gt;&gt; supplier,
+                                            boolean isParallel);
+
+    /**
+     * Create a lazy spliterator that wraps and obtains the supplied the
+     * spliterator when a method is invoked on the lazy spliterator.
+     * @param supplier the supplier of a spliterator
+     */
+    abstract Spliterator&lt;E_OUT&gt; lazySpliterator(Supplier&lt;? extends Spliterator&lt;E_OUT&gt;&gt; supplier);
+
+    /**
+     * Traverse the elements of a spliterator compatible with this stream shape,
+     * pushing those elements into a sink.   If the sink requests cancellation,
+     * no further elements will be pulled or pushed.
+     *
+     * @param spliterator the spliterator to pull elements from
+     * @param sink the sink to push elements to
+     */
+    abstract void forEachWithCancel(Spliterator&lt;E_OUT&gt; spliterator, Sink&lt;E_OUT&gt; sink);
+
+    /**
+     * Make a node builder compatible with this stream shape.
+     *
+     * @param exactSizeIfKnown if {@literal &gt;=0}, then a node builder will be
+     * created that has a fixed capacity of at most sizeIfKnown elements. If
+     * {@literal &lt; 0}, then the node builder has an unfixed capacity. A fixed
+     * capacity node builder will throw exceptions if an element is added after
+     * builder has reached capacity, or is built before the builder has reached
+     * capacity.
+     *
+     * @param generator the array generator to be used to create instances of a
+     * T[] array. For implementations supporting primitive nodes, this parameter
+     * may be ignored.
+     * @return a node builder
+     */
+    @Override
+    abstract Node.Builder&lt;E_OUT&gt; makeNodeBuilder(long exactSizeIfKnown,
+                                                 IntFunction&lt;E_OUT[]&gt; generator);
+
+
+    // Op-specific abstract methods, implemented by the operation class
+
+    /**
+     * Returns whether this operation is stateful or not.  If it is stateful,
+     * then the method
+     * {@link #opEvaluateParallel(PipelineHelper, java.util.Spliterator, java.util.function.IntFunction)}
+     * must be overridden.
+     *
+     * @return {@code true} if this operation is stateful
+     */
+    abstract boolean opIsStateful();
+
+    /**
+     * Accepts a {@code Sink} which will receive the results of this operation,
+     * and return a {@code Sink} which accepts elements of the input type of
+     * this operation and which performs the operation, passing the results to
+     * the provided {@code Sink}.
+     *
+     * @apiNote
+     * The implementation may use the {@code flags} parameter to optimize the
+     * sink wrapping.  For example, if the input is already {@code DISTINCT},
+     * the implementation for the {@code Stream#distinct()} method could just
+     * return the sink it was passed.
+     *
+     * @param flags The combined stream and operation flags up to, but not
+     *        including, this operation
+     * @param sink sink to which elements should be sent after processing
+     * @return a sink which accepts elements, perform the operation upon
+     *         each element, and passes the results (if any) to the provided
+     *         {@code Sink}.
+     */
+    abstract Sink&lt;E_IN&gt; opWrapSink(int flags, Sink&lt;E_OUT&gt; sink);
+
+    /**
+     * Performs a parallel evaluation of the operation using the specified
+     * {@code PipelineHelper} which describes the upstream intermediate
+     * operations.  Only called on stateful operations.  If {@link
+     * #opIsStateful()} returns true then implementations must override the
+     * default implementation.
+     *
+     * @implSpec The default implementation always throw
+     * {@code UnsupportedOperationException}.
+     *
+     * @param helper the pipeline helper describing the pipeline stages
+     * @param spliterator the source {@code Spliterator}
+     * @param generator the array generator
+     * @return a {@code Node} describing the result of the evaluation
+     */
+    &lt;P_IN&gt; Node&lt;E_OUT&gt; opEvaluateParallel(PipelineHelper&lt;E_OUT&gt; helper,
+                                          Spliterator&lt;P_IN&gt; spliterator,
+                                          IntFunction&lt;E_OUT[]&gt; generator) {
+<span class="nc" id="L709">        throw new UnsupportedOperationException(&quot;Parallel evaluation is not supported&quot;);</span>
+    }
+
+    /**
+     * Returns a {@code Spliterator} describing a parallel evaluation of the
+     * operation, using the specified {@code PipelineHelper} which describes the
+     * upstream intermediate operations.  Only called on stateful operations.
+     * It is not necessary (though acceptable) to do a full computation of the
+     * result here; it is preferable, if possible, to describe the result via a
+     * lazily evaluated spliterator.
+     *
+     * @implSpec The default implementation behaves as if:
+     * &lt;pre&gt;{@code
+     *     return evaluateParallel(helper, i -&gt; (E_OUT[]) new
+     * Object[i]).spliterator();
+     * }&lt;/pre&gt;
+     * and is suitable for implementations that cannot do better than a full
+     * synchronous evaluation.
+     *
+     * @param helper the pipeline helper
+     * @param spliterator the source {@code Spliterator}
+     * @return a {@code Spliterator} describing the result of the evaluation
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    &lt;P_IN&gt; Spliterator&lt;E_OUT&gt; opEvaluateParallelLazy(PipelineHelper&lt;E_OUT&gt; helper,
+                                                     Spliterator&lt;P_IN&gt; spliterator) {
+<span class="nc" id="L735">        return opEvaluateParallel(helper, spliterator, i -&gt; (E_OUT[]) new Object[i]).spliterator();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

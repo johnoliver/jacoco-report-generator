@@ -1,0 +1,457 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ExchangeImpl.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.net.httpserver</a> &gt; <span class="el_source">ExchangeImpl.java</span></div><h1>ExchangeImpl.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.net.httpserver;
+
+import java.io.*;
+import java.net.*;
+import javax.net.ssl.*;
+import java.util.*;
+import java.util.logging.Logger;
+import java.text.*;
+import com.sun.net.httpserver.*;
+
+<span class="pc bpc" id="L36" title="1 of 2 branches missed.">class ExchangeImpl {</span>
+
+    Headers reqHdrs, rspHdrs;
+    Request req;
+    String method;
+    boolean writefinished;
+    URI uri;
+    HttpConnection connection;
+    long reqContentLen;
+    long rspContentLen;
+    /* raw streams which access the socket directly */
+    InputStream ris;
+    OutputStream ros;
+    Thread thread;
+    /* close the underlying connection when this exchange finished */
+    boolean close;
+    boolean closed;
+<span class="fc" id="L53">    boolean http10 = false;</span>
+
+    /* for formatting the Date: header */
+    private static final String pattern = &quot;EEE, dd MMM yyyy HH:mm:ss zzz&quot;;
+<span class="fc" id="L57">    private static final TimeZone gmtTZ = TimeZone.getTimeZone(&quot;GMT&quot;);</span>
+<span class="fc" id="L58">    private static final ThreadLocal&lt;DateFormat&gt; dateFormat =</span>
+<span class="fc" id="L59">         new ThreadLocal&lt;DateFormat&gt;() {</span>
+             @Override protected DateFormat initialValue() {
+<span class="fc" id="L61">                 DateFormat df = new SimpleDateFormat(pattern, Locale.US);</span>
+<span class="fc" id="L62">                 df.setTimeZone(gmtTZ);</span>
+<span class="fc" id="L63">                 return df;</span>
+         }
+     };
+
+    private static final String HEAD = &quot;HEAD&quot;;
+
+    /* streams which take care of the HTTP protocol framing
+     * and are passed up to higher layers
+     */
+    InputStream uis;
+    OutputStream uos;
+    LeftOverInputStream uis_orig; // uis may have be a user supplied wrapper
+    PlaceholderOutputStream uos_orig;
+
+    boolean sentHeaders; /* true after response headers sent */
+    Map&lt;String,Object&gt; attributes;
+<span class="fc" id="L79">    int rcode = -1;</span>
+    HttpPrincipal principal;
+    ServerImpl server;
+
+    ExchangeImpl (
+        String m, URI u, Request req, long len, HttpConnection connection
+<span class="fc" id="L85">    ) throws IOException {</span>
+<span class="fc" id="L86">        this.req = req;</span>
+<span class="fc" id="L87">        this.reqHdrs = req.headers();</span>
+<span class="fc" id="L88">        this.rspHdrs = new Headers();</span>
+<span class="fc" id="L89">        this.method = m;</span>
+<span class="fc" id="L90">        this.uri = u;</span>
+<span class="fc" id="L91">        this.connection = connection;</span>
+<span class="fc" id="L92">        this.reqContentLen = len;</span>
+        /* ros only used for headers, body written directly to stream */
+<span class="fc" id="L94">        this.ros = req.outputStream();</span>
+<span class="fc" id="L95">        this.ris = req.inputStream();</span>
+<span class="fc" id="L96">        server = getServerImpl();</span>
+<span class="fc" id="L97">        server.startExchange();</span>
+<span class="fc" id="L98">    }</span>
+
+    public Headers getRequestHeaders () {
+<span class="fc" id="L101">        return new UnmodifiableHeaders (reqHdrs);</span>
+    }
+
+    public Headers getResponseHeaders () {
+<span class="fc" id="L105">        return rspHdrs;</span>
+    }
+
+    public URI getRequestURI () {
+<span class="fc" id="L109">        return uri;</span>
+    }
+
+    public String getRequestMethod (){
+<span class="fc" id="L113">        return method;</span>
+    }
+
+    public HttpContextImpl getHttpContext (){
+<span class="fc" id="L117">        return connection.getHttpContext();</span>
+    }
+
+    private boolean isHeadRequest() {
+<span class="fc" id="L121">        return HEAD.equals(getRequestMethod());</span>
+    }
+
+    public void close () {
+<span class="fc bfc" id="L125" title="All 2 branches covered.">        if (closed) {</span>
+<span class="fc" id="L126">            return;</span>
+        }
+<span class="fc" id="L128">        closed = true;</span>
+
+        /* close the underlying connection if,
+         * a) the streams not set up yet, no response can be sent, or
+         * b) if the wrapper output stream is not set up, or
+         * c) if the close of the input/outpu stream fails
+         */
+        try {
+<span class="pc bpc" id="L136" title="2 of 4 branches missed.">            if (uis_orig == null || uos == null) {</span>
+<span class="nc" id="L137">                connection.close();</span>
+<span class="nc" id="L138">                return;</span>
+            }
+<span class="fc bfc" id="L140" title="All 2 branches covered.">            if (!uos_orig.isWrapped()) {</span>
+<span class="fc" id="L141">                connection.close();</span>
+<span class="fc" id="L142">                return;</span>
+            }
+<span class="fc bfc" id="L144" title="All 2 branches covered.">            if (!uis_orig.isClosed()) {</span>
+<span class="fc" id="L145">                uis_orig.close();</span>
+            }
+<span class="fc" id="L147">            uos.close();</span>
+<span class="nc" id="L148">        } catch (IOException e) {</span>
+<span class="nc" id="L149">            connection.close();</span>
+<span class="fc" id="L150">        }</span>
+<span class="fc" id="L151">    }</span>
+
+    public InputStream getRequestBody () {
+<span class="fc bfc" id="L154" title="All 2 branches covered.">        if (uis != null) {</span>
+<span class="fc" id="L155">            return uis;</span>
+        }
+<span class="fc bfc" id="L157" title="All 2 branches covered.">        if (reqContentLen == -1L) {</span>
+<span class="fc" id="L158">            uis_orig = new ChunkedInputStream (this, ris);</span>
+<span class="fc" id="L159">            uis = uis_orig;</span>
+        } else {
+<span class="fc" id="L161">            uis_orig = new FixedLengthInputStream (this, ris, reqContentLen);</span>
+<span class="fc" id="L162">            uis = uis_orig;</span>
+        }
+<span class="fc" id="L164">        return uis;</span>
+    }
+
+    LeftOverInputStream getOriginalInputStream () {
+<span class="fc" id="L168">        return uis_orig;</span>
+    }
+
+    public int getResponseCode () {
+<span class="fc" id="L172">        return rcode;</span>
+    }
+
+    public OutputStream getResponseBody () {
+        /* TODO. Change spec to remove restriction below. Filters
+         * cannot work with this restriction
+         *
+         * if (!sentHeaders) {
+         *    throw new IllegalStateException (&quot;headers not sent&quot;);
+         * }
+         */
+<span class="fc bfc" id="L183" title="All 2 branches covered.">        if (uos == null) {</span>
+<span class="fc" id="L184">            uos_orig = new PlaceholderOutputStream (null);</span>
+<span class="fc" id="L185">            uos = uos_orig;</span>
+        }
+<span class="fc" id="L187">        return uos;</span>
+    }
+
+
+    /* returns the place holder stream, which is the stream
+     * returned from the 1st call to getResponseBody()
+     * The &quot;real&quot; ouputstream is then placed inside this
+     */
+    PlaceholderOutputStream getPlaceholderResponseBody () {
+<span class="fc" id="L196">        getResponseBody();</span>
+<span class="fc" id="L197">        return uos_orig;</span>
+    }
+
+    public void sendResponseHeaders (int rCode, long contentLen)
+    throws IOException
+    {
+<span class="pc bpc" id="L203" title="1 of 2 branches missed.">        if (sentHeaders) {</span>
+<span class="nc" id="L204">            throw new IOException (&quot;headers already sent&quot;);</span>
+        }
+<span class="fc" id="L206">        this.rcode = rCode;</span>
+<span class="fc" id="L207">        String statusLine = &quot;HTTP/1.1 &quot;+rCode+Code.msg(rCode)+&quot;\r\n&quot;;</span>
+<span class="fc" id="L208">        OutputStream tmpout = new BufferedOutputStream (ros);</span>
+<span class="fc" id="L209">        PlaceholderOutputStream o = getPlaceholderResponseBody();</span>
+<span class="fc" id="L210">        tmpout.write (bytes(statusLine, 0), 0, statusLine.length());</span>
+<span class="fc" id="L211">        boolean noContentToSend = false; // assume there is content</span>
+<span class="fc" id="L212">        rspHdrs.set (&quot;Date&quot;, dateFormat.get().format (new Date()));</span>
+
+        /* check for response type that is not allowed to send a body */
+
+<span class="pc bpc" id="L216" title="4 of 8 branches missed.">        if ((rCode&gt;=100 &amp;&amp; rCode &lt;200) /* informational */</span>
+            ||(rCode == 204)           /* no content */
+            ||(rCode == 304))          /* not modified */
+        {
+<span class="nc bnc" id="L220" title="All 2 branches missed.">            if (contentLen != -1) {</span>
+<span class="nc" id="L221">                Logger logger = server.getLogger();</span>
+<span class="nc" id="L222">                String msg = &quot;sendResponseHeaders: rCode = &quot;+ rCode</span>
+                    + &quot;: forcing contentLen = -1&quot;;
+<span class="nc" id="L224">                logger.warning (msg);</span>
+            }
+<span class="nc" id="L226">            contentLen = -1;</span>
+        }
+
+<span class="fc bfc" id="L229" title="All 2 branches covered.">        if (isHeadRequest()) {</span>
+            /* HEAD requests should not set a content length by passing it
+             * through this API, but should instead manually set the required
+             * headers.*/
+<span class="pc bpc" id="L233" title="1 of 2 branches missed.">            if (contentLen &gt;= 0) {</span>
+<span class="nc" id="L234">                final Logger logger = server.getLogger();</span>
+<span class="nc" id="L235">                String msg =</span>
+                    &quot;sendResponseHeaders: being invoked with a content length for a HEAD request&quot;;
+<span class="nc" id="L237">                logger.warning (msg);</span>
+            }
+<span class="fc" id="L239">            noContentToSend = true;</span>
+<span class="fc" id="L240">            contentLen = 0;</span>
+        } else { /* not a HEAD request */
+<span class="fc bfc" id="L242" title="All 2 branches covered.">            if (contentLen == 0) {</span>
+<span class="fc bfc" id="L243" title="All 2 branches covered.">                if (http10) {</span>
+<span class="fc" id="L244">                    o.setWrappedStream (new UndefLengthOutputStream (this, ros));</span>
+<span class="fc" id="L245">                    close = true;</span>
+                } else {
+<span class="fc" id="L247">                    rspHdrs.set (&quot;Transfer-encoding&quot;, &quot;chunked&quot;);</span>
+<span class="fc" id="L248">                    o.setWrappedStream (new ChunkedOutputStream (this, ros));</span>
+                }
+            } else {
+<span class="fc bfc" id="L251" title="All 2 branches covered.">                if (contentLen == -1) {</span>
+<span class="fc" id="L252">                    noContentToSend = true;</span>
+<span class="fc" id="L253">                    contentLen = 0;</span>
+                }
+<span class="fc" id="L255">                rspHdrs.set(&quot;Content-length&quot;, Long.toString(contentLen));</span>
+<span class="fc" id="L256">                o.setWrappedStream (new FixedLengthOutputStream (this, ros, contentLen));</span>
+            }
+        }
+<span class="fc" id="L259">        write (rspHdrs, tmpout);</span>
+<span class="fc" id="L260">        this.rspContentLen = contentLen;</span>
+<span class="fc" id="L261">        tmpout.flush() ;</span>
+<span class="fc" id="L262">        tmpout = null;</span>
+<span class="fc" id="L263">        sentHeaders = true;</span>
+<span class="fc bfc" id="L264" title="All 2 branches covered.">        if (noContentToSend) {</span>
+<span class="fc" id="L265">            WriteFinishedEvent e = new WriteFinishedEvent (this);</span>
+<span class="fc" id="L266">            server.addEvent (e);</span>
+<span class="fc" id="L267">            closed = true;</span>
+        }
+<span class="fc" id="L269">        server.logReply (rCode, req.requestLine(), null);</span>
+<span class="fc" id="L270">    }</span>
+
+    void write (Headers map, OutputStream os) throws IOException {
+<span class="fc" id="L273">        Set&lt;Map.Entry&lt;String,List&lt;String&gt;&gt;&gt; entries = map.entrySet();</span>
+<span class="fc bfc" id="L274" title="All 2 branches covered.">        for (Map.Entry&lt;String,List&lt;String&gt;&gt; entry : entries) {</span>
+<span class="fc" id="L275">            String key = entry.getKey();</span>
+            byte[] buf;
+<span class="fc" id="L277">            List&lt;String&gt; values = entry.getValue();</span>
+<span class="fc bfc" id="L278" title="All 2 branches covered.">            for (String val : values) {</span>
+<span class="fc" id="L279">                int i = key.length();</span>
+<span class="fc" id="L280">                buf = bytes (key, 2);</span>
+<span class="fc" id="L281">                buf[i++] = ':';</span>
+<span class="fc" id="L282">                buf[i++] = ' ';</span>
+<span class="fc" id="L283">                os.write (buf, 0, i);</span>
+<span class="fc" id="L284">                buf = bytes (val, 2);</span>
+<span class="fc" id="L285">                i = val.length();</span>
+<span class="fc" id="L286">                buf[i++] = '\r';</span>
+<span class="fc" id="L287">                buf[i++] = '\n';</span>
+<span class="fc" id="L288">                os.write (buf, 0, i);</span>
+<span class="fc" id="L289">            }</span>
+<span class="fc" id="L290">        }</span>
+<span class="fc" id="L291">        os.write ('\r');</span>
+<span class="fc" id="L292">        os.write ('\n');</span>
+<span class="fc" id="L293">    }</span>
+
+<span class="fc" id="L295">    private byte[] rspbuf = new byte [128]; // used by bytes()</span>
+
+    /**
+     * convert string to byte[], using rspbuf
+     * Make sure that at least &quot;extra&quot; bytes are free at end
+     * of rspbuf. Reallocate rspbuf if not big enough.
+     * caller must check return value to see if rspbuf moved
+     */
+    private byte[] bytes (String s, int extra) {
+<span class="fc" id="L304">        int slen = s.length();</span>
+<span class="pc bpc" id="L305" title="1 of 2 branches missed.">        if (slen+extra &gt; rspbuf.length) {</span>
+<span class="nc" id="L306">            int diff = slen + extra - rspbuf.length;</span>
+<span class="nc" id="L307">            rspbuf = new byte [2* (rspbuf.length + diff)];</span>
+        }
+<span class="fc" id="L309">        char c[] = s.toCharArray();</span>
+<span class="fc bfc" id="L310" title="All 2 branches covered.">        for (int i=0; i&lt;c.length; i++) {</span>
+<span class="fc" id="L311">            rspbuf[i] = (byte)c[i];</span>
+        }
+<span class="fc" id="L313">        return rspbuf;</span>
+    }
+
+    public InetSocketAddress getRemoteAddress (){
+<span class="fc" id="L317">        Socket s = connection.getChannel().socket();</span>
+<span class="fc" id="L318">        InetAddress ia = s.getInetAddress();</span>
+<span class="fc" id="L319">        int port = s.getPort();</span>
+<span class="fc" id="L320">        return new InetSocketAddress (ia, port);</span>
+    }
+
+    public InetSocketAddress getLocalAddress (){
+<span class="nc" id="L324">        Socket s = connection.getChannel().socket();</span>
+<span class="nc" id="L325">        InetAddress ia = s.getLocalAddress();</span>
+<span class="nc" id="L326">        int port = s.getLocalPort();</span>
+<span class="nc" id="L327">        return new InetSocketAddress (ia, port);</span>
+    }
+
+    public String getProtocol (){
+<span class="nc" id="L331">        String reqline = req.requestLine();</span>
+<span class="nc" id="L332">        int index = reqline.lastIndexOf (' ');</span>
+<span class="nc" id="L333">        return reqline.substring (index+1);</span>
+    }
+
+    public SSLSession getSSLSession () {
+<span class="nc" id="L337">        SSLEngine e = connection.getSSLEngine();</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">        if (e == null) {</span>
+<span class="nc" id="L339">            return null;</span>
+        }
+<span class="nc" id="L341">        return e.getSession();</span>
+    }
+
+    public Object getAttribute (String name) {
+<span class="nc bnc" id="L345" title="All 2 branches missed.">        if (name == null) {</span>
+<span class="nc" id="L346">            throw new NullPointerException (&quot;null name parameter&quot;);</span>
+        }
+<span class="nc bnc" id="L348" title="All 2 branches missed.">        if (attributes == null) {</span>
+<span class="nc" id="L349">            attributes = getHttpContext().getAttributes();</span>
+        }
+<span class="nc" id="L351">        return attributes.get (name);</span>
+    }
+
+    public void setAttribute (String name, Object value) {
+<span class="nc bnc" id="L355" title="All 2 branches missed.">        if (name == null) {</span>
+<span class="nc" id="L356">            throw new NullPointerException (&quot;null name parameter&quot;);</span>
+        }
+<span class="nc bnc" id="L358" title="All 2 branches missed.">        if (attributes == null) {</span>
+<span class="nc" id="L359">            attributes = getHttpContext().getAttributes();</span>
+        }
+<span class="nc" id="L361">        attributes.put (name, value);</span>
+<span class="nc" id="L362">    }</span>
+
+    public void setStreams (InputStream i, OutputStream o) {
+<span class="pc bpc" id="L365" title="2 of 4 branches missed.">        assert uis != null;</span>
+<span class="pc bpc" id="L366" title="1 of 2 branches missed.">        if (i != null) {</span>
+<span class="nc" id="L367">            uis = i;</span>
+        }
+<span class="pc bpc" id="L369" title="1 of 2 branches missed.">        if (o != null) {</span>
+<span class="fc" id="L370">            uos = o;</span>
+        }
+<span class="fc" id="L372">    }</span>
+
+    /**
+     * PP
+     */
+    HttpConnection getConnection () {
+<span class="fc" id="L378">        return connection;</span>
+    }
+
+    ServerImpl getServerImpl () {
+<span class="fc" id="L382">        return getHttpContext().getServerImpl();</span>
+    }
+
+    public HttpPrincipal getPrincipal () {
+<span class="fc" id="L386">        return principal;</span>
+    }
+
+    void setPrincipal (HttpPrincipal principal) {
+<span class="fc" id="L390">        this.principal = principal;</span>
+<span class="fc" id="L391">    }</span>
+
+    static ExchangeImpl get (HttpExchange t) {
+<span class="pc bpc" id="L394" title="1 of 2 branches missed.">        if (t instanceof HttpExchangeImpl) {</span>
+<span class="fc" id="L395">            return ((HttpExchangeImpl)t).getExchangeImpl();</span>
+        } else {
+<span class="nc bnc" id="L397" title="All 4 branches missed.">            assert t instanceof HttpsExchangeImpl;</span>
+<span class="nc" id="L398">            return ((HttpsExchangeImpl)t).getExchangeImpl();</span>
+        }
+    }
+}
+
+/**
+ * An OutputStream which wraps another stream
+ * which is supplied either at creation time, or sometime later.
+ * If a caller/user tries to write to this stream before
+ * the wrapped stream has been provided, then an IOException will
+ * be thrown.
+ */
+class PlaceholderOutputStream extends java.io.OutputStream {
+
+    OutputStream wrapped;
+
+<span class="fc" id="L414">    PlaceholderOutputStream (OutputStream os) {</span>
+<span class="fc" id="L415">        wrapped = os;</span>
+<span class="fc" id="L416">    }</span>
+
+    void setWrappedStream (OutputStream os) {
+<span class="fc" id="L419">        wrapped = os;</span>
+<span class="fc" id="L420">    }</span>
+
+    boolean isWrapped () {
+<span class="fc bfc" id="L423" title="All 2 branches covered.">        return wrapped != null;</span>
+    }
+
+    private void checkWrap () throws IOException {
+<span class="pc bpc" id="L427" title="1 of 2 branches missed.">        if (wrapped == null) {</span>
+<span class="nc" id="L428">            throw new IOException (&quot;response headers not sent yet&quot;);</span>
+        }
+<span class="fc" id="L430">    }</span>
+
+    public void write(int b) throws IOException {
+<span class="fc" id="L433">        checkWrap();</span>
+<span class="fc" id="L434">        wrapped.write (b);</span>
+<span class="fc" id="L435">    }</span>
+
+    public void write(byte b[]) throws IOException {
+<span class="fc" id="L438">        checkWrap();</span>
+<span class="fc" id="L439">        wrapped.write (b);</span>
+<span class="fc" id="L440">    }</span>
+
+    public void write(byte b[], int off, int len) throws IOException {
+<span class="fc" id="L443">        checkWrap();</span>
+<span class="fc" id="L444">        wrapped.write (b, off, len);</span>
+<span class="fc" id="L445">    }</span>
+
+    public void flush() throws IOException {
+<span class="fc" id="L448">        checkWrap();</span>
+<span class="fc" id="L449">        wrapped.flush();</span>
+<span class="fc" id="L450">    }</span>
+
+    public void close() throws IOException {
+<span class="fc" id="L453">        checkWrap();</span>
+<span class="fc" id="L454">        wrapped.close();</span>
+<span class="fc" id="L455">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

@@ -1,0 +1,598 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>AsynchronousSocketChannelImpl.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.nio.ch</a> &gt; <span class="el_source">AsynchronousSocketChannelImpl.java</span></div><h1>AsynchronousSocketChannelImpl.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2008, 2011, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.nio.ch;
+
+import java.nio.ByteBuffer;
+import java.nio.channels.*;
+import java.net.SocketOption;
+import java.net.StandardSocketOptions;
+import java.net.SocketAddress;
+import java.net.InetSocketAddress;
+import java.io.IOException;
+import java.io.FileDescriptor;
+import java.util.Set;
+import java.util.HashSet;
+import java.util.Collections;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.*;
+import sun.net.NetHooks;
+
+/**
+ * Base implementation of AsynchronousSocketChannel
+ */
+
+abstract class AsynchronousSocketChannelImpl
+    extends AsynchronousSocketChannel
+    implements Cancellable, Groupable
+{
+    protected final FileDescriptor fd;
+
+    // protects state, localAddress, and remoteAddress
+<span class="fc" id="L54">    protected final Object stateLock = new Object();</span>
+
+<span class="fc" id="L56">    protected volatile InetSocketAddress localAddress = null;</span>
+<span class="fc" id="L57">    protected volatile InetSocketAddress remoteAddress = null;</span>
+
+    // State, increases monotonically
+    static final int ST_UNINITIALIZED = -1;
+    static final int ST_UNCONNECTED = 0;
+    static final int ST_PENDING = 1;
+    static final int ST_CONNECTED = 2;
+<span class="fc" id="L64">    protected volatile int state = ST_UNINITIALIZED;</span>
+
+    // reading state
+<span class="fc" id="L67">    private final Object readLock = new Object();</span>
+    private boolean reading;
+    private boolean readShutdown;
+    private boolean readKilled;     // further reading disallowed due to timeout
+
+    // writing state
+<span class="fc" id="L73">    private final Object writeLock = new Object();</span>
+    private boolean writing;
+    private boolean writeShutdown;
+    private boolean writeKilled;    // further writing disallowed due to timeout
+
+    // close support
+<span class="fc" id="L79">    private final ReadWriteLock closeLock = new ReentrantReadWriteLock();</span>
+<span class="fc" id="L80">    private volatile boolean open = true;</span>
+
+    // set true when exclusive binding is on and SO_REUSEADDR is emulated
+    private boolean isReuseAddress;
+
+    AsynchronousSocketChannelImpl(AsynchronousChannelGroupImpl group)
+        throws IOException
+    {
+<span class="fc" id="L88">        super(group.provider());</span>
+<span class="fc" id="L89">        this.fd = Net.socket(true);</span>
+<span class="fc" id="L90">        this.state = ST_UNCONNECTED;</span>
+<span class="fc" id="L91">    }</span>
+
+    // Constructor for sockets obtained from AsynchronousServerSocketChannelImpl
+    AsynchronousSocketChannelImpl(AsynchronousChannelGroupImpl group,
+                                  FileDescriptor fd,
+                                  InetSocketAddress remote)
+        throws IOException
+    {
+<span class="fc" id="L99">        super(group.provider());</span>
+<span class="fc" id="L100">        this.fd = fd;</span>
+<span class="fc" id="L101">        this.state = ST_CONNECTED;</span>
+<span class="fc" id="L102">        this.localAddress = Net.localAddress(fd);</span>
+<span class="fc" id="L103">        this.remoteAddress = remote;</span>
+<span class="fc" id="L104">    }</span>
+
+    @Override
+    public final boolean isOpen() {
+<span class="fc" id="L108">        return open;</span>
+    }
+
+    /**
+     * Marks beginning of access to file descriptor/handle
+     */
+    final void begin() throws IOException {
+<span class="fc" id="L115">        closeLock.readLock().lock();</span>
+<span class="pc bpc" id="L116" title="1 of 2 branches missed.">        if (!isOpen())</span>
+<span class="nc" id="L117">            throw new ClosedChannelException();</span>
+<span class="fc" id="L118">    }</span>
+
+    /**
+     * Marks end of access to file descriptor/handle
+     */
+    final void end() {
+<span class="fc" id="L124">        closeLock.readLock().unlock();</span>
+<span class="fc" id="L125">    }</span>
+
+    /**
+     * Invoked to close socket and release other resources.
+     */
+    abstract void implClose() throws IOException;
+
+    @Override
+    public final void close() throws IOException {
+        // synchronize with any threads initiating asynchronous operations
+<span class="fc" id="L135">        closeLock.writeLock().lock();</span>
+        try {
+<span class="pc bpc" id="L137" title="1 of 2 branches missed.">            if (!open)</span>
+<span class="nc" id="L138">                return;     // already closed</span>
+<span class="fc" id="L139">            open = false;</span>
+        } finally {
+<span class="pc" id="L141">            closeLock.writeLock().unlock();</span>
+<span class="fc" id="L142">        }</span>
+<span class="fc" id="L143">        implClose();</span>
+<span class="fc" id="L144">    }</span>
+
+    final void enableReading(boolean killed) {
+<span class="fc" id="L147">        synchronized (readLock) {</span>
+<span class="fc" id="L148">            reading = false;</span>
+<span class="pc bpc" id="L149" title="1 of 2 branches missed.">            if (killed)</span>
+<span class="nc" id="L150">                readKilled = true;</span>
+<span class="pc" id="L151">        }</span>
+<span class="fc" id="L152">    }</span>
+
+    final void enableReading() {
+<span class="fc" id="L155">        enableReading(false);</span>
+<span class="fc" id="L156">    }</span>
+
+    final void enableWriting(boolean killed) {
+<span class="fc" id="L159">        synchronized (writeLock) {</span>
+<span class="fc" id="L160">            writing = false;</span>
+<span class="pc bpc" id="L161" title="1 of 2 branches missed.">            if (killed)</span>
+<span class="nc" id="L162">                writeKilled = true;</span>
+<span class="pc" id="L163">        }</span>
+<span class="fc" id="L164">    }</span>
+
+    final void enableWriting() {
+<span class="fc" id="L167">        enableWriting(false);</span>
+<span class="fc" id="L168">    }</span>
+
+    final void killReading() {
+<span class="nc" id="L171">        synchronized (readLock) {</span>
+<span class="nc" id="L172">            readKilled = true;</span>
+<span class="nc" id="L173">        }</span>
+<span class="nc" id="L174">    }</span>
+
+    final void killWriting() {
+<span class="nc" id="L177">        synchronized (writeLock) {</span>
+<span class="nc" id="L178">            writeKilled = true;</span>
+<span class="nc" id="L179">        }</span>
+<span class="nc" id="L180">    }</span>
+
+    final void killConnect() {
+        // when a connect is cancelled then the connection may have been
+        // established so prevent reading or writing.
+<span class="nc" id="L185">        killReading();</span>
+<span class="nc" id="L186">        killWriting();</span>
+<span class="nc" id="L187">    }</span>
+
+    /**
+     * Invoked by connect to initiate the connect operation.
+     */
+    abstract &lt;A&gt; Future&lt;Void&gt; implConnect(SocketAddress remote,
+                                          A attachment,
+                                          CompletionHandler&lt;Void,? super A&gt; handler);
+
+    @Override
+    public final Future&lt;Void&gt; connect(SocketAddress remote) {
+<span class="fc" id="L198">        return implConnect(remote, null, null);</span>
+    }
+
+    @Override
+    public final &lt;A&gt; void connect(SocketAddress remote,
+                                  A attachment,
+                                  CompletionHandler&lt;Void,? super A&gt; handler)
+    {
+<span class="nc bnc" id="L206" title="All 2 branches missed.">        if (handler == null)</span>
+<span class="nc" id="L207">            throw new NullPointerException(&quot;'handler' is null&quot;);</span>
+<span class="nc" id="L208">        implConnect(remote, attachment, handler);</span>
+<span class="nc" id="L209">    }</span>
+
+    /**
+     * Invoked by read to initiate the I/O operation.
+     */
+    abstract &lt;V extends Number,A&gt; Future&lt;V&gt; implRead(boolean isScatteringRead,
+                                                     ByteBuffer dst,
+                                                     ByteBuffer[] dsts,
+                                                     long timeout,
+                                                     TimeUnit unit,
+                                                     A attachment,
+                                                     CompletionHandler&lt;V,? super A&gt; handler);
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private &lt;V extends Number,A&gt; Future&lt;V&gt; read(boolean isScatteringRead,
+                                                ByteBuffer dst,
+                                                ByteBuffer[] dsts,
+                                                long timeout,
+                                                TimeUnit unit,
+                                                A att,
+                                                CompletionHandler&lt;V,? super A&gt; handler)
+    {
+<span class="pc bpc" id="L231" title="1 of 2 branches missed.">        if (!isOpen()) {</span>
+<span class="nc" id="L232">            Throwable e = new ClosedChannelException();</span>
+<span class="nc bnc" id="L233" title="All 2 branches missed.">            if (handler == null)</span>
+<span class="nc" id="L234">                return CompletedFuture.withFailure(e);</span>
+<span class="nc" id="L235">            Invoker.invoke(this, handler, att, null, e);</span>
+<span class="nc" id="L236">            return null;</span>
+        }
+
+<span class="pc bpc" id="L239" title="1 of 2 branches missed.">        if (remoteAddress == null)</span>
+<span class="nc" id="L240">            throw new NotYetConnectedException();</span>
+
+<span class="pc bpc" id="L242" title="2 of 4 branches missed.">        boolean hasSpaceToRead = isScatteringRead || dst.hasRemaining();</span>
+<span class="fc" id="L243">        boolean shutdown = false;</span>
+
+        // check and update state
+<span class="fc" id="L246">        synchronized (readLock) {</span>
+<span class="pc bpc" id="L247" title="1 of 2 branches missed.">            if (readKilled)</span>
+<span class="nc" id="L248">                throw new IllegalStateException(&quot;Reading not allowed due to timeout or cancellation&quot;);</span>
+<span class="pc bpc" id="L249" title="1 of 2 branches missed.">            if (reading)</span>
+<span class="nc" id="L250">                throw new ReadPendingException();</span>
+<span class="pc bpc" id="L251" title="1 of 2 branches missed.">            if (readShutdown) {</span>
+<span class="nc" id="L252">                shutdown = true;</span>
+            } else {
+<span class="pc bpc" id="L254" title="1 of 2 branches missed.">                if (hasSpaceToRead) {</span>
+<span class="fc" id="L255">                    reading = true;</span>
+                }
+            }
+<span class="pc" id="L258">        }</span>
+
+        // immediately complete with -1 if shutdown for read
+        // immediately complete with 0 if no space remaining
+<span class="pc bpc" id="L262" title="2 of 4 branches missed.">        if (shutdown || !hasSpaceToRead) {</span>
+            Number result;
+<span class="nc bnc" id="L264" title="All 2 branches missed.">            if (isScatteringRead) {</span>
+<span class="nc bnc" id="L265" title="All 2 branches missed.">                result = (shutdown) ? Long.valueOf(-1L) : Long.valueOf(0L);</span>
+            } else {
+<span class="nc bnc" id="L267" title="All 2 branches missed.">                result = (shutdown) ? -1 : 0;</span>
+            }
+<span class="nc bnc" id="L269" title="All 2 branches missed.">            if (handler == null)</span>
+<span class="nc" id="L270">                return CompletedFuture.withResult((V)result);</span>
+<span class="nc" id="L271">            Invoker.invoke(this, handler, att, (V)result, null);</span>
+<span class="nc" id="L272">            return null;</span>
+        }
+
+<span class="fc" id="L275">        return implRead(isScatteringRead, dst, dsts, timeout, unit, att, handler);</span>
+    }
+
+    @Override
+    public final Future&lt;Integer&gt; read(ByteBuffer dst) {
+<span class="pc bpc" id="L280" title="1 of 2 branches missed.">        if (dst.isReadOnly())</span>
+<span class="nc" id="L281">            throw new IllegalArgumentException(&quot;Read-only buffer&quot;);</span>
+<span class="fc" id="L282">        return read(false, dst, null, 0L, TimeUnit.MILLISECONDS, null, null);</span>
+    }
+
+    @Override
+    public final &lt;A&gt; void read(ByteBuffer dst,
+                               long timeout,
+                               TimeUnit unit,
+                               A attachment,
+                               CompletionHandler&lt;Integer,? super A&gt; handler)
+    {
+<span class="pc bpc" id="L292" title="1 of 2 branches missed.">        if (handler == null)</span>
+<span class="nc" id="L293">            throw new NullPointerException(&quot;'handler' is null&quot;);</span>
+<span class="pc bpc" id="L294" title="1 of 2 branches missed.">        if (dst.isReadOnly())</span>
+<span class="nc" id="L295">            throw new IllegalArgumentException(&quot;Read-only buffer&quot;);</span>
+<span class="fc" id="L296">        read(false, dst, null, timeout, unit, attachment, handler);</span>
+<span class="fc" id="L297">    }</span>
+
+    @Override
+    public final &lt;A&gt; void read(ByteBuffer[] dsts,
+                               int offset,
+                               int length,
+                               long timeout,
+                               TimeUnit unit,
+                               A attachment,
+                               CompletionHandler&lt;Long,? super A&gt; handler)
+    {
+<span class="nc bnc" id="L308" title="All 2 branches missed.">        if (handler == null)</span>
+<span class="nc" id="L309">            throw new NullPointerException(&quot;'handler' is null&quot;);</span>
+<span class="nc bnc" id="L310" title="All 6 branches missed.">        if ((offset &lt; 0) || (length &lt; 0) || (offset &gt; dsts.length - length))</span>
+<span class="nc" id="L311">            throw new IndexOutOfBoundsException();</span>
+<span class="nc" id="L312">        ByteBuffer[] bufs = Util.subsequence(dsts, offset, length);</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">        for (int i=0; i&lt;bufs.length; i++) {</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">            if (bufs[i].isReadOnly())</span>
+<span class="nc" id="L315">                throw new IllegalArgumentException(&quot;Read-only buffer&quot;);</span>
+        }
+<span class="nc" id="L317">        read(true, null, bufs, timeout, unit, attachment, handler);</span>
+<span class="nc" id="L318">    }</span>
+
+    /**
+     * Invoked by write to initiate the I/O operation.
+     */
+    abstract &lt;V extends Number,A&gt; Future&lt;V&gt; implWrite(boolean isGatheringWrite,
+                                                      ByteBuffer src,
+                                                      ByteBuffer[] srcs,
+                                                      long timeout,
+                                                      TimeUnit unit,
+                                                      A attachment,
+                                                      CompletionHandler&lt;V,? super A&gt; handler);
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private &lt;V extends Number,A&gt; Future&lt;V&gt; write(boolean isGatheringWrite,
+                                                 ByteBuffer src,
+                                                 ByteBuffer[] srcs,
+                                                 long timeout,
+                                                 TimeUnit unit,
+                                                 A att,
+                                                 CompletionHandler&lt;V,? super A&gt; handler)
+    {
+<span class="pc bpc" id="L340" title="2 of 4 branches missed.">        boolean hasDataToWrite = isGatheringWrite || src.hasRemaining();</span>
+
+<span class="fc" id="L342">        boolean closed = false;</span>
+<span class="pc bpc" id="L343" title="1 of 2 branches missed.">        if (isOpen()) {</span>
+<span class="pc bpc" id="L344" title="1 of 2 branches missed.">            if (remoteAddress == null)</span>
+<span class="nc" id="L345">                throw new NotYetConnectedException();</span>
+            // check and update state
+<span class="fc" id="L347">            synchronized (writeLock) {</span>
+<span class="pc bpc" id="L348" title="1 of 2 branches missed.">                if (writeKilled)</span>
+<span class="nc" id="L349">                    throw new IllegalStateException(&quot;Writing not allowed due to timeout or cancellation&quot;);</span>
+<span class="pc bpc" id="L350" title="1 of 2 branches missed.">                if (writing)</span>
+<span class="nc" id="L351">                    throw new WritePendingException();</span>
+<span class="pc bpc" id="L352" title="1 of 2 branches missed.">                if (writeShutdown) {</span>
+<span class="nc" id="L353">                    closed = true;</span>
+                } else {
+<span class="pc bpc" id="L355" title="1 of 2 branches missed.">                    if (hasDataToWrite)</span>
+<span class="fc" id="L356">                        writing = true;</span>
+                }
+<span class="pc" id="L358">            }</span>
+        } else {
+<span class="nc" id="L360">            closed = true;</span>
+        }
+
+        // channel is closed or shutdown for write
+<span class="pc bpc" id="L364" title="1 of 2 branches missed.">        if (closed) {</span>
+<span class="nc" id="L365">            Throwable e = new ClosedChannelException();</span>
+<span class="nc bnc" id="L366" title="All 2 branches missed.">            if (handler == null)</span>
+<span class="nc" id="L367">                return CompletedFuture.withFailure(e);</span>
+<span class="nc" id="L368">            Invoker.invoke(this, handler, att, null, e);</span>
+<span class="nc" id="L369">            return null;</span>
+        }
+
+        // nothing to write so complete immediately
+<span class="pc bpc" id="L373" title="1 of 2 branches missed.">        if (!hasDataToWrite) {</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">            Number result = (isGatheringWrite) ? (Number)0L : (Number)0;</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">            if (handler == null)</span>
+<span class="nc" id="L376">                return CompletedFuture.withResult((V)result);</span>
+<span class="nc" id="L377">            Invoker.invoke(this, handler, att, (V)result, null);</span>
+<span class="nc" id="L378">            return null;</span>
+        }
+
+<span class="fc" id="L381">        return implWrite(isGatheringWrite, src, srcs, timeout, unit, att, handler);</span>
+    }
+
+    @Override
+    public final Future&lt;Integer&gt; write(ByteBuffer src) {
+<span class="fc" id="L386">        return write(false, src, null, 0L, TimeUnit.MILLISECONDS, null, null);</span>
+    }
+
+    @Override
+    public final &lt;A&gt; void write(ByteBuffer src,
+                                long timeout,
+                                TimeUnit unit,
+                                A attachment,
+                                CompletionHandler&lt;Integer,? super A&gt; handler)
+    {
+<span class="pc bpc" id="L396" title="1 of 2 branches missed.">        if (handler == null)</span>
+<span class="nc" id="L397">            throw new NullPointerException(&quot;'handler' is null&quot;);</span>
+<span class="fc" id="L398">        write(false, src, null, timeout, unit, attachment, handler);</span>
+<span class="fc" id="L399">    }</span>
+
+    @Override
+    public final &lt;A&gt; void  write(ByteBuffer[] srcs,
+                                 int offset,
+                                 int length,
+                                 long timeout,
+                                 TimeUnit unit,
+                                 A attachment,
+                                 CompletionHandler&lt;Long,? super A&gt; handler)
+    {
+<span class="nc bnc" id="L410" title="All 2 branches missed.">        if (handler == null)</span>
+<span class="nc" id="L411">            throw new NullPointerException(&quot;'handler' is null&quot;);</span>
+<span class="nc bnc" id="L412" title="All 6 branches missed.">        if ((offset &lt; 0) || (length &lt; 0) || (offset &gt; srcs.length - length))</span>
+<span class="nc" id="L413">            throw new IndexOutOfBoundsException();</span>
+<span class="nc" id="L414">        srcs = Util.subsequence(srcs, offset, length);</span>
+<span class="nc" id="L415">        write(true, null, srcs, timeout, unit, attachment, handler);</span>
+<span class="nc" id="L416">    }</span>
+
+    @Override
+    public final AsynchronousSocketChannel bind(SocketAddress local)
+        throws IOException
+    {
+        try {
+<span class="nc" id="L423">            begin();</span>
+<span class="nc" id="L424">            synchronized (stateLock) {</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">                if (state == ST_PENDING)</span>
+<span class="nc" id="L426">                    throw new ConnectionPendingException();</span>
+<span class="nc bnc" id="L427" title="All 2 branches missed.">                if (localAddress != null)</span>
+<span class="nc" id="L428">                    throw new AlreadyBoundException();</span>
+<span class="nc bnc" id="L429" title="All 2 branches missed.">                InetSocketAddress isa = (local == null) ?</span>
+<span class="nc" id="L430">                    new InetSocketAddress(0) : Net.checkAddress(local);</span>
+<span class="nc" id="L431">                NetHooks.beforeTcpBind(fd, isa.getAddress(), isa.getPort());</span>
+<span class="nc" id="L432">                Net.bind(fd, isa.getAddress(), isa.getPort());</span>
+<span class="nc" id="L433">                localAddress = Net.localAddress(fd);</span>
+<span class="nc" id="L434">            }</span>
+        } finally {
+<span class="nc" id="L436">            end();</span>
+<span class="nc" id="L437">        }</span>
+<span class="nc" id="L438">        return this;</span>
+    }
+
+    @Override
+    public final SocketAddress getLocalAddress() throws IOException {
+<span class="nc bnc" id="L443" title="All 2 branches missed.">        if (!isOpen())</span>
+<span class="nc" id="L444">            throw new ClosedChannelException();</span>
+<span class="nc" id="L445">         return Net.getRevealedLocalAddress(localAddress);</span>
+    }
+
+    @Override
+    public final &lt;T&gt; AsynchronousSocketChannel setOption(SocketOption&lt;T&gt; name, T value)
+        throws IOException
+    {
+<span class="nc bnc" id="L452" title="All 2 branches missed.">        if (name == null)</span>
+<span class="nc" id="L453">            throw new NullPointerException();</span>
+<span class="nc bnc" id="L454" title="All 2 branches missed.">        if (!supportedOptions().contains(name))</span>
+<span class="nc" id="L455">            throw new UnsupportedOperationException(&quot;'&quot; + name + &quot;' not supported&quot;);</span>
+
+        try {
+<span class="nc" id="L458">            begin();</span>
+<span class="nc bnc" id="L459" title="All 2 branches missed.">            if (writeShutdown)</span>
+<span class="nc" id="L460">                throw new IOException(&quot;Connection has been shutdown for writing&quot;);</span>
+<span class="nc bnc" id="L461" title="All 2 branches missed.">            if (name == StandardSocketOptions.SO_REUSEADDR &amp;&amp;</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">                    Net.useExclusiveBind())</span>
+            {
+                // SO_REUSEADDR emulated when using exclusive bind
+<span class="nc" id="L465">                isReuseAddress = (Boolean)value;</span>
+            } else {
+<span class="nc" id="L467">                Net.setSocketOption(fd, Net.UNSPEC, name, value);</span>
+            }
+<span class="nc" id="L469">            return this;</span>
+        } finally {
+<span class="nc" id="L471">            end();</span>
+        }
+    }
+
+    @Override
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public final &lt;T&gt; T getOption(SocketOption&lt;T&gt; name) throws IOException {
+<span class="nc bnc" id="L478" title="All 2 branches missed.">        if (name == null)</span>
+<span class="nc" id="L479">            throw new NullPointerException();</span>
+<span class="nc bnc" id="L480" title="All 2 branches missed.">        if (!supportedOptions().contains(name))</span>
+<span class="nc" id="L481">            throw new UnsupportedOperationException(&quot;'&quot; + name + &quot;' not supported&quot;);</span>
+
+        try {
+<span class="nc" id="L484">            begin();</span>
+<span class="nc bnc" id="L485" title="All 2 branches missed.">            if (name == StandardSocketOptions.SO_REUSEADDR &amp;&amp;</span>
+<span class="nc bnc" id="L486" title="All 2 branches missed.">                    Net.useExclusiveBind())</span>
+            {
+                // SO_REUSEADDR emulated when using exclusive bind
+<span class="nc" id="L489">                return (T)Boolean.valueOf(isReuseAddress);</span>
+            }
+<span class="nc" id="L491">            return (T) Net.getSocketOption(fd, Net.UNSPEC, name);</span>
+        } finally {
+<span class="nc" id="L493">            end();</span>
+        }
+    }
+
+<span class="nc" id="L497">    private static class DefaultOptionsHolder {</span>
+<span class="nc" id="L498">        static final Set&lt;SocketOption&lt;?&gt;&gt; defaultOptions = defaultOptions();</span>
+
+        private static Set&lt;SocketOption&lt;?&gt;&gt; defaultOptions() {
+<span class="nc" id="L501">            HashSet&lt;SocketOption&lt;?&gt;&gt; set = new HashSet&lt;SocketOption&lt;?&gt;&gt;(5);</span>
+<span class="nc" id="L502">            set.add(StandardSocketOptions.SO_SNDBUF);</span>
+<span class="nc" id="L503">            set.add(StandardSocketOptions.SO_RCVBUF);</span>
+<span class="nc" id="L504">            set.add(StandardSocketOptions.SO_KEEPALIVE);</span>
+<span class="nc" id="L505">            set.add(StandardSocketOptions.SO_REUSEADDR);</span>
+<span class="nc" id="L506">            set.add(StandardSocketOptions.TCP_NODELAY);</span>
+<span class="nc" id="L507">            return Collections.unmodifiableSet(set);</span>
+        }
+    }
+
+    @Override
+    public final Set&lt;SocketOption&lt;?&gt;&gt; supportedOptions() {
+<span class="nc" id="L513">        return DefaultOptionsHolder.defaultOptions;</span>
+    }
+
+    @Override
+    public final SocketAddress getRemoteAddress() throws IOException {
+<span class="nc bnc" id="L518" title="All 2 branches missed.">        if (!isOpen())</span>
+<span class="nc" id="L519">            throw new ClosedChannelException();</span>
+<span class="nc" id="L520">        return remoteAddress;</span>
+    }
+
+    @Override
+    public final AsynchronousSocketChannel shutdownInput() throws IOException {
+        try {
+<span class="nc" id="L526">            begin();</span>
+<span class="nc bnc" id="L527" title="All 2 branches missed.">            if (remoteAddress == null)</span>
+<span class="nc" id="L528">                throw new NotYetConnectedException();</span>
+<span class="nc" id="L529">            synchronized (readLock) {</span>
+<span class="nc bnc" id="L530" title="All 2 branches missed.">                if (!readShutdown) {</span>
+<span class="nc" id="L531">                    Net.shutdown(fd, Net.SHUT_RD);</span>
+<span class="nc" id="L532">                    readShutdown = true;</span>
+                }
+<span class="nc" id="L534">            }</span>
+        } finally {
+<span class="nc" id="L536">            end();</span>
+<span class="nc" id="L537">        }</span>
+<span class="nc" id="L538">        return this;</span>
+    }
+
+    @Override
+    public final AsynchronousSocketChannel shutdownOutput() throws IOException {
+        try {
+<span class="fc" id="L544">            begin();</span>
+<span class="pc bpc" id="L545" title="1 of 2 branches missed.">            if (remoteAddress == null)</span>
+<span class="nc" id="L546">                throw new NotYetConnectedException();</span>
+<span class="fc" id="L547">            synchronized (writeLock) {</span>
+<span class="pc bpc" id="L548" title="1 of 2 branches missed.">                if (!writeShutdown) {</span>
+<span class="fc" id="L549">                    Net.shutdown(fd, Net.SHUT_WR);</span>
+<span class="fc" id="L550">                    writeShutdown = true;</span>
+                }
+<span class="pc" id="L552">            }</span>
+        } finally {
+<span class="pc" id="L554">            end();</span>
+<span class="fc" id="L555">        }</span>
+<span class="fc" id="L556">        return this;</span>
+    }
+
+    @Override
+    public final String toString() {
+<span class="nc" id="L561">        StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L562">        sb.append(this.getClass().getName());</span>
+<span class="nc" id="L563">        sb.append('[');</span>
+<span class="nc" id="L564">        synchronized (stateLock) {</span>
+<span class="nc bnc" id="L565" title="All 2 branches missed.">            if (!isOpen()) {</span>
+<span class="nc" id="L566">                sb.append(&quot;closed&quot;);</span>
+            } else {
+<span class="nc bnc" id="L568" title="All 4 branches missed.">                switch (state) {</span>
+                case ST_UNCONNECTED:
+<span class="nc" id="L570">                    sb.append(&quot;unconnected&quot;);</span>
+<span class="nc" id="L571">                    break;</span>
+                case ST_PENDING:
+<span class="nc" id="L573">                    sb.append(&quot;connection-pending&quot;);</span>
+<span class="nc" id="L574">                    break;</span>
+                case ST_CONNECTED:
+<span class="nc" id="L576">                    sb.append(&quot;connected&quot;);</span>
+<span class="nc bnc" id="L577" title="All 2 branches missed.">                    if (readShutdown)</span>
+<span class="nc" id="L578">                        sb.append(&quot; ishut&quot;);</span>
+<span class="nc bnc" id="L579" title="All 2 branches missed.">                    if (writeShutdown)</span>
+<span class="nc" id="L580">                        sb.append(&quot; oshut&quot;);</span>
+                    break;
+                }
+<span class="nc bnc" id="L583" title="All 2 branches missed.">                if (localAddress != null) {</span>
+<span class="nc" id="L584">                    sb.append(&quot; local=&quot;);</span>
+<span class="nc" id="L585">                    sb.append(</span>
+<span class="nc" id="L586">                            Net.getRevealedLocalAddressAsString(localAddress));</span>
+                }
+<span class="nc bnc" id="L588" title="All 2 branches missed.">                if (remoteAddress != null) {</span>
+<span class="nc" id="L589">                    sb.append(&quot; remote=&quot;);</span>
+<span class="nc" id="L590">                    sb.append(remoteAddress.toString());</span>
+                }
+            }
+<span class="nc" id="L593">        }</span>
+<span class="nc" id="L594">        sb.append(']');</span>
+<span class="nc" id="L595">        return sb.toString();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

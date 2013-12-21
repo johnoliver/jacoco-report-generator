@@ -1,0 +1,2762 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>BandStructure.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">com.sun.java.util.jar.pack</a> &gt; <span class="el_source">BandStructure.java</span></div><h1>BandStructure.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2001, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package com.sun.java.util.jar.pack;
+
+import com.sun.java.util.jar.pack.ConstantPool.Entry;
+import com.sun.java.util.jar.pack.ConstantPool.Index;
+import com.sun.java.util.jar.pack.Package.Class.Field;
+import java.io.BufferedOutputStream;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.EOFException;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.FilterInputStream;
+import java.io.FilterOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.PrintStream;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.jar.Pack200;
+import static com.sun.java.util.jar.pack.Constants.*;
+import java.util.LinkedList;
+
+/**
+ * Define the structure and ordering of &quot;bands&quot; in a packed file.
+ * @author John Rose
+ */
+<span class="nc bnc" id="L57" title="All 2 branches missed.">abstract</span>
+class BandStructure {
+    static final int MAX_EFFORT = 9;
+    static final int MIN_EFFORT = 1;
+    static final int DEFAULT_EFFORT = 5;
+
+    // Inherit options from Pack200:
+<span class="nc" id="L64">    PropMap p200 = Utils.currentPropMap();</span>
+
+<span class="nc" id="L66">    int verbose = p200.getInteger(Utils.DEBUG_VERBOSE);</span>
+<span class="nc" id="L67">    int effort = p200.getInteger(Pack200.Packer.EFFORT);</span>
+<span class="nc bnc" id="L68" title="All 2 branches missed.">    { if (effort == 0)  effort = DEFAULT_EFFORT; }</span>
+<span class="nc" id="L69">    boolean optDumpBands = p200.getBoolean(Utils.COM_PREFIX+&quot;dump.bands&quot;);</span>
+<span class="nc" id="L70">    boolean optDebugBands = p200.getBoolean(Utils.COM_PREFIX+&quot;debug.bands&quot;);</span>
+
+    // Various heuristic options.
+<span class="nc bnc" id="L73" title="All 2 branches missed.">    boolean optVaryCodings = !p200.getBoolean(Utils.COM_PREFIX+&quot;no.vary.codings&quot;);</span>
+<span class="nc bnc" id="L74" title="All 2 branches missed.">    boolean optBigStrings = !p200.getBoolean(Utils.COM_PREFIX+&quot;no.big.strings&quot;);</span>
+
+    abstract protected Index getCPIndex(byte tag);
+
+    // Local copy of highest class version.
+<span class="nc" id="L79">    private Package.Version highestClassVersion = null;</span>
+
+    /** Call this exactly once, early, to specify the archive major version. */
+    public void initHighestClassVersion(Package.Version highestClassVersion) throws IOException {
+<span class="nc bnc" id="L83" title="All 2 branches missed.">        if (this.highestClassVersion != null) {</span>
+<span class="nc" id="L84">            throw new IOException(</span>
+                &quot;Highest class major version is already initialized to &quot; +
+                this.highestClassVersion + &quot;; new setting is &quot; + highestClassVersion);
+        }
+<span class="nc" id="L88">        this.highestClassVersion = highestClassVersion;</span>
+<span class="nc" id="L89">        adjustToClassVersion();</span>
+<span class="nc" id="L90">    }</span>
+
+    public Package.Version getHighestClassVersion() {
+<span class="nc" id="L93">        return highestClassVersion;</span>
+    }
+
+<span class="nc" id="L96">    private final boolean isReader = this instanceof PackageReader;</span>
+
+<span class="nc" id="L98">    protected BandStructure() {}</span>
+
+<span class="nc" id="L100">    final static Coding BYTE1 = Coding.of(1,256);</span>
+
+<span class="nc" id="L102">    final static Coding CHAR3 = Coding.of(3,128);</span>
+    // Note:  Tried sharper (3,16) with no post-zip benefit.
+
+    // This is best used with BCI values:
+<span class="nc" id="L106">    final static Coding BCI5 = Coding.of(5,4);  // mostly 1-byte offsets</span>
+<span class="nc" id="L107">    final static Coding BRANCH5 = Coding.of(5,4,2); // mostly forward branches</span>
+
+<span class="nc" id="L109">    final static Coding UNSIGNED5 = Coding.of(5,64);</span>
+<span class="nc" id="L110">    final static Coding UDELTA5 = UNSIGNED5.getDeltaCoding();</span>
+    // &quot;sharp&quot; (5,64) zips 0.4% better than &quot;medium&quot; (5,128)
+    // It zips 1.1% better than &quot;flat&quot; (5,192)
+
+<span class="nc" id="L114">    final static Coding SIGNED5 = Coding.of(5,64,1);  //sharp</span>
+<span class="nc" id="L115">    final static Coding DELTA5 = SIGNED5.getDeltaCoding();</span>
+    // Note:  Tried (5,128,2) and (5,192,2) with no benefit.
+
+<span class="nc" id="L118">    final static Coding MDELTA5 = Coding.of(5,64,2).getDeltaCoding();</span>
+
+<span class="nc" id="L120">    final private static Coding[] basicCodings = {</span>
+        // Table of &quot;Canonical BHSD Codings&quot; from Pack200 spec.
+        null,  // _meta_default
+
+        // Fixed-length codings:
+<span class="nc" id="L125">        Coding.of(1,256,0),</span>
+<span class="nc" id="L126">        Coding.of(1,256,1),</span>
+<span class="nc" id="L127">        Coding.of(1,256,0).getDeltaCoding(),</span>
+<span class="nc" id="L128">        Coding.of(1,256,1).getDeltaCoding(),</span>
+<span class="nc" id="L129">        Coding.of(2,256,0),</span>
+<span class="nc" id="L130">        Coding.of(2,256,1),</span>
+<span class="nc" id="L131">        Coding.of(2,256,0).getDeltaCoding(),</span>
+<span class="nc" id="L132">        Coding.of(2,256,1).getDeltaCoding(),</span>
+<span class="nc" id="L133">        Coding.of(3,256,0),</span>
+<span class="nc" id="L134">        Coding.of(3,256,1),</span>
+<span class="nc" id="L135">        Coding.of(3,256,0).getDeltaCoding(),</span>
+<span class="nc" id="L136">        Coding.of(3,256,1).getDeltaCoding(),</span>
+<span class="nc" id="L137">        Coding.of(4,256,0),</span>
+<span class="nc" id="L138">        Coding.of(4,256,1),</span>
+<span class="nc" id="L139">        Coding.of(4,256,0).getDeltaCoding(),</span>
+<span class="nc" id="L140">        Coding.of(4,256,1).getDeltaCoding(),</span>
+
+        // Full-range variable-length codings:
+<span class="nc" id="L143">        Coding.of(5,  4,0),</span>
+<span class="nc" id="L144">        Coding.of(5,  4,1),</span>
+<span class="nc" id="L145">        Coding.of(5,  4,2),</span>
+<span class="nc" id="L146">        Coding.of(5, 16,0),</span>
+<span class="nc" id="L147">        Coding.of(5, 16,1),</span>
+<span class="nc" id="L148">        Coding.of(5, 16,2),</span>
+<span class="nc" id="L149">        Coding.of(5, 32,0),</span>
+<span class="nc" id="L150">        Coding.of(5, 32,1),</span>
+<span class="nc" id="L151">        Coding.of(5, 32,2),</span>
+<span class="nc" id="L152">        Coding.of(5, 64,0),</span>
+<span class="nc" id="L153">        Coding.of(5, 64,1),</span>
+<span class="nc" id="L154">        Coding.of(5, 64,2),</span>
+<span class="nc" id="L155">        Coding.of(5,128,0),</span>
+<span class="nc" id="L156">        Coding.of(5,128,1),</span>
+<span class="nc" id="L157">        Coding.of(5,128,2),</span>
+
+<span class="nc" id="L159">        Coding.of(5,  4,0).getDeltaCoding(),</span>
+<span class="nc" id="L160">        Coding.of(5,  4,1).getDeltaCoding(),</span>
+<span class="nc" id="L161">        Coding.of(5,  4,2).getDeltaCoding(),</span>
+<span class="nc" id="L162">        Coding.of(5, 16,0).getDeltaCoding(),</span>
+<span class="nc" id="L163">        Coding.of(5, 16,1).getDeltaCoding(),</span>
+<span class="nc" id="L164">        Coding.of(5, 16,2).getDeltaCoding(),</span>
+<span class="nc" id="L165">        Coding.of(5, 32,0).getDeltaCoding(),</span>
+<span class="nc" id="L166">        Coding.of(5, 32,1).getDeltaCoding(),</span>
+<span class="nc" id="L167">        Coding.of(5, 32,2).getDeltaCoding(),</span>
+<span class="nc" id="L168">        Coding.of(5, 64,0).getDeltaCoding(),</span>
+<span class="nc" id="L169">        Coding.of(5, 64,1).getDeltaCoding(),</span>
+<span class="nc" id="L170">        Coding.of(5, 64,2).getDeltaCoding(),</span>
+<span class="nc" id="L171">        Coding.of(5,128,0).getDeltaCoding(),</span>
+<span class="nc" id="L172">        Coding.of(5,128,1).getDeltaCoding(),</span>
+<span class="nc" id="L173">        Coding.of(5,128,2).getDeltaCoding(),</span>
+
+        // Variable length subrange codings:
+<span class="nc" id="L176">        Coding.of(2,192,0),</span>
+<span class="nc" id="L177">        Coding.of(2,224,0),</span>
+<span class="nc" id="L178">        Coding.of(2,240,0),</span>
+<span class="nc" id="L179">        Coding.of(2,248,0),</span>
+<span class="nc" id="L180">        Coding.of(2,252,0),</span>
+
+<span class="nc" id="L182">        Coding.of(2,  8,0).getDeltaCoding(),</span>
+<span class="nc" id="L183">        Coding.of(2,  8,1).getDeltaCoding(),</span>
+<span class="nc" id="L184">        Coding.of(2, 16,0).getDeltaCoding(),</span>
+<span class="nc" id="L185">        Coding.of(2, 16,1).getDeltaCoding(),</span>
+<span class="nc" id="L186">        Coding.of(2, 32,0).getDeltaCoding(),</span>
+<span class="nc" id="L187">        Coding.of(2, 32,1).getDeltaCoding(),</span>
+<span class="nc" id="L188">        Coding.of(2, 64,0).getDeltaCoding(),</span>
+<span class="nc" id="L189">        Coding.of(2, 64,1).getDeltaCoding(),</span>
+<span class="nc" id="L190">        Coding.of(2,128,0).getDeltaCoding(),</span>
+<span class="nc" id="L191">        Coding.of(2,128,1).getDeltaCoding(),</span>
+<span class="nc" id="L192">        Coding.of(2,192,0).getDeltaCoding(),</span>
+<span class="nc" id="L193">        Coding.of(2,192,1).getDeltaCoding(),</span>
+<span class="nc" id="L194">        Coding.of(2,224,0).getDeltaCoding(),</span>
+<span class="nc" id="L195">        Coding.of(2,224,1).getDeltaCoding(),</span>
+<span class="nc" id="L196">        Coding.of(2,240,0).getDeltaCoding(),</span>
+<span class="nc" id="L197">        Coding.of(2,240,1).getDeltaCoding(),</span>
+<span class="nc" id="L198">        Coding.of(2,248,0).getDeltaCoding(),</span>
+<span class="nc" id="L199">        Coding.of(2,248,1).getDeltaCoding(),</span>
+
+<span class="nc" id="L201">        Coding.of(3,192,0),</span>
+<span class="nc" id="L202">        Coding.of(3,224,0),</span>
+<span class="nc" id="L203">        Coding.of(3,240,0),</span>
+<span class="nc" id="L204">        Coding.of(3,248,0),</span>
+<span class="nc" id="L205">        Coding.of(3,252,0),</span>
+
+<span class="nc" id="L207">        Coding.of(3,  8,0).getDeltaCoding(),</span>
+<span class="nc" id="L208">        Coding.of(3,  8,1).getDeltaCoding(),</span>
+<span class="nc" id="L209">        Coding.of(3, 16,0).getDeltaCoding(),</span>
+<span class="nc" id="L210">        Coding.of(3, 16,1).getDeltaCoding(),</span>
+<span class="nc" id="L211">        Coding.of(3, 32,0).getDeltaCoding(),</span>
+<span class="nc" id="L212">        Coding.of(3, 32,1).getDeltaCoding(),</span>
+<span class="nc" id="L213">        Coding.of(3, 64,0).getDeltaCoding(),</span>
+<span class="nc" id="L214">        Coding.of(3, 64,1).getDeltaCoding(),</span>
+<span class="nc" id="L215">        Coding.of(3,128,0).getDeltaCoding(),</span>
+<span class="nc" id="L216">        Coding.of(3,128,1).getDeltaCoding(),</span>
+<span class="nc" id="L217">        Coding.of(3,192,0).getDeltaCoding(),</span>
+<span class="nc" id="L218">        Coding.of(3,192,1).getDeltaCoding(),</span>
+<span class="nc" id="L219">        Coding.of(3,224,0).getDeltaCoding(),</span>
+<span class="nc" id="L220">        Coding.of(3,224,1).getDeltaCoding(),</span>
+<span class="nc" id="L221">        Coding.of(3,240,0).getDeltaCoding(),</span>
+<span class="nc" id="L222">        Coding.of(3,240,1).getDeltaCoding(),</span>
+<span class="nc" id="L223">        Coding.of(3,248,0).getDeltaCoding(),</span>
+<span class="nc" id="L224">        Coding.of(3,248,1).getDeltaCoding(),</span>
+
+<span class="nc" id="L226">        Coding.of(4,192,0),</span>
+<span class="nc" id="L227">        Coding.of(4,224,0),</span>
+<span class="nc" id="L228">        Coding.of(4,240,0),</span>
+<span class="nc" id="L229">        Coding.of(4,248,0),</span>
+<span class="nc" id="L230">        Coding.of(4,252,0),</span>
+
+<span class="nc" id="L232">        Coding.of(4,  8,0).getDeltaCoding(),</span>
+<span class="nc" id="L233">        Coding.of(4,  8,1).getDeltaCoding(),</span>
+<span class="nc" id="L234">        Coding.of(4, 16,0).getDeltaCoding(),</span>
+<span class="nc" id="L235">        Coding.of(4, 16,1).getDeltaCoding(),</span>
+<span class="nc" id="L236">        Coding.of(4, 32,0).getDeltaCoding(),</span>
+<span class="nc" id="L237">        Coding.of(4, 32,1).getDeltaCoding(),</span>
+<span class="nc" id="L238">        Coding.of(4, 64,0).getDeltaCoding(),</span>
+<span class="nc" id="L239">        Coding.of(4, 64,1).getDeltaCoding(),</span>
+<span class="nc" id="L240">        Coding.of(4,128,0).getDeltaCoding(),</span>
+<span class="nc" id="L241">        Coding.of(4,128,1).getDeltaCoding(),</span>
+<span class="nc" id="L242">        Coding.of(4,192,0).getDeltaCoding(),</span>
+<span class="nc" id="L243">        Coding.of(4,192,1).getDeltaCoding(),</span>
+<span class="nc" id="L244">        Coding.of(4,224,0).getDeltaCoding(),</span>
+<span class="nc" id="L245">        Coding.of(4,224,1).getDeltaCoding(),</span>
+<span class="nc" id="L246">        Coding.of(4,240,0).getDeltaCoding(),</span>
+<span class="nc" id="L247">        Coding.of(4,240,1).getDeltaCoding(),</span>
+<span class="nc" id="L248">        Coding.of(4,248,0).getDeltaCoding(),</span>
+<span class="nc" id="L249">        Coding.of(4,248,1).getDeltaCoding(),</span>
+
+        null
+    };
+    final private static Map&lt;Coding, Integer&gt; basicCodingIndexes;
+    static {
+<span class="nc bnc" id="L255" title="All 4 branches missed.">        assert(basicCodings[_meta_default] == null);</span>
+<span class="nc bnc" id="L256" title="All 4 branches missed.">        assert(basicCodings[_meta_canon_min] != null);</span>
+<span class="nc bnc" id="L257" title="All 4 branches missed.">        assert(basicCodings[_meta_canon_max] != null);</span>
+<span class="nc" id="L258">        Map&lt;Coding, Integer&gt; map = new HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L259" title="All 2 branches missed.">        for (int i = 0; i &lt; basicCodings.length; i++) {</span>
+<span class="nc" id="L260">            Coding c = basicCodings[i];</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">            if (c == null)  continue;</span>
+<span class="nc bnc" id="L262" title="All 4 branches missed.">            assert(i &gt;= _meta_canon_min);</span>
+<span class="nc bnc" id="L263" title="All 4 branches missed.">            assert(i &lt;= _meta_canon_max);</span>
+<span class="nc" id="L264">            map.put(c, i);</span>
+        }
+<span class="nc" id="L266">        basicCodingIndexes = map;</span>
+    }
+    public static Coding codingForIndex(int i) {
+<span class="nc bnc" id="L269" title="All 2 branches missed.">        return i &lt; basicCodings.length ? basicCodings[i] : null;</span>
+    }
+    public static int indexOf(Coding c) {
+<span class="nc" id="L272">        Integer i = basicCodingIndexes.get(c);</span>
+<span class="nc bnc" id="L273" title="All 2 branches missed.">        if (i == null)  return 0;</span>
+<span class="nc" id="L274">        return i.intValue();</span>
+    }
+    public static Coding[] getBasicCodings() {
+<span class="nc" id="L277">        return basicCodings.clone();</span>
+    }
+
+    protected byte[] bandHeaderBytes;    // used for input only
+    protected int    bandHeaderBytePos;  // BHB read pointer, for input only
+    protected int    bandHeaderBytePos0; // for debug
+
+    protected CodingMethod getBandHeader(int XB, Coding regularCoding) {
+<span class="nc" id="L285">        CodingMethod[] res = {null};</span>
+        // push back XB onto the band header bytes
+<span class="nc" id="L287">        bandHeaderBytes[--bandHeaderBytePos] = (byte) XB;</span>
+<span class="nc" id="L288">        bandHeaderBytePos0 = bandHeaderBytePos;</span>
+        // scan forward through XB and any additional band header bytes
+<span class="nc" id="L290">        bandHeaderBytePos = parseMetaCoding(bandHeaderBytes,</span>
+                                            bandHeaderBytePos,
+                                            regularCoding,
+                                            res);
+<span class="nc" id="L294">        return res[0];</span>
+    }
+
+    public static int parseMetaCoding(byte[] bytes, int pos, Coding dflt, CodingMethod[] res) {
+<span class="nc bnc" id="L298" title="All 2 branches missed.">        if ((bytes[pos] &amp; 0xFF) == _meta_default) {</span>
+<span class="nc" id="L299">            res[0] = dflt;</span>
+<span class="nc" id="L300">            return pos+1;</span>
+        }
+        int pos2;
+<span class="nc" id="L303">        pos2 = Coding.parseMetaCoding(bytes, pos, dflt, res);</span>
+<span class="nc bnc" id="L304" title="All 2 branches missed.">        if (pos2 &gt; pos)  return pos2;</span>
+<span class="nc" id="L305">        pos2 = PopulationCoding.parseMetaCoding(bytes, pos, dflt, res);</span>
+<span class="nc bnc" id="L306" title="All 2 branches missed.">        if (pos2 &gt; pos)  return pos2;</span>
+<span class="nc" id="L307">        pos2 = AdaptiveCoding.parseMetaCoding(bytes, pos, dflt, res);</span>
+<span class="nc bnc" id="L308" title="All 2 branches missed.">        if (pos2 &gt; pos)  return pos2;</span>
+<span class="nc" id="L309">        throw new RuntimeException(&quot;Bad meta-coding op &quot;+(bytes[pos]&amp;0xFF));</span>
+    }
+
+    static final int SHORT_BAND_HEURISTIC = 100;
+
+    public static final int NO_PHASE        = 0;
+
+    // package writing phases:
+    public static final int COLLECT_PHASE   = 1; // collect data before write
+    public static final int FROZEN_PHASE    = 3; // no longer collecting
+    public static final int WRITE_PHASE     = 5; // ready to write bytes
+
+    // package reading phases:
+    public static final int EXPECT_PHASE    = 2; // gather expected counts
+    public static final int READ_PHASE      = 4; // ready to read bytes
+    public static final int DISBURSE_PHASE  = 6; // pass out data after read
+
+    public static final int DONE_PHASE      = 8; // done writing or reading
+
+    static boolean phaseIsRead(int p) {
+<span class="nc bnc" id="L329" title="All 2 branches missed.">        return (p % 2) == 0;</span>
+    }
+    static int phaseCmp(int p0, int p1) {
+<span class="nc bnc" id="L332" title="All 8 branches missed.">        assert((p0 % 2) == (p1 % 2) || (p0 % 8) == 0 || (p1 % 8) == 0);</span>
+<span class="nc" id="L333">        return p0 - p1;</span>
+    }
+
+    /** The packed file is divided up into a number of segments.
+     *  Most segments are typed as ValueBand, strongly-typed sequences
+     *  of integer values, all interpreted in a single way.
+     *  A few segments are ByteBands, which hetergeneous sequences
+     *  of bytes.
+     *
+     *  The two phases for writing a packed file are COLLECT and WRITE.
+     *  1. When writing a packed file, each band collects
+     *  data in an ad-hoc order.
+     *  2. At the end, each band is assigned a coding scheme,
+     *  and then all the bands are written in their global order.
+     *
+     *  The three phases for reading a packed file are EXPECT, READ,
+     *  and DISBURSE.
+     *  1. For each band, the expected number of integers  is determined.
+     *  2. The data is actually read from the file into the band.
+     *  3. The band pays out its values as requested, in an ad hoc order.
+     *
+     *  When the last phase of a band is done, it is marked so (DONE).
+     *  Clearly, these phases must be properly ordered WRT each other.
+     */
+<span class="nc bnc" id="L357" title="All 2 branches missed.">    abstract class Band {</span>
+<span class="nc" id="L358">        private int    phase = NO_PHASE;</span>
+        private final  String name;
+
+        private int    valuesExpected;
+
+<span class="nc" id="L363">        protected long outputSize = -1;  // cache</span>
+
+        final public Coding regularCoding;
+
+        final public int seqForDebug;
+        public int       elementCountForDebug;
+
+
+<span class="nc" id="L371">        protected Band(String name, Coding regularCoding) {</span>
+<span class="nc" id="L372">            this.name = name;</span>
+<span class="nc" id="L373">            this.regularCoding = regularCoding;</span>
+<span class="nc" id="L374">            this.seqForDebug = ++nextSeqForDebug;</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">            if (verbose &gt; 2)</span>
+<span class="nc" id="L376">                Utils.log.fine(&quot;Band &quot;+seqForDebug+&quot; is &quot;+name);</span>
+            // caller must call init
+<span class="nc" id="L378">        }</span>
+
+        public Band init() {
+            // Cannot due this from the constructor, because constructor
+            // may wish to initialize some subclass variables.
+            // Set initial phase for reading or writing:
+<span class="nc bnc" id="L384" title="All 2 branches missed.">            if (isReader)</span>
+<span class="nc" id="L385">                readyToExpect();</span>
+            else
+<span class="nc" id="L387">                readyToCollect();</span>
+<span class="nc" id="L388">            return this;</span>
+        }
+
+        // common operations
+<span class="nc" id="L392">        boolean isReader() { return isReader; }</span>
+<span class="nc" id="L393">        int phase() { return phase; }</span>
+<span class="nc" id="L394">        String name() { return name; }</span>
+
+        /** Return -1 if data buffer not allocated, else max length. */
+        public abstract int capacity();
+
+        /** Allocate data buffer to specified length. */
+        protected abstract void setCapacity(int cap);
+
+        /** Return current number of values in buffer, which must exist. */
+        public abstract int length();
+
+        protected abstract int valuesRemainingForDebug();
+
+        public final int valuesExpected() {
+<span class="nc" id="L408">            return valuesExpected;</span>
+        }
+
+        /** Write out bytes, encoding the values. */
+        public final void writeTo(OutputStream out) throws IOException {
+<span class="nc bnc" id="L413" title="All 4 branches missed.">            assert(assertReadyToWriteTo(this, out));</span>
+<span class="nc" id="L414">            setPhase(WRITE_PHASE);</span>
+            // subclasses continue by writing their contents to output
+<span class="nc" id="L416">            writeDataTo(out);</span>
+<span class="nc" id="L417">            doneWriting();</span>
+<span class="nc" id="L418">        }</span>
+
+        abstract void chooseBandCodings() throws IOException;
+
+        public final long outputSize() {
+<span class="nc bnc" id="L423" title="All 2 branches missed.">            if (outputSize &gt;= 0) {</span>
+<span class="nc" id="L424">                long size = outputSize;</span>
+<span class="nc bnc" id="L425" title="All 4 branches missed.">                assert(size == computeOutputSize());</span>
+<span class="nc" id="L426">                return size;</span>
+            }
+<span class="nc" id="L428">            return computeOutputSize();</span>
+        }
+
+        protected abstract long computeOutputSize();
+
+        abstract protected void writeDataTo(OutputStream out) throws IOException;
+
+        /** Expect a certain number of values. */
+        void expectLength(int l) {
+<span class="nc bnc" id="L437" title="All 4 branches missed.">            assert(assertPhase(this, EXPECT_PHASE));</span>
+<span class="nc bnc" id="L438" title="All 4 branches missed.">            assert(valuesExpected == 0);  // all at once</span>
+<span class="nc bnc" id="L439" title="All 4 branches missed.">            assert(l &gt;= 0);</span>
+<span class="nc" id="L440">            valuesExpected = l;</span>
+<span class="nc" id="L441">        }</span>
+        /** Expect more values.  (Multiple calls accumulate.) */
+        void expectMoreLength(int l) {
+<span class="nc bnc" id="L444" title="All 4 branches missed.">            assert(assertPhase(this, EXPECT_PHASE));</span>
+<span class="nc" id="L445">            valuesExpected += l;</span>
+<span class="nc" id="L446">        }</span>
+
+
+        /// Phase change markers.
+
+        private void readyToCollect() { // called implicitly by constructor
+<span class="nc" id="L452">            setCapacity(1);</span>
+<span class="nc" id="L453">            setPhase(COLLECT_PHASE);</span>
+<span class="nc" id="L454">        }</span>
+        protected void doneWriting() {
+<span class="nc bnc" id="L456" title="All 4 branches missed.">            assert(assertPhase(this, WRITE_PHASE));</span>
+<span class="nc" id="L457">            setPhase(DONE_PHASE);</span>
+<span class="nc" id="L458">        }</span>
+        private void readyToExpect() { // called implicitly by constructor
+<span class="nc" id="L460">            setPhase(EXPECT_PHASE);</span>
+<span class="nc" id="L461">        }</span>
+        /** Read in bytes, decoding the values. */
+        public final void readFrom(InputStream in) throws IOException {
+<span class="nc bnc" id="L464" title="All 4 branches missed.">            assert(assertReadyToReadFrom(this, in));</span>
+<span class="nc" id="L465">            setCapacity(valuesExpected());</span>
+<span class="nc" id="L466">            setPhase(READ_PHASE);</span>
+            // subclasses continue by reading their contents from input:
+<span class="nc" id="L468">            readDataFrom(in);</span>
+<span class="nc" id="L469">            readyToDisburse();</span>
+<span class="nc" id="L470">        }</span>
+        abstract protected void readDataFrom(InputStream in) throws IOException;
+        protected void readyToDisburse() {
+<span class="nc bnc" id="L473" title="All 2 branches missed.">            if (verbose &gt; 1)  Utils.log.fine(&quot;readyToDisburse &quot;+this);</span>
+<span class="nc" id="L474">            setPhase(DISBURSE_PHASE);</span>
+<span class="nc" id="L475">        }</span>
+        public void doneDisbursing() {
+<span class="nc bnc" id="L477" title="All 4 branches missed.">            assert(assertPhase(this, DISBURSE_PHASE));</span>
+<span class="nc" id="L478">            setPhase(DONE_PHASE);</span>
+<span class="nc" id="L479">        }</span>
+        public final void doneWithUnusedBand() {
+<span class="nc bnc" id="L481" title="All 2 branches missed.">            if (isReader) {</span>
+<span class="nc bnc" id="L482" title="All 4 branches missed.">                assert(assertPhase(this, EXPECT_PHASE));</span>
+<span class="nc bnc" id="L483" title="All 4 branches missed.">                assert(valuesExpected() == 0);</span>
+                // Fast forward:
+<span class="nc" id="L485">                setPhase(READ_PHASE);</span>
+<span class="nc" id="L486">                setPhase(DISBURSE_PHASE);</span>
+<span class="nc" id="L487">                setPhase(DONE_PHASE);</span>
+            } else {
+<span class="nc" id="L489">                setPhase(FROZEN_PHASE);</span>
+            }
+<span class="nc" id="L491">        }</span>
+
+        protected void setPhase(int newPhase) {
+<span class="nc bnc" id="L494" title="All 4 branches missed.">            assert(assertPhaseChangeOK(this, phase, newPhase));</span>
+<span class="nc" id="L495">            this.phase = newPhase;</span>
+<span class="nc" id="L496">        }</span>
+
+<span class="nc" id="L498">        protected int lengthForDebug = -1;  // DEBUG ONLY</span>
+        @Override
+        public String toString() {  // DEBUG ONLY
+<span class="nc bnc" id="L501" title="All 2 branches missed.">            int length = (lengthForDebug != -1 ? lengthForDebug : length());</span>
+<span class="nc" id="L502">            String str = name;</span>
+<span class="nc bnc" id="L503" title="All 2 branches missed.">            if (length != 0)</span>
+<span class="nc" id="L504">                str += &quot;[&quot; + length + &quot;]&quot;;</span>
+<span class="nc bnc" id="L505" title="All 2 branches missed.">            if (elementCountForDebug != 0)</span>
+<span class="nc" id="L506">                str += &quot;(&quot; + elementCountForDebug + &quot;)&quot;;</span>
+<span class="nc" id="L507">            return str;</span>
+        }
+    }
+
+<span class="nc bnc" id="L511" title="All 2 branches missed.">    class ValueBand extends Band {</span>
+        private int[]  values;   // must be null in EXPECT phase
+        private int    length;
+        private int    valuesDisbursed;
+
+        private CodingMethod bandCoding;
+        private byte[] metaCoding;
+
+<span class="nc" id="L519">        protected ValueBand(String name, Coding regularCoding) {</span>
+<span class="nc" id="L520">            super(name, regularCoding);</span>
+<span class="nc" id="L521">        }</span>
+
+        @Override
+        public int capacity() {
+<span class="nc bnc" id="L525" title="All 2 branches missed.">            return values == null ? -1 : values.length;</span>
+        }
+
+        /** Declare predicted or needed capacity. */
+        @Override
+        protected void setCapacity(int cap) {
+<span class="nc bnc" id="L531" title="All 4 branches missed.">            assert(length &lt;= cap);</span>
+<span class="nc bnc" id="L532" title="All 2 branches missed.">            if (cap == -1) { values = null; return; }</span>
+<span class="nc" id="L533">            values = realloc(values, cap);</span>
+<span class="nc" id="L534">        }</span>
+
+        @Override
+        public int length() {
+<span class="nc" id="L538">            return length;</span>
+        }
+        @Override
+        protected int valuesRemainingForDebug() {
+<span class="nc" id="L542">            return length - valuesDisbursed;</span>
+        }
+        protected int valueAtForDebug(int i) {
+<span class="nc" id="L545">            return values[i];</span>
+        }
+
+        void patchValue(int i, int value) {
+            // Only one use for this.
+<span class="nc bnc" id="L550" title="All 4 branches missed.">            assert(this == archive_header_S);</span>
+<span class="nc bnc" id="L551" title="All 6 branches missed.">            assert(i == AH_ARCHIVE_SIZE_HI || i == AH_ARCHIVE_SIZE_LO);</span>
+<span class="nc bnc" id="L552" title="All 4 branches missed.">            assert(i &lt; length);  // must have already output a dummy</span>
+<span class="nc" id="L553">            values[i] = value;</span>
+<span class="nc" id="L554">            outputSize = -1;  // decache</span>
+<span class="nc" id="L555">        }</span>
+
+        protected void initializeValues(int[] values) {
+<span class="nc bnc" id="L558" title="All 4 branches missed.">            assert(assertCanChangeLength(this));</span>
+<span class="nc bnc" id="L559" title="All 4 branches missed.">            assert(length == 0);</span>
+<span class="nc" id="L560">            this.values = values;</span>
+<span class="nc" id="L561">            this.length = values.length;</span>
+<span class="nc" id="L562">        }</span>
+
+        /** Collect one value, or store one decoded value. */
+        protected void addValue(int x) {
+<span class="nc bnc" id="L566" title="All 4 branches missed.">            assert(assertCanChangeLength(this));</span>
+<span class="nc bnc" id="L567" title="All 2 branches missed.">            if (length == values.length)</span>
+<span class="nc bnc" id="L568" title="All 2 branches missed.">                setCapacity(length &lt; 1000 ? length * 10 : length * 2);</span>
+<span class="nc" id="L569">            values[length++] = x;</span>
+<span class="nc" id="L570">        }</span>
+
+        private boolean canVaryCoding() {
+<span class="nc bnc" id="L573" title="All 2 branches missed.">            if (!optVaryCodings)           return false;</span>
+<span class="nc bnc" id="L574" title="All 2 branches missed.">            if (length == 0)               return false;</span>
+            // Can't read band_headers w/o the archive header:
+<span class="nc bnc" id="L576" title="All 2 branches missed.">            if (this == archive_header_0)  return false;</span>
+<span class="nc bnc" id="L577" title="All 2 branches missed.">            if (this == archive_header_S)  return false;</span>
+<span class="nc bnc" id="L578" title="All 2 branches missed.">            if (this == archive_header_1)  return false;</span>
+            // BYTE1 bands can't vary codings, but the others can.
+            // All that's needed for the initial escape is at least
+            // 256 negative values or more than 256 non-negative values
+<span class="nc bnc" id="L582" title="All 4 branches missed.">            return (regularCoding.min() &lt;= -256 || regularCoding.max() &gt;= 256);</span>
+        }
+
+        private boolean shouldVaryCoding() {
+<span class="nc bnc" id="L586" title="All 4 branches missed.">            assert(canVaryCoding());</span>
+<span class="nc bnc" id="L587" title="All 4 branches missed.">            if (effort &lt; MAX_EFFORT &amp;&amp; length &lt; SHORT_BAND_HEURISTIC)</span>
+<span class="nc" id="L588">                return false;</span>
+<span class="nc" id="L589">            return true;</span>
+        }
+
+        @Override
+        protected void chooseBandCodings() throws IOException {
+<span class="nc" id="L594">            boolean canVary = canVaryCoding();</span>
+<span class="nc bnc" id="L595" title="All 4 branches missed.">            if (!canVary || !shouldVaryCoding()) {</span>
+<span class="nc bnc" id="L596" title="All 2 branches missed.">                if (regularCoding.canRepresent(values, 0, length)) {</span>
+<span class="nc" id="L597">                    bandCoding = regularCoding;</span>
+                } else {
+<span class="nc bnc" id="L599" title="All 4 branches missed.">                    assert(canVary);</span>
+<span class="nc bnc" id="L600" title="All 2 branches missed.">                    if (verbose &gt; 1)</span>
+<span class="nc" id="L601">                        Utils.log.fine(&quot;regular coding fails in band &quot;+name());</span>
+<span class="nc" id="L602">                    bandCoding = UNSIGNED5;</span>
+                }
+<span class="nc" id="L604">                outputSize = -1;</span>
+            } else {
+<span class="nc" id="L606">                int[] sizes = {0,0};</span>
+<span class="nc" id="L607">                bandCoding = chooseCoding(values, 0, length,</span>
+<span class="nc" id="L608">                                          regularCoding, name(),</span>
+                                          sizes);
+<span class="nc" id="L610">                outputSize = sizes[CodingChooser.BYTE_SIZE];</span>
+<span class="nc bnc" id="L611" title="All 2 branches missed.">                if (outputSize == 0)  // CodingChooser failed to size it.</span>
+<span class="nc" id="L612">                    outputSize = -1;</span>
+            }
+
+            // Compute and save the meta-coding bytes also.
+<span class="nc bnc" id="L616" title="All 2 branches missed.">            if (bandCoding != regularCoding) {</span>
+<span class="nc" id="L617">                metaCoding = bandCoding.getMetaCoding(regularCoding);</span>
+<span class="nc bnc" id="L618" title="All 2 branches missed.">                if (verbose &gt; 1) {</span>
+<span class="nc" id="L619">                    Utils.log.fine(&quot;alternate coding &quot;+this+&quot; &quot;+bandCoding);</span>
+                }
+<span class="nc bnc" id="L621" title="All 2 branches missed.">            } else if (canVary &amp;&amp;</span>
+<span class="nc bnc" id="L622" title="All 2 branches missed.">                       decodeEscapeValue(values[0], regularCoding) &gt;= 0) {</span>
+                // Need an explicit default.
+<span class="nc" id="L624">                metaCoding = defaultMetaCoding;</span>
+            } else {
+                // Common case:  Zero bytes of meta coding.
+<span class="nc" id="L627">                metaCoding = noMetaCoding;</span>
+            }
+<span class="nc bnc" id="L629" title="All 8 branches missed.">            if (metaCoding.length &gt; 0</span>
+                &amp;&amp; (verbose &gt; 2 || verbose &gt; 1 &amp;&amp; metaCoding.length &gt; 1)) {
+<span class="nc" id="L631">                StringBuffer sb = new StringBuffer();</span>
+<span class="nc bnc" id="L632" title="All 2 branches missed.">                for (int i = 0; i &lt; metaCoding.length; i++) {</span>
+<span class="nc bnc" id="L633" title="All 2 branches missed.">                    if (i == 1)  sb.append(&quot; /&quot;);</span>
+<span class="nc" id="L634">                    sb.append(&quot; &quot;).append(metaCoding[i] &amp; 0xFF);</span>
+                }
+<span class="nc" id="L636">                Utils.log.fine(&quot;   meta-coding &quot;+sb);</span>
+            }
+
+<span class="nc bnc" id="L639" title="All 6 branches missed.">            assert((outputSize &lt; 0) ||</span>
+                   !(bandCoding instanceof Coding) ||
+                   (outputSize == ((Coding)bandCoding)
+<span class="nc bnc" id="L642" title="All 2 branches missed.">                    .getLength(values, 0, length)))</span>
+                : (bandCoding+&quot; : &quot;+
+                   outputSize+&quot; != &quot;+
+<span class="nc" id="L645">                   ((Coding)bandCoding).getLength(values, 0, length)</span>
+<span class="nc" id="L646">                   +&quot; ?= &quot;+getCodingChooser().computeByteSize(bandCoding,values,0,length)</span>
+                   );
+
+            // Compute outputSize of the escape value X, if any.
+<span class="nc bnc" id="L650" title="All 2 branches missed.">            if (metaCoding.length &gt; 0) {</span>
+                // First byte XB of meta-coding is treated specially,
+                // but any other bytes go into the band headers band.
+                // This must be done before any other output happens.
+<span class="nc bnc" id="L654" title="All 2 branches missed.">                if (outputSize &gt;= 0)</span>
+<span class="nc" id="L655">                    outputSize += computeEscapeSize();  // good cache</span>
+                // Other bytes go into band_headers.
+<span class="nc bnc" id="L657" title="All 2 branches missed.">                for (int i = 1; i &lt; metaCoding.length; i++) {</span>
+<span class="nc" id="L658">                    band_headers.putByte(metaCoding[i] &amp; 0xFF);</span>
+                }
+            }
+<span class="nc" id="L661">        }</span>
+
+        @Override
+        protected long computeOutputSize() {
+<span class="nc" id="L665">            outputSize = getCodingChooser().computeByteSize(bandCoding,</span>
+                                                            values, 0, length);
+<span class="nc bnc" id="L667" title="All 4 branches missed.">            assert(outputSize &lt; Integer.MAX_VALUE);</span>
+<span class="nc" id="L668">            outputSize += computeEscapeSize();</span>
+<span class="nc" id="L669">            return outputSize;</span>
+        }
+
+        protected int computeEscapeSize() {
+<span class="nc bnc" id="L673" title="All 2 branches missed.">            if (metaCoding.length == 0)  return 0;</span>
+<span class="nc" id="L674">            int XB = metaCoding[0] &amp; 0xFF;</span>
+<span class="nc" id="L675">            int X = encodeEscapeValue(XB, regularCoding);</span>
+<span class="nc" id="L676">            return regularCoding.setD(0).getLength(X);</span>
+        }
+
+        @Override
+        protected void writeDataTo(OutputStream out) throws IOException {
+<span class="nc bnc" id="L681" title="All 2 branches missed.">            if (length == 0)  return;  // nothing to write</span>
+<span class="nc" id="L682">            long len0 = 0;</span>
+<span class="nc bnc" id="L683" title="All 2 branches missed.">            if (out == outputCounter) {</span>
+<span class="nc" id="L684">                len0 = outputCounter.getCount();</span>
+            }
+<span class="nc bnc" id="L686" title="All 2 branches missed.">            if (metaCoding.length &gt; 0) {</span>
+<span class="nc" id="L687">                int XB = metaCoding[0] &amp; 0xFF;</span>
+                // We need an explicit band header, either because
+                // there is a non-default coding method, or because
+                // the first value would be parsed as an escape value.
+<span class="nc" id="L691">                int X = encodeEscapeValue(XB, regularCoding);</span>
+                //System.out.println(&quot;X=&quot;+X+&quot; XB=&quot;+XB+&quot; in &quot;+this);
+<span class="nc" id="L693">                regularCoding.setD(0).writeTo(out, X);</span>
+            }
+<span class="nc" id="L695">            bandCoding.writeArrayTo(out, values, 0, length);</span>
+<span class="nc bnc" id="L696" title="All 2 branches missed.">            if (out == outputCounter) {</span>
+<span class="nc bnc" id="L697" title="All 4 branches missed.">                assert(outputSize == outputCounter.getCount() - len0)</span>
+<span class="nc" id="L698">                    : (outputSize+&quot; != &quot;+outputCounter.getCount()+&quot;-&quot;+len0);</span>
+            }
+<span class="nc bnc" id="L700" title="All 2 branches missed.">            if (optDumpBands)  dumpBand();</span>
+<span class="nc" id="L701">        }</span>
+
+        @Override
+        protected void readDataFrom(InputStream in) throws IOException {
+<span class="nc" id="L705">            length = valuesExpected();</span>
+<span class="nc bnc" id="L706" title="All 2 branches missed.">            if (length == 0)  return;  // nothing to read</span>
+<span class="nc bnc" id="L707" title="All 2 branches missed.">            if (verbose &gt; 1)</span>
+<span class="nc" id="L708">                Utils.log.fine(&quot;Reading band &quot;+this);</span>
+<span class="nc bnc" id="L709" title="All 2 branches missed.">            if (!canVaryCoding()) {</span>
+<span class="nc" id="L710">                bandCoding = regularCoding;</span>
+<span class="nc" id="L711">                metaCoding = noMetaCoding;</span>
+            } else {
+<span class="nc bnc" id="L713" title="All 4 branches missed.">                assert(in.markSupported());  // input must be buffered</span>
+<span class="nc" id="L714">                in.mark(Coding.B_MAX);</span>
+<span class="nc" id="L715">                int X = regularCoding.setD(0).readFrom(in);</span>
+<span class="nc" id="L716">                int XB = decodeEscapeValue(X, regularCoding);</span>
+<span class="nc bnc" id="L717" title="All 2 branches missed.">                if (XB &lt; 0) {</span>
+                    // Do not consume this value.  No alternate coding.
+<span class="nc" id="L719">                    in.reset();</span>
+<span class="nc" id="L720">                    bandCoding = regularCoding;</span>
+<span class="nc" id="L721">                    metaCoding = noMetaCoding;</span>
+<span class="nc bnc" id="L722" title="All 2 branches missed.">                } else if (XB == _meta_default) {</span>
+<span class="nc" id="L723">                    bandCoding = regularCoding;</span>
+<span class="nc" id="L724">                    metaCoding = defaultMetaCoding;</span>
+                } else {
+<span class="nc bnc" id="L726" title="All 2 branches missed.">                    if (verbose &gt; 2)</span>
+<span class="nc" id="L727">                        Utils.log.fine(&quot;found X=&quot;+X+&quot; =&gt; XB=&quot;+XB);</span>
+<span class="nc" id="L728">                    bandCoding = getBandHeader(XB, regularCoding);</span>
+                    // This is really used only by dumpBands.
+<span class="nc" id="L730">                    int p0 = bandHeaderBytePos0;</span>
+<span class="nc" id="L731">                    int p1 = bandHeaderBytePos;</span>
+<span class="nc" id="L732">                    metaCoding = new byte[p1-p0];</span>
+<span class="nc" id="L733">                    System.arraycopy(bandHeaderBytes, p0,</span>
+                                     metaCoding, 0, metaCoding.length);
+                }
+            }
+<span class="nc bnc" id="L737" title="All 2 branches missed.">            if (bandCoding != regularCoding) {</span>
+<span class="nc bnc" id="L738" title="All 2 branches missed.">                if (verbose &gt; 1)</span>
+<span class="nc" id="L739">                    Utils.log.fine(name()+&quot;: irregular coding &quot;+bandCoding);</span>
+            }
+<span class="nc" id="L741">            bandCoding.readArrayFrom(in, values, 0, length);</span>
+<span class="nc bnc" id="L742" title="All 2 branches missed.">            if (optDumpBands)  dumpBand();</span>
+<span class="nc" id="L743">        }</span>
+
+        @Override
+        public void doneDisbursing() {
+<span class="nc" id="L747">            super.doneDisbursing();</span>
+<span class="nc" id="L748">            values = null;  // for GC</span>
+<span class="nc" id="L749">        }</span>
+
+        private void dumpBand() throws IOException {
+<span class="nc bnc" id="L752" title="All 4 branches missed.">            assert(optDumpBands);</span>
+<span class="nc" id="L753">            try (PrintStream ps = new PrintStream(getDumpStream(this, &quot;.txt&quot;))) {</span>
+<span class="nc bnc" id="L754" title="All 2 branches missed.">                String irr = (bandCoding == regularCoding) ? &quot;&quot; : &quot; irregular&quot;;</span>
+<span class="nc" id="L755">                ps.print(&quot;# length=&quot;+length+</span>
+<span class="nc" id="L756">                         &quot; size=&quot;+outputSize()+</span>
+                         irr+&quot; coding=&quot;+bandCoding);
+<span class="nc bnc" id="L758" title="All 2 branches missed.">                if (metaCoding != noMetaCoding) {</span>
+<span class="nc" id="L759">                    StringBuffer sb = new StringBuffer();</span>
+<span class="nc bnc" id="L760" title="All 2 branches missed.">                    for (int i = 0; i &lt; metaCoding.length; i++) {</span>
+<span class="nc bnc" id="L761" title="All 2 branches missed.">                        if (i == 1)  sb.append(&quot; /&quot;);</span>
+<span class="nc" id="L762">                        sb.append(&quot; &quot;).append(metaCoding[i] &amp; 0xFF);</span>
+                    }
+<span class="nc" id="L764">                    ps.print(&quot; //header: &quot;+sb);</span>
+                }
+<span class="nc" id="L766">                printArrayTo(ps, values, 0, length);</span>
+<span class="nc bnc" id="L767" title="All 8 branches missed.">            }</span>
+<span class="nc" id="L768">            try (OutputStream ds = getDumpStream(this, &quot;.bnd&quot;)) {</span>
+<span class="nc" id="L769">                bandCoding.writeArrayTo(ds, values, 0, length);</span>
+<span class="nc bnc" id="L770" title="All 8 branches missed.">            }</span>
+<span class="nc" id="L771">        }</span>
+
+        /** Disburse one value. */
+        protected int getValue() {
+<span class="nc bnc" id="L775" title="All 4 branches missed.">            assert(phase() == DISBURSE_PHASE);</span>
+            // when debugging return a zero if lengths are zero
+<span class="nc bnc" id="L777" title="All 6 branches missed.">            if (optDebugBands &amp;&amp; length == 0 &amp;&amp; valuesDisbursed == length)</span>
+<span class="nc" id="L778">                return 0;</span>
+<span class="nc bnc" id="L779" title="All 4 branches missed.">            assert(valuesDisbursed &lt;= length);</span>
+<span class="nc" id="L780">            return values[valuesDisbursed++];</span>
+        }
+
+        /** Reset for another pass over the same value set. */
+        public void resetForSecondPass() {
+<span class="nc bnc" id="L785" title="All 4 branches missed.">            assert(phase() == DISBURSE_PHASE);</span>
+<span class="nc bnc" id="L786" title="All 4 branches missed.">            assert(valuesDisbursed == length());  // 1st pass is complete</span>
+<span class="nc" id="L787">            valuesDisbursed = 0;</span>
+<span class="nc" id="L788">        }</span>
+    }
+
+<span class="nc bnc" id="L791" title="All 2 branches missed.">    class ByteBand extends Band {</span>
+        private ByteArrayOutputStream bytes;  // input buffer
+        private ByteArrayOutputStream bytesForDump;
+        private InputStream in;
+
+<span class="nc" id="L796">        public ByteBand(String name) {</span>
+<span class="nc" id="L797">            super(name, BYTE1);</span>
+<span class="nc" id="L798">        }</span>
+
+        @Override
+        public int capacity() {
+<span class="nc bnc" id="L802" title="All 2 branches missed.">            return bytes == null ? -1 : Integer.MAX_VALUE;</span>
+        }
+        @Override
+        protected void setCapacity(int cap) {
+<span class="nc bnc" id="L806" title="All 4 branches missed.">            assert(bytes == null);  // do this just once</span>
+<span class="nc" id="L807">            bytes = new ByteArrayOutputStream(cap);</span>
+<span class="nc" id="L808">        }</span>
+        public void destroy() {
+<span class="nc" id="L810">            lengthForDebug = length();</span>
+<span class="nc" id="L811">            bytes = null;</span>
+<span class="nc" id="L812">        }</span>
+
+        @Override
+        public int length() {
+<span class="nc bnc" id="L816" title="All 2 branches missed.">            return bytes == null ? -1 : bytes.size();</span>
+        }
+        public void reset() {
+<span class="nc" id="L819">            bytes.reset();</span>
+<span class="nc" id="L820">        }</span>
+        @Override
+        protected int valuesRemainingForDebug() {
+<span class="nc bnc" id="L823" title="All 2 branches missed.">            return (bytes == null) ? -1 : ((ByteArrayInputStream)in).available();</span>
+        }
+
+        @Override
+        protected void chooseBandCodings() throws IOException {
+            // No-op.
+<span class="nc bnc" id="L829" title="All 4 branches missed.">            assert(decodeEscapeValue(regularCoding.min(), regularCoding) &lt; 0);</span>
+<span class="nc bnc" id="L830" title="All 4 branches missed.">            assert(decodeEscapeValue(regularCoding.max(), regularCoding) &lt; 0);</span>
+<span class="nc" id="L831">        }</span>
+
+        @Override
+        protected long computeOutputSize() {
+            // do not cache
+<span class="nc" id="L836">            return bytes.size();</span>
+        }
+
+        @Override
+        public void writeDataTo(OutputStream out) throws IOException {
+<span class="nc bnc" id="L841" title="All 2 branches missed.">            if (length() == 0)  return;</span>
+<span class="nc" id="L842">            bytes.writeTo(out);</span>
+<span class="nc bnc" id="L843" title="All 2 branches missed.">            if (optDumpBands)  dumpBand();</span>
+<span class="nc" id="L844">            destroy();  // done with the bits!</span>
+<span class="nc" id="L845">        }</span>
+
+        private void dumpBand() throws IOException {
+<span class="nc bnc" id="L848" title="All 4 branches missed.">            assert(optDumpBands);</span>
+<span class="nc" id="L849">            try (OutputStream ds = getDumpStream(this, &quot;.bnd&quot;)) {</span>
+<span class="nc bnc" id="L850" title="All 2 branches missed.">                if (bytesForDump != null)</span>
+<span class="nc" id="L851">                    bytesForDump.writeTo(ds);</span>
+                else
+<span class="nc" id="L853">                    bytes.writeTo(ds);</span>
+<span class="nc bnc" id="L854" title="All 8 branches missed.">            }</span>
+<span class="nc" id="L855">        }</span>
+
+        @Override
+        public void readDataFrom(InputStream in) throws IOException {
+<span class="nc" id="L859">            int vex = valuesExpected();</span>
+<span class="nc bnc" id="L860" title="All 2 branches missed.">            if (vex == 0)  return;</span>
+<span class="nc bnc" id="L861" title="All 2 branches missed.">            if (verbose &gt; 1) {</span>
+<span class="nc" id="L862">                lengthForDebug = vex;</span>
+<span class="nc" id="L863">                Utils.log.fine(&quot;Reading band &quot;+this);</span>
+<span class="nc" id="L864">                lengthForDebug = -1;</span>
+            }
+<span class="nc" id="L866">            byte[] buf = new byte[Math.min(vex, 1&lt;&lt;14)];</span>
+<span class="nc bnc" id="L867" title="All 2 branches missed.">            while (vex &gt; 0) {</span>
+<span class="nc" id="L868">                int nr = in.read(buf, 0, Math.min(vex, buf.length));</span>
+<span class="nc bnc" id="L869" title="All 2 branches missed.">                if (nr &lt; 0)  throw new EOFException();</span>
+<span class="nc" id="L870">                bytes.write(buf, 0, nr);</span>
+<span class="nc" id="L871">                vex -= nr;</span>
+<span class="nc" id="L872">            }</span>
+<span class="nc bnc" id="L873" title="All 2 branches missed.">            if (optDumpBands)  dumpBand();</span>
+<span class="nc" id="L874">        }</span>
+
+        @Override
+        public void readyToDisburse() {
+<span class="nc" id="L878">            in = new ByteArrayInputStream(bytes.toByteArray());</span>
+<span class="nc" id="L879">            super.readyToDisburse();</span>
+<span class="nc" id="L880">        }</span>
+
+        @Override
+        public void doneDisbursing() {
+<span class="nc" id="L884">            super.doneDisbursing();</span>
+<span class="nc bnc" id="L885" title="All 4 branches missed.">            if (optDumpBands</span>
+<span class="nc bnc" id="L886" title="All 2 branches missed.">                &amp;&amp; bytesForDump != null &amp;&amp; bytesForDump.size() &gt; 0) {</span>
+                try {
+<span class="nc" id="L888">                    dumpBand();</span>
+<span class="nc" id="L889">                } catch (IOException ee) {</span>
+<span class="nc" id="L890">                    throw new RuntimeException(ee);</span>
+<span class="nc" id="L891">                }</span>
+            }
+<span class="nc" id="L893">            in = null; // GC</span>
+<span class="nc" id="L894">            bytes = null;  // GC</span>
+<span class="nc" id="L895">            bytesForDump = null;  // GC</span>
+<span class="nc" id="L896">        }</span>
+
+        // alternative to readFrom:
+        public void setInputStreamFrom(InputStream in) throws IOException {
+<span class="nc bnc" id="L900" title="All 4 branches missed.">            assert(bytes == null);</span>
+<span class="nc bnc" id="L901" title="All 4 branches missed.">            assert(assertReadyToReadFrom(this, in));</span>
+<span class="nc" id="L902">            setPhase(READ_PHASE);</span>
+<span class="nc" id="L903">            this.in = in;</span>
+<span class="nc bnc" id="L904" title="All 2 branches missed.">            if (optDumpBands) {</span>
+                // Tap the stream.
+<span class="nc" id="L906">                bytesForDump = new ByteArrayOutputStream();</span>
+<span class="nc" id="L907">                this.in = new FilterInputStream(in) {</span>
+                    @Override
+                    public int read() throws IOException {
+<span class="nc" id="L910">                        int ch = in.read();</span>
+<span class="nc bnc" id="L911" title="All 2 branches missed.">                        if (ch &gt;= 0)  bytesForDump.write(ch);</span>
+<span class="nc" id="L912">                        return ch;</span>
+                    }
+                    @Override
+                    public int read(byte b[], int off, int len) throws IOException {
+<span class="nc" id="L916">                        int nr = in.read(b, off, len);</span>
+<span class="nc bnc" id="L917" title="All 2 branches missed.">                        if (nr &gt;= 0)  bytesForDump.write(b, off, nr);</span>
+<span class="nc" id="L918">                        return nr;</span>
+                    }
+                };
+            }
+<span class="nc" id="L922">            super.readyToDisburse();</span>
+<span class="nc" id="L923">        }</span>
+
+        public OutputStream collectorStream() {
+<span class="nc bnc" id="L926" title="All 4 branches missed.">            assert(phase() == COLLECT_PHASE);</span>
+<span class="nc bnc" id="L927" title="All 4 branches missed.">            assert(bytes != null);</span>
+<span class="nc" id="L928">            return bytes;</span>
+        }
+
+        public InputStream getInputStream() {
+<span class="nc bnc" id="L932" title="All 4 branches missed.">            assert(phase() == DISBURSE_PHASE);</span>
+<span class="nc bnc" id="L933" title="All 4 branches missed.">            assert(in != null);</span>
+<span class="nc" id="L934">            return in;</span>
+        }
+        public int getByte() throws IOException {
+<span class="nc" id="L937">            int b = getInputStream().read();</span>
+<span class="nc bnc" id="L938" title="All 2 branches missed.">            if (b &lt; 0)  throw new EOFException();</span>
+<span class="nc" id="L939">            return b;</span>
+        }
+        public void putByte(int b) throws IOException {
+<span class="nc bnc" id="L942" title="All 4 branches missed.">            assert(b == (b &amp; 0xFF));</span>
+<span class="nc" id="L943">            collectorStream().write(b);</span>
+<span class="nc" id="L944">        }</span>
+        @Override
+        public String toString() {
+<span class="nc" id="L947">            return &quot;byte &quot;+super.toString();</span>
+        }
+    }
+
+<span class="nc bnc" id="L951" title="All 2 branches missed.">    class IntBand extends ValueBand {</span>
+        // The usual coding for bands is 7bit/5byte/delta.
+<span class="nc" id="L953">        public IntBand(String name, Coding regularCoding) {</span>
+<span class="nc" id="L954">            super(name, regularCoding);</span>
+<span class="nc" id="L955">        }</span>
+
+        public void putInt(int x) {
+<span class="nc bnc" id="L958" title="All 4 branches missed.">            assert(phase() == COLLECT_PHASE);</span>
+<span class="nc" id="L959">            addValue(x);</span>
+<span class="nc" id="L960">        }</span>
+
+        public int getInt() {
+<span class="nc" id="L963">            return getValue();</span>
+        }
+        /** Return the sum of all values in this band. */
+        public int getIntTotal() {
+<span class="nc bnc" id="L967" title="All 4 branches missed.">            assert(phase() == DISBURSE_PHASE);</span>
+            // assert that this is the whole pass; no other reads allowed
+<span class="nc bnc" id="L969" title="All 4 branches missed.">            assert(valuesRemainingForDebug() == length());</span>
+<span class="nc" id="L970">            int total = 0;</span>
+<span class="nc bnc" id="L971" title="All 2 branches missed.">            for (int k = length(); k &gt; 0; k--) {</span>
+<span class="nc" id="L972">                total += getInt();</span>
+            }
+<span class="nc" id="L974">            resetForSecondPass();</span>
+<span class="nc" id="L975">            return total;</span>
+        }
+        /** Return the occurrence count of a specific value in this band. */
+        public int getIntCount(int value) {
+<span class="nc bnc" id="L979" title="All 4 branches missed.">            assert(phase() == DISBURSE_PHASE);</span>
+            // assert that this is the whole pass; no other reads allowed
+<span class="nc bnc" id="L981" title="All 4 branches missed.">            assert(valuesRemainingForDebug() == length());</span>
+<span class="nc" id="L982">            int total = 0;</span>
+<span class="nc bnc" id="L983" title="All 2 branches missed.">            for (int k = length(); k &gt; 0; k--) {</span>
+<span class="nc bnc" id="L984" title="All 2 branches missed.">                if (getInt() == value) {</span>
+<span class="nc" id="L985">                    total += 1;</span>
+                }
+            }
+<span class="nc" id="L988">            resetForSecondPass();</span>
+<span class="nc" id="L989">            return total;</span>
+        }
+    }
+
+    static int getIntTotal(int[] values) {
+<span class="nc" id="L994">        int total = 0;</span>
+<span class="nc bnc" id="L995" title="All 2 branches missed.">        for (int i = 0; i &lt; values.length; i++) {</span>
+<span class="nc" id="L996">            total += values[i];</span>
+        }
+<span class="nc" id="L998">        return total;</span>
+    }
+
+<span class="nc bnc" id="L1001" title="All 2 branches missed.">    class CPRefBand extends ValueBand {</span>
+        Index index;
+        boolean nullOK;
+
+<span class="nc" id="L1005">        public CPRefBand(String name, Coding regularCoding, byte cpTag, boolean nullOK) {</span>
+<span class="nc" id="L1006">            super(name, regularCoding);</span>
+<span class="nc" id="L1007">            this.nullOK = nullOK;</span>
+<span class="nc bnc" id="L1008" title="All 2 branches missed.">            if (cpTag != CONSTANT_None)</span>
+<span class="nc" id="L1009">                setBandIndex(this, cpTag);</span>
+<span class="nc" id="L1010">        }</span>
+        public CPRefBand(String name, Coding regularCoding, byte cpTag) {
+<span class="nc" id="L1012">            this(name, regularCoding, cpTag, false);</span>
+<span class="nc" id="L1013">        }</span>
+        public CPRefBand(String name, Coding regularCoding, Object undef) {
+<span class="nc" id="L1015">            this(name, regularCoding, CONSTANT_None, false);</span>
+<span class="nc" id="L1016">        }</span>
+
+        public void setIndex(Index index) {
+<span class="nc" id="L1019">            this.index = index;</span>
+<span class="nc" id="L1020">        }</span>
+
+        protected void readDataFrom(InputStream in) throws IOException {
+<span class="nc" id="L1023">            super.readDataFrom(in);</span>
+<span class="nc bnc" id="L1024" title="All 4 branches missed.">            assert(assertValidCPRefs(this));</span>
+<span class="nc" id="L1025">        }</span>
+
+        /** Write a constant pool reference. */
+        public void putRef(Entry e) {
+<span class="nc" id="L1029">            addValue(encodeRefOrNull(e, index));</span>
+<span class="nc" id="L1030">        }</span>
+        public void putRef(Entry e, Index index) {
+<span class="nc bnc" id="L1032" title="All 4 branches missed.">            assert(this.index == null);</span>
+<span class="nc" id="L1033">            addValue(encodeRefOrNull(e, index));</span>
+<span class="nc" id="L1034">        }</span>
+        public void putRef(Entry e, byte cptag) {
+<span class="nc" id="L1036">            putRef(e, getCPIndex(cptag));</span>
+<span class="nc" id="L1037">        }</span>
+
+        public Entry getRef() {
+<span class="nc bnc" id="L1040" title="All 2 branches missed.">            if (index == null)  Utils.log.warning(&quot;No index for &quot;+this);</span>
+<span class="nc bnc" id="L1041" title="All 4 branches missed.">            assert(index != null);</span>
+<span class="nc" id="L1042">            return decodeRefOrNull(getValue(), index);</span>
+        }
+        public Entry getRef(Index index) {
+<span class="nc bnc" id="L1045" title="All 4 branches missed.">            assert(this.index == null);</span>
+<span class="nc" id="L1046">            return decodeRefOrNull(getValue(), index);</span>
+        }
+        public Entry getRef(byte cptag) {
+<span class="nc" id="L1049">            return getRef(getCPIndex(cptag));</span>
+        }
+
+        private int encodeRefOrNull(Entry e, Index index) {
+            int nonNullCode;  // NNC is the coding which assumes nulls are rare
+<span class="nc bnc" id="L1054" title="All 2 branches missed.">            if (e == null) {</span>
+<span class="nc" id="L1055">                nonNullCode = -1;  // negative values are rare</span>
+            } else {
+<span class="nc" id="L1057">                nonNullCode = encodeRef(e, index);</span>
+            }
+            // If nulls are expected, increment, to make -1 code turn to 0.
+<span class="nc bnc" id="L1060" title="All 2 branches missed.">            return (nullOK ? 1 : 0) + nonNullCode;</span>
+        }
+        private Entry decodeRefOrNull(int code, Index index) {
+            // Inverse to encodeRefOrNull...
+<span class="nc bnc" id="L1064" title="All 2 branches missed.">            int nonNullCode = code - (nullOK ? 1 : 0);</span>
+<span class="nc bnc" id="L1065" title="All 2 branches missed.">            if (nonNullCode == -1) {</span>
+<span class="nc" id="L1066">                return null;</span>
+            } else {
+<span class="nc" id="L1068">                return decodeRef(nonNullCode, index);</span>
+            }
+        }
+    }
+
+    // Bootstrap support for CPRefBands.  These are needed to record
+    // intended CP indexes, before the CP has been created.
+<span class="nc" id="L1075">    private final List&lt;CPRefBand&gt; allKQBands = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L1076">    private List&lt;Object[]&gt; needPredefIndex = new ArrayList&lt;&gt;();</span>
+
+
+    int encodeRef(Entry e, Index ix) {
+<span class="nc bnc" id="L1080" title="All 2 branches missed.">        if (ix == null)</span>
+<span class="nc" id="L1081">            throw new RuntimeException(&quot;null index for &quot; + e.stringValue());</span>
+<span class="nc" id="L1082">        int coding = ix.indexOf(e);</span>
+<span class="nc bnc" id="L1083" title="All 2 branches missed.">        if (verbose &gt; 2)</span>
+<span class="nc" id="L1084">            Utils.log.fine(&quot;putRef &quot;+coding+&quot; =&gt; &quot;+e);</span>
+<span class="nc" id="L1085">        return coding;</span>
+    }
+
+    Entry decodeRef(int n, Index ix) {
+<span class="nc bnc" id="L1089" title="All 4 branches missed.">        if (n &lt; 0 || n &gt;= ix.size())</span>
+<span class="nc" id="L1090">            Utils.log.warning(&quot;decoding bad ref &quot;+n+&quot; in &quot;+ix);</span>
+<span class="nc" id="L1091">        Entry e = ix.getEntry(n);</span>
+<span class="nc bnc" id="L1092" title="All 2 branches missed.">        if (verbose &gt; 2)</span>
+<span class="nc" id="L1093">            Utils.log.fine(&quot;getRef &quot;+n+&quot; =&gt; &quot;+e);</span>
+<span class="nc" id="L1094">        return e;</span>
+    }
+
+    private CodingChooser codingChooser;
+    protected CodingChooser getCodingChooser() {
+<span class="nc bnc" id="L1099" title="All 2 branches missed.">        if (codingChooser == null) {</span>
+<span class="nc" id="L1100">            codingChooser = new CodingChooser(effort, basicCodings);</span>
+<span class="nc bnc" id="L1101" title="All 4 branches missed.">            if (codingChooser.stress != null</span>
+                &amp;&amp; this instanceof PackageWriter) {
+                // Twist the random state based on my first file.
+                // This sends each segment off in a different direction.
+<span class="nc" id="L1105">                List&lt;Package.Class&gt; classes = ((PackageWriter)this).pkg.classes;</span>
+<span class="nc bnc" id="L1106" title="All 2 branches missed.">                if (!classes.isEmpty()) {</span>
+<span class="nc" id="L1107">                    Package.Class cls = classes.get(0);</span>
+<span class="nc" id="L1108">                    codingChooser.addStressSeed(cls.getName().hashCode());</span>
+                }
+            }
+        }
+<span class="nc" id="L1112">        return codingChooser;</span>
+    }
+
+    public CodingMethod chooseCoding(int[] values, int start, int end,
+                                     Coding regular, String bandName,
+                                     int[] sizes) {
+<span class="nc bnc" id="L1118" title="All 4 branches missed.">        assert(optVaryCodings);</span>
+<span class="nc bnc" id="L1119" title="All 2 branches missed.">        if (effort &lt;= MIN_EFFORT) {</span>
+<span class="nc" id="L1120">            return regular;</span>
+        }
+<span class="nc" id="L1122">        CodingChooser cc = getCodingChooser();</span>
+<span class="nc bnc" id="L1123" title="All 4 branches missed.">        if (verbose &gt; 1 || cc.verbose &gt; 1) {</span>
+<span class="nc" id="L1124">            Utils.log.fine(&quot;--- chooseCoding &quot;+bandName);</span>
+        }
+<span class="nc" id="L1126">        return cc.choose(values, start, end, regular, sizes);</span>
+    }
+
+<span class="nc" id="L1129">    static final byte[] defaultMetaCoding = { _meta_default };</span>
+<span class="nc" id="L1130">    static final byte[] noMetaCoding      = {};</span>
+
+    // The first value in a band is always coded with the default coding D.
+    // If this first value X is an escape value, it actually represents the
+    // first (and perhaps only) byte of a meta-coding.
+    //
+    // If D.S != 0 and D includes the range [-256..-1],
+    // the escape values are in that range,
+    // and the first byte XB is -1-X.
+    //
+    // If D.S == 0 and D includes the range [(D.L)..(D.L)+255],
+    // the escape values are in that range,
+    // and XB is X-(D.L).
+    //
+    // This representation is designed so that a band header is unlikely
+    // to be confused with the initial value of a headerless band,
+    // and yet so that a band header is likely to occupy only a byte or two.
+    //
+    // Result is in [0..255] if XB was successfully extracted, else -1.
+    // See section &quot;Coding Specifier Meta-Encoding&quot; in the JSR 200 spec.
+    protected static int decodeEscapeValue(int X, Coding regularCoding) {
+        // The first value in a band is always coded with the default coding D.
+        // If this first value X is an escape value, it actually represents the
+        // first (and perhaps only) byte of a meta-coding.
+        // Result is in [0..255] if XB was successfully extracted, else -1.
+<span class="nc bnc" id="L1155" title="All 4 branches missed.">        if (regularCoding.B() == 1 || regularCoding.L() == 0)</span>
+<span class="nc" id="L1156">            return -1;  // degenerate regular coding (BYTE1)</span>
+<span class="nc bnc" id="L1157" title="All 2 branches missed.">        if (regularCoding.S() != 0) {</span>
+<span class="nc bnc" id="L1158" title="All 6 branches missed.">            if (-256 &lt;= X &amp;&amp; X &lt;= -1 &amp;&amp; regularCoding.min() &lt;= -256) {</span>
+<span class="nc" id="L1159">                int XB = -1-X;</span>
+<span class="nc bnc" id="L1160" title="All 6 branches missed.">                assert(XB &gt;= 0 &amp;&amp; XB &lt; 256);</span>
+<span class="nc" id="L1161">                return XB;</span>
+            }
+        } else {
+<span class="nc" id="L1164">            int L = regularCoding.L();</span>
+<span class="nc bnc" id="L1165" title="All 6 branches missed.">            if (L &lt;= X &amp;&amp; X &lt;= L+255 &amp;&amp; regularCoding.max() &gt;= L+255) {</span>
+<span class="nc" id="L1166">                int XB = X-L;</span>
+<span class="nc bnc" id="L1167" title="All 6 branches missed.">                assert(XB &gt;= 0 &amp;&amp; XB &lt; 256);</span>
+<span class="nc" id="L1168">                return XB;</span>
+            }
+        }
+<span class="nc" id="L1171">        return -1;  // negative value for failure</span>
+    }
+    // Inverse to decodeEscapeValue().
+    protected static int encodeEscapeValue(int XB, Coding regularCoding) {
+<span class="nc bnc" id="L1175" title="All 6 branches missed.">        assert(XB &gt;= 0 &amp;&amp; XB &lt; 256);</span>
+<span class="nc bnc" id="L1176" title="All 6 branches missed.">        assert(regularCoding.B() &gt; 1 &amp;&amp; regularCoding.L() &gt; 0);</span>
+        int X;
+<span class="nc bnc" id="L1178" title="All 2 branches missed.">        if (regularCoding.S() != 0) {</span>
+<span class="nc bnc" id="L1179" title="All 4 branches missed.">            assert(regularCoding.min() &lt;= -256);</span>
+<span class="nc" id="L1180">            X = -1-XB;</span>
+        } else {
+<span class="nc" id="L1182">            int L = regularCoding.L();</span>
+<span class="nc bnc" id="L1183" title="All 4 branches missed.">            assert(regularCoding.max() &gt;= L+255);</span>
+<span class="nc" id="L1184">            X = XB+L;</span>
+        }
+<span class="nc bnc" id="L1186" title="All 4 branches missed.">        assert(decodeEscapeValue(X, regularCoding) == XB)</span>
+            : (regularCoding+&quot; XB=&quot;+XB+&quot; X=&quot;+X);
+<span class="nc" id="L1188">        return X;</span>
+    }
+
+    static {
+<span class="nc" id="L1192">        boolean checkXB = false;</span>
+<span class="nc bnc" id="L1193" title="All 4 branches missed.">        assert(checkXB = true);</span>
+<span class="nc bnc" id="L1194" title="All 2 branches missed.">        if (checkXB) {</span>
+<span class="nc bnc" id="L1195" title="All 2 branches missed.">            for (int i = 0; i &lt; basicCodings.length; i++) {</span>
+<span class="nc" id="L1196">                Coding D = basicCodings[i];</span>
+<span class="nc bnc" id="L1197" title="All 2 branches missed.">                if (D == null)   continue;</span>
+<span class="nc bnc" id="L1198" title="All 2 branches missed.">                if (D.B() == 1)  continue;</span>
+<span class="nc bnc" id="L1199" title="All 2 branches missed.">                if (D.L() == 0)  continue;</span>
+<span class="nc bnc" id="L1200" title="All 2 branches missed.">                for (int XB = 0; XB &lt;= 255; XB++) {</span>
+                    // The following exercises decodeEscapeValue also:
+<span class="nc" id="L1202">                    encodeEscapeValue(XB, D);</span>
+                }
+            }
+        }
+    }
+
+<span class="nc bnc" id="L1208" title="All 2 branches missed.">    class MultiBand extends Band {</span>
+<span class="nc" id="L1209">        MultiBand(String name, Coding regularCoding) {</span>
+<span class="nc" id="L1210">            super(name, regularCoding);</span>
+<span class="nc" id="L1211">        }</span>
+
+        @Override
+        public Band init() {
+<span class="nc" id="L1215">            super.init();</span>
+            // This is all just to keep the asserts happy:
+<span class="nc" id="L1217">            setCapacity(0);</span>
+<span class="nc bnc" id="L1218" title="All 2 branches missed.">            if (phase() == EXPECT_PHASE) {</span>
+                // Fast forward:
+<span class="nc" id="L1220">                setPhase(READ_PHASE);</span>
+<span class="nc" id="L1221">                setPhase(DISBURSE_PHASE);</span>
+            }
+<span class="nc" id="L1223">            return this;</span>
+        }
+
+<span class="nc" id="L1226">        Band[] bands     = new Band[10];</span>
+<span class="nc" id="L1227">        int    bandCount = 0;</span>
+
+        int size() {
+<span class="nc" id="L1230">            return bandCount;</span>
+        }
+        Band get(int i) {
+<span class="nc bnc" id="L1233" title="All 4 branches missed.">            assert(i &lt; bandCount);</span>
+<span class="nc" id="L1234">            return bands[i];</span>
+        }
+        Band[] toArray() {
+<span class="nc" id="L1237">            return (Band[]) realloc(bands, bandCount);</span>
+        }
+
+        void add(Band b) {
+<span class="nc bnc" id="L1241" title="All 6 branches missed.">            assert(bandCount == 0 || notePrevForAssert(b, bands[bandCount-1]));</span>
+<span class="nc bnc" id="L1242" title="All 2 branches missed.">            if (bandCount == bands.length) {</span>
+<span class="nc" id="L1243">                bands = (Band[]) realloc(bands);</span>
+            }
+<span class="nc" id="L1245">            bands[bandCount++] = b;</span>
+<span class="nc" id="L1246">        }</span>
+
+        ByteBand newByteBand(String name) {
+<span class="nc" id="L1249">            ByteBand b = new ByteBand(name);</span>
+<span class="nc" id="L1250">            b.init(); add(b);</span>
+<span class="nc" id="L1251">            return b;</span>
+        }
+        IntBand newIntBand(String name) {
+<span class="nc" id="L1254">            IntBand b = new IntBand(name, regularCoding);</span>
+<span class="nc" id="L1255">            b.init(); add(b);</span>
+<span class="nc" id="L1256">            return b;</span>
+        }
+        IntBand newIntBand(String name, Coding regularCoding) {
+<span class="nc" id="L1259">            IntBand b = new IntBand(name, regularCoding);</span>
+<span class="nc" id="L1260">            b.init(); add(b);</span>
+<span class="nc" id="L1261">            return b;</span>
+        }
+        MultiBand newMultiBand(String name, Coding regularCoding) {
+<span class="nc" id="L1264">            MultiBand b = new MultiBand(name, regularCoding);</span>
+<span class="nc" id="L1265">            b.init(); add(b);</span>
+<span class="nc" id="L1266">            return b;</span>
+        }
+        CPRefBand newCPRefBand(String name, byte cpTag) {
+<span class="nc" id="L1269">            CPRefBand b = new CPRefBand(name, regularCoding, cpTag);</span>
+<span class="nc" id="L1270">            b.init(); add(b);</span>
+<span class="nc" id="L1271">            return b;</span>
+        }
+        CPRefBand newCPRefBand(String name, Coding regularCoding,
+                               byte cpTag) {
+<span class="nc" id="L1275">            CPRefBand b = new CPRefBand(name, regularCoding, cpTag);</span>
+<span class="nc" id="L1276">            b.init(); add(b);</span>
+<span class="nc" id="L1277">            return b;</span>
+        }
+        CPRefBand newCPRefBand(String name, Coding regularCoding,
+                               byte cpTag, boolean nullOK) {
+<span class="nc" id="L1281">            CPRefBand b = new CPRefBand(name, regularCoding, cpTag, nullOK);</span>
+<span class="nc" id="L1282">            b.init(); add(b);</span>
+<span class="nc" id="L1283">            return b;</span>
+        }
+
+<span class="nc" id="L1286">        int bandCount() { return bandCount; }</span>
+
+<span class="nc" id="L1288">        private int cap = -1;</span>
+        @Override
+<span class="nc" id="L1290">        public int capacity() { return cap; }</span>
+        @Override
+<span class="nc" id="L1292">        public void setCapacity(int cap) { this.cap = cap; }</span>
+
+        @Override
+<span class="nc" id="L1295">        public int length() { return 0; }</span>
+        @Override
+<span class="nc" id="L1297">        public int valuesRemainingForDebug() { return 0; }</span>
+
+        @Override
+        protected void chooseBandCodings() throws IOException {
+            // coding decision pass
+<span class="nc bnc" id="L1302" title="All 2 branches missed.">            for (int i = 0; i &lt; bandCount; i++) {</span>
+<span class="nc" id="L1303">                Band b = bands[i];</span>
+<span class="nc" id="L1304">                b.chooseBandCodings();</span>
+            }
+<span class="nc" id="L1306">        }</span>
+
+        @Override
+        protected long computeOutputSize() {
+            // coding decision pass
+<span class="nc" id="L1311">            long sum = 0;</span>
+<span class="nc bnc" id="L1312" title="All 2 branches missed.">            for (int i = 0; i &lt; bandCount; i++) {</span>
+<span class="nc" id="L1313">                Band b = bands[i];</span>
+<span class="nc" id="L1314">                long bsize = b.outputSize();</span>
+<span class="nc bnc" id="L1315" title="All 4 branches missed.">                assert(bsize &gt;= 0) : b;</span>
+<span class="nc" id="L1316">                sum += bsize;</span>
+            }
+            // do not cache
+<span class="nc" id="L1319">            return sum;</span>
+        }
+
+        @Override
+        protected void writeDataTo(OutputStream out) throws IOException {
+<span class="nc" id="L1324">            long preCount = 0;</span>
+<span class="nc bnc" id="L1325" title="All 2 branches missed.">            if (outputCounter != null)  preCount = outputCounter.getCount();</span>
+<span class="nc bnc" id="L1326" title="All 2 branches missed.">            for (int i = 0; i &lt; bandCount; i++) {</span>
+<span class="nc" id="L1327">                Band b = bands[i];</span>
+<span class="nc" id="L1328">                b.writeTo(out);</span>
+<span class="nc bnc" id="L1329" title="All 2 branches missed.">                if (outputCounter != null) {</span>
+<span class="nc" id="L1330">                    long postCount = outputCounter.getCount();</span>
+<span class="nc" id="L1331">                    long len = postCount - preCount;</span>
+<span class="nc" id="L1332">                    preCount = postCount;</span>
+<span class="nc bnc" id="L1333" title="All 6 branches missed.">                    if ((verbose &gt; 0 &amp;&amp; len &gt; 0) || verbose &gt; 1) {</span>
+<span class="nc" id="L1334">                        Utils.log.info(&quot;  ...wrote &quot;+len+&quot; bytes from &quot;+b);</span>
+                    }
+                }
+            }
+<span class="nc" id="L1338">        }</span>
+
+        @Override
+        protected void readDataFrom(InputStream in) throws IOException {
+<span class="nc bnc" id="L1342" title="All 2 branches missed.">            assert(false);  // not called?</span>
+<span class="nc bnc" id="L1343" title="All 2 branches missed.">            for (int i = 0; i &lt; bandCount; i++) {</span>
+<span class="nc" id="L1344">                Band b = bands[i];</span>
+<span class="nc" id="L1345">                b.readFrom(in);</span>
+<span class="nc bnc" id="L1346" title="All 6 branches missed.">                if ((verbose &gt; 0 &amp;&amp; b.length() &gt; 0) || verbose &gt; 1) {</span>
+<span class="nc" id="L1347">                    Utils.log.info(&quot;  ...read &quot;+b);</span>
+                }
+            }
+<span class="nc" id="L1350">        }</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1354">            return &quot;{&quot;+bandCount()+&quot; bands: &quot;+super.toString()+&quot;}&quot;;</span>
+        }
+    }
+
+    /**
+     * An output stream which counts the number of bytes written.
+     */
+    private static
+    class ByteCounter extends FilterOutputStream {
+        // (should go public under the name CountingOutputStream?)
+
+        private long count;
+
+        public ByteCounter(OutputStream out) {
+<span class="nc" id="L1368">            super(out);</span>
+<span class="nc" id="L1369">        }</span>
+
+<span class="nc" id="L1371">        public long getCount() { return count; }</span>
+<span class="nc" id="L1372">        public void setCount(long c) { count = c; }</span>
+
+        @Override
+        public void write(int b) throws IOException {
+<span class="nc" id="L1376">            count++;</span>
+<span class="nc bnc" id="L1377" title="All 2 branches missed.">            if (out != null)  out.write(b);</span>
+<span class="nc" id="L1378">        }</span>
+        @Override
+        public void write(byte b[], int off, int len) throws IOException {
+<span class="nc" id="L1381">            count += len;</span>
+<span class="nc bnc" id="L1382" title="All 2 branches missed.">            if (out != null)  out.write(b, off, len);</span>
+<span class="nc" id="L1383">        }</span>
+        @Override
+        public String toString() {
+<span class="nc" id="L1386">            return String.valueOf(getCount());</span>
+        }
+    }
+    ByteCounter outputCounter;
+
+    void writeAllBandsTo(OutputStream out) throws IOException {
+        // Wrap a byte-counter around the output stream.
+<span class="nc" id="L1393">        outputCounter = new ByteCounter(out);</span>
+<span class="nc" id="L1394">        out = outputCounter;</span>
+<span class="nc" id="L1395">        all_bands.writeTo(out);</span>
+<span class="nc bnc" id="L1396" title="All 2 branches missed.">        if (verbose &gt; 0) {</span>
+<span class="nc" id="L1397">            long nbytes = outputCounter.getCount();</span>
+<span class="nc" id="L1398">            Utils.log.info(&quot;Wrote total of &quot;+nbytes+&quot; bytes.&quot;);</span>
+<span class="nc bnc" id="L1399" title="All 4 branches missed.">            assert(nbytes == archiveSize0+archiveSize1);</span>
+        }
+<span class="nc" id="L1401">        outputCounter = null;</span>
+<span class="nc" id="L1402">    }</span>
+
+    // random AO_XXX bits, decoded from the archive header
+    protected int archiveOptions;
+
+    // archiveSize1 sizes most of the archive [archive_options..file_bits).
+    protected long archiveSize0; // size through archive_size_lo
+    protected long archiveSize1; // size reported in archive_header
+    protected int  archiveNextCount; // reported in archive_header
+
+    static final int AH_LENGTH_0 = 3;     // archive_header_0 = {minver, majver, options}
+    static final int AH_LENGTH_MIN = 15;  // observed in spec {header_0[3], cp_counts[8], class_counts[4]}
+    // Length contributions from optional archive size fields:
+    static final int AH_LENGTH_S = 2; // archive_header_S = optional {size_hi, size_lo}
+    static final int AH_ARCHIVE_SIZE_HI = 0; // offset in archive_header_S
+    static final int AH_ARCHIVE_SIZE_LO = 1; // offset in archive_header_S
+    // Length contributions from optional header fields:
+    static final int AH_FILE_HEADER_LEN = 5; // file_counts = {{size_hi, size_lo}, next, modtime, files}
+    static final int AH_SPECIAL_FORMAT_LEN = 2; // special_counts = {layouts, band_headers}
+    static final int AH_CP_NUMBER_LEN = 4;  // cp_number_counts = {int, float, long, double}
+    static final int AH_CP_EXTRA_LEN = 4;  // cp_attr_counts = {MH, MT, InDy, BSM}
+
+    // Common structure of attribute band groups:
+    static final int AB_FLAGS_HI = 0;
+    static final int AB_FLAGS_LO = 1;
+    static final int AB_ATTR_COUNT = 2;
+    static final int AB_ATTR_INDEXES = 3;
+    static final int AB_ATTR_CALLS = 4;
+
+    static IntBand getAttrBand(MultiBand xxx_attr_bands, int which) {
+<span class="nc" id="L1432">        IntBand b = (IntBand) xxx_attr_bands.get(which);</span>
+<span class="nc bnc" id="L1433" title="All 6 branches missed.">        switch (which) {</span>
+        case AB_FLAGS_HI:
+<span class="nc bnc" id="L1435" title="All 4 branches missed.">            assert(b.name().endsWith(&quot;_flags_hi&quot;)); break;</span>
+        case AB_FLAGS_LO:
+<span class="nc bnc" id="L1437" title="All 4 branches missed.">            assert(b.name().endsWith(&quot;_flags_lo&quot;)); break;</span>
+        case AB_ATTR_COUNT:
+<span class="nc bnc" id="L1439" title="All 4 branches missed.">            assert(b.name().endsWith(&quot;_attr_count&quot;)); break;</span>
+        case AB_ATTR_INDEXES:
+<span class="nc bnc" id="L1441" title="All 4 branches missed.">            assert(b.name().endsWith(&quot;_attr_indexes&quot;)); break;</span>
+        case AB_ATTR_CALLS:
+<span class="nc bnc" id="L1443" title="All 4 branches missed.">            assert(b.name().endsWith(&quot;_attr_calls&quot;)); break;</span>
+        default:
+<span class="nc bnc" id="L1445" title="All 2 branches missed.">            assert(false); break;</span>
+        }
+<span class="nc" id="L1447">        return b;</span>
+    }
+
+    static private final boolean NULL_IS_OK = true;
+
+<span class="nc" id="L1452">    MultiBand all_bands = (MultiBand) new MultiBand(&quot;(package)&quot;, UNSIGNED5).init();</span>
+
+    // file header (various random bytes)
+<span class="nc" id="L1455">    ByteBand archive_magic = all_bands.newByteBand(&quot;archive_magic&quot;);</span>
+<span class="nc" id="L1456">    IntBand  archive_header_0 = all_bands.newIntBand(&quot;archive_header_0&quot;, UNSIGNED5);</span>
+<span class="nc" id="L1457">    IntBand  archive_header_S = all_bands.newIntBand(&quot;archive_header_S&quot;, UNSIGNED5);</span>
+<span class="nc" id="L1458">    IntBand  archive_header_1 = all_bands.newIntBand(&quot;archive_header_1&quot;, UNSIGNED5);</span>
+<span class="nc" id="L1459">    ByteBand band_headers = all_bands.newByteBand(&quot;band_headers&quot;);</span>
+
+    // constant pool contents
+<span class="nc" id="L1462">    MultiBand cp_bands = all_bands.newMultiBand(&quot;(constant_pool)&quot;, DELTA5);</span>
+<span class="nc" id="L1463">    IntBand   cp_Utf8_prefix = cp_bands.newIntBand(&quot;cp_Utf8_prefix&quot;);</span>
+<span class="nc" id="L1464">    IntBand   cp_Utf8_suffix = cp_bands.newIntBand(&quot;cp_Utf8_suffix&quot;, UNSIGNED5);</span>
+<span class="nc" id="L1465">    IntBand   cp_Utf8_chars = cp_bands.newIntBand(&quot;cp_Utf8_chars&quot;, CHAR3);</span>
+<span class="nc" id="L1466">    IntBand   cp_Utf8_big_suffix = cp_bands.newIntBand(&quot;cp_Utf8_big_suffix&quot;);</span>
+<span class="nc" id="L1467">    MultiBand cp_Utf8_big_chars = cp_bands.newMultiBand(&quot;(cp_Utf8_big_chars)&quot;, DELTA5);</span>
+<span class="nc" id="L1468">    IntBand   cp_Int = cp_bands.newIntBand(&quot;cp_Int&quot;, UDELTA5);</span>
+<span class="nc" id="L1469">    IntBand   cp_Float = cp_bands.newIntBand(&quot;cp_Float&quot;, UDELTA5);</span>
+<span class="nc" id="L1470">    IntBand   cp_Long_hi = cp_bands.newIntBand(&quot;cp_Long_hi&quot;, UDELTA5);</span>
+<span class="nc" id="L1471">    IntBand   cp_Long_lo = cp_bands.newIntBand(&quot;cp_Long_lo&quot;);</span>
+<span class="nc" id="L1472">    IntBand   cp_Double_hi = cp_bands.newIntBand(&quot;cp_Double_hi&quot;, UDELTA5);</span>
+<span class="nc" id="L1473">    IntBand   cp_Double_lo = cp_bands.newIntBand(&quot;cp_Double_lo&quot;);</span>
+<span class="nc" id="L1474">    CPRefBand cp_String = cp_bands.newCPRefBand(&quot;cp_String&quot;, UDELTA5, CONSTANT_Utf8);</span>
+<span class="nc" id="L1475">    CPRefBand cp_Class = cp_bands.newCPRefBand(&quot;cp_Class&quot;, UDELTA5, CONSTANT_Utf8);</span>
+<span class="nc" id="L1476">    CPRefBand cp_Signature_form = cp_bands.newCPRefBand(&quot;cp_Signature_form&quot;, CONSTANT_Utf8);</span>
+<span class="nc" id="L1477">    CPRefBand cp_Signature_classes = cp_bands.newCPRefBand(&quot;cp_Signature_classes&quot;, UDELTA5, CONSTANT_Class);</span>
+<span class="nc" id="L1478">    CPRefBand cp_Descr_name = cp_bands.newCPRefBand(&quot;cp_Descr_name&quot;, CONSTANT_Utf8);</span>
+<span class="nc" id="L1479">    CPRefBand cp_Descr_type = cp_bands.newCPRefBand(&quot;cp_Descr_type&quot;, UDELTA5, CONSTANT_Signature);</span>
+<span class="nc" id="L1480">    CPRefBand cp_Field_class = cp_bands.newCPRefBand(&quot;cp_Field_class&quot;, CONSTANT_Class);</span>
+<span class="nc" id="L1481">    CPRefBand cp_Field_desc = cp_bands.newCPRefBand(&quot;cp_Field_desc&quot;, UDELTA5, CONSTANT_NameandType);</span>
+<span class="nc" id="L1482">    CPRefBand cp_Method_class = cp_bands.newCPRefBand(&quot;cp_Method_class&quot;, CONSTANT_Class);</span>
+<span class="nc" id="L1483">    CPRefBand cp_Method_desc = cp_bands.newCPRefBand(&quot;cp_Method_desc&quot;, UDELTA5, CONSTANT_NameandType);</span>
+<span class="nc" id="L1484">    CPRefBand cp_Imethod_class = cp_bands.newCPRefBand(&quot;cp_Imethod_class&quot;, CONSTANT_Class);</span>
+<span class="nc" id="L1485">    CPRefBand cp_Imethod_desc = cp_bands.newCPRefBand(&quot;cp_Imethod_desc&quot;, UDELTA5, CONSTANT_NameandType);</span>
+<span class="nc" id="L1486">    IntBand   cp_MethodHandle_refkind = cp_bands.newIntBand(&quot;cp_MethodHandle_refkind&quot;, DELTA5);</span>
+<span class="nc" id="L1487">    CPRefBand cp_MethodHandle_member = cp_bands.newCPRefBand(&quot;cp_MethodHandle_member&quot;, UDELTA5, CONSTANT_AnyMember);</span>
+<span class="nc" id="L1488">    CPRefBand cp_MethodType = cp_bands.newCPRefBand(&quot;cp_MethodType&quot;, UDELTA5, CONSTANT_Signature);</span>
+<span class="nc" id="L1489">    CPRefBand cp_BootstrapMethod_ref = cp_bands.newCPRefBand(&quot;cp_BootstrapMethod_ref&quot;, DELTA5, CONSTANT_MethodHandle);</span>
+<span class="nc" id="L1490">    IntBand   cp_BootstrapMethod_arg_count = cp_bands.newIntBand(&quot;cp_BootstrapMethod_arg_count&quot;, UDELTA5);</span>
+<span class="nc" id="L1491">    CPRefBand cp_BootstrapMethod_arg = cp_bands.newCPRefBand(&quot;cp_BootstrapMethod_arg&quot;, DELTA5, CONSTANT_LoadableValue);</span>
+<span class="nc" id="L1492">    CPRefBand cp_InvokeDynamic_spec = cp_bands.newCPRefBand(&quot;cp_InvokeDynamic_spec&quot;, DELTA5, CONSTANT_BootstrapMethod);</span>
+<span class="nc" id="L1493">    CPRefBand cp_InvokeDynamic_desc = cp_bands.newCPRefBand(&quot;cp_InvokeDynamic_desc&quot;, UDELTA5, CONSTANT_NameandType);</span>
+
+    // bands for carrying attribute definitions:
+<span class="nc" id="L1496">    MultiBand attr_definition_bands = all_bands.newMultiBand(&quot;(attr_definition_bands)&quot;, UNSIGNED5);</span>
+<span class="nc" id="L1497">    ByteBand attr_definition_headers = attr_definition_bands.newByteBand(&quot;attr_definition_headers&quot;);</span>
+<span class="nc" id="L1498">    CPRefBand attr_definition_name = attr_definition_bands.newCPRefBand(&quot;attr_definition_name&quot;, CONSTANT_Utf8);</span>
+<span class="nc" id="L1499">    CPRefBand attr_definition_layout = attr_definition_bands.newCPRefBand(&quot;attr_definition_layout&quot;, CONSTANT_Utf8);</span>
+
+    // bands for hardwired InnerClasses attribute (shared across the package)
+<span class="nc" id="L1502">    MultiBand ic_bands = all_bands.newMultiBand(&quot;(ic_bands)&quot;, DELTA5);</span>
+<span class="nc" id="L1503">    CPRefBand ic_this_class = ic_bands.newCPRefBand(&quot;ic_this_class&quot;, UDELTA5, CONSTANT_Class);</span>
+<span class="nc" id="L1504">    IntBand ic_flags = ic_bands.newIntBand(&quot;ic_flags&quot;, UNSIGNED5);</span>
+    // These bands contain data only where flags sets ACC_IC_LONG_FORM:
+<span class="nc" id="L1506">    CPRefBand ic_outer_class = ic_bands.newCPRefBand(&quot;ic_outer_class&quot;, DELTA5, CONSTANT_Class, NULL_IS_OK);</span>
+<span class="nc" id="L1507">    CPRefBand ic_name = ic_bands.newCPRefBand(&quot;ic_name&quot;, DELTA5, CONSTANT_Utf8, NULL_IS_OK);</span>
+
+    // bands for carrying class schema information:
+<span class="nc" id="L1510">    MultiBand class_bands = all_bands.newMultiBand(&quot;(class_bands)&quot;, DELTA5);</span>
+<span class="nc" id="L1511">    CPRefBand class_this = class_bands.newCPRefBand(&quot;class_this&quot;, CONSTANT_Class);</span>
+<span class="nc" id="L1512">    CPRefBand class_super = class_bands.newCPRefBand(&quot;class_super&quot;, CONSTANT_Class);</span>
+<span class="nc" id="L1513">    IntBand   class_interface_count = class_bands.newIntBand(&quot;class_interface_count&quot;);</span>
+<span class="nc" id="L1514">    CPRefBand class_interface = class_bands.newCPRefBand(&quot;class_interface&quot;, CONSTANT_Class);</span>
+
+    // bands for class members
+<span class="nc" id="L1517">    IntBand   class_field_count = class_bands.newIntBand(&quot;class_field_count&quot;);</span>
+<span class="nc" id="L1518">    IntBand   class_method_count = class_bands.newIntBand(&quot;class_method_count&quot;);</span>
+
+<span class="nc" id="L1520">    CPRefBand field_descr = class_bands.newCPRefBand(&quot;field_descr&quot;, CONSTANT_NameandType);</span>
+<span class="nc" id="L1521">    MultiBand field_attr_bands = class_bands.newMultiBand(&quot;(field_attr_bands)&quot;, UNSIGNED5);</span>
+<span class="nc" id="L1522">    IntBand field_flags_hi = field_attr_bands.newIntBand(&quot;field_flags_hi&quot;);</span>
+<span class="nc" id="L1523">    IntBand field_flags_lo = field_attr_bands.newIntBand(&quot;field_flags_lo&quot;);</span>
+<span class="nc" id="L1524">    IntBand field_attr_count = field_attr_bands.newIntBand(&quot;field_attr_count&quot;);</span>
+<span class="nc" id="L1525">    IntBand field_attr_indexes = field_attr_bands.newIntBand(&quot;field_attr_indexes&quot;);</span>
+<span class="nc" id="L1526">    IntBand field_attr_calls = field_attr_bands.newIntBand(&quot;field_attr_calls&quot;);</span>
+
+    // bands for predefined field attributes
+<span class="nc" id="L1529">    CPRefBand field_ConstantValue_KQ = field_attr_bands.newCPRefBand(&quot;field_ConstantValue_KQ&quot;, CONSTANT_FieldSpecific);</span>
+<span class="nc" id="L1530">    CPRefBand field_Signature_RS = field_attr_bands.newCPRefBand(&quot;field_Signature_RS&quot;, CONSTANT_Signature);</span>
+<span class="nc" id="L1531">    MultiBand field_metadata_bands = field_attr_bands.newMultiBand(&quot;(field_metadata_bands)&quot;, UNSIGNED5);</span>
+<span class="nc" id="L1532">    MultiBand field_type_metadata_bands = field_attr_bands.newMultiBand(&quot;(field_type_metadata_bands)&quot;, UNSIGNED5);</span>
+
+<span class="nc" id="L1534">    CPRefBand method_descr = class_bands.newCPRefBand(&quot;method_descr&quot;, MDELTA5, CONSTANT_NameandType);</span>
+<span class="nc" id="L1535">    MultiBand method_attr_bands = class_bands.newMultiBand(&quot;(method_attr_bands)&quot;, UNSIGNED5);</span>
+<span class="nc" id="L1536">    IntBand  method_flags_hi = method_attr_bands.newIntBand(&quot;method_flags_hi&quot;);</span>
+<span class="nc" id="L1537">    IntBand  method_flags_lo = method_attr_bands.newIntBand(&quot;method_flags_lo&quot;);</span>
+<span class="nc" id="L1538">    IntBand  method_attr_count = method_attr_bands.newIntBand(&quot;method_attr_count&quot;);</span>
+<span class="nc" id="L1539">    IntBand  method_attr_indexes = method_attr_bands.newIntBand(&quot;method_attr_indexes&quot;);</span>
+<span class="nc" id="L1540">    IntBand  method_attr_calls = method_attr_bands.newIntBand(&quot;method_attr_calls&quot;);</span>
+    // band for predefined method attributes
+<span class="nc" id="L1542">    IntBand  method_Exceptions_N = method_attr_bands.newIntBand(&quot;method_Exceptions_N&quot;);</span>
+<span class="nc" id="L1543">    CPRefBand method_Exceptions_RC = method_attr_bands.newCPRefBand(&quot;method_Exceptions_RC&quot;, CONSTANT_Class);</span>
+<span class="nc" id="L1544">    CPRefBand method_Signature_RS = method_attr_bands.newCPRefBand(&quot;method_Signature_RS&quot;, CONSTANT_Signature);</span>
+<span class="nc" id="L1545">    MultiBand method_metadata_bands = method_attr_bands.newMultiBand(&quot;(method_metadata_bands)&quot;, UNSIGNED5);</span>
+    // band for predefine method parameters
+<span class="nc" id="L1547">    IntBand  method_MethodParameters_NB = method_attr_bands.newIntBand(&quot;method_MethodParameters_NB&quot;, BYTE1);</span>
+<span class="nc" id="L1548">    CPRefBand method_MethodParameters_name_RUN = method_attr_bands.newCPRefBand(&quot;method_MethodParameters_name_RUN&quot;, UNSIGNED5, CONSTANT_Utf8, NULL_IS_OK);</span>
+<span class="nc" id="L1549">    IntBand   method_MethodParameters_flag_FH = method_attr_bands.newIntBand(&quot;method_MethodParameters_flag_FH&quot;);</span>
+<span class="nc" id="L1550">    MultiBand method_type_metadata_bands = method_attr_bands.newMultiBand(&quot;(method_type_metadata_bands)&quot;, UNSIGNED5);</span>
+
+<span class="nc" id="L1552">    MultiBand class_attr_bands = class_bands.newMultiBand(&quot;(class_attr_bands)&quot;, UNSIGNED5);</span>
+<span class="nc" id="L1553">    IntBand class_flags_hi = class_attr_bands.newIntBand(&quot;class_flags_hi&quot;);</span>
+<span class="nc" id="L1554">    IntBand class_flags_lo = class_attr_bands.newIntBand(&quot;class_flags_lo&quot;);</span>
+<span class="nc" id="L1555">    IntBand class_attr_count = class_attr_bands.newIntBand(&quot;class_attr_count&quot;);</span>
+<span class="nc" id="L1556">    IntBand class_attr_indexes = class_attr_bands.newIntBand(&quot;class_attr_indexes&quot;);</span>
+<span class="nc" id="L1557">    IntBand class_attr_calls = class_attr_bands.newIntBand(&quot;class_attr_calls&quot;);</span>
+    // band for predefined SourceFile and other class attributes
+<span class="nc" id="L1559">    CPRefBand class_SourceFile_RUN = class_attr_bands.newCPRefBand(&quot;class_SourceFile_RUN&quot;, UNSIGNED5, CONSTANT_Utf8, NULL_IS_OK);</span>
+<span class="nc" id="L1560">    CPRefBand class_EnclosingMethod_RC = class_attr_bands.newCPRefBand(&quot;class_EnclosingMethod_RC&quot;, CONSTANT_Class);</span>
+<span class="nc" id="L1561">    CPRefBand class_EnclosingMethod_RDN = class_attr_bands.newCPRefBand(&quot;class_EnclosingMethod_RDN&quot;, UNSIGNED5, CONSTANT_NameandType, NULL_IS_OK);</span>
+<span class="nc" id="L1562">    CPRefBand class_Signature_RS = class_attr_bands.newCPRefBand(&quot;class_Signature_RS&quot;, CONSTANT_Signature);</span>
+<span class="nc" id="L1563">    MultiBand class_metadata_bands = class_attr_bands.newMultiBand(&quot;(class_metadata_bands)&quot;, UNSIGNED5);</span>
+<span class="nc" id="L1564">    IntBand   class_InnerClasses_N = class_attr_bands.newIntBand(&quot;class_InnerClasses_N&quot;);</span>
+<span class="nc" id="L1565">    CPRefBand class_InnerClasses_RC = class_attr_bands.newCPRefBand(&quot;class_InnerClasses_RC&quot;, CONSTANT_Class);</span>
+<span class="nc" id="L1566">    IntBand   class_InnerClasses_F = class_attr_bands.newIntBand(&quot;class_InnerClasses_F&quot;);</span>
+<span class="nc" id="L1567">    CPRefBand class_InnerClasses_outer_RCN = class_attr_bands.newCPRefBand(&quot;class_InnerClasses_outer_RCN&quot;, UNSIGNED5, CONSTANT_Class, NULL_IS_OK);</span>
+<span class="nc" id="L1568">    CPRefBand class_InnerClasses_name_RUN = class_attr_bands.newCPRefBand(&quot;class_InnerClasses_name_RUN&quot;, UNSIGNED5, CONSTANT_Utf8, NULL_IS_OK);</span>
+<span class="nc" id="L1569">    IntBand class_ClassFile_version_minor_H = class_attr_bands.newIntBand(&quot;class_ClassFile_version_minor_H&quot;);</span>
+<span class="nc" id="L1570">    IntBand class_ClassFile_version_major_H = class_attr_bands.newIntBand(&quot;class_ClassFile_version_major_H&quot;);</span>
+<span class="nc" id="L1571">    MultiBand class_type_metadata_bands = class_attr_bands.newMultiBand(&quot;(class_type_metadata_bands)&quot;, UNSIGNED5);</span>
+
+<span class="nc" id="L1573">    MultiBand code_bands = class_bands.newMultiBand(&quot;(code_bands)&quot;, UNSIGNED5);</span>
+<span class="nc" id="L1574">    ByteBand  code_headers = code_bands.newByteBand(&quot;code_headers&quot;); //BYTE1</span>
+<span class="nc" id="L1575">    IntBand   code_max_stack = code_bands.newIntBand(&quot;code_max_stack&quot;, UNSIGNED5);</span>
+<span class="nc" id="L1576">    IntBand   code_max_na_locals = code_bands.newIntBand(&quot;code_max_na_locals&quot;, UNSIGNED5);</span>
+<span class="nc" id="L1577">    IntBand   code_handler_count = code_bands.newIntBand(&quot;code_handler_count&quot;, UNSIGNED5);</span>
+<span class="nc" id="L1578">    IntBand   code_handler_start_P = code_bands.newIntBand(&quot;code_handler_start_P&quot;, BCI5);</span>
+<span class="nc" id="L1579">    IntBand   code_handler_end_PO = code_bands.newIntBand(&quot;code_handler_end_PO&quot;, BRANCH5);</span>
+<span class="nc" id="L1580">    IntBand   code_handler_catch_PO = code_bands.newIntBand(&quot;code_handler_catch_PO&quot;, BRANCH5);</span>
+<span class="nc" id="L1581">    CPRefBand code_handler_class_RCN = code_bands.newCPRefBand(&quot;code_handler_class_RCN&quot;, UNSIGNED5, CONSTANT_Class, NULL_IS_OK);</span>
+
+<span class="nc" id="L1583">    MultiBand code_attr_bands = class_bands.newMultiBand(&quot;(code_attr_bands)&quot;, UNSIGNED5);</span>
+<span class="nc" id="L1584">    IntBand   code_flags_hi = code_attr_bands.newIntBand(&quot;code_flags_hi&quot;);</span>
+<span class="nc" id="L1585">    IntBand   code_flags_lo = code_attr_bands.newIntBand(&quot;code_flags_lo&quot;);</span>
+<span class="nc" id="L1586">    IntBand   code_attr_count = code_attr_bands.newIntBand(&quot;code_attr_count&quot;);</span>
+<span class="nc" id="L1587">    IntBand   code_attr_indexes = code_attr_bands.newIntBand(&quot;code_attr_indexes&quot;);</span>
+<span class="nc" id="L1588">    IntBand   code_attr_calls = code_attr_bands.newIntBand(&quot;code_attr_calls&quot;);</span>
+
+<span class="nc" id="L1590">    MultiBand stackmap_bands = code_attr_bands.newMultiBand(&quot;(StackMapTable_bands)&quot;, UNSIGNED5);</span>
+<span class="nc" id="L1591">    IntBand   code_StackMapTable_N = stackmap_bands.newIntBand(&quot;code_StackMapTable_N&quot;);</span>
+<span class="nc" id="L1592">    IntBand   code_StackMapTable_frame_T = stackmap_bands.newIntBand(&quot;code_StackMapTable_frame_T&quot;,BYTE1);</span>
+<span class="nc" id="L1593">    IntBand   code_StackMapTable_local_N = stackmap_bands.newIntBand(&quot;code_StackMapTable_local_N&quot;);</span>
+<span class="nc" id="L1594">    IntBand   code_StackMapTable_stack_N = stackmap_bands.newIntBand(&quot;code_StackMapTable_stack_N&quot;);</span>
+<span class="nc" id="L1595">    IntBand   code_StackMapTable_offset = stackmap_bands.newIntBand(&quot;code_StackMapTable_offset&quot;, UNSIGNED5);</span>
+<span class="nc" id="L1596">    IntBand   code_StackMapTable_T = stackmap_bands.newIntBand(&quot;code_StackMapTable_T&quot;, BYTE1);</span>
+<span class="nc" id="L1597">    CPRefBand code_StackMapTable_RC = stackmap_bands.newCPRefBand(&quot;code_StackMapTable_RC&quot;, CONSTANT_Class);</span>
+<span class="nc" id="L1598">    IntBand   code_StackMapTable_P = stackmap_bands.newIntBand(&quot;code_StackMapTable_P&quot;, BCI5);</span>
+
+    // bands for predefined LineNumberTable attribute
+<span class="nc" id="L1601">    IntBand   code_LineNumberTable_N = code_attr_bands.newIntBand(&quot;code_LineNumberTable_N&quot;);</span>
+<span class="nc" id="L1602">    IntBand   code_LineNumberTable_bci_P = code_attr_bands.newIntBand(&quot;code_LineNumberTable_bci_P&quot;, BCI5);</span>
+<span class="nc" id="L1603">    IntBand   code_LineNumberTable_line = code_attr_bands.newIntBand(&quot;code_LineNumberTable_line&quot;);</span>
+
+    // bands for predefined LocalVariable{Type}Table attributes
+<span class="nc" id="L1606">    IntBand   code_LocalVariableTable_N = code_attr_bands.newIntBand(&quot;code_LocalVariableTable_N&quot;);</span>
+<span class="nc" id="L1607">    IntBand   code_LocalVariableTable_bci_P = code_attr_bands.newIntBand(&quot;code_LocalVariableTable_bci_P&quot;, BCI5);</span>
+<span class="nc" id="L1608">    IntBand   code_LocalVariableTable_span_O = code_attr_bands.newIntBand(&quot;code_LocalVariableTable_span_O&quot;, BRANCH5);</span>
+<span class="nc" id="L1609">    CPRefBand code_LocalVariableTable_name_RU = code_attr_bands.newCPRefBand(&quot;code_LocalVariableTable_name_RU&quot;, CONSTANT_Utf8);</span>
+<span class="nc" id="L1610">    CPRefBand code_LocalVariableTable_type_RS = code_attr_bands.newCPRefBand(&quot;code_LocalVariableTable_type_RS&quot;, CONSTANT_Signature);</span>
+<span class="nc" id="L1611">    IntBand   code_LocalVariableTable_slot = code_attr_bands.newIntBand(&quot;code_LocalVariableTable_slot&quot;);</span>
+<span class="nc" id="L1612">    IntBand   code_LocalVariableTypeTable_N = code_attr_bands.newIntBand(&quot;code_LocalVariableTypeTable_N&quot;);</span>
+<span class="nc" id="L1613">    IntBand   code_LocalVariableTypeTable_bci_P = code_attr_bands.newIntBand(&quot;code_LocalVariableTypeTable_bci_P&quot;, BCI5);</span>
+<span class="nc" id="L1614">    IntBand   code_LocalVariableTypeTable_span_O = code_attr_bands.newIntBand(&quot;code_LocalVariableTypeTable_span_O&quot;, BRANCH5);</span>
+<span class="nc" id="L1615">    CPRefBand code_LocalVariableTypeTable_name_RU = code_attr_bands.newCPRefBand(&quot;code_LocalVariableTypeTable_name_RU&quot;, CONSTANT_Utf8);</span>
+<span class="nc" id="L1616">    CPRefBand code_LocalVariableTypeTable_type_RS = code_attr_bands.newCPRefBand(&quot;code_LocalVariableTypeTable_type_RS&quot;, CONSTANT_Signature);</span>
+<span class="nc" id="L1617">    IntBand   code_LocalVariableTypeTable_slot = code_attr_bands.newIntBand(&quot;code_LocalVariableTypeTable_slot&quot;);</span>
+<span class="nc" id="L1618">    MultiBand code_type_metadata_bands = code_attr_bands.newMultiBand(&quot;(code_type_metadata_bands)&quot;, UNSIGNED5);</span>
+
+    // bands for bytecodes
+<span class="nc" id="L1621">    MultiBand bc_bands = all_bands.newMultiBand(&quot;(byte_codes)&quot;, UNSIGNED5);</span>
+<span class="nc" id="L1622">    ByteBand  bc_codes = bc_bands.newByteBand(&quot;bc_codes&quot;); //BYTE1</span>
+    // remaining bands provide typed opcode fields required by the bc_codes
+
+<span class="nc" id="L1625">    IntBand   bc_case_count = bc_bands.newIntBand(&quot;bc_case_count&quot;);  // *switch</span>
+<span class="nc" id="L1626">    IntBand   bc_case_value = bc_bands.newIntBand(&quot;bc_case_value&quot;, DELTA5);  // *switch</span>
+<span class="nc" id="L1627">    ByteBand  bc_byte = bc_bands.newByteBand(&quot;bc_byte&quot;); //BYTE1   // bipush, iinc, *newarray</span>
+<span class="nc" id="L1628">    IntBand   bc_short = bc_bands.newIntBand(&quot;bc_short&quot;, DELTA5);  // sipush, wide iinc</span>
+<span class="nc" id="L1629">    IntBand   bc_local = bc_bands.newIntBand(&quot;bc_local&quot;);    // *load, *store, iinc, ret</span>
+<span class="nc" id="L1630">    IntBand   bc_label = bc_bands.newIntBand(&quot;bc_label&quot;, BRANCH5);    // if*, goto*, jsr*, *switch</span>
+
+    // Most CP refs exhibit some correlation, and benefit from delta coding.
+    // The notable exceptions are class and method references.
+
+    // ldc* operands:
+<span class="nc" id="L1636">    CPRefBand bc_intref = bc_bands.newCPRefBand(&quot;bc_intref&quot;, DELTA5, CONSTANT_Integer);</span>
+<span class="nc" id="L1637">    CPRefBand bc_floatref = bc_bands.newCPRefBand(&quot;bc_floatref&quot;, DELTA5, CONSTANT_Float);</span>
+<span class="nc" id="L1638">    CPRefBand bc_longref = bc_bands.newCPRefBand(&quot;bc_longref&quot;, DELTA5, CONSTANT_Long);</span>
+<span class="nc" id="L1639">    CPRefBand bc_doubleref = bc_bands.newCPRefBand(&quot;bc_doubleref&quot;, DELTA5, CONSTANT_Double);</span>
+<span class="nc" id="L1640">    CPRefBand bc_stringref = bc_bands.newCPRefBand(&quot;bc_stringref&quot;, DELTA5, CONSTANT_String);</span>
+<span class="nc" id="L1641">    CPRefBand bc_loadablevalueref = bc_bands.newCPRefBand(&quot;bc_loadablevalueref&quot;, DELTA5, CONSTANT_LoadableValue);</span>
+
+    // nulls produced by bc_classref are taken to mean the current class
+<span class="nc" id="L1644">    CPRefBand bc_classref = bc_bands.newCPRefBand(&quot;bc_classref&quot;, UNSIGNED5, CONSTANT_Class, NULL_IS_OK);   // new, *anew*, c*cast, i*of, ldc</span>
+<span class="nc" id="L1645">    CPRefBand bc_fieldref = bc_bands.newCPRefBand(&quot;bc_fieldref&quot;, DELTA5, CONSTANT_Fieldref);   // get*, put*</span>
+<span class="nc" id="L1646">    CPRefBand bc_methodref = bc_bands.newCPRefBand(&quot;bc_methodref&quot;, CONSTANT_Methodref); // invoke[vs]*</span>
+<span class="nc" id="L1647">    CPRefBand bc_imethodref = bc_bands.newCPRefBand(&quot;bc_imethodref&quot;, DELTA5, CONSTANT_InterfaceMethodref); // invokeinterface</span>
+<span class="nc" id="L1648">    CPRefBand bc_indyref = bc_bands.newCPRefBand(&quot;bc_indyref&quot;, DELTA5, CONSTANT_InvokeDynamic); // invokedynamic</span>
+
+    // _self_linker_op family
+<span class="nc" id="L1651">    CPRefBand bc_thisfield = bc_bands.newCPRefBand(&quot;bc_thisfield&quot;, CONSTANT_None);     // any field within cur. class</span>
+<span class="nc" id="L1652">    CPRefBand bc_superfield = bc_bands.newCPRefBand(&quot;bc_superfield&quot;, CONSTANT_None);   // any field within superclass</span>
+<span class="nc" id="L1653">    CPRefBand bc_thismethod = bc_bands.newCPRefBand(&quot;bc_thismethod&quot;, CONSTANT_None);   // any method within cur. class</span>
+<span class="nc" id="L1654">    CPRefBand bc_supermethod = bc_bands.newCPRefBand(&quot;bc_supermethod&quot;, CONSTANT_None); // any method within superclass</span>
+    // bc_invokeinit family:
+<span class="nc" id="L1656">    IntBand   bc_initref = bc_bands.newIntBand(&quot;bc_initref&quot;);</span>
+    // escapes
+<span class="nc" id="L1658">    CPRefBand bc_escref = bc_bands.newCPRefBand(&quot;bc_escref&quot;, CONSTANT_All);</span>
+<span class="nc" id="L1659">    IntBand   bc_escrefsize = bc_bands.newIntBand(&quot;bc_escrefsize&quot;);</span>
+<span class="nc" id="L1660">    IntBand   bc_escsize = bc_bands.newIntBand(&quot;bc_escsize&quot;);</span>
+<span class="nc" id="L1661">    ByteBand  bc_escbyte = bc_bands.newByteBand(&quot;bc_escbyte&quot;);</span>
+
+    // bands for carrying resource files and file attributes:
+<span class="nc" id="L1664">    MultiBand file_bands = all_bands.newMultiBand(&quot;(file_bands)&quot;, UNSIGNED5);</span>
+<span class="nc" id="L1665">    CPRefBand file_name = file_bands.newCPRefBand(&quot;file_name&quot;, CONSTANT_Utf8);</span>
+<span class="nc" id="L1666">    IntBand file_size_hi = file_bands.newIntBand(&quot;file_size_hi&quot;);</span>
+<span class="nc" id="L1667">    IntBand file_size_lo = file_bands.newIntBand(&quot;file_size_lo&quot;);</span>
+<span class="nc" id="L1668">    IntBand file_modtime = file_bands.newIntBand(&quot;file_modtime&quot;, DELTA5);</span>
+<span class="nc" id="L1669">    IntBand file_options = file_bands.newIntBand(&quot;file_options&quot;);</span>
+<span class="nc" id="L1670">    ByteBand file_bits = file_bands.newByteBand(&quot;file_bits&quot;);</span>
+
+    // End of band definitions!
+
+    /** Given CP indexes, distribute tag-specific indexes to bands. */
+    protected void setBandIndexes() {
+        // Handle prior calls to setBandIndex:
+<span class="nc bnc" id="L1677" title="All 2 branches missed.">        for (Object[] need : needPredefIndex) {</span>
+<span class="nc" id="L1678">            CPRefBand b     = (CPRefBand) need[0];</span>
+<span class="nc" id="L1679">            Byte      which = (Byte)      need[1];</span>
+<span class="nc" id="L1680">            b.setIndex(getCPIndex(which.byteValue()));</span>
+<span class="nc" id="L1681">        }</span>
+<span class="nc" id="L1682">        needPredefIndex = null;  // no more predefs</span>
+
+<span class="nc bnc" id="L1684" title="All 2 branches missed.">        if (verbose &gt; 3) {</span>
+<span class="nc" id="L1685">            printCDecl(all_bands);</span>
+        }
+<span class="nc" id="L1687">    }</span>
+
+    protected void setBandIndex(CPRefBand b, byte which) {
+<span class="nc" id="L1690">        Object[] need = { b, Byte.valueOf(which) };</span>
+<span class="nc bnc" id="L1691" title="All 2 branches missed.">        if (which == CONSTANT_FieldSpecific) {</span>
+            // I.e., attribute layouts KQ (no null) or KQN (null ok).
+<span class="nc" id="L1693">            allKQBands.add(b);</span>
+<span class="nc bnc" id="L1694" title="All 2 branches missed.">        } else if (needPredefIndex != null) {</span>
+<span class="nc" id="L1695">            needPredefIndex.add(need);</span>
+        } else {
+            // Not in predefinition mode; getCPIndex now works.
+<span class="nc" id="L1698">            b.setIndex(getCPIndex(which));</span>
+        }
+<span class="nc" id="L1700">    }</span>
+
+    protected void setConstantValueIndex(Field f) {
+<span class="nc" id="L1703">        Index ix = null;</span>
+<span class="nc bnc" id="L1704" title="All 2 branches missed.">        if (f != null) {</span>
+<span class="nc" id="L1705">            byte tag = f.getLiteralTag();</span>
+<span class="nc" id="L1706">            ix = getCPIndex(tag);</span>
+<span class="nc bnc" id="L1707" title="All 2 branches missed.">            if (verbose &gt; 2)</span>
+<span class="nc" id="L1708">                Utils.log.fine(&quot;setConstantValueIndex &quot;+f+&quot; &quot;+ConstantPool.tagName(tag)+&quot; =&gt; &quot;+ix);</span>
+<span class="nc bnc" id="L1709" title="All 4 branches missed.">            assert(ix != null);</span>
+        }
+        // Typically, allKQBands is the singleton of field_ConstantValue_KQ.
+<span class="nc bnc" id="L1712" title="All 2 branches missed.">        for (CPRefBand xxx_KQ : allKQBands) {</span>
+<span class="nc" id="L1713">            xxx_KQ.setIndex(ix);</span>
+<span class="nc" id="L1714">        }</span>
+<span class="nc" id="L1715">    }</span>
+
+    // Table of bands which contain metadata.
+<span class="nc" id="L1718">    protected MultiBand[] metadataBands = new MultiBand[ATTR_CONTEXT_LIMIT];</span>
+    {
+<span class="nc" id="L1720">        metadataBands[ATTR_CONTEXT_CLASS] = class_metadata_bands;</span>
+<span class="nc" id="L1721">        metadataBands[ATTR_CONTEXT_FIELD] = field_metadata_bands;</span>
+<span class="nc" id="L1722">        metadataBands[ATTR_CONTEXT_METHOD] = method_metadata_bands;</span>
+    }
+    // Table of bands which contains type_metadata (TypeAnnotations)
+<span class="nc" id="L1725">    protected MultiBand[] typeMetadataBands = new MultiBand[ATTR_CONTEXT_LIMIT];</span>
+    {
+<span class="nc" id="L1727">        typeMetadataBands[ATTR_CONTEXT_CLASS] = class_type_metadata_bands;</span>
+<span class="nc" id="L1728">        typeMetadataBands[ATTR_CONTEXT_FIELD] = field_type_metadata_bands;</span>
+<span class="nc" id="L1729">        typeMetadataBands[ATTR_CONTEXT_METHOD] = method_type_metadata_bands;</span>
+<span class="nc" id="L1730">        typeMetadataBands[ATTR_CONTEXT_CODE]   = code_type_metadata_bands;</span>
+    }
+
+    // Attribute layouts.
+    public static final int ADH_CONTEXT_MASK   = 0x3;  // (ad_hdr &amp; ADH_CONTEXT_MASK)
+    public static final int ADH_BIT_SHIFT      = 0x2;  // (ad_hdr &gt;&gt; ADH_BIT_SHIFT)
+    public static final int ADH_BIT_IS_LSB     = 1;
+    public static final int ATTR_INDEX_OVERFLOW  = -1;
+
+<span class="nc" id="L1739">    public int[] attrIndexLimit = new int[ATTR_CONTEXT_LIMIT];</span>
+    // Each index limit is either 32 or 63, depending on AO_HAVE_XXX_FLAGS_HI.
+
+    // Which flag bits are taken over by attributes?
+<span class="nc" id="L1743">    protected long[] attrFlagMask = new long[ATTR_CONTEXT_LIMIT];</span>
+    // Which flag bits have been taken over explicitly?
+<span class="nc" id="L1745">    protected long[] attrDefSeen = new long[ATTR_CONTEXT_LIMIT];</span>
+
+    // What pseudo-attribute bits are there to watch for?
+<span class="nc" id="L1748">    protected int[] attrOverflowMask = new int[ATTR_CONTEXT_LIMIT];</span>
+    protected int attrClassFileVersionMask;
+
+    // Mapping from Attribute.Layout to Band[] (layout element bands).
+<span class="nc" id="L1752">    protected Map&lt;Attribute.Layout, Band[]&gt; attrBandTable = new HashMap&lt;&gt;();</span>
+
+    // Well-known attributes:
+    protected final Attribute.Layout attrCodeEmpty;
+    protected final Attribute.Layout attrInnerClassesEmpty;
+    protected final Attribute.Layout attrClassFileVersion;
+    protected final Attribute.Layout attrConstantValue;
+
+    // Mapping from Attribute.Layout to Integer (inverse of attrDefs)
+<span class="nc" id="L1761">    Map&lt;Attribute.Layout, Integer&gt; attrIndexTable = new HashMap&lt;&gt;();</span>
+
+    // Mapping from attribute index (&lt;32 are flag bits) to attributes.
+<span class="nc" id="L1764">    protected List&lt;List&lt;Attribute.Layout&gt;&gt; attrDefs =</span>
+            new FixedList&lt;&gt;(ATTR_CONTEXT_LIMIT);
+    {
+<span class="nc bnc" id="L1767" title="All 2 branches missed.">        for (int i = 0; i &lt; ATTR_CONTEXT_LIMIT; i++) {</span>
+<span class="nc bnc" id="L1768" title="All 4 branches missed.">            assert(attrIndexLimit[i] == 0);</span>
+<span class="nc" id="L1769">            attrIndexLimit[i] = 32;  // just for the sake of predefs.</span>
+<span class="nc" id="L1770">            attrDefs.set(i, new ArrayList&lt;&gt;(Collections.nCopies(</span>
+                    attrIndexLimit[i], (Attribute.Layout)null)));
+
+        }
+
+        // Add predefined attribute definitions:
+<span class="nc" id="L1776">        attrInnerClassesEmpty =</span>
+<span class="nc" id="L1777">        predefineAttribute(CLASS_ATTR_InnerClasses, ATTR_CONTEXT_CLASS, null,</span>
+                           &quot;InnerClasses&quot;, &quot;&quot;);
+<span class="nc bnc" id="L1779" title="All 4 branches missed.">        assert(attrInnerClassesEmpty == Package.attrInnerClassesEmpty);</span>
+<span class="nc" id="L1780">        predefineAttribute(CLASS_ATTR_SourceFile, ATTR_CONTEXT_CLASS,</span>
+                           new Band[] { class_SourceFile_RUN },
+                           &quot;SourceFile&quot;, &quot;RUNH&quot;);
+<span class="nc" id="L1783">        predefineAttribute(CLASS_ATTR_EnclosingMethod, ATTR_CONTEXT_CLASS,</span>
+                           new Band[] {
+                               class_EnclosingMethod_RC,
+                               class_EnclosingMethod_RDN
+                           },
+                           &quot;EnclosingMethod&quot;, &quot;RCHRDNH&quot;);
+<span class="nc" id="L1789">        attrClassFileVersion =</span>
+<span class="nc" id="L1790">        predefineAttribute(CLASS_ATTR_ClassFile_version, ATTR_CONTEXT_CLASS,</span>
+                           new Band[] {
+                               class_ClassFile_version_minor_H,
+                               class_ClassFile_version_major_H
+                           },
+                           &quot;.ClassFile.version&quot;, &quot;HH&quot;);
+<span class="nc" id="L1796">        predefineAttribute(X_ATTR_Signature, ATTR_CONTEXT_CLASS,</span>
+                           new Band[] { class_Signature_RS },
+                           &quot;Signature&quot;, &quot;RSH&quot;);
+<span class="nc" id="L1799">        predefineAttribute(X_ATTR_Deprecated, ATTR_CONTEXT_CLASS, null,</span>
+                           &quot;Deprecated&quot;, &quot;&quot;);
+        //predefineAttribute(X_ATTR_Synthetic, ATTR_CONTEXT_CLASS, null,
+        //                 &quot;Synthetic&quot;, &quot;&quot;);
+<span class="nc" id="L1803">        predefineAttribute(X_ATTR_OVERFLOW, ATTR_CONTEXT_CLASS, null,</span>
+                           &quot;.Overflow&quot;, &quot;&quot;);
+<span class="nc" id="L1805">        attrConstantValue =</span>
+<span class="nc" id="L1806">        predefineAttribute(FIELD_ATTR_ConstantValue, ATTR_CONTEXT_FIELD,</span>
+                           new Band[] { field_ConstantValue_KQ },
+                           &quot;ConstantValue&quot;, &quot;KQH&quot;);
+<span class="nc" id="L1809">        predefineAttribute(X_ATTR_Signature, ATTR_CONTEXT_FIELD,</span>
+                           new Band[] { field_Signature_RS },
+                           &quot;Signature&quot;, &quot;RSH&quot;);
+<span class="nc" id="L1812">        predefineAttribute(X_ATTR_Deprecated, ATTR_CONTEXT_FIELD, null,</span>
+                           &quot;Deprecated&quot;, &quot;&quot;);
+        //predefineAttribute(X_ATTR_Synthetic, ATTR_CONTEXT_FIELD, null,
+        //                 &quot;Synthetic&quot;, &quot;&quot;);
+<span class="nc" id="L1816">        predefineAttribute(X_ATTR_OVERFLOW, ATTR_CONTEXT_FIELD, null,</span>
+                           &quot;.Overflow&quot;, &quot;&quot;);
+<span class="nc" id="L1818">        attrCodeEmpty =</span>
+<span class="nc" id="L1819">        predefineAttribute(METHOD_ATTR_Code, ATTR_CONTEXT_METHOD, null,</span>
+                           &quot;Code&quot;, &quot;&quot;);
+<span class="nc" id="L1821">        predefineAttribute(METHOD_ATTR_Exceptions, ATTR_CONTEXT_METHOD,</span>
+                           new Band[] {
+                               method_Exceptions_N,
+                               method_Exceptions_RC
+                           },
+                           &quot;Exceptions&quot;, &quot;NH[RCH]&quot;);
+<span class="nc" id="L1827">        predefineAttribute(METHOD_ATTR_MethodParameters, ATTR_CONTEXT_METHOD,</span>
+                           new Band[]{
+                                method_MethodParameters_NB,
+                                method_MethodParameters_name_RUN,
+                                method_MethodParameters_flag_FH
+                           },
+                           &quot;MethodParameters&quot;, &quot;NB[RUNHFH]&quot;);
+<span class="nc bnc" id="L1834" title="All 4 branches missed.">        assert(attrCodeEmpty == Package.attrCodeEmpty);</span>
+<span class="nc" id="L1835">        predefineAttribute(X_ATTR_Signature, ATTR_CONTEXT_METHOD,</span>
+                           new Band[] { method_Signature_RS },
+                           &quot;Signature&quot;, &quot;RSH&quot;);
+<span class="nc" id="L1838">        predefineAttribute(X_ATTR_Deprecated, ATTR_CONTEXT_METHOD, null,</span>
+                           &quot;Deprecated&quot;, &quot;&quot;);
+        //predefineAttribute(X_ATTR_Synthetic, ATTR_CONTEXT_METHOD, null,
+        //                 &quot;Synthetic&quot;, &quot;&quot;);
+<span class="nc" id="L1842">        predefineAttribute(X_ATTR_OVERFLOW, ATTR_CONTEXT_METHOD, null,</span>
+                           &quot;.Overflow&quot;, &quot;&quot;);
+
+<span class="nc bnc" id="L1845" title="All 2 branches missed.">        for (int ctype = 0; ctype &lt; ATTR_CONTEXT_LIMIT; ctype++) {</span>
+<span class="nc" id="L1846">            MultiBand xxx_metadata_bands = metadataBands[ctype];</span>
+<span class="nc bnc" id="L1847" title="All 2 branches missed.">            if (ctype != ATTR_CONTEXT_CODE) {</span>
+                // These arguments cause the bands to be built
+                // automatically for this complicated layout:
+<span class="nc" id="L1850">                predefineAttribute(X_ATTR_RuntimeVisibleAnnotations,</span>
+                                   ATTR_CONTEXT_NAME[ctype]+&quot;_RVA_&quot;,
+                                   xxx_metadata_bands,
+<span class="nc" id="L1853">                                   Attribute.lookup(null, ctype,</span>
+                                                    &quot;RuntimeVisibleAnnotations&quot;));
+<span class="nc" id="L1855">                predefineAttribute(X_ATTR_RuntimeInvisibleAnnotations,</span>
+                                   ATTR_CONTEXT_NAME[ctype]+&quot;_RIA_&quot;,
+                                   xxx_metadata_bands,
+<span class="nc" id="L1858">                                   Attribute.lookup(null, ctype,</span>
+                                                    &quot;RuntimeInvisibleAnnotations&quot;));
+
+<span class="nc bnc" id="L1861" title="All 2 branches missed.">                if (ctype == ATTR_CONTEXT_METHOD) {</span>
+<span class="nc" id="L1862">                    predefineAttribute(METHOD_ATTR_RuntimeVisibleParameterAnnotations,</span>
+                                       &quot;method_RVPA_&quot;, xxx_metadata_bands,
+<span class="nc" id="L1864">                                       Attribute.lookup(null, ctype,</span>
+                                       &quot;RuntimeVisibleParameterAnnotations&quot;));
+<span class="nc" id="L1866">                    predefineAttribute(METHOD_ATTR_RuntimeInvisibleParameterAnnotations,</span>
+                                       &quot;method_RIPA_&quot;, xxx_metadata_bands,
+<span class="nc" id="L1868">                                       Attribute.lookup(null, ctype,</span>
+                                       &quot;RuntimeInvisibleParameterAnnotations&quot;));
+<span class="nc" id="L1870">                    predefineAttribute(METHOD_ATTR_AnnotationDefault,</span>
+                                       &quot;method_AD_&quot;, xxx_metadata_bands,
+<span class="nc" id="L1872">                                       Attribute.lookup(null, ctype,</span>
+                                       &quot;AnnotationDefault&quot;));
+                }
+            }
+            // All contexts have these
+<span class="nc" id="L1877">            MultiBand xxx_type_metadata_bands = typeMetadataBands[ctype];</span>
+<span class="nc" id="L1878">            predefineAttribute(X_ATTR_RuntimeVisibleTypeAnnotations,</span>
+                    ATTR_CONTEXT_NAME[ctype] + &quot;_RVTA_&quot;,
+                    xxx_type_metadata_bands,
+<span class="nc" id="L1881">                    Attribute.lookup(null, ctype,</span>
+                    &quot;RuntimeVisibleTypeAnnotations&quot;));
+<span class="nc" id="L1883">            predefineAttribute(X_ATTR_RuntimeInvisibleTypeAnnotations,</span>
+                    ATTR_CONTEXT_NAME[ctype] + &quot;_RITA_&quot;,
+                    xxx_type_metadata_bands,
+<span class="nc" id="L1886">                    Attribute.lookup(null, ctype,</span>
+                    &quot;RuntimeInvisibleTypeAnnotations&quot;));
+        }
+
+
+<span class="nc" id="L1891">        Attribute.Layout stackMapDef = Attribute.lookup(null, ATTR_CONTEXT_CODE, &quot;StackMapTable&quot;).layout();</span>
+<span class="nc" id="L1892">        predefineAttribute(CODE_ATTR_StackMapTable, ATTR_CONTEXT_CODE,</span>
+<span class="nc" id="L1893">                           stackmap_bands.toArray(),</span>
+<span class="nc" id="L1894">                           stackMapDef.name(), stackMapDef.layout());</span>
+
+<span class="nc" id="L1896">        predefineAttribute(CODE_ATTR_LineNumberTable, ATTR_CONTEXT_CODE,</span>
+                           new Band[] {
+                               code_LineNumberTable_N,
+                               code_LineNumberTable_bci_P,
+                               code_LineNumberTable_line
+                           },
+                           &quot;LineNumberTable&quot;, &quot;NH[PHH]&quot;);
+<span class="nc" id="L1903">        predefineAttribute(CODE_ATTR_LocalVariableTable, ATTR_CONTEXT_CODE,</span>
+                           new Band[] {
+                               code_LocalVariableTable_N,
+                               code_LocalVariableTable_bci_P,
+                               code_LocalVariableTable_span_O,
+                               code_LocalVariableTable_name_RU,
+                               code_LocalVariableTable_type_RS,
+                               code_LocalVariableTable_slot
+                           },
+                           &quot;LocalVariableTable&quot;, &quot;NH[PHOHRUHRSHH]&quot;);
+<span class="nc" id="L1913">        predefineAttribute(CODE_ATTR_LocalVariableTypeTable, ATTR_CONTEXT_CODE,</span>
+                           new Band[] {
+                               code_LocalVariableTypeTable_N,
+                               code_LocalVariableTypeTable_bci_P,
+                               code_LocalVariableTypeTable_span_O,
+                               code_LocalVariableTypeTable_name_RU,
+                               code_LocalVariableTypeTable_type_RS,
+                               code_LocalVariableTypeTable_slot
+                           },
+                           &quot;LocalVariableTypeTable&quot;, &quot;NH[PHOHRUHRSHH]&quot;);
+<span class="nc" id="L1923">        predefineAttribute(X_ATTR_OVERFLOW, ATTR_CONTEXT_CODE, null,</span>
+                           &quot;.Overflow&quot;, &quot;&quot;);
+
+        // Clear the record of having seen these definitions,
+        // so they may be redefined without error.
+<span class="nc bnc" id="L1928" title="All 2 branches missed.">        for (int i = 0; i &lt; ATTR_CONTEXT_LIMIT; i++) {</span>
+<span class="nc" id="L1929">            attrDefSeen[i] = 0;</span>
+        }
+
+        // Set up the special masks:
+<span class="nc bnc" id="L1933" title="All 2 branches missed.">        for (int i = 0; i &lt; ATTR_CONTEXT_LIMIT; i++) {</span>
+<span class="nc" id="L1934">            attrOverflowMask[i] = (1&lt;&lt;X_ATTR_OVERFLOW);</span>
+<span class="nc" id="L1935">            attrIndexLimit[i] = 0;  // will make a final decision later</span>
+        }
+<span class="nc" id="L1937">        attrClassFileVersionMask = (1&lt;&lt;CLASS_ATTR_ClassFile_version);</span>
+    }
+
+    private void adjustToClassVersion() throws IOException {
+<span class="nc bnc" id="L1941" title="All 2 branches missed.">        if (getHighestClassVersion().lessThan(JAVA6_MAX_CLASS_VERSION)) {</span>
+<span class="nc bnc" id="L1942" title="All 2 branches missed.">            if (verbose &gt; 0)  Utils.log.fine(&quot;Legacy package version&quot;);</span>
+            // Revoke definition of pre-1.6 attribute type.
+<span class="nc" id="L1944">            undefineAttribute(CODE_ATTR_StackMapTable, ATTR_CONTEXT_CODE);</span>
+        }
+<span class="nc" id="L1946">    }</span>
+
+    protected void initAttrIndexLimit() {
+<span class="nc bnc" id="L1949" title="All 2 branches missed.">        for (int i = 0; i &lt; ATTR_CONTEXT_LIMIT; i++) {</span>
+<span class="nc bnc" id="L1950" title="All 4 branches missed.">            assert(attrIndexLimit[i] == 0);  // decide on it now!</span>
+<span class="nc bnc" id="L1951" title="All 2 branches missed.">            attrIndexLimit[i] = (haveFlagsHi(i)? 63: 32);</span>
+<span class="nc" id="L1952">            List&lt;Attribute.Layout&gt; defList = attrDefs.get(i);</span>
+<span class="nc bnc" id="L1953" title="All 4 branches missed.">            assert(defList.size() == 32);  // all predef indexes are &lt;32</span>
+<span class="nc" id="L1954">            int addMore = attrIndexLimit[i] - defList.size();</span>
+<span class="nc" id="L1955">            defList.addAll(Collections.nCopies(addMore, (Attribute.Layout) null));</span>
+        }
+<span class="nc" id="L1957">    }</span>
+
+    protected boolean haveFlagsHi(int ctype) {
+<span class="nc" id="L1960">        int mask = 1&lt;&lt;(LG_AO_HAVE_XXX_FLAGS_HI+ctype);</span>
+<span class="nc bnc" id="L1961" title="All 5 branches missed.">        switch (ctype) {</span>
+        case ATTR_CONTEXT_CLASS:
+<span class="nc bnc" id="L1963" title="All 4 branches missed.">            assert(mask == AO_HAVE_CLASS_FLAGS_HI); break;</span>
+        case ATTR_CONTEXT_FIELD:
+<span class="nc bnc" id="L1965" title="All 4 branches missed.">            assert(mask == AO_HAVE_FIELD_FLAGS_HI); break;</span>
+        case ATTR_CONTEXT_METHOD:
+<span class="nc bnc" id="L1967" title="All 4 branches missed.">            assert(mask == AO_HAVE_METHOD_FLAGS_HI); break;</span>
+        case ATTR_CONTEXT_CODE:
+<span class="nc bnc" id="L1969" title="All 4 branches missed.">            assert(mask == AO_HAVE_CODE_FLAGS_HI); break;</span>
+        default:
+<span class="nc bnc" id="L1971" title="All 2 branches missed.">            assert(false);</span>
+        }
+<span class="nc" id="L1973">        return testBit(archiveOptions, mask);</span>
+    }
+
+    protected List&lt;Attribute.Layout&gt; getPredefinedAttrs(int ctype) {
+<span class="nc bnc" id="L1977" title="All 4 branches missed.">        assert(attrIndexLimit[ctype] != 0);</span>
+<span class="nc" id="L1978">        List&lt;Attribute.Layout&gt; res = new ArrayList&lt;&gt;(attrIndexLimit[ctype]);</span>
+        // Remove nulls and non-predefs.
+<span class="nc bnc" id="L1980" title="All 2 branches missed.">        for (int ai = 0; ai &lt; attrIndexLimit[ctype]; ai++) {</span>
+<span class="nc bnc" id="L1981" title="All 2 branches missed.">            if (testBit(attrDefSeen[ctype], 1L&lt;&lt;ai))  continue;</span>
+<span class="nc" id="L1982">            Attribute.Layout def = attrDefs.get(ctype).get(ai);</span>
+<span class="nc bnc" id="L1983" title="All 2 branches missed.">            if (def == null)  continue;  // unused flag bit</span>
+<span class="nc bnc" id="L1984" title="All 4 branches missed.">            assert(isPredefinedAttr(ctype, ai));</span>
+<span class="nc" id="L1985">            res.add(def);</span>
+        }
+<span class="nc" id="L1987">        return res;</span>
+    }
+
+    protected boolean isPredefinedAttr(int ctype, int ai) {
+<span class="nc bnc" id="L1991" title="All 4 branches missed.">        assert(attrIndexLimit[ctype] != 0);</span>
+        // Overflow attrs are never predefined.
+<span class="nc bnc" id="L1993" title="All 2 branches missed.">        if (ai &gt;= attrIndexLimit[ctype])          return false;</span>
+        // If the bit is set, it was explicitly def'd.
+<span class="nc bnc" id="L1995" title="All 2 branches missed.">        if (testBit(attrDefSeen[ctype], 1L&lt;&lt;ai))  return false;</span>
+<span class="nc bnc" id="L1996" title="All 2 branches missed.">        return (attrDefs.get(ctype).get(ai) != null);</span>
+    }
+
+    protected void adjustSpecialAttrMasks() {
+        // Clear special masks if new definitions have been seen for them.
+<span class="nc" id="L2001">        attrClassFileVersionMask &amp;= ~ attrDefSeen[ATTR_CONTEXT_CLASS];</span>
+        // It is possible to clear the overflow mask (bit 16).
+<span class="nc bnc" id="L2003" title="All 2 branches missed.">        for (int i = 0; i &lt; ATTR_CONTEXT_LIMIT; i++) {</span>
+<span class="nc" id="L2004">            attrOverflowMask[i] &amp;= ~ attrDefSeen[i];</span>
+        }
+<span class="nc" id="L2006">    }</span>
+
+    protected Attribute makeClassFileVersionAttr(Package.Version ver) {
+<span class="nc" id="L2009">        return attrClassFileVersion.addContent(ver.asBytes());</span>
+    }
+
+    protected Package.Version parseClassFileVersionAttr(Attribute attr) {
+<span class="nc bnc" id="L2013" title="All 4 branches missed.">        assert(attr.layout() == attrClassFileVersion);</span>
+<span class="nc bnc" id="L2014" title="All 4 branches missed.">        assert(attr.size() == 4);</span>
+<span class="nc" id="L2015">        return Package.Version.of(attr.bytes());</span>
+    }
+
+    private boolean assertBandOKForElems(Band[] ab, Attribute.Layout.Element[] elems) {
+<span class="nc bnc" id="L2019" title="All 2 branches missed.">        for (int i = 0; i &lt; elems.length; i++) {</span>
+<span class="nc bnc" id="L2020" title="All 4 branches missed.">            assert(assertBandOKForElem(ab, elems[i]));</span>
+        }
+<span class="nc" id="L2022">        return true;</span>
+    }
+    private boolean assertBandOKForElem(Band[] ab, Attribute.Layout.Element e) {
+<span class="nc" id="L2025">        Band b = null;</span>
+<span class="nc bnc" id="L2026" title="All 2 branches missed.">        if (e.bandIndex != Attribute.NO_BAND_INDEX)</span>
+<span class="nc" id="L2027">            b = ab[e.bandIndex];</span>
+<span class="nc" id="L2028">        Coding rc = UNSIGNED5;</span>
+<span class="nc" id="L2029">        boolean wantIntBand = true;</span>
+<span class="nc bnc" id="L2030" title="All 11 branches missed.">        switch (e.kind) {</span>
+        case Attribute.EK_INT:
+<span class="nc bnc" id="L2032" title="All 2 branches missed.">            if (e.flagTest(Attribute.EF_SIGN)) {</span>
+<span class="nc" id="L2033">                rc = SIGNED5;</span>
+<span class="nc bnc" id="L2034" title="All 2 branches missed.">            } else if (e.len == 1) {</span>
+<span class="nc" id="L2035">                rc = BYTE1;</span>
+            }
+            break;
+        case Attribute.EK_BCI:
+<span class="nc bnc" id="L2039" title="All 2 branches missed.">            if (!e.flagTest(Attribute.EF_DELTA)) {</span>
+<span class="nc" id="L2040">                rc = BCI5;</span>
+            } else {
+<span class="nc" id="L2042">                rc = BRANCH5;</span>
+            }
+<span class="nc" id="L2044">            break;</span>
+        case Attribute.EK_BCO:
+<span class="nc" id="L2046">            rc = BRANCH5;</span>
+<span class="nc" id="L2047">            break;</span>
+        case Attribute.EK_FLAG:
+<span class="nc bnc" id="L2049" title="All 2 branches missed.">            if (e.len == 1)  rc = BYTE1;</span>
+            break;
+        case Attribute.EK_REPL:
+<span class="nc bnc" id="L2052" title="All 2 branches missed.">            if (e.len == 1)  rc = BYTE1;</span>
+<span class="nc" id="L2053">            assertBandOKForElems(ab, e.body);</span>
+<span class="nc" id="L2054">            break;</span>
+        case Attribute.EK_UN:
+<span class="nc bnc" id="L2056" title="All 2 branches missed.">            if (e.flagTest(Attribute.EF_SIGN)) {</span>
+<span class="nc" id="L2057">                rc = SIGNED5;</span>
+<span class="nc bnc" id="L2058" title="All 2 branches missed.">            } else if (e.len == 1) {</span>
+<span class="nc" id="L2059">                rc = BYTE1;</span>
+            }
+<span class="nc" id="L2061">            assertBandOKForElems(ab, e.body);</span>
+<span class="nc" id="L2062">            break;</span>
+        case Attribute.EK_CASE:
+<span class="nc bnc" id="L2064" title="All 4 branches missed.">            assert(b == null);</span>
+<span class="nc" id="L2065">            assertBandOKForElems(ab, e.body);</span>
+<span class="nc" id="L2066">            return true;  // no direct band</span>
+        case Attribute.EK_CALL:
+<span class="nc bnc" id="L2068" title="All 4 branches missed.">            assert(b == null);</span>
+<span class="nc" id="L2069">            return true;  // no direct band</span>
+        case Attribute.EK_CBLE:
+<span class="nc bnc" id="L2071" title="All 4 branches missed.">            assert(b == null);</span>
+<span class="nc" id="L2072">            assertBandOKForElems(ab, e.body);</span>
+<span class="nc" id="L2073">            return true;  // no direct band</span>
+        case Attribute.EK_REF:
+<span class="nc" id="L2075">            wantIntBand = false;</span>
+<span class="nc bnc" id="L2076" title="All 4 branches missed.">            assert(b instanceof CPRefBand);</span>
+<span class="nc bnc" id="L2077" title="All 4 branches missed.">            assert(((CPRefBand)b).nullOK == e.flagTest(Attribute.EF_NULL));</span>
+            break;
+<span class="nc bnc" id="L2079" title="All 2 branches missed.">        default: assert(false);</span>
+        }
+<span class="nc bnc" id="L2081" title="All 4 branches missed.">        assert(b.regularCoding == rc)</span>
+            : (e+&quot; // &quot;+b);
+<span class="nc bnc" id="L2083" title="All 2 branches missed.">        if (wantIntBand)</span>
+<span class="nc bnc" id="L2084" title="All 4 branches missed.">            assert(b instanceof IntBand);</span>
+<span class="nc" id="L2085">        return true;</span>
+    }
+
+    private
+    Attribute.Layout predefineAttribute(int index, int ctype, Band[] ab,
+                                        String name, String layout) {
+        // Use Attribute.find to get uniquification of layouts.
+<span class="nc" id="L2092">        Attribute.Layout def = Attribute.find(ctype, name, layout).layout();</span>
+        //def.predef = true;
+<span class="nc bnc" id="L2094" title="All 2 branches missed.">        if (index &gt;= 0) {</span>
+<span class="nc" id="L2095">            setAttributeLayoutIndex(def, index);</span>
+        }
+<span class="nc bnc" id="L2097" title="All 2 branches missed.">        if (ab == null) {</span>
+<span class="nc" id="L2098">            ab = new Band[0];</span>
+        }
+<span class="nc bnc" id="L2100" title="All 4 branches missed.">        assert(attrBandTable.get(def) == null);  // no redef</span>
+<span class="nc" id="L2101">        attrBandTable.put(def, ab);</span>
+<span class="nc bnc" id="L2102" title="All 4 branches missed.">        assert(def.bandCount == ab.length)</span>
+<span class="nc" id="L2103">            : (def+&quot; // &quot;+Arrays.asList(ab));</span>
+        // Let's make sure the band types match:
+<span class="nc bnc" id="L2105" title="All 4 branches missed.">        assert(assertBandOKForElems(ab, def.elems));</span>
+<span class="nc" id="L2106">        return def;</span>
+    }
+
+    // This version takes bandPrefix/addHere instead of prebuilt Band[] ab.
+    private
+    Attribute.Layout predefineAttribute(int index,
+                                        String bandPrefix, MultiBand addHere,
+                                        Attribute attr) {
+        //Attribute.Layout def = Attribute.find(ctype, name, layout).layout();
+<span class="nc" id="L2115">        Attribute.Layout def = attr.layout();</span>
+<span class="nc" id="L2116">        int ctype = def.ctype();</span>
+<span class="nc" id="L2117">        return predefineAttribute(index, ctype,</span>
+<span class="nc" id="L2118">                                  makeNewAttributeBands(bandPrefix, def, addHere),</span>
+<span class="nc" id="L2119">                                  def.name(), def.layout());</span>
+    }
+
+    private
+    void undefineAttribute(int index, int ctype) {
+<span class="nc bnc" id="L2124" title="All 2 branches missed.">        if (verbose &gt; 1) {</span>
+<span class="nc" id="L2125">            System.out.println(&quot;Removing predefined &quot;+ATTR_CONTEXT_NAME[ctype]+</span>
+                               &quot; attribute on bit &quot;+index);
+        }
+<span class="nc" id="L2128">        List&lt;Attribute.Layout&gt; defList = attrDefs.get(ctype);</span>
+<span class="nc" id="L2129">        Attribute.Layout def = defList.get(index);</span>
+<span class="nc bnc" id="L2130" title="All 4 branches missed.">        assert(def != null);</span>
+<span class="nc" id="L2131">        defList.set(index, null);</span>
+<span class="nc" id="L2132">        attrIndexTable.put(def, null);</span>
+        // Clear the def bit.  (For predefs, it's already clear.)
+<span class="nc bnc" id="L2134" title="All 4 branches missed.">        assert(index &lt; 64);</span>
+<span class="nc" id="L2135">        attrDefSeen[ctype]  &amp;= ~(1L&lt;&lt;index);</span>
+<span class="nc" id="L2136">        attrFlagMask[ctype] &amp;= ~(1L&lt;&lt;index);</span>
+<span class="nc" id="L2137">        Band[] ab = attrBandTable.get(def);</span>
+<span class="nc bnc" id="L2138" title="All 2 branches missed.">        for (int j = 0; j &lt; ab.length; j++) {</span>
+<span class="nc" id="L2139">            ab[j].doneWithUnusedBand();</span>
+        }
+<span class="nc" id="L2141">    }</span>
+
+    // Bands which contain non-predefined attrs.
+<span class="nc" id="L2144">    protected MultiBand[] attrBands = new MultiBand[ATTR_CONTEXT_LIMIT];</span>
+    {
+<span class="nc" id="L2146">        attrBands[ATTR_CONTEXT_CLASS] = class_attr_bands;</span>
+<span class="nc" id="L2147">        attrBands[ATTR_CONTEXT_FIELD] = field_attr_bands;</span>
+<span class="nc" id="L2148">        attrBands[ATTR_CONTEXT_METHOD] = method_attr_bands;</span>
+<span class="nc" id="L2149">        attrBands[ATTR_CONTEXT_CODE] = code_attr_bands;</span>
+    }
+
+    // Create bands for all non-predefined attrs.
+    void makeNewAttributeBands() {
+        // Retract special flag bit bindings, if they were taken over.
+<span class="nc" id="L2155">        adjustSpecialAttrMasks();</span>
+
+<span class="nc bnc" id="L2157" title="All 2 branches missed.">        for (int ctype = 0; ctype &lt; ATTR_CONTEXT_LIMIT; ctype++) {</span>
+<span class="nc" id="L2158">            String cname = ATTR_CONTEXT_NAME[ctype];</span>
+<span class="nc" id="L2159">            MultiBand xxx_attr_bands = attrBands[ctype];</span>
+<span class="nc" id="L2160">            long defSeen = attrDefSeen[ctype];</span>
+            // Note: attrDefSeen is always a subset of attrFlagMask.
+<span class="nc bnc" id="L2162" title="All 4 branches missed.">            assert((defSeen &amp; ~attrFlagMask[ctype]) == 0);</span>
+<span class="nc bnc" id="L2163" title="All 2 branches missed.">            for (int i = 0; i &lt; attrDefs.get(ctype).size(); i++) {</span>
+<span class="nc" id="L2164">                Attribute.Layout def = attrDefs.get(ctype).get(i);</span>
+<span class="nc bnc" id="L2165" title="All 2 branches missed.">                if (def == null)  continue;  // unused flag bit</span>
+<span class="nc bnc" id="L2166" title="All 2 branches missed.">                if (def.bandCount == 0)  continue;  // empty attr</span>
+<span class="nc bnc" id="L2167" title="All 4 branches missed.">                if (i &lt; attrIndexLimit[ctype] &amp;&amp; !testBit(defSeen, 1L&lt;&lt;i)) {</span>
+                    // There are already predefined bands here.
+<span class="nc bnc" id="L2169" title="All 4 branches missed.">                    assert(attrBandTable.get(def) != null);</span>
+                    continue;
+                }
+<span class="nc" id="L2172">                int base = xxx_attr_bands.size();</span>
+<span class="nc" id="L2173">                String pfx = cname+&quot;_&quot;+def.name()+&quot;_&quot;;  // debug only</span>
+<span class="nc bnc" id="L2174" title="All 2 branches missed.">                if (verbose &gt; 1)</span>
+<span class="nc" id="L2175">                    Utils.log.fine(&quot;Making new bands for &quot;+def);</span>
+<span class="nc" id="L2176">                Band[] newAB  = makeNewAttributeBands(pfx, def,</span>
+                                                      xxx_attr_bands);
+<span class="nc bnc" id="L2178" title="All 4 branches missed.">                assert(newAB.length == def.bandCount);</span>
+<span class="nc" id="L2179">                Band[] prevAB = attrBandTable.put(def, newAB);</span>
+<span class="nc bnc" id="L2180" title="All 2 branches missed.">                if (prevAB != null) {</span>
+                    // We won't be using these predefined bands.
+<span class="nc bnc" id="L2182" title="All 2 branches missed.">                    for (int j = 0; j &lt; prevAB.length; j++) {</span>
+<span class="nc" id="L2183">                        prevAB[j].doneWithUnusedBand();</span>
+                    }
+                }
+            }
+        }
+        //System.out.println(prevForAssertMap);
+<span class="nc" id="L2189">    }</span>
+    private
+    Band[] makeNewAttributeBands(String pfx, Attribute.Layout def,
+                                 MultiBand addHere) {
+<span class="nc" id="L2193">        int base = addHere.size();</span>
+<span class="nc" id="L2194">        makeNewAttributeBands(pfx, def.elems, addHere);</span>
+<span class="nc" id="L2195">        int nb = addHere.size() - base;</span>
+<span class="nc" id="L2196">        Band[] newAB = new Band[nb];</span>
+<span class="nc bnc" id="L2197" title="All 2 branches missed.">        for (int i = 0; i &lt; nb; i++) {</span>
+<span class="nc" id="L2198">            newAB[i] = addHere.get(base+i);</span>
+        }
+<span class="nc" id="L2200">        return newAB;</span>
+    }
+    // Recursive helper, operates on a &quot;body&quot; or other sequence of elems:
+    private
+    void makeNewAttributeBands(String pfx, Attribute.Layout.Element[] elems,
+                               MultiBand ab) {
+<span class="nc bnc" id="L2206" title="All 2 branches missed.">        for (int i = 0; i &lt; elems.length; i++) {</span>
+<span class="nc" id="L2207">            Attribute.Layout.Element e = elems[i];</span>
+<span class="nc" id="L2208">            String name = pfx+ab.size()+&quot;_&quot;+e.layout;</span>
+            {
+                int tem;
+<span class="nc bnc" id="L2211" title="All 2 branches missed.">                if ((tem = name.indexOf('[')) &gt; 0)</span>
+<span class="nc" id="L2212">                    name = name.substring(0, tem);</span>
+<span class="nc bnc" id="L2213" title="All 2 branches missed.">                if ((tem = name.indexOf('(')) &gt; 0)</span>
+<span class="nc" id="L2214">                    name = name.substring(0, tem);</span>
+<span class="nc bnc" id="L2215" title="All 2 branches missed.">                if (name.endsWith(&quot;H&quot;))</span>
+<span class="nc" id="L2216">                    name = name.substring(0, name.length()-1);</span>
+            }
+            Band nb;
+<span class="nc bnc" id="L2219" title="All 11 branches missed.">            switch (e.kind) {</span>
+            case Attribute.EK_INT:
+<span class="nc" id="L2221">                nb = newElemBand(e, name, ab);</span>
+<span class="nc" id="L2222">                break;</span>
+            case Attribute.EK_BCI:
+<span class="nc bnc" id="L2224" title="All 2 branches missed.">                if (!e.flagTest(Attribute.EF_DELTA)) {</span>
+                    // PH:  transmit R(bci), store bci
+<span class="nc" id="L2226">                    nb = ab.newIntBand(name, BCI5);</span>
+                } else {
+                    // POH:  transmit D(R(bci)), store bci
+<span class="nc" id="L2229">                    nb = ab.newIntBand(name, BRANCH5);</span>
+                }
+                // Note:  No case for BYTE1 here.
+<span class="nc" id="L2232">                break;</span>
+            case Attribute.EK_BCO:
+                // OH:  transmit D(R(bci)), store D(bci)
+<span class="nc" id="L2235">                nb = ab.newIntBand(name, BRANCH5);</span>
+                // Note:  No case for BYTE1 here.
+<span class="nc" id="L2237">                break;</span>
+            case Attribute.EK_FLAG:
+<span class="nc bnc" id="L2239" title="All 4 branches missed.">                assert(!e.flagTest(Attribute.EF_SIGN));</span>
+<span class="nc" id="L2240">                nb = newElemBand(e, name, ab);</span>
+<span class="nc" id="L2241">                break;</span>
+            case Attribute.EK_REPL:
+<span class="nc bnc" id="L2243" title="All 4 branches missed.">                assert(!e.flagTest(Attribute.EF_SIGN));</span>
+<span class="nc" id="L2244">                nb = newElemBand(e, name, ab);</span>
+<span class="nc" id="L2245">                makeNewAttributeBands(pfx, e.body, ab);</span>
+<span class="nc" id="L2246">                break;</span>
+            case Attribute.EK_UN:
+<span class="nc" id="L2248">                nb = newElemBand(e, name, ab);</span>
+<span class="nc" id="L2249">                makeNewAttributeBands(pfx, e.body, ab);</span>
+<span class="nc" id="L2250">                break;</span>
+            case Attribute.EK_CASE:
+<span class="nc bnc" id="L2252" title="All 2 branches missed.">                if (!e.flagTest(Attribute.EF_BACK)) {</span>
+                    // If it's not a duplicate body, make the bands.
+<span class="nc" id="L2254">                    makeNewAttributeBands(pfx, e.body, ab);</span>
+                }
+                continue;  // no new band to make
+            case Attribute.EK_REF:
+<span class="nc" id="L2258">                byte    refKind = e.refKind;</span>
+<span class="nc" id="L2259">                boolean nullOK  = e.flagTest(Attribute.EF_NULL);</span>
+<span class="nc" id="L2260">                nb = ab.newCPRefBand(name, UNSIGNED5, refKind, nullOK);</span>
+                // Note:  No case for BYTE1 here.
+<span class="nc" id="L2262">                break;</span>
+            case Attribute.EK_CALL:
+<span class="nc" id="L2264">                continue;  // no new band to make</span>
+            case Attribute.EK_CBLE:
+<span class="nc" id="L2266">                makeNewAttributeBands(pfx, e.body, ab);</span>
+<span class="nc" id="L2267">                continue;  // no new band to make</span>
+<span class="nc bnc" id="L2268" title="All 2 branches missed.">            default: assert(false); continue;</span>
+            }
+<span class="nc bnc" id="L2270" title="All 2 branches missed.">            if (verbose &gt; 1) {</span>
+<span class="nc" id="L2271">                Utils.log.fine(&quot;New attribute band &quot;+nb);</span>
+            }
+        }
+<span class="nc" id="L2274">    }</span>
+    private
+    Band newElemBand(Attribute.Layout.Element e, String name, MultiBand ab) {
+<span class="nc bnc" id="L2277" title="All 2 branches missed.">        if (e.flagTest(Attribute.EF_SIGN)) {</span>
+<span class="nc" id="L2278">            return ab.newIntBand(name, SIGNED5);</span>
+<span class="nc bnc" id="L2279" title="All 2 branches missed.">        } else if (e.len == 1) {</span>
+<span class="nc" id="L2280">            return ab.newIntBand(name, BYTE1);  // Not ByteBand, please.</span>
+        } else {
+<span class="nc" id="L2282">            return ab.newIntBand(name, UNSIGNED5);</span>
+        }
+    }
+
+    protected int setAttributeLayoutIndex(Attribute.Layout def, int index) {
+<span class="nc" id="L2287">        int ctype = def.ctype;</span>
+<span class="nc bnc" id="L2288" title="All 6 branches missed.">        assert(ATTR_INDEX_OVERFLOW &lt;= index &amp;&amp; index &lt; attrIndexLimit[ctype]);</span>
+<span class="nc" id="L2289">        List&lt;Attribute.Layout&gt; defList = attrDefs.get(ctype);</span>
+<span class="nc bnc" id="L2290" title="All 2 branches missed.">        if (index == ATTR_INDEX_OVERFLOW) {</span>
+            // Overflow attribute.
+<span class="nc" id="L2292">            index = defList.size();</span>
+<span class="nc" id="L2293">            defList.add(def);</span>
+<span class="nc bnc" id="L2294" title="All 2 branches missed.">            if (verbose &gt; 0)</span>
+<span class="nc" id="L2295">                Utils.log.info(&quot;Adding new attribute at &quot;+def +&quot;: &quot;+index);</span>
+<span class="nc" id="L2296">            attrIndexTable.put(def, index);</span>
+<span class="nc" id="L2297">            return index;</span>
+        }
+
+        // Detect redefinitions:
+<span class="nc bnc" id="L2301" title="All 2 branches missed.">        if (testBit(attrDefSeen[ctype], 1L&lt;&lt;index)) {</span>
+<span class="nc" id="L2302">            throw new RuntimeException(&quot;Multiple explicit definition at &quot;+index+&quot;: &quot;+def);</span>
+        }
+<span class="nc" id="L2304">        attrDefSeen[ctype] |= (1L&lt;&lt;index);</span>
+
+        // Adding a new fixed attribute.
+<span class="nc bnc" id="L2307" title="All 6 branches missed.">        assert(0 &lt;= index &amp;&amp; index &lt; attrIndexLimit[ctype]);</span>
+<span class="nc bnc" id="L2308" title="All 4 branches missed.">        if (verbose &gt; (attrClassFileVersionMask == 0? 2:0))</span>
+<span class="nc" id="L2309">            Utils.log.fine(&quot;Fixing new attribute at &quot;+index</span>
+                               +&quot;: &quot;+def
+<span class="nc bnc" id="L2311" title="All 2 branches missed.">                               +(defList.get(index) == null? &quot;&quot;:</span>
+<span class="nc" id="L2312">                                 &quot;; replacing &quot;+defList.get(index)));</span>
+<span class="nc" id="L2313">        attrFlagMask[ctype] |= (1L&lt;&lt;index);</span>
+        // Remove index binding of any previous fixed attr.
+<span class="nc" id="L2315">        attrIndexTable.put(defList.get(index), null);</span>
+<span class="nc" id="L2316">        defList.set(index, def);</span>
+<span class="nc" id="L2317">        attrIndexTable.put(def, index);</span>
+<span class="nc" id="L2318">        return index;</span>
+    }
+
+    // encodings found in the code_headers band
+<span class="nc" id="L2322">    private static final int[][] shortCodeLimits = {</span>
+        { 12, 12 }, // s&lt;12, l&lt;12, e=0 [1..144]
+        {  8,  8 }, //  s&lt;8,  l&lt;8, e=1 [145..208]
+        {  7,  7 }, //  s&lt;7,  l&lt;7, e=2 [209..256]
+    };
+<span class="nc" id="L2327">    public final int shortCodeHeader_h_limit = shortCodeLimits.length;</span>
+
+    // return 0 if it won't encode, else a number in [1..255]
+    static int shortCodeHeader(Code code) {
+<span class="nc" id="L2331">        int s = code.max_stack;</span>
+<span class="nc" id="L2332">        int l0 = code.max_locals;</span>
+<span class="nc" id="L2333">        int h = code.handler_class.length;</span>
+<span class="nc bnc" id="L2334" title="All 2 branches missed.">        if (h &gt;= shortCodeLimits.length)  return LONG_CODE_HEADER;</span>
+<span class="nc" id="L2335">        int siglen = code.getMethod().getArgumentSize();</span>
+<span class="nc bnc" id="L2336" title="All 4 branches missed.">        assert(l0 &gt;= siglen);  // enough locals for signature!</span>
+<span class="nc bnc" id="L2337" title="All 2 branches missed.">        if (l0 &lt; siglen)  return LONG_CODE_HEADER;</span>
+<span class="nc" id="L2338">        int l1 = l0 - siglen;  // do not count locals required by the signature</span>
+<span class="nc" id="L2339">        int lims = shortCodeLimits[h][0];</span>
+<span class="nc" id="L2340">        int liml = shortCodeLimits[h][1];</span>
+<span class="nc bnc" id="L2341" title="All 4 branches missed.">        if (s &gt;= lims || l1 &gt;= liml)  return LONG_CODE_HEADER;</span>
+<span class="nc" id="L2342">        int sc = shortCodeHeader_h_base(h);</span>
+<span class="nc" id="L2343">        sc += s + lims*l1;</span>
+<span class="nc bnc" id="L2344" title="All 2 branches missed.">        if (sc &gt; 255)  return LONG_CODE_HEADER;</span>
+<span class="nc bnc" id="L2345" title="All 4 branches missed.">        assert(shortCodeHeader_max_stack(sc) == s);</span>
+<span class="nc bnc" id="L2346" title="All 4 branches missed.">        assert(shortCodeHeader_max_na_locals(sc) == l1);</span>
+<span class="nc bnc" id="L2347" title="All 4 branches missed.">        assert(shortCodeHeader_handler_count(sc) == h);</span>
+<span class="nc" id="L2348">        return sc;</span>
+    }
+
+    static final int LONG_CODE_HEADER = 0;
+    static int shortCodeHeader_handler_count(int sc) {
+<span class="nc bnc" id="L2353" title="All 6 branches missed.">        assert(sc &gt; 0 &amp;&amp; sc &lt;= 255);</span>
+<span class="nc" id="L2354">        for (int h = 0; ; h++) {</span>
+<span class="nc bnc" id="L2355" title="All 2 branches missed.">            if (sc &lt; shortCodeHeader_h_base(h+1))</span>
+<span class="nc" id="L2356">                return h;</span>
+        }
+    }
+    static int shortCodeHeader_max_stack(int sc) {
+<span class="nc" id="L2360">        int h = shortCodeHeader_handler_count(sc);</span>
+<span class="nc" id="L2361">        int lims = shortCodeLimits[h][0];</span>
+<span class="nc" id="L2362">        return (sc - shortCodeHeader_h_base(h)) % lims;</span>
+    }
+    static int shortCodeHeader_max_na_locals(int sc) {
+<span class="nc" id="L2365">        int h = shortCodeHeader_handler_count(sc);</span>
+<span class="nc" id="L2366">        int lims = shortCodeLimits[h][0];</span>
+<span class="nc" id="L2367">        return (sc - shortCodeHeader_h_base(h)) / lims;</span>
+    }
+
+    private static int shortCodeHeader_h_base(int h) {
+<span class="nc bnc" id="L2371" title="All 4 branches missed.">        assert(h &lt;= shortCodeLimits.length);</span>
+<span class="nc" id="L2372">        int sc = 1;</span>
+<span class="nc bnc" id="L2373" title="All 2 branches missed.">        for (int h0 = 0; h0 &lt; h; h0++) {</span>
+<span class="nc" id="L2374">            int lims = shortCodeLimits[h0][0];</span>
+<span class="nc" id="L2375">            int liml = shortCodeLimits[h0][1];</span>
+<span class="nc" id="L2376">            sc += lims * liml;</span>
+        }
+<span class="nc" id="L2378">        return sc;</span>
+    }
+
+    // utilities for accessing the bc_label band:
+    protected void putLabel(IntBand bc_label, Code c, int pc, int targetPC) {
+<span class="nc" id="L2383">        bc_label.putInt(c.encodeBCI(targetPC) - c.encodeBCI(pc));</span>
+<span class="nc" id="L2384">    }</span>
+    protected int getLabel(IntBand bc_label, Code c, int pc) {
+<span class="nc" id="L2386">        return c.decodeBCI(bc_label.getInt() + c.encodeBCI(pc));</span>
+    }
+
+    protected CPRefBand getCPRefOpBand(int bc) {
+<span class="nc bnc" id="L2390" title="All 7 branches missed.">        switch (Instruction.getCPRefOpTag(bc)) {</span>
+        case CONSTANT_Class:
+<span class="nc" id="L2392">            return bc_classref;</span>
+        case CONSTANT_Fieldref:
+<span class="nc" id="L2394">            return bc_fieldref;</span>
+        case CONSTANT_Methodref:
+<span class="nc" id="L2396">            return bc_methodref;</span>
+        case CONSTANT_InterfaceMethodref:
+<span class="nc" id="L2398">            return bc_imethodref;</span>
+        case CONSTANT_InvokeDynamic:
+<span class="nc" id="L2400">            return bc_indyref;</span>
+        case CONSTANT_LoadableValue:
+<span class="nc bnc" id="L2402" title="All 8 branches missed.">            switch (bc) {</span>
+            case _ildc: case _ildc_w:
+<span class="nc" id="L2404">                return bc_intref;</span>
+            case _fldc: case _fldc_w:
+<span class="nc" id="L2406">                return bc_floatref;</span>
+            case _lldc2_w:
+<span class="nc" id="L2408">                return bc_longref;</span>
+            case _dldc2_w:
+<span class="nc" id="L2410">                return bc_doubleref;</span>
+            case _sldc: case _sldc_w:
+<span class="nc" id="L2412">                return bc_stringref;</span>
+            case _cldc: case _cldc_w:
+<span class="nc" id="L2414">                return bc_classref;</span>
+            case _qldc: case _qldc_w:
+<span class="nc" id="L2416">                return bc_loadablevalueref;</span>
+            }
+            break;
+        }
+<span class="nc bnc" id="L2420" title="All 2 branches missed.">        assert(false);</span>
+<span class="nc" id="L2421">        return null;</span>
+    }
+
+    protected CPRefBand selfOpRefBand(int self_bc) {
+<span class="nc bnc" id="L2425" title="All 4 branches missed.">        assert(Instruction.isSelfLinkerOp(self_bc));</span>
+<span class="nc" id="L2426">        int idx = (self_bc - _self_linker_op);</span>
+<span class="nc bnc" id="L2427" title="All 2 branches missed.">        boolean isSuper = (idx &gt;= _self_linker_super_flag);</span>
+<span class="nc bnc" id="L2428" title="All 2 branches missed.">        if (isSuper)  idx -= _self_linker_super_flag;</span>
+<span class="nc bnc" id="L2429" title="All 2 branches missed.">        boolean isAload = (idx &gt;= _self_linker_aload_flag);</span>
+<span class="nc bnc" id="L2430" title="All 2 branches missed.">        if (isAload)  idx -= _self_linker_aload_flag;</span>
+<span class="nc" id="L2431">        int origBC = _first_linker_op + idx;</span>
+<span class="nc" id="L2432">        boolean isField = Instruction.isFieldOp(origBC);</span>
+<span class="nc bnc" id="L2433" title="All 2 branches missed.">        if (!isSuper)</span>
+<span class="nc bnc" id="L2434" title="All 2 branches missed.">            return isField? bc_thisfield: bc_thismethod;</span>
+        else
+<span class="nc bnc" id="L2436" title="All 2 branches missed.">            return isField? bc_superfield: bc_supermethod;</span>
+    }
+
+    ////////////////////////////////////////////////////////////////////
+
+    static int nextSeqForDebug;
+<span class="nc" id="L2442">    static File dumpDir = null;</span>
+    static OutputStream getDumpStream(Band b, String ext) throws IOException {
+<span class="nc" id="L2444">        return getDumpStream(b.name, b.seqForDebug, ext, b);</span>
+    }
+    static OutputStream getDumpStream(Index ix, String ext) throws IOException {
+<span class="nc bnc" id="L2447" title="All 2 branches missed.">        if (ix.size() == 0)  return new ByteArrayOutputStream();</span>
+<span class="nc" id="L2448">        int seq = ConstantPool.TAG_ORDER[ix.cpMap[0].tag];</span>
+<span class="nc" id="L2449">        return getDumpStream(ix.debugName, seq, ext, ix);</span>
+    }
+    static OutputStream getDumpStream(String name, int seq, String ext, Object b) throws IOException {
+<span class="nc bnc" id="L2452" title="All 2 branches missed.">        if (dumpDir == null) {</span>
+<span class="nc" id="L2453">            dumpDir = File.createTempFile(&quot;BD_&quot;, &quot;&quot;, new File(&quot;.&quot;));</span>
+<span class="nc" id="L2454">            dumpDir.delete();</span>
+<span class="nc bnc" id="L2455" title="All 2 branches missed.">            if (dumpDir.mkdir())</span>
+<span class="nc" id="L2456">                Utils.log.info(&quot;Dumping bands to &quot;+dumpDir);</span>
+        }
+<span class="nc" id="L2458">        name = name.replace('(', ' ').replace(')', ' ');</span>
+<span class="nc" id="L2459">        name = name.replace('/', ' ');</span>
+<span class="nc" id="L2460">        name = name.replace('*', ' ');</span>
+<span class="nc" id="L2461">        name = name.trim().replace(' ','_');</span>
+<span class="nc" id="L2462">        name = ((10000+seq) + &quot;_&quot; + name).substring(1);</span>
+<span class="nc" id="L2463">        File dumpFile = new File(dumpDir, name+ext);</span>
+<span class="nc" id="L2464">        Utils.log.info(&quot;Dumping &quot;+b+&quot; to &quot;+dumpFile);</span>
+<span class="nc" id="L2465">        return new BufferedOutputStream(new FileOutputStream(dumpFile));</span>
+    }
+
+    // DEBUG ONLY:  Validate me at each length change.
+    static boolean assertCanChangeLength(Band b) {
+<span class="nc bnc" id="L2470" title="All 2 branches missed.">        switch (b.phase) {</span>
+        case COLLECT_PHASE:
+        case READ_PHASE:
+<span class="nc" id="L2473">            return true;</span>
+        }
+<span class="nc" id="L2475">        return false;</span>
+    }
+
+    // DEBUG ONLY:  Validate a phase.
+    static boolean assertPhase(Band b, int phaseExpected) {
+<span class="nc bnc" id="L2480" title="All 2 branches missed.">        if (b.phase() != phaseExpected) {</span>
+<span class="nc" id="L2481">            Utils.log.warning(&quot;phase expected &quot;+phaseExpected+&quot; was &quot;+b.phase()+&quot; in &quot;+b);</span>
+<span class="nc" id="L2482">            return false;</span>
+        }
+<span class="nc" id="L2484">        return true;</span>
+    }
+
+
+    // DEBUG ONLY:  Tells whether verbosity is turned on.
+    static int verbose() {
+<span class="nc" id="L2490">        return Utils.currentPropMap().getInteger(Utils.DEBUG_VERBOSE);</span>
+    }
+
+
+    // DEBUG ONLY:  Validate me at each phase change.
+    static boolean assertPhaseChangeOK(Band b, int p0, int p1) {
+<span class="nc bnc" id="L2496" title="All 9 branches missed.">        switch (p0*10+p1) {</span>
+        /// Writing phases:
+        case NO_PHASE*10+COLLECT_PHASE:
+            // Ready to collect data from the input classes.
+<span class="nc bnc" id="L2500" title="All 4 branches missed.">            assert(!b.isReader());</span>
+<span class="nc bnc" id="L2501" title="All 4 branches missed.">            assert(b.capacity() &gt;= 0);</span>
+<span class="nc bnc" id="L2502" title="All 4 branches missed.">            assert(b.length() == 0);</span>
+<span class="nc" id="L2503">            return true;</span>
+        case COLLECT_PHASE*10+FROZEN_PHASE:
+        case FROZEN_PHASE*10+FROZEN_PHASE:
+<span class="nc bnc" id="L2506" title="All 4 branches missed.">            assert(b.length() == 0);</span>
+<span class="nc" id="L2507">            return true;</span>
+        case COLLECT_PHASE*10+WRITE_PHASE:
+        case FROZEN_PHASE*10+WRITE_PHASE:
+            // Data is all collected.  Ready to write bytes to disk.
+<span class="nc" id="L2511">            return true;</span>
+        case WRITE_PHASE*10+DONE_PHASE:
+            // Done writing to disk.  Ready to reset, in principle.
+<span class="nc" id="L2514">            return true;</span>
+
+        /// Reading phases:
+        case NO_PHASE*10+EXPECT_PHASE:
+<span class="nc bnc" id="L2518" title="All 4 branches missed.">            assert(b.isReader());</span>
+<span class="nc bnc" id="L2519" title="All 4 branches missed.">            assert(b.capacity() &lt; 0);</span>
+<span class="nc" id="L2520">            return true;</span>
+        case EXPECT_PHASE*10+READ_PHASE:
+            // Ready to read values from disk.
+<span class="nc bnc" id="L2523" title="All 4 branches missed.">            assert(Math.max(0,b.capacity()) &gt;= b.valuesExpected());</span>
+<span class="nc bnc" id="L2524" title="All 4 branches missed.">            assert(b.length() &lt;= 0);</span>
+<span class="nc" id="L2525">            return true;</span>
+        case READ_PHASE*10+DISBURSE_PHASE:
+            // Ready to disburse values.
+<span class="nc bnc" id="L2528" title="All 4 branches missed.">            assert(b.valuesRemainingForDebug() == b.length());</span>
+<span class="nc" id="L2529">            return true;</span>
+        case DISBURSE_PHASE*10+DONE_PHASE:
+            // Done disbursing values.  Ready to reset, in principle.
+<span class="nc bnc" id="L2532" title="All 4 branches missed.">            assert(assertDoneDisbursing(b));</span>
+<span class="nc" id="L2533">            return true;</span>
+        }
+<span class="nc bnc" id="L2535" title="All 2 branches missed.">        if (p0 == p1)</span>
+<span class="nc" id="L2536">            Utils.log.warning(&quot;Already in phase &quot;+p0);</span>
+        else
+<span class="nc" id="L2538">            Utils.log.warning(&quot;Unexpected phase &quot;+p0+&quot; -&gt; &quot;+p1);</span>
+<span class="nc" id="L2539">        return false;</span>
+    }
+
+    static private boolean assertDoneDisbursing(Band b) {
+<span class="nc bnc" id="L2543" title="All 2 branches missed.">        if (b.phase != DISBURSE_PHASE) {</span>
+<span class="nc" id="L2544">            Utils.log.warning(&quot;assertDoneDisbursing: still in phase &quot;+b.phase+&quot;: &quot;+b);</span>
+<span class="nc bnc" id="L2545" title="All 2 branches missed.">            if (verbose() &lt;= 1)  return false;  // fail now</span>
+        }
+<span class="nc" id="L2547">        int left = b.valuesRemainingForDebug();</span>
+<span class="nc bnc" id="L2548" title="All 2 branches missed.">        if (left &gt; 0) {</span>
+<span class="nc" id="L2549">            Utils.log.warning(&quot;assertDoneDisbursing: &quot;+left+&quot; values left in &quot;+b);</span>
+<span class="nc bnc" id="L2550" title="All 2 branches missed.">            if (verbose() &lt;= 1)  return false;  // fail now</span>
+        }
+<span class="nc bnc" id="L2552" title="All 2 branches missed.">        if (b instanceof MultiBand) {</span>
+<span class="nc" id="L2553">            MultiBand mb = (MultiBand) b;</span>
+<span class="nc bnc" id="L2554" title="All 2 branches missed.">            for (int i = 0; i &lt; mb.bandCount; i++) {</span>
+<span class="nc" id="L2555">                Band sub = mb.bands[i];</span>
+<span class="nc bnc" id="L2556" title="All 2 branches missed.">                if (sub.phase != DONE_PHASE) {</span>
+<span class="nc" id="L2557">                    Utils.log.warning(&quot;assertDoneDisbursing: sub-band still in phase &quot;+sub.phase+&quot;: &quot;+sub);</span>
+<span class="nc bnc" id="L2558" title="All 2 branches missed.">                    if (verbose() &lt;= 1)  return false;  // fail now</span>
+                }
+            }
+        }
+<span class="nc" id="L2562">        return true;</span>
+    }
+
+    static private void printCDecl(Band b) {
+<span class="nc bnc" id="L2566" title="All 2 branches missed.">        if (b instanceof MultiBand) {</span>
+<span class="nc" id="L2567">            MultiBand mb = (MultiBand) b;</span>
+<span class="nc bnc" id="L2568" title="All 2 branches missed.">            for (int i = 0; i &lt; mb.bandCount; i++) {</span>
+<span class="nc" id="L2569">                printCDecl(mb.bands[i]);</span>
+            }
+<span class="nc" id="L2571">            return;</span>
+        }
+<span class="nc" id="L2573">        String ixS = &quot;NULL&quot;;</span>
+<span class="nc bnc" id="L2574" title="All 2 branches missed.">        if (b instanceof CPRefBand) {</span>
+<span class="nc" id="L2575">            Index ix = ((CPRefBand)b).index;</span>
+<span class="nc bnc" id="L2576" title="All 2 branches missed.">            if (ix != null)  ixS = &quot;INDEX(&quot;+ix.debugName+&quot;)&quot;;</span>
+        }
+<span class="nc" id="L2578">        Coding[] knownc = { BYTE1, CHAR3, BCI5, BRANCH5, UNSIGNED5,</span>
+                            UDELTA5, SIGNED5, DELTA5, MDELTA5 };
+<span class="nc" id="L2580">        String[] knowns = { &quot;BYTE1&quot;, &quot;CHAR3&quot;, &quot;BCI5&quot;, &quot;BRANCH5&quot;, &quot;UNSIGNED5&quot;,</span>
+                            &quot;UDELTA5&quot;, &quot;SIGNED5&quot;, &quot;DELTA5&quot;, &quot;MDELTA5&quot; };
+<span class="nc" id="L2582">        Coding rc = b.regularCoding;</span>
+<span class="nc" id="L2583">        int rci = Arrays.asList(knownc).indexOf(rc);</span>
+        String cstr;
+<span class="nc bnc" id="L2585" title="All 2 branches missed.">        if (rci &gt;= 0)</span>
+<span class="nc" id="L2586">            cstr = knowns[rci];</span>
+        else
+<span class="nc" id="L2588">            cstr = &quot;CODING&quot;+rc.keyString();</span>
+<span class="nc" id="L2589">        System.out.println(&quot;  BAND_INIT(\&quot;&quot;+b.name()+&quot;\&quot;&quot;</span>
+                           +&quot;, &quot;+cstr+&quot;, &quot;+ixS+&quot;),&quot;);
+<span class="nc" id="L2591">    }</span>
+
+    private Map&lt;Band, Band&gt; prevForAssertMap;
+
+    // DEBUG ONLY:  Record something about the band order.
+    boolean notePrevForAssert(Band b, Band p) {
+<span class="nc bnc" id="L2597" title="All 2 branches missed.">        if (prevForAssertMap == null)</span>
+<span class="nc" id="L2598">            prevForAssertMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L2599">        prevForAssertMap.put(b, p);</span>
+<span class="nc" id="L2600">        return true;</span>
+    }
+
+    // DEBUG ONLY:  Validate next input band, ensure bands are read in sequence
+    private boolean assertReadyToReadFrom(Band b, InputStream in) throws IOException {
+<span class="nc" id="L2605">        Band p = prevForAssertMap.get(b);</span>
+        // Any previous band must be done reading before this one starts.
+<span class="nc bnc" id="L2607" title="All 4 branches missed.">        if (p != null &amp;&amp; phaseCmp(p.phase(), DISBURSE_PHASE) &lt; 0) {</span>
+<span class="nc" id="L2608">            Utils.log.warning(&quot;Previous band not done reading.&quot;);</span>
+<span class="nc" id="L2609">            Utils.log.info(&quot;    Previous band: &quot;+p);</span>
+<span class="nc" id="L2610">            Utils.log.info(&quot;        Next band: &quot;+b);</span>
+<span class="nc bnc" id="L2611" title="All 4 branches missed.">            assert(verbose &gt; 0);  // die unless verbose is true</span>
+        }
+<span class="nc" id="L2613">        String name = b.name;</span>
+<span class="nc bnc" id="L2614" title="All 4 branches missed.">        if (optDebugBands &amp;&amp; !name.startsWith(&quot;(&quot;)) {</span>
+<span class="nc bnc" id="L2615" title="All 4 branches missed.">            assert(bandSequenceList != null);</span>
+            // Verify synchronization between reader &amp; writer:
+<span class="nc" id="L2617">            String inName = bandSequenceList.removeFirst();</span>
+            // System.out.println(&quot;Reading: &quot; + name);
+<span class="nc bnc" id="L2619" title="All 2 branches missed.">            if (!inName.equals(name)) {</span>
+<span class="nc" id="L2620">                Utils.log.warning(&quot;Expected &quot; + name + &quot; but read: &quot; + inName);</span>
+<span class="nc" id="L2621">                return false;</span>
+            }
+<span class="nc" id="L2623">            Utils.log.info(&quot;Read band in sequence: &quot; + name);</span>
+        }
+<span class="nc" id="L2625">        return true;</span>
+    }
+
+    // DEBUG ONLY:  Make sure a bunch of cprefs are correct.
+    private boolean assertValidCPRefs(CPRefBand b) {
+<span class="nc bnc" id="L2630" title="All 2 branches missed.">        if (b.index == null)  return true;</span>
+<span class="nc" id="L2631">        int limit = b.index.size()+1;</span>
+<span class="nc bnc" id="L2632" title="All 2 branches missed.">        for (int i = 0; i &lt; b.length(); i++) {</span>
+<span class="nc" id="L2633">            int v = b.valueAtForDebug(i);</span>
+<span class="nc bnc" id="L2634" title="All 4 branches missed.">            if (v &lt; 0 || v &gt;= limit) {</span>
+<span class="nc" id="L2635">                Utils.log.warning(&quot;CP ref out of range &quot;+</span>
+                                   &quot;[&quot;+i+&quot;] = &quot;+v+&quot; in &quot;+b);
+<span class="nc" id="L2637">                return false;</span>
+            }
+        }
+<span class="nc" id="L2640">        return true;</span>
+    }
+
+    /*
+     * DEBUG ONLY:  write the bands to a list and read back the list in order,
+     * this works perfectly if we use the java packer and unpacker, typically
+     * this will work with --repack or if they are in the same jvm instance.
+     */
+<span class="nc" id="L2648">    static LinkedList&lt;String&gt; bandSequenceList = null;</span>
+    private boolean assertReadyToWriteTo(Band b, OutputStream out) throws IOException {
+<span class="nc" id="L2650">        Band p = prevForAssertMap.get(b);</span>
+        // Any previous band must be done writing before this one starts.
+<span class="nc bnc" id="L2652" title="All 4 branches missed.">        if (p != null &amp;&amp; phaseCmp(p.phase(), DONE_PHASE) &lt; 0) {</span>
+<span class="nc" id="L2653">            Utils.log.warning(&quot;Previous band not done writing.&quot;);</span>
+<span class="nc" id="L2654">            Utils.log.info(&quot;    Previous band: &quot;+p);</span>
+<span class="nc" id="L2655">            Utils.log.info(&quot;        Next band: &quot;+b);</span>
+<span class="nc bnc" id="L2656" title="All 4 branches missed.">            assert(verbose &gt; 0);  // die unless verbose is true</span>
+        }
+<span class="nc" id="L2658">        String name = b.name;</span>
+<span class="nc bnc" id="L2659" title="All 4 branches missed.">        if (optDebugBands &amp;&amp; !name.startsWith(&quot;(&quot;)) {</span>
+<span class="nc bnc" id="L2660" title="All 2 branches missed.">            if (bandSequenceList == null)</span>
+<span class="nc" id="L2661">                bandSequenceList = new LinkedList&lt;&gt;();</span>
+            // Verify synchronization between reader &amp; writer:
+<span class="nc" id="L2663">            bandSequenceList.add(name);</span>
+            // System.out.println(&quot;Writing: &quot; + b);
+        }
+<span class="nc" id="L2666">        return true;</span>
+    }
+
+    protected static boolean testBit(int flags, int bitMask) {
+<span class="nc bnc" id="L2670" title="All 2 branches missed.">        return (flags &amp; bitMask) != 0;</span>
+    }
+    protected static int setBit(int flags, int bitMask, boolean z) {
+<span class="nc bnc" id="L2673" title="All 2 branches missed.">        return z ? (flags | bitMask) : (flags &amp;~ bitMask);</span>
+    }
+    protected static boolean testBit(long flags, long bitMask) {
+<span class="nc bnc" id="L2676" title="All 2 branches missed.">        return (flags &amp; bitMask) != 0;</span>
+    }
+    protected static long setBit(long flags, long bitMask, boolean z) {
+<span class="nc bnc" id="L2679" title="All 2 branches missed.">        return z ? (flags | bitMask) : (flags &amp;~ bitMask);</span>
+    }
+
+
+    static void printArrayTo(PrintStream ps, int[] values, int start, int end) {
+<span class="nc" id="L2684">        int len = end-start;</span>
+<span class="nc bnc" id="L2685" title="All 2 branches missed.">        for (int i = 0; i &lt; len; i++) {</span>
+<span class="nc bnc" id="L2686" title="All 2 branches missed.">            if (i % 10 == 0)</span>
+<span class="nc" id="L2687">                ps.println();</span>
+            else
+<span class="nc" id="L2689">                ps.print(&quot; &quot;);</span>
+<span class="nc" id="L2690">            ps.print(values[start+i]);</span>
+        }
+<span class="nc" id="L2692">        ps.println();</span>
+<span class="nc" id="L2693">    }</span>
+
+    static void printArrayTo(PrintStream ps, Entry[] cpMap, int start, int end) {
+<span class="nc" id="L2696">        printArrayTo(ps, cpMap, start, end, false);</span>
+<span class="nc" id="L2697">    }</span>
+    static void printArrayTo(PrintStream ps, Entry[] cpMap, int start, int end, boolean showTags) {
+<span class="nc" id="L2699">        StringBuffer buf = new StringBuffer();</span>
+<span class="nc" id="L2700">        int len = end-start;</span>
+<span class="nc bnc" id="L2701" title="All 2 branches missed.">        for (int i = 0; i &lt; len; i++) {</span>
+<span class="nc" id="L2702">            Entry e = cpMap[start+i];</span>
+<span class="nc" id="L2703">            ps.print(start+i); ps.print(&quot;=&quot;);</span>
+<span class="nc bnc" id="L2704" title="All 2 branches missed.">            if (showTags) { ps.print(e.tag); ps.print(&quot;:&quot;); }</span>
+<span class="nc" id="L2705">            String s = e.stringValue();</span>
+<span class="nc" id="L2706">            buf.setLength(0);</span>
+<span class="nc bnc" id="L2707" title="All 2 branches missed.">            for (int j = 0; j &lt; s.length(); j++) {</span>
+<span class="nc" id="L2708">                char ch = s.charAt(j);</span>
+<span class="nc bnc" id="L2709" title="All 6 branches missed.">                if (!(ch &lt; ' ' || ch &gt; '~' || ch == '\\')) {</span>
+<span class="nc" id="L2710">                    buf.append(ch);</span>
+<span class="nc bnc" id="L2711" title="All 2 branches missed.">                } else if (ch == '\\') {</span>
+<span class="nc" id="L2712">                    buf.append(&quot;\\\\&quot;);</span>
+<span class="nc bnc" id="L2713" title="All 2 branches missed.">                } else if (ch == '\n') {</span>
+<span class="nc" id="L2714">                    buf.append(&quot;\\n&quot;);</span>
+<span class="nc bnc" id="L2715" title="All 2 branches missed.">                } else if (ch == '\t') {</span>
+<span class="nc" id="L2716">                    buf.append(&quot;\\t&quot;);</span>
+<span class="nc bnc" id="L2717" title="All 2 branches missed.">                } else if (ch == '\r') {</span>
+<span class="nc" id="L2718">                    buf.append(&quot;\\r&quot;);</span>
+                } else {
+<span class="nc" id="L2720">                    String str = &quot;000&quot;+Integer.toHexString(ch);</span>
+<span class="nc" id="L2721">                    buf.append(&quot;\\u&quot;).append(str.substring(str.length()-4));</span>
+                }
+            }
+<span class="nc" id="L2724">            ps.println(buf);</span>
+        }
+<span class="nc" id="L2726">    }</span>
+
+
+    // Utilities for reallocating:
+    protected static Object[] realloc(Object[] a, int len) {
+<span class="nc" id="L2731">        java.lang.Class&lt;?&gt; elt = a.getClass().getComponentType();</span>
+<span class="nc" id="L2732">        Object[] na = (Object[]) java.lang.reflect.Array.newInstance(elt, len);</span>
+<span class="nc" id="L2733">        System.arraycopy(a, 0, na, 0, Math.min(a.length, len));</span>
+<span class="nc" id="L2734">        return na;</span>
+    }
+    protected static Object[] realloc(Object[] a) {
+<span class="nc" id="L2737">        return realloc(a, Math.max(10, a.length*2));</span>
+    }
+
+    protected static int[] realloc(int[] a, int len) {
+<span class="nc bnc" id="L2741" title="All 2 branches missed.">        if (len == 0)  return noInts;</span>
+<span class="nc bnc" id="L2742" title="All 2 branches missed.">        if (a == null)  return new int[len];</span>
+<span class="nc" id="L2743">        int[] na = new int[len];</span>
+<span class="nc" id="L2744">        System.arraycopy(a, 0, na, 0, Math.min(a.length, len));</span>
+<span class="nc" id="L2745">        return na;</span>
+    }
+    protected static int[] realloc(int[] a) {
+<span class="nc" id="L2748">        return realloc(a, Math.max(10, a.length*2));</span>
+    }
+
+    protected static byte[] realloc(byte[] a, int len) {
+<span class="nc bnc" id="L2752" title="All 2 branches missed.">        if (len == 0)  return noBytes;</span>
+<span class="nc bnc" id="L2753" title="All 2 branches missed.">        if (a == null)  return new byte[len];</span>
+<span class="nc" id="L2754">        byte[] na = new byte[len];</span>
+<span class="nc" id="L2755">        System.arraycopy(a, 0, na, 0, Math.min(a.length, len));</span>
+<span class="nc" id="L2756">        return na;</span>
+    }
+    protected static byte[] realloc(byte[] a) {
+<span class="nc" id="L2759">        return realloc(a, Math.max(10, a.length*2));</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

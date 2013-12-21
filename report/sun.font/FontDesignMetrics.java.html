@@ -1,0 +1,591 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>FontDesignMetrics.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.font</a> &gt; <span class="el_source">FontDesignMetrics.java</span></div><h1>FontDesignMetrics.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1997, 2006, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.font;
+
+import java.lang.ref.ReferenceQueue;
+import java.lang.ref.SoftReference;
+
+import java.awt.FontMetrics;
+import java.awt.Font;
+import java.awt.GraphicsEnvironment;
+import java.awt.geom.AffineTransform;
+import java.awt.geom.NoninvertibleTransformException;
+import java.awt.font.FontRenderContext;
+import java.awt.font.TextLayout;
+
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+
+import java.util.concurrent.ConcurrentHashMap;
+
+import sun.java2d.Disposer;
+import sun.java2d.DisposerRecord;
+
+/*
+ * This class provides a summary of the glyph measurements  for a Font
+ * and a set of hints that guide their display.  It provides more metrics
+ * information for the Font than the java.awt.FontMetrics class. There
+ * is also some redundancy with that class.
+ * &lt;p&gt;
+ * The design metrics for a Font are obtained from Font.getDesignMetrics().
+ * The FontDesignMetrics object returned will be independent of the
+ * point size of the Font.
+ * Most users are familiar with the idea of using &lt;i&gt;point size&lt;/i&gt; to
+ * specify the size of glyphs in a font. This point size defines a
+ * measurement between the baseline of one line to the baseline of the
+ * following line in a single spaced text document. The point size is
+ * based on &lt;i&gt;typographic points&lt;/i&gt;, approximately 1/72 of an inch.
+ * &lt;p&gt;
+ * The Java2D API adopts the convention that one point is equivalent
+ * to one unit in user coordinates.  When using a normalized transform
+ * for converting user space coordinates to device space coordinates (see
+ * GraphicsConfiguration.getDefaultTransform() and
+ * GraphicsConfiguration.getNormalizingTransform()), 72 user space units
+ * equal 1 inch in device space.  In this case one point is 1/72 of an inch.
+ * &lt;p&gt;
+ * The FontDesignMetrics class expresses font metrics in terms of arbitrary
+ * &lt;i&gt;typographic units&lt;/i&gt; (not points) chosen by the font supplier
+ * and used in the underlying platform font representations.  These units are
+ * defined by dividing the em-square into a grid.  The em-sqaure is the
+ * theoretical square whose dimensions are the full body height of the
+ * font.  A typographic unit is the smallest measurable unit in the
+ * em-square.  The number of units-per-em is determined by the font
+ * designer.  The greater the units-per-em, the greater the precision
+ * in metrics.  For example, Type 1 fonts divide the em-square into a
+ * 1000 x 1000 grid, while TrueType fonts typically use a 2048 x 2048
+ * grid.  The scale of these units can be obtained by calling
+ * getUnitsPerEm().
+ * &lt;p&gt;
+ * Typographic units are relative -- their absolute size changes as the
+ * size of the of the em-square changes.  An em-square is 9 points high
+ * in a 9-point font.  Because typographic units are relative to the
+ * em-square, a given location on a glyph will have the same coordinates
+ * in typographic units regardless of the point size.
+ * &lt;p&gt;
+ * Converting typographic units to pixels requires computing pixels-per-em
+ * (ppem).  This can be computed as:
+ * &lt;pre&gt;
+         ppem = device_resolution * (inches-per-point) * pointSize
+ * &lt;/pre&gt;
+ * where device resolution could be measured in pixels/inch and the point
+ * size of a font is effectively points/em.  Using a normalized transform
+ * from user space to device space (see above), results in 1/72 inch/point.
+ * In this case, ppem is equal to the point size on a 72 dpi monitor, so
+ * that an N point font displays N pixels high.  In general,
+ * &lt;pre&gt;
+        pixel_units = typographic_units * (ppem / units_per_em)
+ * &lt;/pre&gt;
+ * @see java.awt.Font
+ * @see java.awt.GraphicsConfiguration#getDefaultTransform
+ * @see java.awt.GraphicsConfiguration#getNormalizingTransform
+ */
+
+public final class FontDesignMetrics extends FontMetrics {
+
+    static final long serialVersionUID = 4480069578560887773L;
+
+    private static final float UNKNOWN_WIDTH = -1;
+    private static final int CURRENT_VERSION = 1;
+
+    // height, ascent, descent, leading are reported to the client
+    // as an integer this value is added to the true fp value to
+    // obtain a value which is usually going to result in a round up
+    // to the next integer except for very marginal cases.
+<span class="nc" id="L118">    private static float roundingUpValue = 0.95f;</span>
+
+    // These fields are all part of the old serialization representation
+    private Font  font;
+    private float ascent;
+    private float descent;
+    private float leading;
+    private float maxAdvance;
+    private double[] matrix;
+    private int[] cache; // now unused, still here only for serialization
+    // End legacy serialization fields
+
+<span class="nc" id="L130">    private int serVersion = 0;  // If 1 in readObject, these fields are on the input stream:</span>
+    private boolean isAntiAliased;
+    private boolean usesFractionalMetrics;
+    private AffineTransform frcTx;
+
+    private transient float[] advCache; // transient since values could change across runtimes
+<span class="nc" id="L136">    private transient int height = -1;</span>
+
+    private transient FontRenderContext frc;
+
+<span class="nc" id="L140">    private transient double[] devmatrix = null;</span>
+
+    private transient FontStrike fontStrike;
+
+<span class="nc" id="L144">    private static FontRenderContext DEFAULT_FRC = null;</span>
+
+    private static FontRenderContext getDefaultFrc() {
+
+<span class="nc bnc" id="L148" title="All 2 branches missed.">        if (DEFAULT_FRC == null) {</span>
+            AffineTransform tx;
+<span class="nc bnc" id="L150" title="All 2 branches missed.">            if (GraphicsEnvironment.isHeadless()) {</span>
+<span class="nc" id="L151">                tx = new AffineTransform();</span>
+            } else {
+                tx =  GraphicsEnvironment
+<span class="nc" id="L154">                    .getLocalGraphicsEnvironment()</span>
+<span class="nc" id="L155">                    .getDefaultScreenDevice()</span>
+<span class="nc" id="L156">                    .getDefaultConfiguration()</span>
+<span class="nc" id="L157">                    .getDefaultTransform();</span>
+            }
+<span class="nc" id="L159">            DEFAULT_FRC = new FontRenderContext(tx, false, false);</span>
+        }
+<span class="nc" id="L161">        return DEFAULT_FRC;</span>
+    }
+
+    /* Strongly cache up to 5 most recently requested FontMetrics objects,
+     * and softly cache as many as GC allows. In practice this means we
+     * should keep references around until memory gets low.
+     * We key the cache either by a Font or a combination of the Font and
+     * and FRC. A lot of callers use only the font so although there's code
+     * duplication, we allow just a font to be a key implying a default FRC.
+     * Also we put the references on a queue so that if they do get nulled
+     * out we can clear the keys from the table.
+     */
+    private static class KeyReference extends SoftReference
+        implements DisposerRecord, Disposer.PollDisposable {
+
+<span class="nc" id="L176">        static ReferenceQueue queue = Disposer.getQueue();</span>
+
+        Object key;
+
+        KeyReference(Object key, Object value) {
+<span class="nc" id="L181">            super(value, queue);</span>
+<span class="nc" id="L182">            this.key = key;</span>
+<span class="nc" id="L183">            Disposer.addReference(this, this);</span>
+<span class="nc" id="L184">        }</span>
+
+        /* It is possible that since this reference object has been
+         * enqueued, that a new metrics has been put into the table
+         * for the same key value. So we'll test to see if the table maps
+         * to THIS reference. If its a new one, we'll leave it alone.
+         * It is possible that a new entry comes in after our test, but
+         * it is unlikely and if this were a problem we would need to
+         * synchronize all 'put' and 'remove' accesses to the cache which
+         * I would prefer not to do.
+         */
+        public void dispose() {
+<span class="nc bnc" id="L196" title="All 2 branches missed.">            if (metricsCache.get(key) == this) {</span>
+<span class="nc" id="L197">                metricsCache.remove(key);</span>
+            }
+<span class="nc" id="L199">        }</span>
+    }
+
+    private static class MetricsKey {
+        Font font;
+        FontRenderContext frc;
+        int hash;
+
+<span class="nc" id="L207">        MetricsKey() {</span>
+<span class="nc" id="L208">        }</span>
+
+<span class="nc" id="L210">        MetricsKey(Font font, FontRenderContext frc) {</span>
+<span class="nc" id="L211">            init(font, frc);</span>
+<span class="nc" id="L212">        }</span>
+
+        void init(Font font, FontRenderContext frc) {
+<span class="nc" id="L215">            this.font = font;</span>
+<span class="nc" id="L216">            this.frc = frc;</span>
+<span class="nc" id="L217">            this.hash = font.hashCode() + frc.hashCode();</span>
+<span class="nc" id="L218">        }</span>
+
+        public boolean equals(Object key) {
+<span class="nc bnc" id="L221" title="All 2 branches missed.">            if (!(key instanceof MetricsKey)) {</span>
+<span class="nc" id="L222">                return false;</span>
+            }
+<span class="nc" id="L224">            return</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">                font.equals(((MetricsKey)key).font) &amp;&amp;</span>
+<span class="nc bnc" id="L226" title="All 2 branches missed.">                frc.equals(((MetricsKey)key).frc);</span>
+        }
+
+        public int hashCode() {
+<span class="nc" id="L230">            return hash;</span>
+        }
+
+        /* Synchronize access to this on the class */
+<span class="nc" id="L234">        static final MetricsKey key = new MetricsKey();</span>
+    }
+
+    /* All accesses to a CHM do not in general need to be synchronized,
+     * as incomplete operations on another thread would just lead to
+     * harmless cache misses.
+     */
+    private static final ConcurrentHashMap&lt;Object, KeyReference&gt;
+<span class="nc" id="L242">        metricsCache = new ConcurrentHashMap&lt;Object, KeyReference&gt;();</span>
+
+    private static final int MAXRECENT = 5;
+    private static final FontDesignMetrics[]
+<span class="nc" id="L246">        recentMetrics = new FontDesignMetrics[MAXRECENT];</span>
+<span class="nc" id="L247">    private static int recentIndex = 0;</span>
+
+    public static FontDesignMetrics getMetrics(Font font) {
+<span class="nc" id="L250">        return getMetrics(font, getDefaultFrc());</span>
+     }
+
+    public static FontDesignMetrics getMetrics(Font font,
+                                               FontRenderContext frc) {
+
+
+        /* When using alternate composites, can't cache based just on
+         * the java.awt.Font. Since this is rarely used and we can still
+         * cache the physical fonts, its not a problem to just return a
+         * new instance in this case.
+         * Note that currently Swing native L&amp;F composites are not handled
+         * by this code as they use the metrics of the physical anyway.
+         */
+<span class="nc" id="L264">        SunFontManager fm = SunFontManager.getInstance();</span>
+<span class="nc bnc" id="L265" title="All 2 branches missed.">        if (fm.maybeUsingAlternateCompositeFonts() &amp;&amp;</span>
+<span class="nc bnc" id="L266" title="All 2 branches missed.">            FontUtilities.getFont2D(font) instanceof CompositeFont) {</span>
+<span class="nc" id="L267">            return new FontDesignMetrics(font, frc);</span>
+        }
+
+<span class="nc" id="L270">        FontDesignMetrics m = null;</span>
+        KeyReference r;
+
+        /* There are 2 possible keys used to perform lookups in metricsCache.
+         * If the FRC is set to all defaults, we just use the font as the key.
+         * If the FRC is non-default in any way, we construct a hybrid key
+         * that combines the font and FRC.
+         */
+<span class="nc" id="L278">        boolean usefontkey = frc.equals(getDefaultFrc());</span>
+
+<span class="nc bnc" id="L280" title="All 2 branches missed.">        if (usefontkey) {</span>
+<span class="nc" id="L281">            r = metricsCache.get(font);</span>
+        } else /* use hybrid key */ {
+            // NB synchronization is not needed here because of updates to
+            // the metrics cache but is needed for the shared key.
+<span class="nc" id="L285">            synchronized (MetricsKey.class) {</span>
+<span class="nc" id="L286">                MetricsKey.key.init(font, frc);</span>
+<span class="nc" id="L287">                r = metricsCache.get(MetricsKey.key);</span>
+<span class="nc" id="L288">            }</span>
+        }
+
+<span class="nc bnc" id="L291" title="All 2 branches missed.">        if (r != null) {</span>
+<span class="nc" id="L292">            m = (FontDesignMetrics)r.get();</span>
+        }
+
+<span class="nc bnc" id="L295" title="All 2 branches missed.">        if (m == null) {</span>
+            /* either there was no reference, or it was cleared. Need a new
+             * metrics instance. The key to use in the map is a new
+             * MetricsKey instance when we've determined the FRC is
+             * non-default. Its constructed from local vars so we are
+             * thread-safe - no need to worry about the shared key changing.
+             */
+<span class="nc" id="L302">            m = new FontDesignMetrics(font, frc);</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">            if (usefontkey) {</span>
+<span class="nc" id="L304">                metricsCache.put(font, new KeyReference(font, m));</span>
+            } else /* use hybrid key */ {
+<span class="nc" id="L306">                MetricsKey newKey = new MetricsKey(font, frc);</span>
+<span class="nc" id="L307">                metricsCache.put(newKey, new KeyReference(newKey, m));</span>
+            }
+        }
+
+        /* Here's where we keep the recent metrics */
+<span class="nc bnc" id="L312" title="All 2 branches missed.">        for (int i=0; i&lt;recentMetrics.length; i++) {</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">            if (recentMetrics[i]==m) {</span>
+<span class="nc" id="L314">                return m;</span>
+            }
+        }
+
+<span class="nc" id="L318">        synchronized (recentMetrics) {</span>
+<span class="nc" id="L319">            recentMetrics[recentIndex++] = m;</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">            if (recentIndex == MAXRECENT) {</span>
+<span class="nc" id="L321">                recentIndex = 0;</span>
+            }
+<span class="nc" id="L323">        }</span>
+<span class="nc" id="L324">        return m;</span>
+    }
+
+  /*
+   * Constructs a new FontDesignMetrics object for the given Font.
+   * Its private to enable caching - call getMetrics() instead.
+   * @param font a Font object.
+   */
+
+    private FontDesignMetrics(Font font) {
+
+<span class="nc" id="L335">        this(font, getDefaultFrc());</span>
+<span class="nc" id="L336">    }</span>
+
+    /* private to enable caching - call getMetrics() instead. */
+    private FontDesignMetrics(Font font, FontRenderContext frc) {
+<span class="nc" id="L340">      super(font);</span>
+<span class="nc" id="L341">      this.font = font;</span>
+<span class="nc" id="L342">      this.frc = frc;</span>
+
+<span class="nc" id="L344">      this.isAntiAliased = frc.isAntiAliased();</span>
+<span class="nc" id="L345">      this.usesFractionalMetrics = frc.usesFractionalMetrics();</span>
+
+<span class="nc" id="L347">      frcTx = frc.getTransform();</span>
+
+<span class="nc" id="L349">      matrix = new double[4];</span>
+<span class="nc" id="L350">      initMatrixAndMetrics();</span>
+
+<span class="nc" id="L352">      initAdvCache();</span>
+<span class="nc" id="L353">    }</span>
+
+    private void initMatrixAndMetrics() {
+
+<span class="nc" id="L357">        Font2D font2D = FontUtilities.getFont2D(font);</span>
+<span class="nc" id="L358">        fontStrike = font2D.getStrike(font, frc);</span>
+<span class="nc" id="L359">        StrikeMetrics metrics = fontStrike.getFontMetrics();</span>
+<span class="nc" id="L360">        this.ascent = metrics.getAscent();</span>
+<span class="nc" id="L361">        this.descent = metrics.getDescent();</span>
+<span class="nc" id="L362">        this.leading = metrics.getLeading();</span>
+<span class="nc" id="L363">        this.maxAdvance = metrics.getMaxAdvance();</span>
+
+<span class="nc" id="L365">        devmatrix = new double[4];</span>
+<span class="nc" id="L366">        frcTx.getMatrix(devmatrix);</span>
+<span class="nc" id="L367">    }</span>
+
+    private void initAdvCache() {
+<span class="nc" id="L370">        advCache = new float[256];</span>
+        // 0 is a valid metric so force it to -1
+<span class="nc bnc" id="L372" title="All 2 branches missed.">        for (int i = 0; i &lt; 256; i++) {</span>
+<span class="nc" id="L373">            advCache[i] = UNKNOWN_WIDTH;</span>
+        }
+<span class="nc" id="L375">    }</span>
+
+    private void readObject(ObjectInputStream in) throws IOException,
+                                                  ClassNotFoundException {
+
+<span class="nc" id="L380">        in.defaultReadObject();</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">        if (serVersion != CURRENT_VERSION) {</span>
+<span class="nc" id="L382">            frc = getDefaultFrc();</span>
+<span class="nc" id="L383">            isAntiAliased = frc.isAntiAliased();</span>
+<span class="nc" id="L384">            usesFractionalMetrics = frc.usesFractionalMetrics();</span>
+<span class="nc" id="L385">            frcTx = frc.getTransform();</span>
+        }
+        else {
+<span class="nc" id="L388">            frc = new FontRenderContext(frcTx, isAntiAliased, usesFractionalMetrics);</span>
+        }
+
+        // when deserialized, members are set to their default values for their type--
+        // not to the values assigned during initialization before the constructor
+        // body!
+<span class="nc" id="L394">        height = -1;</span>
+
+<span class="nc" id="L396">        cache = null;</span>
+
+<span class="nc" id="L398">        initMatrixAndMetrics();</span>
+<span class="nc" id="L399">        initAdvCache();</span>
+<span class="nc" id="L400">    }</span>
+
+    private void writeObject(ObjectOutputStream out) throws IOException {
+
+<span class="nc" id="L404">        cache = new int[256];</span>
+<span class="nc bnc" id="L405" title="All 2 branches missed.">        for (int i=0; i &lt; 256; i++) {</span>
+<span class="nc" id="L406">            cache[i] = -1;</span>
+        }
+<span class="nc" id="L408">        serVersion = CURRENT_VERSION;</span>
+
+<span class="nc" id="L410">        out.defaultWriteObject();</span>
+
+<span class="nc" id="L412">        cache = null;</span>
+<span class="nc" id="L413">    }</span>
+
+    private float handleCharWidth(int ch) {
+<span class="nc" id="L416">        return fontStrike.getCodePointAdvance(ch); // x-component of result only</span>
+    }
+
+    // Uses advCache to get character width
+    // It is incorrect to call this method for ch &gt; 255
+    private float getLatinCharWidth(char ch) {
+
+<span class="nc" id="L423">        float w = advCache[ch];</span>
+<span class="nc bnc" id="L424" title="All 2 branches missed.">        if (w == UNKNOWN_WIDTH) {</span>
+<span class="nc" id="L425">            w = handleCharWidth(ch);</span>
+<span class="nc" id="L426">            advCache[ch] = w;</span>
+        }
+<span class="nc" id="L428">        return w;</span>
+    }
+
+
+    /* Override of FontMetrics.getFontRenderContext() */
+    public FontRenderContext getFontRenderContext() {
+<span class="nc" id="L434">        return frc;</span>
+    }
+
+    public int charWidth(char ch) {
+        // default metrics for compatibility with legacy code
+        float w;
+<span class="nc bnc" id="L440" title="All 2 branches missed.">        if (ch &lt; 0x100) {</span>
+<span class="nc" id="L441">            w = getLatinCharWidth(ch);</span>
+        }
+        else {
+<span class="nc" id="L444">            w = handleCharWidth(ch);</span>
+        }
+<span class="nc" id="L446">        return (int)(0.5 + w);</span>
+    }
+
+    public int charWidth(int ch) {
+<span class="nc bnc" id="L450" title="All 2 branches missed.">        if (!Character.isValidCodePoint(ch)) {</span>
+<span class="nc" id="L451">            ch = 0xffff;</span>
+        }
+
+<span class="nc" id="L454">        float w = handleCharWidth(ch);</span>
+
+<span class="nc" id="L456">        return (int)(0.5 + w);</span>
+    }
+
+    public int stringWidth(String str) {
+
+<span class="nc" id="L461">        float width = 0;</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">        if (font.hasLayoutAttributes()) {</span>
+            /* TextLayout throws IAE for null, so throw NPE explicitly */
+<span class="nc bnc" id="L464" title="All 2 branches missed.">            if (str == null) {</span>
+<span class="nc" id="L465">                throw new NullPointerException(&quot;str is null&quot;);</span>
+            }
+<span class="nc bnc" id="L467" title="All 2 branches missed.">            if (str.length() == 0) {</span>
+<span class="nc" id="L468">                return 0;</span>
+            }
+<span class="nc" id="L470">            width = new TextLayout(str, font, frc).getAdvance();</span>
+        } else {
+<span class="nc" id="L472">            int length = str.length();</span>
+<span class="nc bnc" id="L473" title="All 2 branches missed.">            for (int i=0; i &lt; length; i++) {</span>
+<span class="nc" id="L474">                char ch = str.charAt(i);</span>
+<span class="nc bnc" id="L475" title="All 2 branches missed.">                if (ch &lt; 0x100) {</span>
+<span class="nc" id="L476">                    width += getLatinCharWidth(ch);</span>
+<span class="nc bnc" id="L477" title="All 2 branches missed.">                } else if (FontUtilities.isNonSimpleChar(ch)) {</span>
+<span class="nc" id="L478">                    width = new TextLayout(str, font, frc).getAdvance();</span>
+<span class="nc" id="L479">                    break;</span>
+                } else {
+<span class="nc" id="L481">                    width += handleCharWidth(ch);</span>
+                }
+            }
+        }
+
+<span class="nc" id="L486">        return (int) (0.5 + width);</span>
+    }
+
+    public int charsWidth(char data[], int off, int len) {
+
+<span class="nc" id="L491">        float width = 0;</span>
+<span class="nc bnc" id="L492" title="All 2 branches missed.">        if (font.hasLayoutAttributes()) {</span>
+<span class="nc bnc" id="L493" title="All 2 branches missed.">            if (len == 0) {</span>
+<span class="nc" id="L494">                return 0;</span>
+            }
+<span class="nc" id="L496">            String str = new String(data, off, len);</span>
+<span class="nc" id="L497">            width = new TextLayout(str, font, frc).getAdvance();</span>
+<span class="nc" id="L498">        } else {</span>
+            /* Explicit test needed to satisfy superclass spec */
+<span class="nc bnc" id="L500" title="All 2 branches missed.">            if (len &lt; 0) {</span>
+<span class="nc" id="L501">                throw new IndexOutOfBoundsException(&quot;len=&quot;+len);</span>
+            }
+<span class="nc" id="L503">            int limit = off + len;</span>
+<span class="nc bnc" id="L504" title="All 2 branches missed.">            for (int i=off; i &lt; limit; i++) {</span>
+<span class="nc" id="L505">                char ch = data[i];</span>
+<span class="nc bnc" id="L506" title="All 2 branches missed.">                if (ch &lt; 0x100) {</span>
+<span class="nc" id="L507">                    width += getLatinCharWidth(ch);</span>
+<span class="nc bnc" id="L508" title="All 2 branches missed.">                } else if (FontUtilities.isNonSimpleChar(ch)) {</span>
+<span class="nc" id="L509">                    String str = new String(data, off, len);</span>
+<span class="nc" id="L510">                    width = new TextLayout(str, font, frc).getAdvance();</span>
+<span class="nc" id="L511">                    break;</span>
+                } else {
+<span class="nc" id="L513">                    width += handleCharWidth(ch);</span>
+                }
+            }
+        }
+
+<span class="nc" id="L518">        return (int) (0.5 + width);</span>
+    }
+
+    /**
+     * Gets the advance widths of the first 256 characters in the
+     * &lt;code&gt;Font&lt;/code&gt;.  The advance is the
+     * distance from the leftmost point to the rightmost point on the
+     * character's baseline.  Note that the advance of a
+     * &lt;code&gt;String&lt;/code&gt; is not necessarily the sum of the advances
+     * of its characters.
+     * @return    an array storing the advance widths of the
+     *                 characters in the &lt;code&gt;Font&lt;/code&gt;
+     *                 described by this &lt;code&gt;FontMetrics&lt;/code&gt; object.
+     */
+    // More efficient than base class implementation - reuses existing cache
+    public int[] getWidths() {
+<span class="nc" id="L534">        int[] widths = new int[256];</span>
+<span class="nc bnc" id="L535" title="All 2 branches missed.">        for (char ch = 0 ; ch &lt; 256 ; ch++) {</span>
+<span class="nc" id="L536">            float w = advCache[ch];</span>
+<span class="nc bnc" id="L537" title="All 2 branches missed.">            if (w == UNKNOWN_WIDTH) {</span>
+<span class="nc" id="L538">                w = advCache[ch] = handleCharWidth(ch);</span>
+            }
+<span class="nc" id="L540">            widths[ch] = (int) (0.5 + w);</span>
+        }
+<span class="nc" id="L542">        return widths;</span>
+    }
+
+    public int getMaxAdvance() {
+<span class="nc" id="L546">        return (int)(0.99f + this.maxAdvance);</span>
+    }
+
+  /*
+   * Returns the typographic ascent of the font. This is the maximum distance
+   * glyphs in this font extend above the base line (measured in typographic
+   * units).
+   */
+    public int getAscent() {
+<span class="nc" id="L555">        return (int)(roundingUpValue + this.ascent);</span>
+    }
+
+  /*
+   * Returns the typographic descent of the font. This is the maximum distance
+   * glyphs in this font extend below the base line.
+   */
+    public int getDescent() {
+<span class="nc" id="L563">        return (int)(roundingUpValue + this.descent);</span>
+    }
+
+    public int getLeading() {
+        // nb this ensures the sum of the results of the public methods
+        // for leading, ascent &amp; descent sum to height.
+        // if the calculations in any other methods change this needs
+        // to be changed too.
+        // the 0.95 value used here and in the other methods allows some
+        // tiny fraction of leeway before rouding up. A higher value (0.99)
+        // caused some excessive rounding up.
+<span class="nc" id="L574">        return</span>
+            (int)(roundingUpValue + descent + leading) -
+            (int)(roundingUpValue + descent);
+    }
+
+    // height is calculated as the sum of two separately rounded up values
+    // because typically clients use ascent to determine the y location to
+    // pass to drawString etc and we need to ensure that the height has enough
+    // space below the baseline to fully contain any descender.
+    public int getHeight() {
+
+<span class="nc bnc" id="L585" title="All 2 branches missed.">        if (height &lt; 0) {</span>
+<span class="nc" id="L586">            height = getAscent() + (int)(roundingUpValue + descent + leading);</span>
+        }
+<span class="nc" id="L588">        return height;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

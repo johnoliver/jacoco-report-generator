@@ -1,0 +1,1542 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>DefaultMXBeanMappingFactory.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">com.sun.jmx.mbeanserver</a> &gt; <span class="el_source">DefaultMXBeanMappingFactory.java</span></div><h1>DefaultMXBeanMappingFactory.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2005, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package com.sun.jmx.mbeanserver;
+
+import static com.sun.jmx.mbeanserver.Util.*;
+import static com.sun.jmx.mbeanserver.MXBeanIntrospector.typeName;
+
+import static javax.management.openmbean.SimpleType.*;
+
+import com.sun.jmx.remote.util.EnvHelp;
+
+import java.io.InvalidObjectException;
+import java.lang.annotation.Annotation;
+import java.lang.annotation.ElementType;
+import java.lang.ref.WeakReference;
+import java.lang.reflect.Array;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.GenericArrayType;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Proxy;
+import java.lang.reflect.Type;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.BitSet;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.SortedMap;
+import java.util.SortedSet;
+import java.util.TreeSet;
+import java.util.WeakHashMap;
+
+import javax.management.JMX;
+import javax.management.ObjectName;
+import javax.management.openmbean.ArrayType;
+import javax.management.openmbean.CompositeData;
+import javax.management.openmbean.CompositeDataInvocationHandler;
+import javax.management.openmbean.CompositeDataSupport;
+import javax.management.openmbean.CompositeDataView;
+import javax.management.openmbean.CompositeType;
+import javax.management.openmbean.OpenDataException;
+import javax.management.openmbean.OpenType;
+import javax.management.openmbean.SimpleType;
+import javax.management.openmbean.TabularData;
+import javax.management.openmbean.TabularDataSupport;
+import javax.management.openmbean.TabularType;
+import sun.reflect.misc.MethodUtil;
+import sun.reflect.misc.ReflectUtil;
+
+/**
+ *   &lt;p&gt;A converter between Java types and the limited set of classes
+ *   defined by Open MBeans.&lt;/p&gt;
+ *
+ *   &lt;p&gt;A Java type is an instance of java.lang.reflect.Type.  For our
+ *   purposes, it is either a Class, such as String.class or int.class;
+ *   or a ParameterizedType, such as List&lt;String&gt; or Map&lt;Integer,
+ *   String[]&gt;.  On J2SE 1.4 and earlier, it can only be a Class.&lt;/p&gt;
+ *
+ *   &lt;p&gt;Each Type is associated with an DefaultMXBeanMappingFactory.  The
+ *   DefaultMXBeanMappingFactory defines an OpenType corresponding to the Type, plus a
+ *   Java class corresponding to the OpenType.  For example:&lt;/p&gt;
+ *
+ *   &lt;pre&gt;
+ *   Type                     Open class     OpenType
+ *   ----                     ----------     --------
+ *   Integer                Integer        SimpleType.INTEGER
+ *   int                            int            SimpleType.INTEGER
+ *   Integer[]              Integer[]      ArrayType(1, SimpleType.INTEGER)
+ *   int[]                  Integer[]      ArrayType(SimpleType.INTEGER, true)
+ *   String[][]             String[][]     ArrayType(2, SimpleType.STRING)
+ *   List&lt;String&gt;                   String[]       ArrayType(1, SimpleType.STRING)
+ *   ThreadState (an Enum)    String         SimpleType.STRING
+ *   Map&lt;Integer, String[]&gt;   TabularData          TabularType(
+ *                                           CompositeType(
+ *                                             {&quot;key&quot;, SimpleType.INTEGER},
+ *                                             {&quot;value&quot;,
+ *                                               ArrayType(1,
+ *                                                SimpleType.STRING)}),
+ *                                           indexNames={&quot;key&quot;})
+ *   &lt;/pre&gt;
+ *
+ *   &lt;p&gt;Apart from simple types, arrays, and collections, Java types are
+ *   converted through introspection into CompositeType.  The Java type
+ *   must have at least one getter (method such as &quot;int getSize()&quot; or
+ *   &quot;boolean isBig()&quot;), and we must be able to deduce how to
+ *   reconstruct an instance of the Java class from the values of the
+ *   getters using one of various heuristics.&lt;/p&gt;
+ *
+ * @since 1.6
+ */
+<span class="nc bnc" id="L121" title="All 2 branches missed.">public class DefaultMXBeanMappingFactory extends MXBeanMappingFactory {</span>
+    static abstract class NonNullMXBeanMapping extends MXBeanMapping {
+        NonNullMXBeanMapping(Type javaType, OpenType&lt;?&gt; openType) {
+<span class="nc" id="L124">            super(javaType, openType);</span>
+<span class="nc" id="L125">        }</span>
+
+        @Override
+        public final Object fromOpenValue(Object openValue)
+        throws InvalidObjectException {
+<span class="nc bnc" id="L130" title="All 2 branches missed.">            if (openValue == null)</span>
+<span class="nc" id="L131">                return null;</span>
+            else
+<span class="nc" id="L133">                return fromNonNullOpenValue(openValue);</span>
+        }
+
+        @Override
+        public final Object toOpenValue(Object javaValue) throws OpenDataException {
+<span class="nc bnc" id="L138" title="All 2 branches missed.">            if (javaValue == null)</span>
+<span class="nc" id="L139">                return null;</span>
+            else
+<span class="nc" id="L141">                return toNonNullOpenValue(javaValue);</span>
+        }
+
+        abstract Object fromNonNullOpenValue(Object openValue)
+        throws InvalidObjectException;
+
+        abstract Object toNonNullOpenValue(Object javaValue)
+        throws OpenDataException;
+
+        /**
+         * &lt;p&gt;True if and only if this MXBeanMapping's toOpenValue and
+         * fromOpenValue methods are the identity function.&lt;/p&gt;
+         */
+        boolean isIdentity() {
+<span class="nc" id="L155">            return false;</span>
+        }
+    }
+
+    static boolean isIdentity(MXBeanMapping mapping) {
+<span class="nc bnc" id="L160" title="All 2 branches missed.">        return (mapping instanceof NonNullMXBeanMapping &amp;&amp;</span>
+<span class="nc bnc" id="L161" title="All 2 branches missed.">                ((NonNullMXBeanMapping) mapping).isIdentity());</span>
+    }
+
+<span class="nc" id="L164">    private static final class Mappings</span>
+        extends WeakHashMap&lt;Type, WeakReference&lt;MXBeanMapping&gt;&gt; {}
+
+<span class="nc" id="L167">    private static final Mappings mappings = new Mappings();</span>
+
+    /** Following List simply serves to keep a reference to predefined
+        MXBeanMappings so they don't get garbage collected. */
+<span class="nc" id="L171">    private static final List&lt;MXBeanMapping&gt; permanentMappings = newList();</span>
+
+    private static synchronized MXBeanMapping getMapping(Type type) {
+<span class="nc" id="L174">        WeakReference&lt;MXBeanMapping&gt; wr = mappings.get(type);</span>
+<span class="nc bnc" id="L175" title="All 2 branches missed.">        return (wr == null) ? null : wr.get();</span>
+    }
+
+    private static synchronized void putMapping(Type type, MXBeanMapping mapping) {
+<span class="nc" id="L179">        WeakReference&lt;MXBeanMapping&gt; wr =</span>
+            new WeakReference&lt;MXBeanMapping&gt;(mapping);
+<span class="nc" id="L181">        mappings.put(type, wr);</span>
+<span class="nc" id="L182">    }</span>
+
+    private static synchronized void putPermanentMapping(
+            Type type, MXBeanMapping mapping) {
+<span class="nc" id="L186">        putMapping(type, mapping);</span>
+<span class="nc" id="L187">        permanentMappings.add(mapping);</span>
+<span class="nc" id="L188">    }</span>
+
+    static {
+        /* Set up the mappings for Java types that map to SimpleType.  */
+
+<span class="nc" id="L193">        final OpenType&lt;?&gt;[] simpleTypes = {</span>
+            BIGDECIMAL, BIGINTEGER, BOOLEAN, BYTE, CHARACTER, DATE,
+            DOUBLE, FLOAT, INTEGER, LONG, OBJECTNAME, SHORT, STRING,
+            VOID,
+        };
+
+<span class="nc bnc" id="L199" title="All 2 branches missed.">        for (int i = 0; i &lt; simpleTypes.length; i++) {</span>
+<span class="nc" id="L200">            final OpenType&lt;?&gt; t = simpleTypes[i];</span>
+            Class&lt;?&gt; c;
+            try {
+<span class="nc" id="L203">                c = Class.forName(t.getClassName(), false,</span>
+<span class="nc" id="L204">                                  ObjectName.class.getClassLoader());</span>
+<span class="nc" id="L205">            } catch (ClassNotFoundException e) {</span>
+                // the classes that these predefined types declare must exist!
+<span class="nc" id="L207">                throw new Error(e);</span>
+<span class="nc" id="L208">            }</span>
+<span class="nc" id="L209">            final MXBeanMapping mapping = new IdentityMapping(c, t);</span>
+<span class="nc" id="L210">            putPermanentMapping(c, mapping);</span>
+
+<span class="nc bnc" id="L212" title="All 2 branches missed.">            if (c.getName().startsWith(&quot;java.lang.&quot;)) {</span>
+                try {
+<span class="nc" id="L214">                    final Field typeField = c.getField(&quot;TYPE&quot;);</span>
+<span class="nc" id="L215">                    final Class&lt;?&gt; primitiveType = (Class&lt;?&gt;) typeField.get(null);</span>
+<span class="nc" id="L216">                    final MXBeanMapping primitiveMapping =</span>
+                        new IdentityMapping(primitiveType, t);
+<span class="nc" id="L218">                    putPermanentMapping(primitiveType, primitiveMapping);</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">                    if (primitiveType != void.class) {</span>
+<span class="nc" id="L220">                        final Class&lt;?&gt; primitiveArrayType =</span>
+<span class="nc" id="L221">                            Array.newInstance(primitiveType, 0).getClass();</span>
+<span class="nc" id="L222">                        final OpenType&lt;?&gt; primitiveArrayOpenType =</span>
+<span class="nc" id="L223">                            ArrayType.getPrimitiveArrayType(primitiveArrayType);</span>
+<span class="nc" id="L224">                        final MXBeanMapping primitiveArrayMapping =</span>
+                            new IdentityMapping(primitiveArrayType,
+                                                primitiveArrayOpenType);
+<span class="nc" id="L227">                        putPermanentMapping(primitiveArrayType,</span>
+                                            primitiveArrayMapping);
+                    }
+<span class="nc" id="L230">                } catch (NoSuchFieldException e) {</span>
+                    // OK: must not be a primitive wrapper
+<span class="nc" id="L232">                } catch (IllegalAccessException e) {</span>
+                    // Should not reach here
+<span class="nc bnc" id="L234" title="All 2 branches missed.">                    assert(false);</span>
+<span class="nc" id="L235">                }</span>
+            }
+        }
+    }
+
+    /** Get the converter for the given Java type, creating it if necessary. */
+    @Override
+    public synchronized MXBeanMapping mappingForType(Type objType,
+                                                     MXBeanMappingFactory factory)
+            throws OpenDataException {
+<span class="nc bnc" id="L245" title="All 2 branches missed.">        if (inProgress.containsKey(objType)) {</span>
+<span class="nc" id="L246">            throw new OpenDataException(</span>
+<span class="nc" id="L247">                    &quot;Recursive data structure, including &quot; + typeName(objType));</span>
+        }
+
+        MXBeanMapping mapping;
+
+<span class="nc" id="L252">        mapping = getMapping(objType);</span>
+<span class="nc bnc" id="L253" title="All 2 branches missed.">        if (mapping != null)</span>
+<span class="nc" id="L254">            return mapping;</span>
+
+<span class="nc" id="L256">        inProgress.put(objType, objType);</span>
+        try {
+<span class="nc" id="L258">            mapping = makeMapping(objType, factory);</span>
+<span class="nc" id="L259">        } catch (OpenDataException e) {</span>
+<span class="nc" id="L260">            throw openDataException(&quot;Cannot convert type: &quot; + typeName(objType), e);</span>
+        } finally {
+<span class="nc" id="L262">            inProgress.remove(objType);</span>
+<span class="nc" id="L263">        }</span>
+
+<span class="nc" id="L265">        putMapping(objType, mapping);</span>
+<span class="nc" id="L266">        return mapping;</span>
+    }
+
+    private MXBeanMapping makeMapping(Type objType, MXBeanMappingFactory factory)
+    throws OpenDataException {
+
+        /* It's not yet worth formalizing these tests by having for example
+           an array of factory classes, each of which says whether it
+           recognizes the Type (Chain of Responsibility pattern).  */
+<span class="nc bnc" id="L275" title="All 2 branches missed.">        if (objType instanceof GenericArrayType) {</span>
+<span class="nc" id="L276">            Type componentType =</span>
+<span class="nc" id="L277">                ((GenericArrayType) objType).getGenericComponentType();</span>
+<span class="nc" id="L278">            return makeArrayOrCollectionMapping(objType, componentType, factory);</span>
+<span class="nc bnc" id="L279" title="All 2 branches missed.">        } else if (objType instanceof Class&lt;?&gt;) {</span>
+<span class="nc" id="L280">            Class&lt;?&gt; objClass = (Class&lt;?&gt;) objType;</span>
+<span class="nc bnc" id="L281" title="All 2 branches missed.">            if (objClass.isEnum()) {</span>
+                // Huge hack to avoid compiler warnings here.  The ElementType
+                // parameter is ignored but allows us to obtain a type variable
+                // T that matches &lt;T extends Enum&lt;T&gt;&gt;.
+<span class="nc" id="L285">                return makeEnumMapping((Class&lt;?&gt;) objClass, ElementType.class);</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">            } else if (objClass.isArray()) {</span>
+<span class="nc" id="L287">                Type componentType = objClass.getComponentType();</span>
+<span class="nc" id="L288">                return makeArrayOrCollectionMapping(objClass, componentType,</span>
+                        factory);
+<span class="nc bnc" id="L290" title="All 2 branches missed.">            } else if (JMX.isMXBeanInterface(objClass)) {</span>
+<span class="nc" id="L291">                return makeMXBeanRefMapping(objClass);</span>
+            } else {
+<span class="nc" id="L293">                return makeCompositeMapping(objClass, factory);</span>
+            }
+<span class="nc bnc" id="L295" title="All 2 branches missed.">        } else if (objType instanceof ParameterizedType) {</span>
+<span class="nc" id="L296">            return makeParameterizedTypeMapping((ParameterizedType) objType,</span>
+                                                factory);
+        } else
+<span class="nc" id="L299">            throw new OpenDataException(&quot;Cannot map type: &quot; + objType);</span>
+    }
+
+    private static &lt;T extends Enum&lt;T&gt;&gt; MXBeanMapping
+            makeEnumMapping(Class&lt;?&gt; enumClass, Class&lt;T&gt; fake) {
+<span class="nc" id="L304">        ReflectUtil.checkPackageAccess(enumClass);</span>
+<span class="nc" id="L305">        return new EnumMapping&lt;T&gt;(Util.&lt;Class&lt;T&gt;&gt;cast(enumClass));</span>
+    }
+
+    /* Make the converter for an array type, or a collection such as
+     * List&lt;String&gt; or Set&lt;Integer&gt;.  We never see one-dimensional
+     * primitive arrays (e.g. int[]) here because they use the identity
+     * converter and are registered as such in the static initializer.
+     */
+    private MXBeanMapping
+        makeArrayOrCollectionMapping(Type collectionType, Type elementType,
+                                     MXBeanMappingFactory factory)
+            throws OpenDataException {
+
+<span class="nc" id="L318">        final MXBeanMapping elementMapping = factory.mappingForType(elementType, factory);</span>
+<span class="nc" id="L319">        final OpenType&lt;?&gt; elementOpenType = elementMapping.getOpenType();</span>
+<span class="nc" id="L320">        final ArrayType&lt;?&gt; openType = ArrayType.getArrayType(elementOpenType);</span>
+<span class="nc" id="L321">        final Class&lt;?&gt; elementOpenClass = elementMapping.getOpenClass();</span>
+
+        final Class&lt;?&gt; openArrayClass;
+        final String openArrayClassName;
+<span class="nc bnc" id="L325" title="All 2 branches missed.">        if (elementOpenClass.isArray())</span>
+<span class="nc" id="L326">            openArrayClassName = &quot;[&quot; + elementOpenClass.getName();</span>
+        else
+<span class="nc" id="L328">            openArrayClassName = &quot;[L&quot; + elementOpenClass.getName() + &quot;;&quot;;</span>
+        try {
+<span class="nc" id="L330">            openArrayClass = Class.forName(openArrayClassName);</span>
+<span class="nc" id="L331">        } catch (ClassNotFoundException e) {</span>
+<span class="nc" id="L332">            throw openDataException(&quot;Cannot obtain array class&quot;, e);</span>
+<span class="nc" id="L333">        }</span>
+
+<span class="nc bnc" id="L335" title="All 2 branches missed.">        if (collectionType instanceof ParameterizedType) {</span>
+<span class="nc" id="L336">            return new CollectionMapping(collectionType,</span>
+                                         openType, openArrayClass,
+                                         elementMapping);
+        } else {
+<span class="nc bnc" id="L340" title="All 2 branches missed.">            if (isIdentity(elementMapping)) {</span>
+<span class="nc" id="L341">                return new IdentityMapping(collectionType,</span>
+                                           openType);
+            } else {
+<span class="nc" id="L344">                return new ArrayMapping(collectionType,</span>
+                                          openType,
+                                          openArrayClass,
+                                          elementMapping);
+            }
+        }
+    }
+
+<span class="nc" id="L352">    private static final String[] keyArray = {&quot;key&quot;};</span>
+<span class="nc" id="L353">    private static final String[] keyValueArray = {&quot;key&quot;, &quot;value&quot;};</span>
+
+    private MXBeanMapping
+        makeTabularMapping(Type objType, boolean sortedMap,
+                           Type keyType, Type valueType,
+                           MXBeanMappingFactory factory)
+            throws OpenDataException {
+
+<span class="nc" id="L361">        final String objTypeName = typeName(objType);</span>
+<span class="nc" id="L362">        final MXBeanMapping keyMapping = factory.mappingForType(keyType, factory);</span>
+<span class="nc" id="L363">        final MXBeanMapping valueMapping = factory.mappingForType(valueType, factory);</span>
+<span class="nc" id="L364">        final OpenType&lt;?&gt; keyOpenType = keyMapping.getOpenType();</span>
+<span class="nc" id="L365">        final OpenType&lt;?&gt; valueOpenType = valueMapping.getOpenType();</span>
+<span class="nc" id="L366">        final CompositeType rowType =</span>
+            new CompositeType(objTypeName,
+                              objTypeName,
+                              keyValueArray,
+                              keyValueArray,
+                              new OpenType&lt;?&gt;[] {keyOpenType, valueOpenType});
+<span class="nc" id="L372">        final TabularType tabularType =</span>
+            new TabularType(objTypeName, objTypeName, rowType, keyArray);
+<span class="nc" id="L374">        return new TabularMapping(objType, sortedMap, tabularType,</span>
+                                    keyMapping, valueMapping);
+    }
+
+    /* We know how to translate List&lt;E&gt;, Set&lt;E&gt;, SortedSet&lt;E&gt;,
+       Map&lt;K,V&gt;, SortedMap&lt;K,V&gt;, and that's it.  We don't accept
+       subtypes of those because we wouldn't know how to deserialize
+       them.  We don't accept Queue&lt;E&gt; because it is unlikely people
+       would use that as a parameter or return type in an MBean.  */
+    private MXBeanMapping
+            makeParameterizedTypeMapping(ParameterizedType objType,
+                                         MXBeanMappingFactory factory)
+            throws OpenDataException {
+
+<span class="nc" id="L388">        final Type rawType = objType.getRawType();</span>
+
+<span class="nc bnc" id="L390" title="All 2 branches missed.">        if (rawType instanceof Class&lt;?&gt;) {</span>
+<span class="nc" id="L391">            Class&lt;?&gt; c = (Class&lt;?&gt;) rawType;</span>
+<span class="nc bnc" id="L392" title="All 6 branches missed.">            if (c == List.class || c == Set.class || c == SortedSet.class) {</span>
+<span class="nc" id="L393">                Type[] actuals = objType.getActualTypeArguments();</span>
+<span class="nc bnc" id="L394" title="All 4 branches missed.">                assert(actuals.length == 1);</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">                if (c == SortedSet.class)</span>
+<span class="nc" id="L396">                    mustBeComparable(c, actuals[0]);</span>
+<span class="nc" id="L397">                return makeArrayOrCollectionMapping(objType, actuals[0], factory);</span>
+            } else {
+<span class="nc bnc" id="L399" title="All 2 branches missed.">                boolean sortedMap = (c == SortedMap.class);</span>
+<span class="nc bnc" id="L400" title="All 4 branches missed.">                if (c == Map.class || sortedMap) {</span>
+<span class="nc" id="L401">                    Type[] actuals = objType.getActualTypeArguments();</span>
+<span class="nc bnc" id="L402" title="All 4 branches missed.">                    assert(actuals.length == 2);</span>
+<span class="nc bnc" id="L403" title="All 2 branches missed.">                    if (sortedMap)</span>
+<span class="nc" id="L404">                        mustBeComparable(c, actuals[0]);</span>
+<span class="nc" id="L405">                    return makeTabularMapping(objType, sortedMap,</span>
+                            actuals[0], actuals[1], factory);
+                }
+            }
+        }
+<span class="nc" id="L410">        throw new OpenDataException(&quot;Cannot convert type: &quot; + objType);</span>
+    }
+
+    private static MXBeanMapping makeMXBeanRefMapping(Type t)
+            throws OpenDataException {
+<span class="nc" id="L415">        return new MXBeanRefMapping(t);</span>
+    }
+
+    private MXBeanMapping makeCompositeMapping(Class&lt;?&gt; c,
+                                               MXBeanMappingFactory factory)
+            throws OpenDataException {
+
+        // For historical reasons GcInfo implements CompositeData but we
+        // shouldn't count its CompositeData.getCompositeType() field as
+        // an item in the computed CompositeType.
+<span class="nc" id="L425">        final boolean gcInfoHack =</span>
+<span class="nc bnc" id="L426" title="All 2 branches missed.">            (c.getName().equals(&quot;com.sun.management.GcInfo&quot;) &amp;&amp;</span>
+<span class="nc bnc" id="L427" title="All 2 branches missed.">                c.getClassLoader() == null);</span>
+
+<span class="nc" id="L429">        ReflectUtil.checkPackageAccess(c);</span>
+<span class="nc" id="L430">        final List&lt;Method&gt; methods =</span>
+<span class="nc" id="L431">                MBeanAnalyzer.eliminateCovariantMethods(Arrays.asList(c.getMethods()));</span>
+<span class="nc" id="L432">        final SortedMap&lt;String,Method&gt; getterMap = newSortedMap();</span>
+
+        /* Select public methods that look like &quot;T getX()&quot; or &quot;boolean
+           isX()&quot;, where T is not void and X is not the empty
+           string.  Exclude &quot;Class getClass()&quot; inherited from Object.  */
+<span class="nc bnc" id="L437" title="All 2 branches missed.">        for (Method method : methods) {</span>
+<span class="nc" id="L438">            final String propertyName = propertyName(method);</span>
+
+<span class="nc bnc" id="L440" title="All 2 branches missed.">            if (propertyName == null)</span>
+<span class="nc" id="L441">                continue;</span>
+<span class="nc bnc" id="L442" title="All 4 branches missed.">            if (gcInfoHack &amp;&amp; propertyName.equals(&quot;CompositeType&quot;))</span>
+<span class="nc" id="L443">                continue;</span>
+
+<span class="nc" id="L445">            Method old =</span>
+<span class="nc" id="L446">                getterMap.put(decapitalize(propertyName),</span>
+                            method);
+<span class="nc bnc" id="L448" title="All 2 branches missed.">            if (old != null) {</span>
+<span class="nc" id="L449">                final String msg =</span>
+<span class="nc" id="L450">                    &quot;Class &quot; + c.getName() + &quot; has method name clash: &quot; +</span>
+<span class="nc" id="L451">                    old.getName() + &quot;, &quot; + method.getName();</span>
+<span class="nc" id="L452">                throw new OpenDataException(msg);</span>
+            }
+<span class="nc" id="L454">        }</span>
+
+<span class="nc" id="L456">        final int nitems = getterMap.size();</span>
+
+<span class="nc bnc" id="L458" title="All 2 branches missed.">        if (nitems == 0) {</span>
+<span class="nc" id="L459">            throw new OpenDataException(&quot;Can't map &quot; + c.getName() +</span>
+                                        &quot; to an open data type&quot;);
+        }
+
+<span class="nc" id="L463">        final Method[] getters = new Method[nitems];</span>
+<span class="nc" id="L464">        final String[] itemNames = new String[nitems];</span>
+<span class="nc" id="L465">        final OpenType&lt;?&gt;[] openTypes = new OpenType&lt;?&gt;[nitems];</span>
+<span class="nc" id="L466">        int i = 0;</span>
+<span class="nc bnc" id="L467" title="All 2 branches missed.">        for (Map.Entry&lt;String,Method&gt; entry : getterMap.entrySet()) {</span>
+<span class="nc" id="L468">            itemNames[i] = entry.getKey();</span>
+<span class="nc" id="L469">            final Method getter = entry.getValue();</span>
+<span class="nc" id="L470">            getters[i] = getter;</span>
+<span class="nc" id="L471">            final Type retType = getter.getGenericReturnType();</span>
+<span class="nc" id="L472">            openTypes[i] = factory.mappingForType(retType, factory).getOpenType();</span>
+<span class="nc" id="L473">            i++;</span>
+<span class="nc" id="L474">        }</span>
+
+<span class="nc" id="L476">        CompositeType compositeType =</span>
+<span class="nc" id="L477">            new CompositeType(c.getName(),</span>
+<span class="nc" id="L478">                              c.getName(),</span>
+                              itemNames, // field names
+                              itemNames, // field descriptions
+                              openTypes);
+
+<span class="nc" id="L483">        return new CompositeMapping(c,</span>
+                                    compositeType,
+                                    itemNames,
+                                    getters,
+                                    factory);
+    }
+
+    /* Converter for classes where the open data is identical to the
+       original data.  This is true for any of the SimpleType types,
+       and for an any-dimension array of those.  It is also true for
+       primitive types as of JMX 1.3, since an int[]
+       can be directly represented by an ArrayType, and an int needs no mapping
+       because reflection takes care of it.  */
+    private static final class IdentityMapping extends NonNullMXBeanMapping {
+        IdentityMapping(Type targetType, OpenType&lt;?&gt; openType) {
+<span class="nc" id="L498">            super(targetType, openType);</span>
+<span class="nc" id="L499">        }</span>
+
+        boolean isIdentity() {
+<span class="nc" id="L502">            return true;</span>
+        }
+
+        @Override
+        Object fromNonNullOpenValue(Object openValue)
+        throws InvalidObjectException {
+<span class="nc" id="L508">            return openValue;</span>
+        }
+
+        @Override
+        Object toNonNullOpenValue(Object javaValue) throws OpenDataException {
+<span class="nc" id="L513">            return javaValue;</span>
+        }
+    }
+
+    private static final class EnumMapping&lt;T extends Enum&lt;T&gt;&gt;
+            extends NonNullMXBeanMapping {
+
+        EnumMapping(Class&lt;T&gt; enumClass) {
+<span class="nc" id="L521">            super(enumClass, SimpleType.STRING);</span>
+<span class="nc" id="L522">            this.enumClass = enumClass;</span>
+<span class="nc" id="L523">        }</span>
+
+        @Override
+        final Object toNonNullOpenValue(Object value) {
+<span class="nc" id="L527">            return ((Enum&lt;?&gt;) value).name();</span>
+        }
+
+        @Override
+        final T fromNonNullOpenValue(Object value)
+                throws InvalidObjectException {
+            try {
+<span class="nc" id="L534">                return Enum.valueOf(enumClass, (String) value);</span>
+<span class="nc" id="L535">            } catch (Exception e) {</span>
+<span class="nc" id="L536">                throw invalidObjectException(&quot;Cannot convert to enum: &quot; +</span>
+                                             value, e);
+            }
+        }
+
+        private final Class&lt;T&gt; enumClass;
+    }
+
+    private static final class ArrayMapping extends NonNullMXBeanMapping {
+        ArrayMapping(Type targetType,
+                     ArrayType&lt;?&gt; openArrayType, Class&lt;?&gt; openArrayClass,
+                     MXBeanMapping elementMapping) {
+<span class="nc" id="L548">            super(targetType, openArrayType);</span>
+<span class="nc" id="L549">            this.elementMapping = elementMapping;</span>
+<span class="nc" id="L550">        }</span>
+
+        @Override
+        final Object toNonNullOpenValue(Object value)
+                throws OpenDataException {
+<span class="nc" id="L555">            Object[] valueArray = (Object[]) value;</span>
+<span class="nc" id="L556">            final int len = valueArray.length;</span>
+<span class="nc" id="L557">            final Object[] openArray = (Object[])</span>
+<span class="nc" id="L558">                Array.newInstance(getOpenClass().getComponentType(), len);</span>
+<span class="nc bnc" id="L559" title="All 2 branches missed.">            for (int i = 0; i &lt; len; i++)</span>
+<span class="nc" id="L560">                openArray[i] = elementMapping.toOpenValue(valueArray[i]);</span>
+<span class="nc" id="L561">            return openArray;</span>
+        }
+
+        @Override
+        final Object fromNonNullOpenValue(Object openValue)
+                throws InvalidObjectException {
+<span class="nc" id="L567">            final Object[] openArray = (Object[]) openValue;</span>
+<span class="nc" id="L568">            final Type javaType = getJavaType();</span>
+            final Object[] valueArray;
+            final Type componentType;
+<span class="nc bnc" id="L571" title="All 2 branches missed.">            if (javaType instanceof GenericArrayType) {</span>
+<span class="nc" id="L572">                componentType =</span>
+<span class="nc" id="L573">                    ((GenericArrayType) javaType).getGenericComponentType();</span>
+<span class="nc bnc" id="L574" title="All 2 branches missed.">            } else if (javaType instanceof Class&lt;?&gt; &amp;&amp;</span>
+<span class="nc bnc" id="L575" title="All 2 branches missed.">                       ((Class&lt;?&gt;) javaType).isArray()) {</span>
+<span class="nc" id="L576">                componentType = ((Class&lt;?&gt;) javaType).getComponentType();</span>
+            } else {
+<span class="nc" id="L578">                throw new IllegalArgumentException(&quot;Not an array: &quot; +</span>
+                                                   javaType);
+            }
+<span class="nc" id="L581">            valueArray = (Object[]) Array.newInstance((Class&lt;?&gt;) componentType,</span>
+                                                      openArray.length);
+<span class="nc bnc" id="L583" title="All 2 branches missed.">            for (int i = 0; i &lt; openArray.length; i++)</span>
+<span class="nc" id="L584">                valueArray[i] = elementMapping.fromOpenValue(openArray[i]);</span>
+<span class="nc" id="L585">            return valueArray;</span>
+        }
+
+        public void checkReconstructible() throws InvalidObjectException {
+<span class="nc" id="L589">            elementMapping.checkReconstructible();</span>
+<span class="nc" id="L590">        }</span>
+
+        /**
+         * DefaultMXBeanMappingFactory for the elements of this array.  If this is an
+         *          array of arrays, the converter converts the second-level arrays,
+         *          not the deepest elements.
+         */
+        private final MXBeanMapping elementMapping;
+    }
+
+<span class="nc bnc" id="L600" title="All 2 branches missed.">    private static final class CollectionMapping extends NonNullMXBeanMapping {</span>
+        CollectionMapping(Type targetType,
+                          ArrayType&lt;?&gt; openArrayType,
+                          Class&lt;?&gt; openArrayClass,
+                          MXBeanMapping elementMapping) {
+<span class="nc" id="L605">            super(targetType, openArrayType);</span>
+<span class="nc" id="L606">            this.elementMapping = elementMapping;</span>
+
+            /* Determine the concrete class to be used when converting
+               back to this Java type.  We convert all Lists to ArrayList
+               and all Sets to TreeSet.  (TreeSet because it is a SortedSet,
+               so works for both Set and SortedSet.)  */
+<span class="nc" id="L612">            Type raw = ((ParameterizedType) targetType).getRawType();</span>
+<span class="nc" id="L613">            Class&lt;?&gt; c = (Class&lt;?&gt;) raw;</span>
+            final Class&lt;?&gt; collC;
+<span class="nc bnc" id="L615" title="All 2 branches missed.">            if (c == List.class)</span>
+<span class="nc" id="L616">                collC = ArrayList.class;</span>
+<span class="nc bnc" id="L617" title="All 2 branches missed.">            else if (c == Set.class)</span>
+<span class="nc" id="L618">                collC = HashSet.class;</span>
+<span class="nc bnc" id="L619" title="All 2 branches missed.">            else if (c == SortedSet.class)</span>
+<span class="nc" id="L620">                collC = TreeSet.class;</span>
+            else { // can't happen
+<span class="nc bnc" id="L622" title="All 2 branches missed.">                assert(false);</span>
+<span class="nc" id="L623">                collC = null;</span>
+            }
+<span class="nc" id="L625">            collectionClass = Util.cast(collC);</span>
+<span class="nc" id="L626">        }</span>
+
+        @Override
+        final Object toNonNullOpenValue(Object value)
+                throws OpenDataException {
+<span class="nc" id="L631">            final Collection&lt;?&gt; valueCollection = (Collection&lt;?&gt;) value;</span>
+<span class="nc bnc" id="L632" title="All 2 branches missed.">            if (valueCollection instanceof SortedSet&lt;?&gt;) {</span>
+<span class="nc" id="L633">                Comparator&lt;?&gt; comparator =</span>
+<span class="nc" id="L634">                    ((SortedSet&lt;?&gt;) valueCollection).comparator();</span>
+<span class="nc bnc" id="L635" title="All 2 branches missed.">                if (comparator != null) {</span>
+<span class="nc" id="L636">                    final String msg =</span>
+                        &quot;Cannot convert SortedSet with non-null comparator: &quot; +
+                        comparator;
+<span class="nc" id="L639">                    throw openDataException(msg, new IllegalArgumentException(msg));</span>
+                }
+            }
+<span class="nc" id="L642">            final Object[] openArray = (Object[])</span>
+<span class="nc" id="L643">                Array.newInstance(getOpenClass().getComponentType(),</span>
+<span class="nc" id="L644">                                  valueCollection.size());</span>
+<span class="nc" id="L645">            int i = 0;</span>
+<span class="nc bnc" id="L646" title="All 2 branches missed.">            for (Object o : valueCollection)</span>
+<span class="nc" id="L647">                openArray[i++] = elementMapping.toOpenValue(o);</span>
+<span class="nc" id="L648">            return openArray;</span>
+        }
+
+        @Override
+        final Object fromNonNullOpenValue(Object openValue)
+                throws InvalidObjectException {
+<span class="nc" id="L654">            final Object[] openArray = (Object[]) openValue;</span>
+            final Collection&lt;Object&gt; valueCollection;
+            try {
+<span class="nc" id="L657">                valueCollection = cast(collectionClass.newInstance());</span>
+<span class="nc" id="L658">            } catch (Exception e) {</span>
+<span class="nc" id="L659">                throw invalidObjectException(&quot;Cannot create collection&quot;, e);</span>
+<span class="nc" id="L660">            }</span>
+<span class="nc bnc" id="L661" title="All 2 branches missed.">            for (Object o : openArray) {</span>
+<span class="nc" id="L662">                Object value = elementMapping.fromOpenValue(o);</span>
+<span class="nc bnc" id="L663" title="All 2 branches missed.">                if (!valueCollection.add(value)) {</span>
+<span class="nc" id="L664">                    final String msg =</span>
+                        &quot;Could not add &quot; + o + &quot; to &quot; +
+<span class="nc" id="L666">                        collectionClass.getName() +</span>
+                        &quot; (duplicate set element?)&quot;;
+<span class="nc" id="L668">                    throw new InvalidObjectException(msg);</span>
+                }
+            }
+<span class="nc" id="L671">            return valueCollection;</span>
+        }
+
+        public void checkReconstructible() throws InvalidObjectException {
+<span class="nc" id="L675">            elementMapping.checkReconstructible();</span>
+<span class="nc" id="L676">        }</span>
+
+        private final Class&lt;? extends Collection&lt;?&gt;&gt; collectionClass;
+        private final MXBeanMapping elementMapping;
+    }
+
+    private static final class MXBeanRefMapping extends NonNullMXBeanMapping {
+        MXBeanRefMapping(Type intf) {
+<span class="nc" id="L684">            super(intf, SimpleType.OBJECTNAME);</span>
+<span class="nc" id="L685">        }</span>
+
+        @Override
+        final Object toNonNullOpenValue(Object javaValue)
+                throws OpenDataException {
+<span class="nc" id="L690">            MXBeanLookup lookup = lookupNotNull(OpenDataException.class);</span>
+<span class="nc" id="L691">            ObjectName name = lookup.mxbeanToObjectName(javaValue);</span>
+<span class="nc bnc" id="L692" title="All 2 branches missed.">            if (name == null)</span>
+<span class="nc" id="L693">                throw new OpenDataException(&quot;No name for object: &quot; + javaValue);</span>
+<span class="nc" id="L694">            return name;</span>
+        }
+
+        @Override
+        final Object fromNonNullOpenValue(Object openValue)
+                throws InvalidObjectException {
+<span class="nc" id="L700">            MXBeanLookup lookup = lookupNotNull(InvalidObjectException.class);</span>
+<span class="nc" id="L701">            ObjectName name = (ObjectName) openValue;</span>
+<span class="nc" id="L702">            Object mxbean =</span>
+<span class="nc" id="L703">                lookup.objectNameToMXBean(name, (Class&lt;?&gt;) getJavaType());</span>
+<span class="nc bnc" id="L704" title="All 2 branches missed.">            if (mxbean == null) {</span>
+<span class="nc" id="L705">                final String msg =</span>
+                    &quot;No MXBean for name: &quot; + name;
+<span class="nc" id="L707">                throw new InvalidObjectException(msg);</span>
+            }
+<span class="nc" id="L709">            return mxbean;</span>
+        }
+
+        private &lt;T extends Exception&gt; MXBeanLookup
+            lookupNotNull(Class&lt;T&gt; excClass)
+                throws T {
+<span class="nc" id="L715">            MXBeanLookup lookup = MXBeanLookup.getLookup();</span>
+<span class="nc bnc" id="L716" title="All 2 branches missed.">            if (lookup == null) {</span>
+                final String msg =
+                    &quot;Cannot convert MXBean interface in this context&quot;;
+                T exc;
+                try {
+<span class="nc" id="L721">                    Constructor&lt;T&gt; con = excClass.getConstructor(String.class);</span>
+<span class="nc" id="L722">                    exc = con.newInstance(msg);</span>
+<span class="nc" id="L723">                } catch (Exception e) {</span>
+<span class="nc" id="L724">                    throw new RuntimeException(e);</span>
+<span class="nc" id="L725">                }</span>
+<span class="nc" id="L726">                throw exc;</span>
+            }
+<span class="nc" id="L728">            return lookup;</span>
+        }
+    }
+
+    private static final class TabularMapping extends NonNullMXBeanMapping {
+        TabularMapping(Type targetType,
+                       boolean sortedMap,
+                       TabularType tabularType,
+                       MXBeanMapping keyConverter,
+                       MXBeanMapping valueConverter) {
+<span class="nc" id="L738">            super(targetType, tabularType);</span>
+<span class="nc" id="L739">            this.sortedMap = sortedMap;</span>
+<span class="nc" id="L740">            this.keyMapping = keyConverter;</span>
+<span class="nc" id="L741">            this.valueMapping = valueConverter;</span>
+<span class="nc" id="L742">        }</span>
+
+        @Override
+        final Object toNonNullOpenValue(Object value) throws OpenDataException {
+<span class="nc" id="L746">            final Map&lt;Object, Object&gt; valueMap = cast(value);</span>
+<span class="nc bnc" id="L747" title="All 2 branches missed.">            if (valueMap instanceof SortedMap&lt;?,?&gt;) {</span>
+<span class="nc" id="L748">                Comparator&lt;?&gt; comparator = ((SortedMap&lt;?,?&gt;) valueMap).comparator();</span>
+<span class="nc bnc" id="L749" title="All 2 branches missed.">                if (comparator != null) {</span>
+<span class="nc" id="L750">                    final String msg =</span>
+                        &quot;Cannot convert SortedMap with non-null comparator: &quot; +
+                        comparator;
+<span class="nc" id="L753">                    throw openDataException(msg, new IllegalArgumentException(msg));</span>
+                }
+            }
+<span class="nc" id="L756">            final TabularType tabularType = (TabularType) getOpenType();</span>
+<span class="nc" id="L757">            final TabularData table = new TabularDataSupport(tabularType);</span>
+<span class="nc" id="L758">            final CompositeType rowType = tabularType.getRowType();</span>
+<span class="nc bnc" id="L759" title="All 2 branches missed.">            for (Map.Entry&lt;Object, Object&gt; entry : valueMap.entrySet()) {</span>
+<span class="nc" id="L760">                final Object openKey = keyMapping.toOpenValue(entry.getKey());</span>
+<span class="nc" id="L761">                final Object openValue = valueMapping.toOpenValue(entry.getValue());</span>
+                final CompositeData row;
+<span class="nc" id="L763">                row =</span>
+<span class="nc" id="L764">                    new CompositeDataSupport(rowType, keyValueArray,</span>
+                                             new Object[] {openKey,
+                                                           openValue});
+<span class="nc" id="L767">                table.put(row);</span>
+<span class="nc" id="L768">            }</span>
+<span class="nc" id="L769">            return table;</span>
+        }
+
+        @Override
+        final Object fromNonNullOpenValue(Object openValue)
+                throws InvalidObjectException {
+<span class="nc" id="L775">            final TabularData table = (TabularData) openValue;</span>
+<span class="nc" id="L776">            final Collection&lt;CompositeData&gt; rows = cast(table.values());</span>
+<span class="nc bnc" id="L777" title="All 2 branches missed.">            final Map&lt;Object, Object&gt; valueMap =</span>
+<span class="nc" id="L778">                sortedMap ? newSortedMap() : newInsertionOrderMap();</span>
+<span class="nc bnc" id="L779" title="All 2 branches missed.">            for (CompositeData row : rows) {</span>
+<span class="nc" id="L780">                final Object key =</span>
+<span class="nc" id="L781">                    keyMapping.fromOpenValue(row.get(&quot;key&quot;));</span>
+<span class="nc" id="L782">                final Object value =</span>
+<span class="nc" id="L783">                    valueMapping.fromOpenValue(row.get(&quot;value&quot;));</span>
+<span class="nc bnc" id="L784" title="All 2 branches missed.">                if (valueMap.put(key, value) != null) {</span>
+<span class="nc" id="L785">                    final String msg =</span>
+                        &quot;Duplicate entry in TabularData: key=&quot; + key;
+<span class="nc" id="L787">                    throw new InvalidObjectException(msg);</span>
+                }
+<span class="nc" id="L789">            }</span>
+<span class="nc" id="L790">            return valueMap;</span>
+        }
+
+        @Override
+        public void checkReconstructible() throws InvalidObjectException {
+<span class="nc" id="L795">            keyMapping.checkReconstructible();</span>
+<span class="nc" id="L796">            valueMapping.checkReconstructible();</span>
+<span class="nc" id="L797">        }</span>
+
+        private final boolean sortedMap;
+        private final MXBeanMapping keyMapping;
+        private final MXBeanMapping valueMapping;
+    }
+
+<span class="nc bnc" id="L804" title="All 2 branches missed.">    private final class CompositeMapping extends NonNullMXBeanMapping {</span>
+        CompositeMapping(Class&lt;?&gt; targetClass,
+                         CompositeType compositeType,
+                         String[] itemNames,
+                         Method[] getters,
+<span class="nc" id="L809">                         MXBeanMappingFactory factory) throws OpenDataException {</span>
+<span class="nc" id="L810">            super(targetClass, compositeType);</span>
+
+<span class="nc bnc" id="L812" title="All 4 branches missed.">            assert(itemNames.length == getters.length);</span>
+
+<span class="nc" id="L814">            this.itemNames = itemNames;</span>
+<span class="nc" id="L815">            this.getters = getters;</span>
+<span class="nc" id="L816">            this.getterMappings = new MXBeanMapping[getters.length];</span>
+<span class="nc bnc" id="L817" title="All 2 branches missed.">            for (int i = 0; i &lt; getters.length; i++) {</span>
+<span class="nc" id="L818">                Type retType = getters[i].getGenericReturnType();</span>
+<span class="nc" id="L819">                getterMappings[i] = factory.mappingForType(retType, factory);</span>
+            }
+<span class="nc" id="L821">        }</span>
+
+        @Override
+        final Object toNonNullOpenValue(Object value)
+                throws OpenDataException {
+<span class="nc" id="L826">            CompositeType ct = (CompositeType) getOpenType();</span>
+<span class="nc bnc" id="L827" title="All 2 branches missed.">            if (value instanceof CompositeDataView)</span>
+<span class="nc" id="L828">                return ((CompositeDataView) value).toCompositeData(ct);</span>
+<span class="nc bnc" id="L829" title="All 2 branches missed.">            if (value == null)</span>
+<span class="nc" id="L830">                return null;</span>
+
+<span class="nc" id="L832">            Object[] values = new Object[getters.length];</span>
+<span class="nc bnc" id="L833" title="All 2 branches missed.">            for (int i = 0; i &lt; getters.length; i++) {</span>
+                try {
+<span class="nc" id="L835">                    Object got = MethodUtil.invoke(getters[i], value, (Object[]) null);</span>
+<span class="nc" id="L836">                    values[i] = getterMappings[i].toOpenValue(got);</span>
+<span class="nc" id="L837">                } catch (Exception e) {</span>
+<span class="nc" id="L838">                    throw openDataException(&quot;Error calling getter for &quot; +</span>
+                                            itemNames[i] + &quot;: &quot; + e, e);
+<span class="nc" id="L840">                }</span>
+            }
+<span class="nc" id="L842">            return new CompositeDataSupport(ct, itemNames, values);</span>
+        }
+
+        /** Determine how to convert back from the CompositeData into
+            the original Java type.  For a type that is not reconstructible,
+            this method will fail every time, and will throw the right
+            exception. */
+        private synchronized void makeCompositeBuilder()
+                throws InvalidObjectException {
+<span class="nc bnc" id="L851" title="All 2 branches missed.">            if (compositeBuilder != null)</span>
+<span class="nc" id="L852">                return;</span>
+
+<span class="nc" id="L854">            Class&lt;?&gt; targetClass = (Class&lt;?&gt;) getJavaType();</span>
+            /* In this 2D array, each subarray is a set of builders where
+               there is no point in consulting the ones after the first if
+               the first refuses.  */
+<span class="nc" id="L858">            CompositeBuilder[][] builders = {</span>
+                {
+                    new CompositeBuilderViaFrom(targetClass, itemNames),
+                },
+                {
+                    new CompositeBuilderViaConstructor(targetClass, itemNames),
+                },
+                {
+                    new CompositeBuilderCheckGetters(targetClass, itemNames,
+                                                     getterMappings),
+                    new CompositeBuilderViaSetters(targetClass, itemNames),
+                    new CompositeBuilderViaProxy(targetClass, itemNames),
+                },
+            };
+<span class="nc" id="L872">            CompositeBuilder foundBuilder = null;</span>
+            /* We try to make a meaningful exception message by
+               concatenating each Builder's explanation of why it
+               isn't applicable.  */
+<span class="nc" id="L876">            final StringBuilder whyNots = new StringBuilder();</span>
+<span class="nc" id="L877">            Throwable possibleCause = null;</span>
+        find:
+<span class="nc bnc" id="L879" title="All 2 branches missed.">            for (CompositeBuilder[] relatedBuilders : builders) {</span>
+<span class="nc bnc" id="L880" title="All 2 branches missed.">                for (int i = 0; i &lt; relatedBuilders.length; i++) {</span>
+<span class="nc" id="L881">                    CompositeBuilder builder = relatedBuilders[i];</span>
+<span class="nc" id="L882">                    String whyNot = builder.applicable(getters);</span>
+<span class="nc bnc" id="L883" title="All 2 branches missed.">                    if (whyNot == null) {</span>
+<span class="nc" id="L884">                        foundBuilder = builder;</span>
+<span class="nc" id="L885">                        break find;</span>
+                    }
+<span class="nc" id="L887">                    Throwable cause = builder.possibleCause();</span>
+<span class="nc bnc" id="L888" title="All 2 branches missed.">                    if (cause != null)</span>
+<span class="nc" id="L889">                        possibleCause = cause;</span>
+<span class="nc bnc" id="L890" title="All 2 branches missed.">                    if (whyNot.length() &gt; 0) {</span>
+<span class="nc bnc" id="L891" title="All 2 branches missed.">                        if (whyNots.length() &gt; 0)</span>
+<span class="nc" id="L892">                            whyNots.append(&quot;; &quot;);</span>
+<span class="nc" id="L893">                        whyNots.append(whyNot);</span>
+<span class="nc bnc" id="L894" title="All 2 branches missed.">                        if (i == 0)</span>
+<span class="nc" id="L895">                           break; // skip other builders in this group</span>
+                    }
+                }
+            }
+<span class="nc bnc" id="L899" title="All 2 branches missed.">            if (foundBuilder == null) {</span>
+<span class="nc" id="L900">                String msg =</span>
+<span class="nc" id="L901">                    &quot;Do not know how to make a &quot; + targetClass.getName() +</span>
+                    &quot; from a CompositeData: &quot; + whyNots;
+<span class="nc bnc" id="L903" title="All 2 branches missed.">                if (possibleCause != null)</span>
+<span class="nc" id="L904">                    msg += &quot;. Remaining exceptions show a POSSIBLE cause.&quot;;</span>
+<span class="nc" id="L905">                throw invalidObjectException(msg, possibleCause);</span>
+            }
+<span class="nc" id="L907">            compositeBuilder = foundBuilder;</span>
+<span class="nc" id="L908">        }</span>
+
+        @Override
+        public void checkReconstructible() throws InvalidObjectException {
+<span class="nc" id="L912">            makeCompositeBuilder();</span>
+<span class="nc" id="L913">        }</span>
+
+        @Override
+        final Object fromNonNullOpenValue(Object value)
+                throws InvalidObjectException {
+<span class="nc" id="L918">            makeCompositeBuilder();</span>
+<span class="nc" id="L919">            return compositeBuilder.fromCompositeData((CompositeData) value,</span>
+                                                      itemNames,
+                                                      getterMappings);
+        }
+
+        private final String[] itemNames;
+        private final Method[] getters;
+        private final MXBeanMapping[] getterMappings;
+        private CompositeBuilder compositeBuilder;
+    }
+
+    /** Converts from a CompositeData to an instance of the targetClass.  */
+    private static abstract class CompositeBuilder {
+<span class="nc" id="L932">        CompositeBuilder(Class&lt;?&gt; targetClass, String[] itemNames) {</span>
+<span class="nc" id="L933">            this.targetClass = targetClass;</span>
+<span class="nc" id="L934">            this.itemNames = itemNames;</span>
+<span class="nc" id="L935">        }</span>
+
+        Class&lt;?&gt; getTargetClass() {
+<span class="nc" id="L938">            return targetClass;</span>
+        }
+
+        String[] getItemNames() {
+<span class="nc" id="L942">            return itemNames;</span>
+        }
+
+        /** If the subclass is appropriate for targetClass, then the
+            method returns null.  If the subclass is not appropriate,
+            then the method returns an explanation of why not.  If the
+            subclass should be appropriate but there is a problem,
+            then the method throws InvalidObjectException.  */
+        abstract String applicable(Method[] getters)
+                throws InvalidObjectException;
+
+        /** If the subclass returns an explanation of why it is not applicable,
+            it can additionally indicate an exception with details.  This is
+            potentially confusing, because the real problem could be that one
+            of the other subclasses is supposed to be applicable but isn't.
+            But the advantage of less information loss probably outweighs the
+            disadvantage of possible confusion.  */
+        Throwable possibleCause() {
+<span class="nc" id="L960">            return null;</span>
+        }
+
+        abstract Object fromCompositeData(CompositeData cd,
+                                          String[] itemNames,
+                                          MXBeanMapping[] converters)
+                throws InvalidObjectException;
+
+        private final Class&lt;?&gt; targetClass;
+        private final String[] itemNames;
+    }
+
+    /** Builder for when the target class has a method &quot;public static
+        from(CompositeData)&quot;.  */
+    private static final class CompositeBuilderViaFrom
+            extends CompositeBuilder {
+
+        CompositeBuilderViaFrom(Class&lt;?&gt; targetClass, String[] itemNames) {
+<span class="nc" id="L978">            super(targetClass, itemNames);</span>
+<span class="nc" id="L979">        }</span>
+
+        String applicable(Method[] getters) throws InvalidObjectException {
+            // See if it has a method &quot;T from(CompositeData)&quot;
+            // as is conventional for a CompositeDataView
+<span class="nc" id="L984">            Class&lt;?&gt; targetClass = getTargetClass();</span>
+            try {
+<span class="nc" id="L986">                Method fromMethod =</span>
+<span class="nc" id="L987">                    targetClass.getMethod(&quot;from&quot;, CompositeData.class);</span>
+
+<span class="nc bnc" id="L989" title="All 2 branches missed.">                if (!Modifier.isStatic(fromMethod.getModifiers())) {</span>
+                    final String msg =
+                        &quot;Method from(CompositeData) is not static&quot;;
+<span class="nc" id="L992">                    throw new InvalidObjectException(msg);</span>
+                }
+
+<span class="nc bnc" id="L995" title="All 2 branches missed.">                if (fromMethod.getReturnType() != getTargetClass()) {</span>
+<span class="nc" id="L996">                    final String msg =</span>
+                        &quot;Method from(CompositeData) returns &quot; +
+<span class="nc" id="L998">                        typeName(fromMethod.getReturnType()) +</span>
+<span class="nc" id="L999">                        &quot; not &quot; + typeName(targetClass);</span>
+<span class="nc" id="L1000">                    throw new InvalidObjectException(msg);</span>
+                }
+
+<span class="nc" id="L1003">                this.fromMethod = fromMethod;</span>
+<span class="nc" id="L1004">                return null; // success!</span>
+<span class="nc" id="L1005">            } catch (InvalidObjectException e) {</span>
+<span class="nc" id="L1006">                throw e;</span>
+<span class="nc" id="L1007">            } catch (Exception e) {</span>
+                // OK: it doesn't have the method
+<span class="nc" id="L1009">                return &quot;no method from(CompositeData)&quot;;</span>
+            }
+        }
+
+        final Object fromCompositeData(CompositeData cd,
+                                       String[] itemNames,
+                                       MXBeanMapping[] converters)
+                throws InvalidObjectException {
+            try {
+<span class="nc" id="L1018">                return MethodUtil.invoke(fromMethod, null, new Object[] {cd});</span>
+<span class="nc" id="L1019">            } catch (Exception e) {</span>
+                final String msg = &quot;Failed to invoke from(CompositeData)&quot;;
+<span class="nc" id="L1021">                throw invalidObjectException(msg, e);</span>
+            }
+        }
+
+        private Method fromMethod;
+    }
+
+    /** This builder never actually returns success.  It simply serves
+        to check whether the other builders in the same group have any
+        chance of success.  If any getter in the targetClass returns
+        a type that we don't know how to reconstruct, then we will
+        not be able to make a builder, and there is no point in repeating
+        the error about the problematic getter as many times as there are
+        candidate builders.  Instead, the &quot;applicable&quot; method will return
+        an explanatory string, and the other builders will be skipped.
+        If all the getters are OK, then the &quot;applicable&quot; method will return
+        an empty string and the other builders will be tried.  */
+    private static class CompositeBuilderCheckGetters extends CompositeBuilder {
+        CompositeBuilderCheckGetters(Class&lt;?&gt; targetClass, String[] itemNames,
+                                     MXBeanMapping[] getterConverters) {
+<span class="nc" id="L1041">            super(targetClass, itemNames);</span>
+<span class="nc" id="L1042">            this.getterConverters = getterConverters;</span>
+<span class="nc" id="L1043">        }</span>
+
+        String applicable(Method[] getters) {
+<span class="nc bnc" id="L1046" title="All 2 branches missed.">            for (int i = 0; i &lt; getters.length; i++) {</span>
+                try {
+<span class="nc" id="L1048">                    getterConverters[i].checkReconstructible();</span>
+<span class="nc" id="L1049">                } catch (InvalidObjectException e) {</span>
+<span class="nc" id="L1050">                    possibleCause = e;</span>
+<span class="nc" id="L1051">                    return &quot;method &quot; + getters[i].getName() + &quot; returns type &quot; +</span>
+                        &quot;that cannot be mapped back from OpenData&quot;;
+<span class="nc" id="L1053">                }</span>
+            }
+<span class="nc" id="L1055">            return &quot;&quot;;</span>
+        }
+
+        @Override
+        Throwable possibleCause() {
+<span class="nc" id="L1060">            return possibleCause;</span>
+        }
+
+        final Object fromCompositeData(CompositeData cd,
+                                       String[] itemNames,
+                                       MXBeanMapping[] converters) {
+<span class="nc" id="L1066">            throw new Error();</span>
+        }
+
+        private final MXBeanMapping[] getterConverters;
+        private Throwable possibleCause;
+    }
+
+    /** Builder for when the target class has a setter for every getter. */
+    private static class CompositeBuilderViaSetters extends CompositeBuilder {
+
+        CompositeBuilderViaSetters(Class&lt;?&gt; targetClass, String[] itemNames) {
+<span class="nc" id="L1077">            super(targetClass, itemNames);</span>
+<span class="nc" id="L1078">        }</span>
+
+        String applicable(Method[] getters) {
+            try {
+<span class="nc" id="L1082">                Constructor&lt;?&gt; c = getTargetClass().getConstructor();</span>
+<span class="nc" id="L1083">            } catch (Exception e) {</span>
+<span class="nc" id="L1084">                return &quot;does not have a public no-arg constructor&quot;;</span>
+<span class="nc" id="L1085">            }</span>
+
+<span class="nc" id="L1087">            Method[] setters = new Method[getters.length];</span>
+<span class="nc bnc" id="L1088" title="All 2 branches missed.">            for (int i = 0; i &lt; getters.length; i++) {</span>
+<span class="nc" id="L1089">                Method getter = getters[i];</span>
+<span class="nc" id="L1090">                Class&lt;?&gt; returnType = getter.getReturnType();</span>
+<span class="nc" id="L1091">                String name = propertyName(getter);</span>
+<span class="nc" id="L1092">                String setterName = &quot;set&quot; + name;</span>
+                Method setter;
+                try {
+<span class="nc" id="L1095">                    setter = getTargetClass().getMethod(setterName, returnType);</span>
+<span class="nc bnc" id="L1096" title="All 2 branches missed.">                    if (setter.getReturnType() != void.class)</span>
+<span class="nc" id="L1097">                        throw new Exception();</span>
+<span class="nc" id="L1098">                } catch (Exception e) {</span>
+<span class="nc" id="L1099">                    return &quot;not all getters have corresponding setters &quot; +</span>
+                           &quot;(&quot; + getter + &quot;)&quot;;
+<span class="nc" id="L1101">                }</span>
+<span class="nc" id="L1102">                setters[i] = setter;</span>
+            }
+<span class="nc" id="L1104">            this.setters = setters;</span>
+<span class="nc" id="L1105">            return null;</span>
+        }
+
+        Object fromCompositeData(CompositeData cd,
+                                 String[] itemNames,
+                                 MXBeanMapping[] converters)
+                throws InvalidObjectException {
+            Object o;
+            try {
+<span class="nc" id="L1114">                final Class&lt;?&gt; targetClass = getTargetClass();</span>
+<span class="nc" id="L1115">                ReflectUtil.checkPackageAccess(targetClass);</span>
+<span class="nc" id="L1116">                o = targetClass.newInstance();</span>
+<span class="nc bnc" id="L1117" title="All 2 branches missed.">                for (int i = 0; i &lt; itemNames.length; i++) {</span>
+<span class="nc bnc" id="L1118" title="All 2 branches missed.">                    if (cd.containsKey(itemNames[i])) {</span>
+<span class="nc" id="L1119">                        Object openItem = cd.get(itemNames[i]);</span>
+<span class="nc" id="L1120">                        Object javaItem =</span>
+<span class="nc" id="L1121">                            converters[i].fromOpenValue(openItem);</span>
+<span class="nc" id="L1122">                        MethodUtil.invoke(setters[i], o, new Object[] {javaItem});</span>
+                    }
+                }
+<span class="nc" id="L1125">            } catch (Exception e) {</span>
+<span class="nc" id="L1126">                throw invalidObjectException(e);</span>
+<span class="nc" id="L1127">            }</span>
+<span class="nc" id="L1128">            return o;</span>
+        }
+
+        private Method[] setters;
+    }
+
+    /** Builder for when the target class has a constructor that is
+        annotated with @ConstructorProperties so we can see the correspondence
+        to getters.  */
+    private static final class CompositeBuilderViaConstructor
+            extends CompositeBuilder {
+<span class="nc" id="L1139">        static class AnnotationHelper {</span>
+            private static Class&lt;? extends Annotation&gt; constructorPropertiesClass;
+            private static Method valueMethod;
+            static {
+<span class="nc" id="L1143">                findConstructorPropertiesClass();</span>
+<span class="nc" id="L1144">            }</span>
+
+            @SuppressWarnings(&quot;unchecked&quot;)
+            private static void findConstructorPropertiesClass() {
+                try {
+<span class="nc" id="L1149">                    constructorPropertiesClass = (Class&lt;? extends Annotation&gt;)</span>
+<span class="nc" id="L1150">                        Class.forName(&quot;java.beans.ConstructorProperties&quot;, false,</span>
+<span class="nc" id="L1151">                                      DefaultMXBeanMappingFactory.class.getClassLoader());</span>
+<span class="nc" id="L1152">                    valueMethod = constructorPropertiesClass.getMethod(&quot;value&quot;);</span>
+<span class="nc" id="L1153">                } catch (ClassNotFoundException cnf) {</span>
+                    // java.beans not present
+<span class="nc" id="L1155">                } catch (NoSuchMethodException e) {</span>
+                    // should not reach here
+<span class="nc" id="L1157">                    throw new InternalError(e);</span>
+<span class="nc" id="L1158">                }</span>
+<span class="nc" id="L1159">            }</span>
+
+            static boolean isAvailable() {
+<span class="nc bnc" id="L1162" title="All 2 branches missed.">                return constructorPropertiesClass != null;</span>
+            }
+
+            static String[] getPropertyNames(Constructor&lt;?&gt; constr) {
+<span class="nc bnc" id="L1166" title="All 2 branches missed.">                if (!isAvailable())</span>
+<span class="nc" id="L1167">                    return null;</span>
+
+<span class="nc" id="L1169">                Annotation a = constr.getAnnotation(constructorPropertiesClass);</span>
+<span class="nc bnc" id="L1170" title="All 2 branches missed.">                if (a == null) return null;</span>
+
+                try {
+<span class="nc" id="L1173">                    return (String[]) valueMethod.invoke(a);</span>
+<span class="nc" id="L1174">                } catch (InvocationTargetException e) {</span>
+<span class="nc" id="L1175">                    throw new InternalError(e);</span>
+<span class="nc" id="L1176">                } catch (IllegalAccessException e) {</span>
+<span class="nc" id="L1177">                    throw new InternalError(e);</span>
+                }
+            }
+        }
+
+        CompositeBuilderViaConstructor(Class&lt;?&gt; targetClass, String[] itemNames) {
+<span class="nc" id="L1183">            super(targetClass, itemNames);</span>
+<span class="nc" id="L1184">        }</span>
+
+        String applicable(Method[] getters) throws InvalidObjectException {
+<span class="nc bnc" id="L1187" title="All 2 branches missed.">            if (!AnnotationHelper.isAvailable())</span>
+<span class="nc" id="L1188">                return &quot;@ConstructorProperties annotation not available&quot;;</span>
+
+<span class="nc" id="L1190">            Class&lt;?&gt; targetClass = getTargetClass();</span>
+<span class="nc" id="L1191">            Constructor&lt;?&gt;[] constrs = targetClass.getConstructors();</span>
+
+            // Applicable if and only if there are any annotated constructors
+<span class="nc" id="L1194">            List&lt;Constructor&lt;?&gt;&gt; annotatedConstrList = newList();</span>
+<span class="nc bnc" id="L1195" title="All 2 branches missed.">            for (Constructor&lt;?&gt; constr : constrs) {</span>
+<span class="nc bnc" id="L1196" title="All 2 branches missed.">                if (Modifier.isPublic(constr.getModifiers())</span>
+<span class="nc bnc" id="L1197" title="All 2 branches missed.">                        &amp;&amp; AnnotationHelper.getPropertyNames(constr) != null)</span>
+<span class="nc" id="L1198">                    annotatedConstrList.add(constr);</span>
+            }
+
+<span class="nc bnc" id="L1201" title="All 2 branches missed.">            if (annotatedConstrList.isEmpty())</span>
+<span class="nc" id="L1202">                return &quot;no constructor has @ConstructorProperties annotation&quot;;</span>
+
+<span class="nc" id="L1204">            annotatedConstructors = newList();</span>
+
+            // Now check that all the annotated constructors are valid
+            // and throw an exception if not.
+
+            // First link the itemNames to their getter indexes.
+<span class="nc" id="L1210">            Map&lt;String, Integer&gt; getterMap = newMap();</span>
+<span class="nc" id="L1211">            String[] itemNames = getItemNames();</span>
+<span class="nc bnc" id="L1212" title="All 2 branches missed.">            for (int i = 0; i &lt; itemNames.length; i++)</span>
+<span class="nc" id="L1213">                getterMap.put(itemNames[i], i);</span>
+
+            // Run through the constructors making the checks in the spec.
+            // For each constructor, remember the correspondence between its
+            // parameters and the items.  The int[] for a constructor says
+            // what parameter index should get what item.  For example,
+            // if element 0 is 2 then that means that item 0 in the
+            // CompositeData goes to parameter 2 of the constructor.  If an
+            // element is -1, that item isn't given to the constructor.
+            // Also remember the set of properties in that constructor
+            // so we can test unambiguity.
+<span class="nc" id="L1224">            Set&lt;BitSet&gt; getterIndexSets = newSet();</span>
+<span class="nc bnc" id="L1225" title="All 2 branches missed.">            for (Constructor&lt;?&gt; constr : annotatedConstrList) {</span>
+<span class="nc" id="L1226">                String[] propertyNames = AnnotationHelper.getPropertyNames(constr);</span>
+
+<span class="nc" id="L1228">                Type[] paramTypes = constr.getGenericParameterTypes();</span>
+<span class="nc bnc" id="L1229" title="All 2 branches missed.">                if (paramTypes.length != propertyNames.length) {</span>
+<span class="nc" id="L1230">                    final String msg =</span>
+                        &quot;Number of constructor params does not match &quot; +
+                        &quot;@ConstructorProperties annotation: &quot; + constr;
+<span class="nc" id="L1233">                    throw new InvalidObjectException(msg);</span>
+                }
+
+<span class="nc" id="L1236">                int[] paramIndexes = new int[getters.length];</span>
+<span class="nc bnc" id="L1237" title="All 2 branches missed.">                for (int i = 0; i &lt; getters.length; i++)</span>
+<span class="nc" id="L1238">                    paramIndexes[i] = -1;</span>
+<span class="nc" id="L1239">                BitSet present = new BitSet();</span>
+
+<span class="nc bnc" id="L1241" title="All 2 branches missed.">                for (int i = 0; i &lt; propertyNames.length; i++) {</span>
+<span class="nc" id="L1242">                    String propertyName = propertyNames[i];</span>
+<span class="nc bnc" id="L1243" title="All 2 branches missed.">                    if (!getterMap.containsKey(propertyName)) {</span>
+<span class="nc" id="L1244">                        String msg =</span>
+                            &quot;@ConstructorProperties includes name &quot; + propertyName +
+                            &quot; which does not correspond to a property&quot;;
+<span class="nc bnc" id="L1247" title="All 2 branches missed.">                        for (String getterName : getterMap.keySet()) {</span>
+<span class="nc bnc" id="L1248" title="All 2 branches missed.">                            if (getterName.equalsIgnoreCase(propertyName)) {</span>
+<span class="nc" id="L1249">                                msg += &quot; (differs only in case from property &quot; +</span>
+                                        getterName + &quot;)&quot;;
+                            }
+<span class="nc" id="L1252">                        }</span>
+<span class="nc" id="L1253">                        msg += &quot;: &quot; + constr;</span>
+<span class="nc" id="L1254">                        throw new InvalidObjectException(msg);</span>
+                    }
+<span class="nc" id="L1256">                    int getterIndex = getterMap.get(propertyName);</span>
+<span class="nc" id="L1257">                    paramIndexes[getterIndex] = i;</span>
+<span class="nc bnc" id="L1258" title="All 2 branches missed.">                    if (present.get(getterIndex)) {</span>
+<span class="nc" id="L1259">                        final String msg =</span>
+                            &quot;@ConstructorProperties contains property &quot; +
+                            propertyName + &quot; more than once: &quot; + constr;
+<span class="nc" id="L1262">                        throw new InvalidObjectException(msg);</span>
+                    }
+<span class="nc" id="L1264">                    present.set(getterIndex);</span>
+<span class="nc" id="L1265">                    Method getter = getters[getterIndex];</span>
+<span class="nc" id="L1266">                    Type propertyType = getter.getGenericReturnType();</span>
+<span class="nc bnc" id="L1267" title="All 2 branches missed.">                    if (!propertyType.equals(paramTypes[i])) {</span>
+<span class="nc" id="L1268">                        final String msg =</span>
+                            &quot;@ConstructorProperties gives property &quot; + propertyName +
+                            &quot; of type &quot; + propertyType + &quot; for parameter &quot; +
+                            &quot; of type &quot; + paramTypes[i] + &quot;: &quot; + constr;
+<span class="nc" id="L1272">                        throw new InvalidObjectException(msg);</span>
+                    }
+                }
+
+<span class="nc bnc" id="L1276" title="All 2 branches missed.">                if (!getterIndexSets.add(present)) {</span>
+<span class="nc" id="L1277">                    final String msg =</span>
+                        &quot;More than one constructor has a @ConstructorProperties &quot; +
+                        &quot;annotation with this set of names: &quot; +
+<span class="nc" id="L1280">                        Arrays.toString(propertyNames);</span>
+<span class="nc" id="L1281">                    throw new InvalidObjectException(msg);</span>
+                }
+
+<span class="nc" id="L1284">                Constr c = new Constr(constr, paramIndexes, present);</span>
+<span class="nc" id="L1285">                annotatedConstructors.add(c);</span>
+<span class="nc" id="L1286">            }</span>
+
+            /* Check that no possible set of items could lead to an ambiguous
+             * choice of constructor (spec requires this check).  For any
+             * pair of constructors, their union would be the minimal
+             * ambiguous set.  If this set itself corresponds to a constructor,
+             * there is no ambiguity for that pair.  In the usual case, one
+             * of the constructors is a superset of the other so the union is
+             * just the bigger constructor.
+             *
+             * The algorithm here is quadratic in the number of constructors
+             * with a @ConstructorProperties annotation.  Typically this corresponds
+             * to the number of versions of the class there have been.  Ten
+             * would already be a large number, so although it's probably
+             * possible to have an O(n lg n) algorithm it wouldn't be
+             * worth the complexity.
+             */
+<span class="nc bnc" id="L1303" title="All 2 branches missed.">            for (BitSet a : getterIndexSets) {</span>
+<span class="nc" id="L1304">                boolean seen = false;</span>
+<span class="nc bnc" id="L1305" title="All 2 branches missed.">                for (BitSet b : getterIndexSets) {</span>
+<span class="nc bnc" id="L1306" title="All 2 branches missed.">                    if (a == b)</span>
+<span class="nc" id="L1307">                        seen = true;</span>
+<span class="nc bnc" id="L1308" title="All 2 branches missed.">                    else if (seen) {</span>
+<span class="nc" id="L1309">                        BitSet u = new BitSet();</span>
+<span class="nc" id="L1310">                        u.or(a); u.or(b);</span>
+<span class="nc bnc" id="L1311" title="All 2 branches missed.">                        if (!getterIndexSets.contains(u)) {</span>
+<span class="nc" id="L1312">                            Set&lt;String&gt; names = new TreeSet&lt;String&gt;();</span>
+<span class="nc bnc" id="L1313" title="All 2 branches missed.">                            for (int i = u.nextSetBit(0); i &gt;= 0;</span>
+<span class="nc" id="L1314">                                 i = u.nextSetBit(i+1))</span>
+<span class="nc" id="L1315">                                names.add(itemNames[i]);</span>
+<span class="nc" id="L1316">                            final String msg =</span>
+                                &quot;Constructors with @ConstructorProperties annotation &quot; +
+                                &quot; would be ambiguous for these items: &quot; +
+                                names;
+<span class="nc" id="L1320">                            throw new InvalidObjectException(msg);</span>
+                        }
+                    }
+<span class="nc" id="L1323">                }</span>
+<span class="nc" id="L1324">            }</span>
+
+<span class="nc" id="L1326">            return null; // success!</span>
+        }
+
+        final Object fromCompositeData(CompositeData cd,
+                                       String[] itemNames,
+                                       MXBeanMapping[] mappings)
+                throws InvalidObjectException {
+            // The CompositeData might come from an earlier version where
+            // not all the items were present.  We look for a constructor
+            // that accepts just the items that are present.  Because of
+            // the ambiguity check in applicable(), we know there must be
+            // at most one maximally applicable constructor.
+<span class="nc" id="L1338">            CompositeType ct = cd.getCompositeType();</span>
+<span class="nc" id="L1339">            BitSet present = new BitSet();</span>
+<span class="nc bnc" id="L1340" title="All 2 branches missed.">            for (int i = 0; i &lt; itemNames.length; i++) {</span>
+<span class="nc bnc" id="L1341" title="All 2 branches missed.">                if (ct.getType(itemNames[i]) != null)</span>
+<span class="nc" id="L1342">                    present.set(i);</span>
+            }
+
+<span class="nc" id="L1345">            Constr max = null;</span>
+<span class="nc bnc" id="L1346" title="All 2 branches missed.">            for (Constr constr : annotatedConstructors) {</span>
+<span class="nc bnc" id="L1347" title="All 4 branches missed.">                if (subset(constr.presentParams, present) &amp;&amp;</span>
+                        (max == null ||
+<span class="nc bnc" id="L1349" title="All 2 branches missed.">                         subset(max.presentParams, constr.presentParams)))</span>
+<span class="nc" id="L1350">                    max = constr;</span>
+<span class="nc" id="L1351">            }</span>
+
+<span class="nc bnc" id="L1353" title="All 2 branches missed.">            if (max == null) {</span>
+<span class="nc" id="L1354">                final String msg =</span>
+                    &quot;No constructor has a @ConstructorProperties for this set of &quot; +
+<span class="nc" id="L1356">                    &quot;items: &quot; + ct.keySet();</span>
+<span class="nc" id="L1357">                throw new InvalidObjectException(msg);</span>
+            }
+
+<span class="nc" id="L1360">            Object[] params = new Object[max.presentParams.cardinality()];</span>
+<span class="nc bnc" id="L1361" title="All 2 branches missed.">            for (int i = 0; i &lt; itemNames.length; i++) {</span>
+<span class="nc bnc" id="L1362" title="All 2 branches missed.">                if (!max.presentParams.get(i))</span>
+<span class="nc" id="L1363">                    continue;</span>
+<span class="nc" id="L1364">                Object openItem = cd.get(itemNames[i]);</span>
+<span class="nc" id="L1365">                Object javaItem = mappings[i].fromOpenValue(openItem);</span>
+<span class="nc" id="L1366">                int index = max.paramIndexes[i];</span>
+<span class="nc bnc" id="L1367" title="All 2 branches missed.">                if (index &gt;= 0)</span>
+<span class="nc" id="L1368">                    params[index] = javaItem;</span>
+            }
+
+            try {
+<span class="nc" id="L1372">                ReflectUtil.checkPackageAccess(max.constructor.getDeclaringClass());</span>
+<span class="nc" id="L1373">                return max.constructor.newInstance(params);</span>
+<span class="nc" id="L1374">            } catch (Exception e) {</span>
+<span class="nc" id="L1375">                final String msg =</span>
+<span class="nc" id="L1376">                    &quot;Exception constructing &quot; + getTargetClass().getName();</span>
+<span class="nc" id="L1377">                throw invalidObjectException(msg, e);</span>
+            }
+        }
+
+        private static boolean subset(BitSet sub, BitSet sup) {
+<span class="nc" id="L1382">            BitSet subcopy = (BitSet) sub.clone();</span>
+<span class="nc" id="L1383">            subcopy.andNot(sup);</span>
+<span class="nc" id="L1384">            return subcopy.isEmpty();</span>
+        }
+
+        private static class Constr {
+            final Constructor&lt;?&gt; constructor;
+            final int[] paramIndexes;
+            final BitSet presentParams;
+            Constr(Constructor&lt;?&gt; constructor, int[] paramIndexes,
+<span class="nc" id="L1392">                   BitSet presentParams) {</span>
+<span class="nc" id="L1393">                this.constructor = constructor;</span>
+<span class="nc" id="L1394">                this.paramIndexes = paramIndexes;</span>
+<span class="nc" id="L1395">                this.presentParams = presentParams;</span>
+<span class="nc" id="L1396">            }</span>
+        }
+
+        private List&lt;Constr&gt; annotatedConstructors;
+    }
+
+    /** Builder for when the target class is an interface and contains
+        no methods other than getters.  Then we can make an instance
+        using a dynamic proxy that forwards the getters to the source
+        CompositeData.  */
+<span class="nc" id="L1406">    private static final class CompositeBuilderViaProxy</span>
+            extends CompositeBuilder {
+
+        CompositeBuilderViaProxy(Class&lt;?&gt; targetClass, String[] itemNames) {
+<span class="nc" id="L1410">            super(targetClass, itemNames);</span>
+<span class="nc" id="L1411">        }</span>
+
+        String applicable(Method[] getters) {
+<span class="nc" id="L1414">            Class&lt;?&gt; targetClass = getTargetClass();</span>
+<span class="nc bnc" id="L1415" title="All 2 branches missed.">            if (!targetClass.isInterface())</span>
+<span class="nc" id="L1416">                return &quot;not an interface&quot;;</span>
+<span class="nc" id="L1417">            Set&lt;Method&gt; methods =</span>
+<span class="nc" id="L1418">                newSet(Arrays.asList(targetClass.getMethods()));</span>
+<span class="nc" id="L1419">            methods.removeAll(Arrays.asList(getters));</span>
+            /* If the interface has any methods left over, they better be
+             * public methods that are already present in java.lang.Object.
+             */
+<span class="nc" id="L1423">            String bad = null;</span>
+<span class="nc bnc" id="L1424" title="All 2 branches missed.">            for (Method m : methods) {</span>
+<span class="nc" id="L1425">                String mname = m.getName();</span>
+<span class="nc" id="L1426">                Class&lt;?&gt;[] mparams = m.getParameterTypes();</span>
+                try {
+<span class="nc" id="L1428">                    Method om = Object.class.getMethod(mname, mparams);</span>
+<span class="nc bnc" id="L1429" title="All 2 branches missed.">                    if (!Modifier.isPublic(om.getModifiers()))</span>
+<span class="nc" id="L1430">                        bad = mname;</span>
+<span class="nc" id="L1431">                } catch (NoSuchMethodException e) {</span>
+<span class="nc" id="L1432">                    bad = mname;</span>
+<span class="nc" id="L1433">                }</span>
+                /* We don't catch SecurityException since it shouldn't
+                 * happen for a method in Object and if it does we would
+                 * like to know about it rather than mysteriously complaining.
+                 */
+<span class="nc" id="L1438">            }</span>
+<span class="nc bnc" id="L1439" title="All 2 branches missed.">            if (bad != null)</span>
+<span class="nc" id="L1440">                return &quot;contains methods other than getters (&quot; + bad + &quot;)&quot;;</span>
+<span class="nc" id="L1441">            return null; // success!</span>
+        }
+
+        final Object fromCompositeData(CompositeData cd,
+                                       String[] itemNames,
+                                       MXBeanMapping[] converters) {
+<span class="nc" id="L1447">            final Class&lt;?&gt; targetClass = getTargetClass();</span>
+<span class="nc" id="L1448">            return</span>
+<span class="nc" id="L1449">                Proxy.newProxyInstance(targetClass.getClassLoader(),</span>
+                                       new Class&lt;?&gt;[] {targetClass},
+                                       new CompositeDataInvocationHandler(cd));
+        }
+    }
+
+    static InvalidObjectException invalidObjectException(String msg,
+                                                         Throwable cause) {
+<span class="nc" id="L1457">        return EnvHelp.initCause(new InvalidObjectException(msg), cause);</span>
+    }
+
+    static InvalidObjectException invalidObjectException(Throwable cause) {
+<span class="nc" id="L1461">        return invalidObjectException(cause.getMessage(), cause);</span>
+    }
+
+    static OpenDataException openDataException(String msg, Throwable cause) {
+<span class="nc" id="L1465">        return EnvHelp.initCause(new OpenDataException(msg), cause);</span>
+    }
+
+    static OpenDataException openDataException(Throwable cause) {
+<span class="nc" id="L1469">        return openDataException(cause.getMessage(), cause);</span>
+    }
+
+    static void mustBeComparable(Class&lt;?&gt; collection, Type element)
+            throws OpenDataException {
+<span class="nc bnc" id="L1474" title="All 2 branches missed.">        if (!(element instanceof Class&lt;?&gt;)</span>
+<span class="nc bnc" id="L1475" title="All 2 branches missed.">            || !Comparable.class.isAssignableFrom((Class&lt;?&gt;) element)) {</span>
+<span class="nc" id="L1476">            final String msg =</span>
+                &quot;Parameter class &quot; + element + &quot; of &quot; +
+<span class="nc" id="L1478">                collection.getName() + &quot; does not implement &quot; +</span>
+<span class="nc" id="L1479">                Comparable.class.getName();</span>
+<span class="nc" id="L1480">            throw new OpenDataException(msg);</span>
+        }
+<span class="nc" id="L1482">    }</span>
+
+    /**
+     * Utility method to take a string and convert it to normal Java variable
+     * name capitalization.  This normally means converting the first
+     * character from upper case to lower case, but in the (unusual) special
+     * case when there is more than one character and both the first and
+     * second characters are upper case, we leave it alone.
+     * &lt;p&gt;
+     * Thus &quot;FooBah&quot; becomes &quot;fooBah&quot; and &quot;X&quot; becomes &quot;x&quot;, but &quot;URL&quot; stays
+     * as &quot;URL&quot;.
+     *
+     * @param  name The string to be decapitalized.
+     * @return  The decapitalized version of the string.
+     */
+    public static String decapitalize(String name) {
+<span class="nc bnc" id="L1498" title="All 4 branches missed.">        if (name == null || name.length() == 0) {</span>
+<span class="nc" id="L1499">            return name;</span>
+        }
+<span class="nc" id="L1501">        int offset1 = Character.offsetByCodePoints(name, 0, 1);</span>
+        // Should be name.offsetByCodePoints but 6242664 makes this fail
+<span class="nc bnc" id="L1503" title="All 2 branches missed.">        if (offset1 &lt; name.length() &amp;&amp;</span>
+<span class="nc bnc" id="L1504" title="All 2 branches missed.">                Character.isUpperCase(name.codePointAt(offset1)))</span>
+<span class="nc" id="L1505">            return name;</span>
+<span class="nc" id="L1506">        return name.substring(0, offset1).toLowerCase() +</span>
+<span class="nc" id="L1507">               name.substring(offset1);</span>
+    }
+
+    /**
+     * Reverse operation for java.beans.Introspector.decapitalize.  For any s,
+     * capitalize(decapitalize(s)).equals(s).  The reverse is not true:
+     * e.g. capitalize(&quot;uRL&quot;) produces &quot;URL&quot; which is unchanged by
+     * decapitalize.
+     */
+    static String capitalize(String name) {
+<span class="nc bnc" id="L1517" title="All 4 branches missed.">        if (name == null || name.length() == 0)</span>
+<span class="nc" id="L1518">            return name;</span>
+<span class="nc" id="L1519">        int offset1 = name.offsetByCodePoints(0, 1);</span>
+<span class="nc" id="L1520">        return name.substring(0, offset1).toUpperCase() +</span>
+<span class="nc" id="L1521">               name.substring(offset1);</span>
+    }
+
+    public static String propertyName(Method m) {
+<span class="nc" id="L1525">        String rest = null;</span>
+<span class="nc" id="L1526">        String name = m.getName();</span>
+<span class="nc bnc" id="L1527" title="All 2 branches missed.">        if (name.startsWith(&quot;get&quot;))</span>
+<span class="nc" id="L1528">            rest = name.substring(3);</span>
+<span class="nc bnc" id="L1529" title="All 4 branches missed.">        else if (name.startsWith(&quot;is&quot;) &amp;&amp; m.getReturnType() == boolean.class)</span>
+<span class="nc" id="L1530">            rest = name.substring(2);</span>
+<span class="nc bnc" id="L1531" title="All 4 branches missed.">        if (rest == null || rest.length() == 0</span>
+<span class="nc bnc" id="L1532" title="All 2 branches missed.">            || m.getParameterTypes().length &gt; 0</span>
+<span class="nc bnc" id="L1533" title="All 2 branches missed.">            || m.getReturnType() == void.class</span>
+<span class="nc bnc" id="L1534" title="All 2 branches missed.">            || name.equals(&quot;getClass&quot;))</span>
+<span class="nc" id="L1535">            return null;</span>
+<span class="nc" id="L1536">        return rest;</span>
+    }
+
+<span class="nc" id="L1539">    private final static Map&lt;Type, Type&gt; inProgress = newIdentityHashMap();</span>
+    // really an IdentityHashSet but that doesn't exist
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

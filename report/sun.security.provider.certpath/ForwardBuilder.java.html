@@ -1,0 +1,893 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ForwardBuilder.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.provider.certpath</a> &gt; <span class="el_source">ForwardBuilder.java</span></div><h1>ForwardBuilder.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2000, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.security.provider.certpath;
+
+import java.io.IOException;
+import java.security.GeneralSecurityException;
+import java.security.InvalidKeyException;
+import java.security.PublicKey;
+import java.security.cert.CertificateException;
+import java.security.cert.CertPathValidatorException;
+import java.security.cert.PKIXReason;
+import java.security.cert.CertStore;
+import java.security.cert.CertStoreException;
+import java.security.cert.PKIXBuilderParameters;
+import java.security.cert.PKIXCertPathChecker;
+import java.security.cert.TrustAnchor;
+import java.security.cert.X509Certificate;
+import java.security.cert.X509CertSelector;
+import java.util.*;
+import javax.security.auth.x500.X500Principal;
+
+import sun.security.provider.certpath.PKIX.BuilderParams;
+import sun.security.util.Debug;
+import sun.security.x509.AccessDescription;
+import sun.security.x509.AuthorityInfoAccessExtension;
+import static sun.security.x509.PKIXExtensions.*;
+import sun.security.x509.PolicyMappingsExtension;
+import sun.security.x509.X500Name;
+import sun.security.x509.X509CertImpl;
+import sun.security.x509.AuthorityKeyIdentifierExtension;
+
+/**
+ * This class represents a forward builder, which is able to retrieve
+ * matching certificates from CertStores and verify a particular certificate
+ * against a ForwardState.
+ *
+ * @since       1.4
+ * @author      Yassir Elley
+ * @author      Sean Mullan
+ */
+class ForwardBuilder extends Builder {
+
+<span class="fc" id="L66">    private static final Debug debug = Debug.getInstance(&quot;certpath&quot;);</span>
+    private final Set&lt;X509Certificate&gt; trustedCerts;
+    private final Set&lt;X500Principal&gt; trustedSubjectDNs;
+    private final Set&lt;TrustAnchor&gt; trustAnchors;
+    private X509CertSelector eeSelector;
+    private AdaptableX509CertSelector caSelector;
+    private X509CertSelector caTargetSelector;
+    TrustAnchor trustAnchor;
+    private Comparator&lt;X509Certificate&gt; comparator;
+<span class="fc" id="L75">    private boolean searchAllCertStores = true;</span>
+
+    /**
+     * Initialize the builder with the input parameters.
+     *
+     * @param params the parameter set used to build a certification path
+     */
+    ForwardBuilder(BuilderParams buildParams, boolean searchAllCertStores) {
+<span class="fc" id="L83">        super(buildParams);</span>
+
+        // populate sets of trusted certificates and subject DNs
+<span class="fc" id="L86">        trustAnchors = buildParams.trustAnchors();</span>
+<span class="fc" id="L87">        trustedCerts = new HashSet&lt;X509Certificate&gt;(trustAnchors.size());</span>
+<span class="fc" id="L88">        trustedSubjectDNs = new HashSet&lt;X500Principal&gt;(trustAnchors.size());</span>
+<span class="fc bfc" id="L89" title="All 2 branches covered.">        for (TrustAnchor anchor : trustAnchors) {</span>
+<span class="fc" id="L90">            X509Certificate trustedCert = anchor.getTrustedCert();</span>
+<span class="fc bfc" id="L91" title="All 2 branches covered.">            if (trustedCert != null) {</span>
+<span class="fc" id="L92">                trustedCerts.add(trustedCert);</span>
+<span class="fc" id="L93">                trustedSubjectDNs.add(trustedCert.getSubjectX500Principal());</span>
+            } else {
+<span class="fc" id="L95">                trustedSubjectDNs.add(anchor.getCA());</span>
+            }
+<span class="fc" id="L97">        }</span>
+<span class="fc" id="L98">        comparator = new PKIXCertComparator(trustedSubjectDNs);</span>
+<span class="fc" id="L99">        this.searchAllCertStores = searchAllCertStores;</span>
+<span class="fc" id="L100">    }</span>
+
+    /**
+     * Retrieves all certs from the specified CertStores that satisfy the
+     * requirements specified in the parameters and the current
+     * PKIX state (name constraints, policy constraints, etc).
+     *
+     * @param currentState the current state.
+     *        Must be an instance of &lt;code&gt;ForwardState&lt;/code&gt;
+     * @param certStores list of CertStores
+     */
+    @Override
+    Collection&lt;X509Certificate&gt; getMatchingCerts(State currentState,
+                                                 List&lt;CertStore&gt; certStores)
+        throws CertStoreException, CertificateException, IOException
+    {
+<span class="pc bpc" id="L116" title="1 of 2 branches missed.">        if (debug != null) {</span>
+<span class="nc" id="L117">            debug.println(&quot;ForwardBuilder.getMatchingCerts()...&quot;);</span>
+        }
+
+<span class="fc" id="L120">        ForwardState currState = (ForwardState) currentState;</span>
+
+        /*
+         * We store certs in a Set because we don't want duplicates.
+         * As each cert is added, it is sorted based on the PKIXCertComparator
+         * algorithm.
+         */
+<span class="fc" id="L127">        Set&lt;X509Certificate&gt; certs = new TreeSet&lt;&gt;(comparator);</span>
+
+        /*
+         * Only look for EE certs if search has just started.
+         */
+<span class="fc bfc" id="L132" title="All 2 branches covered.">        if (currState.isInitial()) {</span>
+<span class="fc" id="L133">            getMatchingEECerts(currState, certStores, certs);</span>
+        }
+<span class="fc" id="L135">        getMatchingCACerts(currState, certStores, certs);</span>
+
+<span class="fc" id="L137">        return certs;</span>
+    }
+
+    /*
+     * Retrieves all end-entity certificates which satisfy constraints
+     * and requirements specified in the parameters and PKIX state.
+     */
+    private void getMatchingEECerts(ForwardState currentState,
+                                    List&lt;CertStore&gt; certStores,
+                                    Collection&lt;X509Certificate&gt; eeCerts)
+        throws IOException
+    {
+<span class="pc bpc" id="L149" title="1 of 2 branches missed.">        if (debug != null) {</span>
+<span class="nc" id="L150">            debug.println(&quot;ForwardBuilder.getMatchingEECerts()...&quot;);</span>
+        }
+        /*
+         * Compose a certificate matching rule to filter out
+         * certs which don't satisfy constraints
+         *
+         * First, retrieve clone of current target cert constraints,
+         * and then add more selection criteria based on current validation
+         * state. Since selector never changes, cache local copy &amp; reuse.
+         */
+<span class="pc bpc" id="L160" title="1 of 2 branches missed.">        if (eeSelector == null) {</span>
+<span class="fc" id="L161">            eeSelector = (X509CertSelector) targetCertConstraints.clone();</span>
+
+            /*
+             * Match on certificate validity date
+             */
+<span class="fc" id="L166">            eeSelector.setCertificateValid(buildParams.date());</span>
+
+            /*
+             * Policy processing optimizations
+             */
+<span class="pc bpc" id="L171" title="1 of 2 branches missed.">            if (buildParams.explicitPolicyRequired()) {</span>
+<span class="nc" id="L172">                eeSelector.setPolicy(getMatchingPolicies());</span>
+            }
+            /*
+             * Require EE certs
+             */
+<span class="fc" id="L177">            eeSelector.setBasicConstraints(-2);</span>
+        }
+
+        /* Retrieve matching EE certs from CertStores */
+<span class="fc" id="L181">        addMatchingCerts(eeSelector, certStores, eeCerts, searchAllCertStores);</span>
+<span class="fc" id="L182">    }</span>
+
+    /**
+     * Retrieves all CA certificates which satisfy constraints
+     * and requirements specified in the parameters and PKIX state.
+     */
+    private void getMatchingCACerts(ForwardState currentState,
+                                    List&lt;CertStore&gt; certStores,
+                                    Collection&lt;X509Certificate&gt; caCerts)
+        throws IOException
+    {
+<span class="pc bpc" id="L193" title="1 of 2 branches missed.">        if (debug != null) {</span>
+<span class="nc" id="L194">            debug.println(&quot;ForwardBuilder.getMatchingCACerts()...&quot;);</span>
+        }
+<span class="fc" id="L196">        int initialSize = caCerts.size();</span>
+
+        /*
+         * Compose a CertSelector to filter out
+         * certs which do not satisfy requirements.
+         */
+<span class="fc" id="L202">        X509CertSelector sel = null;</span>
+
+<span class="fc bfc" id="L204" title="All 2 branches covered.">        if (currentState.isInitial()) {</span>
+<span class="fc bfc" id="L205" title="All 2 branches covered.">            if (targetCertConstraints.getBasicConstraints() == -2) {</span>
+                // no need to continue: this means we never can match a CA cert
+<span class="fc" id="L207">                return;</span>
+            }
+
+            /* This means a CA is the target, so match on same stuff as
+             * getMatchingEECerts
+             */
+<span class="pc bpc" id="L213" title="1 of 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L214">                debug.println(&quot;ForwardBuilder.getMatchingCACerts(): ca is target&quot;);</span>
+            }
+
+<span class="pc bpc" id="L217" title="1 of 2 branches missed.">            if (caTargetSelector == null) {</span>
+<span class="fc" id="L218">                caTargetSelector =</span>
+<span class="fc" id="L219">                    (X509CertSelector) targetCertConstraints.clone();</span>
+
+                /*
+                 * Since we don't check the validity period of trusted
+                 * certificates, please don't set the certificate valid
+                 * criterion unless the trusted certificate matching is
+                 * completed.
+                 */
+
+                /*
+                 * Policy processing optimizations
+                 */
+<span class="pc bpc" id="L231" title="1 of 2 branches missed.">                if (buildParams.explicitPolicyRequired())</span>
+<span class="nc" id="L232">                    caTargetSelector.setPolicy(getMatchingPolicies());</span>
+            }
+
+<span class="fc" id="L235">            sel = caTargetSelector;</span>
+        } else {
+
+<span class="fc bfc" id="L238" title="All 2 branches covered.">            if (caSelector == null) {</span>
+<span class="fc" id="L239">                caSelector = new AdaptableX509CertSelector();</span>
+
+                /*
+                 * Since we don't check the validity period of trusted
+                 * certificates, please don't set the certificate valid
+                 * criterion unless the trusted certificate matching is
+                 * completed.
+                 */
+
+                /*
+                 * Policy processing optimizations
+                 */
+<span class="pc bpc" id="L251" title="1 of 2 branches missed.">                if (buildParams.explicitPolicyRequired())</span>
+<span class="nc" id="L252">                    caSelector.setPolicy(getMatchingPolicies());</span>
+            }
+
+            /*
+             * Match on subject (issuer of previous cert)
+             */
+<span class="fc" id="L258">            caSelector.setSubject(currentState.issuerDN);</span>
+
+            /*
+             * Match on subjectNamesTraversed (both DNs and AltNames)
+             * (checks that current cert's name constraints permit it
+             * to certify all the DNs and AltNames that have been traversed)
+             */
+<span class="fc" id="L265">            CertPathHelper.setPathToNames</span>
+<span class="fc" id="L266">                (caSelector, currentState.subjectNamesTraversed);</span>
+
+            /*
+             * Facilitate certification path construction with authority
+             * key identifier and subject key identifier.
+             */
+<span class="fc" id="L272">            AuthorityKeyIdentifierExtension akidext =</span>
+<span class="fc" id="L273">                    currentState.cert.getAuthorityKeyIdentifierExtension();</span>
+<span class="fc" id="L274">            caSelector.parseAuthorityKeyIdentifierExtension(akidext);</span>
+
+            /*
+             * check the validity period
+             */
+<span class="fc" id="L279">            caSelector.setValidityPeriod(currentState.cert.getNotBefore(),</span>
+<span class="fc" id="L280">                                         currentState.cert.getNotAfter());</span>
+
+<span class="fc" id="L282">            sel = caSelector;</span>
+        }
+
+        /*
+         * For compatibility, conservatively, we don't check the path
+         * length constraint of trusted anchors.  Please don't set the
+         * basic constraints criterion unless the trusted certificate
+         * matching is completed.
+         */
+<span class="fc" id="L291">        sel.setBasicConstraints(-1);</span>
+
+<span class="fc bfc" id="L293" title="All 2 branches covered.">        for (X509Certificate trustedCert : trustedCerts) {</span>
+<span class="fc bfc" id="L294" title="All 2 branches covered.">            if (sel.match(trustedCert)) {</span>
+<span class="pc bpc" id="L295" title="1 of 2 branches missed.">                if (debug != null) {</span>
+<span class="nc" id="L296">                    debug.println(&quot;ForwardBuilder.getMatchingCACerts: &quot;</span>
+                        + &quot;found matching trust anchor&quot;);
+                }
+<span class="pc bpc" id="L299" title="1 of 4 branches missed.">                if (caCerts.add(trustedCert) &amp;&amp; !searchAllCertStores) {</span>
+<span class="fc" id="L300">                    return;</span>
+                }
+            }
+<span class="fc" id="L303">        }</span>
+
+        /*
+         * The trusted certificate matching is completed. We need to match
+         * on certificate validity date.
+         */
+<span class="fc" id="L309">        sel.setCertificateValid(buildParams.date());</span>
+
+        /*
+         * Require CA certs with a pathLenConstraint that allows
+         * at least as many CA certs that have already been traversed
+         */
+<span class="fc" id="L315">        sel.setBasicConstraints(currentState.traversedCACerts);</span>
+
+        /*
+         * If we have already traversed as many CA certs as the maxPathLength
+         * will allow us to, then we don't bother looking through these
+         * certificate pairs. If maxPathLength has a value of -1, this
+         * means it is unconstrained, so we always look through the
+         * certificate pairs.
+         */
+<span class="fc bfc" id="L324" title="All 2 branches covered.">        if (currentState.isInitial() ||</span>
+<span class="pc bpc" id="L325" title="1 of 2 branches missed.">           (buildParams.maxPathLength() == -1) ||</span>
+<span class="pc bpc" id="L326" title="1 of 2 branches missed.">           (buildParams.maxPathLength() &gt; currentState.traversedCACerts))</span>
+        {
+<span class="fc bfc" id="L328" title="All 4 branches covered.">            if (addMatchingCerts(sel, certStores,</span>
+                                 caCerts, searchAllCertStores)
+                &amp;&amp; !searchAllCertStores) {
+<span class="fc" id="L331">                return;</span>
+            }
+        }
+
+<span class="pc bpc" id="L335" title="1 of 4 branches missed.">        if (!currentState.isInitial() &amp;&amp; Builder.USE_AIA) {</span>
+            // check for AuthorityInformationAccess extension
+<span class="nc" id="L337">            AuthorityInfoAccessExtension aiaExt =</span>
+<span class="nc" id="L338">                currentState.cert.getAuthorityInfoAccessExtension();</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">            if (aiaExt != null) {</span>
+<span class="nc" id="L340">                getCerts(aiaExt, caCerts);</span>
+            }
+        }
+
+<span class="pc bpc" id="L344" title="1 of 2 branches missed.">        if (debug != null) {</span>
+<span class="nc" id="L345">            int numCerts = caCerts.size() - initialSize;</span>
+<span class="nc" id="L346">            debug.println(&quot;ForwardBuilder.getMatchingCACerts: found &quot; +</span>
+                numCerts + &quot; CA certs&quot;);
+        }
+<span class="fc" id="L349">    }</span>
+
+    /**
+     * Download Certificates from the given AIA and add them to the
+     * specified Collection.
+     */
+    // cs.getCertificates(caSelector) returns a collection of X509Certificate's
+    // because of the selector, so the cast is safe
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private boolean getCerts(AuthorityInfoAccessExtension aiaExt,
+                             Collection&lt;X509Certificate&gt; certs)
+    {
+<span class="nc bnc" id="L361" title="All 2 branches missed.">        if (Builder.USE_AIA == false) {</span>
+<span class="nc" id="L362">            return false;</span>
+        }
+<span class="nc" id="L364">        List&lt;AccessDescription&gt; adList = aiaExt.getAccessDescriptions();</span>
+<span class="nc bnc" id="L365" title="All 4 branches missed.">        if (adList == null || adList.isEmpty()) {</span>
+<span class="nc" id="L366">            return false;</span>
+        }
+
+<span class="nc" id="L369">        boolean add = false;</span>
+<span class="nc bnc" id="L370" title="All 2 branches missed.">        for (AccessDescription ad : adList) {</span>
+<span class="nc" id="L371">            CertStore cs = URICertStore.getInstance(ad);</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">            if (cs != null) {</span>
+                try {
+<span class="nc bnc" id="L374" title="All 2 branches missed.">                    if (certs.addAll((Collection&lt;X509Certificate&gt;)</span>
+<span class="nc" id="L375">                        cs.getCertificates(caSelector))) {</span>
+<span class="nc" id="L376">                        add = true;</span>
+<span class="nc bnc" id="L377" title="All 2 branches missed.">                        if (!searchAllCertStores) {</span>
+<span class="nc" id="L378">                            return true;</span>
+                        }
+                    }
+<span class="nc" id="L381">                } catch (CertStoreException cse) {</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">                    if (debug != null) {</span>
+<span class="nc" id="L383">                        debug.println(&quot;exception getting certs from CertStore:&quot;);</span>
+<span class="nc" id="L384">                        cse.printStackTrace();</span>
+                    }
+<span class="nc" id="L386">                }</span>
+            }
+<span class="nc" id="L388">        }</span>
+<span class="nc" id="L389">        return add;</span>
+    }
+
+    /**
+     * This inner class compares 2 PKIX certificates according to which
+     * should be tried first when building a path from the target.
+     * The preference order is as follows:
+     *
+     * Given trusted certificate(s):
+     *    Subject:ou=D,ou=C,o=B,c=A
+     *
+     * Preference order for current cert:
+     *
+     * 1) Issuer matches a trusted subject
+     *    Issuer: ou=D,ou=C,o=B,c=A
+     *
+     * 2) Issuer is a descendant of a trusted subject (in order of
+     *    number of links to the trusted subject)
+     *    a) Issuer: ou=E,ou=D,ou=C,o=B,c=A        [links=1]
+     *    b) Issuer: ou=F,ou=E,ou=D,ou=C,ou=B,c=A  [links=2]
+     *
+     * 3) Issuer is an ancestor of a trusted subject (in order of number of
+     *    links to the trusted subject)
+     *    a) Issuer: ou=C,o=B,c=A [links=1]
+     *    b) Issuer: o=B,c=A      [links=2]
+     *
+     * 4) Issuer is in the same namespace as a trusted subject (in order of
+     *    number of links to the trusted subject)
+     *    a) Issuer: ou=G,ou=C,o=B,c=A  [links=2]
+     *    b) Issuer: ou=H,o=B,c=A       [links=3]
+     *
+     * 5) Issuer is an ancestor of certificate subject (in order of number
+     *    of links to the certificate subject)
+     *    a) Issuer:  ou=K,o=J,c=A
+     *       Subject: ou=L,ou=K,o=J,c=A
+     *    b) Issuer:  o=J,c=A
+     *       Subject: ou=L,ou=K,0=J,c=A
+     *
+     * 6) Any other certificates
+     */
+    static class PKIXCertComparator implements Comparator&lt;X509Certificate&gt; {
+
+        final static String METHOD_NME = &quot;PKIXCertComparator.compare()&quot;;
+
+        private final Set&lt;X500Principal&gt; trustedSubjectDNs;
+
+<span class="fc" id="L435">        PKIXCertComparator(Set&lt;X500Principal&gt; trustedSubjectDNs) {</span>
+<span class="fc" id="L436">            this.trustedSubjectDNs = trustedSubjectDNs;</span>
+<span class="fc" id="L437">        }</span>
+
+        /**
+         * @param oCert1 First X509Certificate to be compared
+         * @param oCert2 Second X509Certificate to be compared
+         * @return -1 if oCert1 is preferable to oCert2, or
+         *            if oCert1 and oCert2 are equally preferable (in this
+         *            case it doesn't matter which is preferable, but we don't
+         *            return 0 because the comparator would behave strangely
+         *            when used in a SortedSet).
+         *          1 if oCert2 is preferable to oCert1
+         *          0 if oCert1.equals(oCert2). We only return 0 if the
+         *          certs are equal so that this comparator behaves
+         *          correctly when used in a SortedSet.
+         * @throws ClassCastException if either argument is not of type
+         * X509Certificate
+         */
+        @Override
+        public int compare(X509Certificate oCert1, X509Certificate oCert2) {
+
+            // if certs are the same, return 0
+<span class="fc bfc" id="L458" title="All 2 branches covered.">            if (oCert1.equals(oCert2)) return 0;</span>
+
+<span class="fc" id="L460">            X500Principal cIssuer1 = oCert1.getIssuerX500Principal();</span>
+<span class="fc" id="L461">            X500Principal cIssuer2 = oCert2.getIssuerX500Principal();</span>
+<span class="fc" id="L462">            X500Name cIssuer1Name = X500Name.asX500Name(cIssuer1);</span>
+<span class="fc" id="L463">            X500Name cIssuer2Name = X500Name.asX500Name(cIssuer2);</span>
+
+<span class="pc bpc" id="L465" title="1 of 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L466">                debug.println(METHOD_NME + &quot; o1 Issuer:  &quot; + cIssuer1);</span>
+<span class="nc" id="L467">                debug.println(METHOD_NME + &quot; o2 Issuer:  &quot; + cIssuer2);</span>
+            }
+
+            /* If one cert's issuer matches a trusted subject, then it is
+             * preferable.
+             */
+<span class="pc bpc" id="L473" title="1 of 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L474">                debug.println(METHOD_NME + &quot; MATCH TRUSTED SUBJECT TEST...&quot;);</span>
+            }
+
+<span class="fc" id="L477">            boolean m1 = trustedSubjectDNs.contains(cIssuer1);</span>
+<span class="fc" id="L478">            boolean m2 = trustedSubjectDNs.contains(cIssuer2);</span>
+<span class="pc bpc" id="L479" title="1 of 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L480">                debug.println(METHOD_NME + &quot; m1: &quot; + m1);</span>
+<span class="nc" id="L481">                debug.println(METHOD_NME + &quot; m2: &quot; + m2);</span>
+            }
+<span class="pc bpc" id="L483" title="2 of 4 branches missed.">            if (m1 &amp;&amp; m2) {</span>
+<span class="fc" id="L484">                return -1;</span>
+<span class="nc bnc" id="L485" title="All 2 branches missed.">            } else if (m1) {</span>
+<span class="nc" id="L486">                return -1;</span>
+<span class="nc bnc" id="L487" title="All 2 branches missed.">            } else if (m2) {</span>
+<span class="nc" id="L488">                return 1;</span>
+            }
+
+            /* If one cert's issuer is a naming descendant of a trusted subject,
+             * then it is preferable, in order of increasing naming distance.
+             */
+<span class="nc bnc" id="L494" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L495">                debug.println(METHOD_NME + &quot; NAMING DESCENDANT TEST...&quot;);</span>
+            }
+<span class="nc bnc" id="L497" title="All 2 branches missed.">            for (X500Principal tSubject : trustedSubjectDNs) {</span>
+<span class="nc" id="L498">                X500Name tSubjectName = X500Name.asX500Name(tSubject);</span>
+<span class="nc" id="L499">                int distanceTto1 =</span>
+<span class="nc" id="L500">                    Builder.distance(tSubjectName, cIssuer1Name, -1);</span>
+<span class="nc" id="L501">                int distanceTto2 =</span>
+<span class="nc" id="L502">                    Builder.distance(tSubjectName, cIssuer2Name, -1);</span>
+<span class="nc bnc" id="L503" title="All 2 branches missed.">                if (debug != null) {</span>
+<span class="nc" id="L504">                    debug.println(METHOD_NME +&quot; distanceTto1: &quot; + distanceTto1);</span>
+<span class="nc" id="L505">                    debug.println(METHOD_NME +&quot; distanceTto2: &quot; + distanceTto2);</span>
+                }
+<span class="nc bnc" id="L507" title="All 4 branches missed.">                if (distanceTto1 &gt; 0 || distanceTto2 &gt; 0) {</span>
+<span class="nc bnc" id="L508" title="All 2 branches missed.">                    if (distanceTto1 == distanceTto2) {</span>
+<span class="nc" id="L509">                        return -1;</span>
+<span class="nc bnc" id="L510" title="All 4 branches missed.">                    } else if (distanceTto1 &gt; 0 &amp;&amp; distanceTto2 &lt;= 0) {</span>
+<span class="nc" id="L511">                        return -1;</span>
+<span class="nc bnc" id="L512" title="All 4 branches missed.">                    } else if (distanceTto1 &lt;= 0 &amp;&amp; distanceTto2 &gt; 0) {</span>
+<span class="nc" id="L513">                        return 1;</span>
+<span class="nc bnc" id="L514" title="All 2 branches missed.">                    } else if (distanceTto1 &lt; distanceTto2) {</span>
+<span class="nc" id="L515">                        return -1;</span>
+                    } else {    // distanceTto1 &gt; distanceTto2
+<span class="nc" id="L517">                        return 1;</span>
+                    }
+                }
+<span class="nc" id="L520">            }</span>
+
+            /* If one cert's issuer is a naming ancestor of a trusted subject,
+             * then it is preferable, in order of increasing naming distance.
+             */
+<span class="nc bnc" id="L525" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L526">                debug.println(METHOD_NME + &quot; NAMING ANCESTOR TEST...&quot;);</span>
+            }
+<span class="nc bnc" id="L528" title="All 2 branches missed.">            for (X500Principal tSubject : trustedSubjectDNs) {</span>
+<span class="nc" id="L529">                X500Name tSubjectName = X500Name.asX500Name(tSubject);</span>
+
+<span class="nc" id="L531">                int distanceTto1 = Builder.distance</span>
+<span class="nc" id="L532">                    (tSubjectName, cIssuer1Name, Integer.MAX_VALUE);</span>
+<span class="nc" id="L533">                int distanceTto2 = Builder.distance</span>
+<span class="nc" id="L534">                    (tSubjectName, cIssuer2Name, Integer.MAX_VALUE);</span>
+<span class="nc bnc" id="L535" title="All 2 branches missed.">                if (debug != null) {</span>
+<span class="nc" id="L536">                    debug.println(METHOD_NME +&quot; distanceTto1: &quot; + distanceTto1);</span>
+<span class="nc" id="L537">                    debug.println(METHOD_NME +&quot; distanceTto2: &quot; + distanceTto2);</span>
+                }
+<span class="nc bnc" id="L539" title="All 4 branches missed.">                if (distanceTto1 &lt; 0 || distanceTto2 &lt; 0) {</span>
+<span class="nc bnc" id="L540" title="All 2 branches missed.">                    if (distanceTto1 == distanceTto2) {</span>
+<span class="nc" id="L541">                        return -1;</span>
+<span class="nc bnc" id="L542" title="All 4 branches missed.">                    } else if (distanceTto1 &lt; 0 &amp;&amp; distanceTto2 &gt;= 0) {</span>
+<span class="nc" id="L543">                        return -1;</span>
+<span class="nc bnc" id="L544" title="All 4 branches missed.">                    } else if (distanceTto1 &gt;= 0 &amp;&amp; distanceTto2 &lt; 0) {</span>
+<span class="nc" id="L545">                        return 1;</span>
+<span class="nc bnc" id="L546" title="All 2 branches missed.">                    } else if (distanceTto1 &gt; distanceTto2) {</span>
+<span class="nc" id="L547">                        return -1;</span>
+                    } else {
+<span class="nc" id="L549">                        return 1;</span>
+                    }
+                }
+<span class="nc" id="L552">            }</span>
+
+            /* If one cert's issuer is in the same namespace as a trusted
+             * subject, then it is preferable, in order of increasing naming
+             * distance.
+             */
+<span class="nc bnc" id="L558" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L559">                debug.println(METHOD_NME +&quot; SAME NAMESPACE AS TRUSTED TEST...&quot;);</span>
+            }
+<span class="nc bnc" id="L561" title="All 2 branches missed.">            for (X500Principal tSubject : trustedSubjectDNs) {</span>
+<span class="nc" id="L562">                X500Name tSubjectName = X500Name.asX500Name(tSubject);</span>
+<span class="nc" id="L563">                X500Name tAo1 = tSubjectName.commonAncestor(cIssuer1Name);</span>
+<span class="nc" id="L564">                X500Name tAo2 = tSubjectName.commonAncestor(cIssuer2Name);</span>
+<span class="nc bnc" id="L565" title="All 2 branches missed.">                if (debug != null) {</span>
+<span class="nc" id="L566">                    debug.println(METHOD_NME +&quot; tAo1: &quot; + String.valueOf(tAo1));</span>
+<span class="nc" id="L567">                    debug.println(METHOD_NME +&quot; tAo2: &quot; + String.valueOf(tAo2));</span>
+                }
+<span class="nc bnc" id="L569" title="All 4 branches missed.">                if (tAo1 != null || tAo2 != null) {</span>
+<span class="nc bnc" id="L570" title="All 4 branches missed.">                    if (tAo1 != null &amp;&amp; tAo2 != null) {</span>
+<span class="nc" id="L571">                        int hopsTto1 = Builder.hops</span>
+<span class="nc" id="L572">                            (tSubjectName, cIssuer1Name, Integer.MAX_VALUE);</span>
+<span class="nc" id="L573">                        int hopsTto2 = Builder.hops</span>
+<span class="nc" id="L574">                            (tSubjectName, cIssuer2Name, Integer.MAX_VALUE);</span>
+<span class="nc bnc" id="L575" title="All 2 branches missed.">                        if (debug != null) {</span>
+<span class="nc" id="L576">                            debug.println(METHOD_NME +&quot; hopsTto1: &quot; + hopsTto1);</span>
+<span class="nc" id="L577">                            debug.println(METHOD_NME +&quot; hopsTto2: &quot; + hopsTto2);</span>
+                        }
+<span class="nc bnc" id="L579" title="All 2 branches missed.">                        if (hopsTto1 == hopsTto2) {</span>
+<span class="nc bnc" id="L580" title="All 2 branches missed.">                        } else if (hopsTto1 &gt; hopsTto2) {</span>
+<span class="nc" id="L581">                            return 1;</span>
+                        } else {  // hopsTto1 &lt; hopsTto2
+<span class="nc" id="L583">                            return -1;</span>
+                        }
+<span class="nc bnc" id="L585" title="All 2 branches missed.">                    } else if (tAo1 == null) {</span>
+<span class="nc" id="L586">                        return 1;</span>
+                    } else {
+<span class="nc" id="L588">                        return -1;</span>
+                    }
+                }
+<span class="nc" id="L591">            }</span>
+
+
+            /* If one cert's issuer is an ancestor of that cert's subject,
+             * then it is preferable, in order of increasing naming distance.
+             */
+<span class="nc bnc" id="L597" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L598">                debug.println(METHOD_NME+&quot; CERT ISSUER/SUBJECT COMPARISON TEST...&quot;);</span>
+            }
+<span class="nc" id="L600">            X500Principal cSubject1 = oCert1.getSubjectX500Principal();</span>
+<span class="nc" id="L601">            X500Principal cSubject2 = oCert2.getSubjectX500Principal();</span>
+<span class="nc" id="L602">            X500Name cSubject1Name = X500Name.asX500Name(cSubject1);</span>
+<span class="nc" id="L603">            X500Name cSubject2Name = X500Name.asX500Name(cSubject2);</span>
+
+<span class="nc bnc" id="L605" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L606">                debug.println(METHOD_NME + &quot; o1 Subject: &quot; + cSubject1);</span>
+<span class="nc" id="L607">                debug.println(METHOD_NME + &quot; o2 Subject: &quot; + cSubject2);</span>
+            }
+<span class="nc" id="L609">            int distanceStoI1 = Builder.distance</span>
+<span class="nc" id="L610">                (cSubject1Name, cIssuer1Name, Integer.MAX_VALUE);</span>
+<span class="nc" id="L611">            int distanceStoI2 = Builder.distance</span>
+<span class="nc" id="L612">                (cSubject2Name, cIssuer2Name, Integer.MAX_VALUE);</span>
+<span class="nc bnc" id="L613" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L614">                debug.println(METHOD_NME + &quot; distanceStoI1: &quot; + distanceStoI1);</span>
+<span class="nc" id="L615">                debug.println(METHOD_NME + &quot; distanceStoI2: &quot; + distanceStoI2);</span>
+            }
+<span class="nc bnc" id="L617" title="All 2 branches missed.">            if (distanceStoI2 &gt; distanceStoI1) {</span>
+<span class="nc" id="L618">                return -1;</span>
+<span class="nc bnc" id="L619" title="All 2 branches missed.">            } else if (distanceStoI2 &lt; distanceStoI1) {</span>
+<span class="nc" id="L620">                return 1;</span>
+            }
+
+            /* Otherwise, certs are equally preferable.
+             */
+<span class="nc bnc" id="L625" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L626">                debug.println(METHOD_NME + &quot; no tests matched; RETURN 0&quot;);</span>
+            }
+<span class="nc" id="L628">            return -1;</span>
+        }
+    }
+
+    /**
+     * Verifies a matching certificate.
+     *
+     * This method executes the validation steps in the PKIX path
+     * validation algorithm &lt;draft-ietf-pkix-new-part1-08.txt&gt; which were
+     * not satisfied by the selection criteria used by getCertificates()
+     * to find the certs and only the steps that can be executed in a
+     * forward direction (target to trust anchor). Those steps that can
+     * only be executed in a reverse direction are deferred until the
+     * complete path has been built.
+     *
+     * Trust anchor certs are not validated, but are used to verify the
+     * signature and revocation status of the previous cert.
+     *
+     * If the last certificate is being verified (the one whose subject
+     * matches the target subject, then steps in 6.1.4 of the PKIX
+     * Certification Path Validation algorithm are NOT executed,
+     * regardless of whether or not the last cert is an end-entity
+     * cert or not. This allows callers to certify CA certs as
+     * well as EE certs.
+     *
+     * @param cert the certificate to be verified
+     * @param currentState the current state against which the cert is verified
+     * @param certPathList the certPathList generated thus far
+     */
+    @Override
+    void verifyCert(X509Certificate cert, State currentState,
+                    List&lt;X509Certificate&gt; certPathList)
+        throws GeneralSecurityException
+    {
+<span class="pc bpc" id="L662" title="1 of 2 branches missed.">        if (debug != null) {</span>
+<span class="nc" id="L663">            debug.println(&quot;ForwardBuilder.verifyCert(SN: &quot;</span>
+<span class="nc" id="L664">                + Debug.toHexString(cert.getSerialNumber())</span>
+<span class="nc" id="L665">                + &quot;\n  Issuer: &quot; + cert.getIssuerX500Principal() + &quot;)&quot;</span>
+<span class="nc" id="L666">                + &quot;\n  Subject: &quot; + cert.getSubjectX500Principal() + &quot;)&quot;);</span>
+        }
+
+<span class="fc" id="L669">        ForwardState currState = (ForwardState)currentState;</span>
+
+        // Don't bother to verify untrusted certificate more.
+<span class="fc" id="L672">        currState.untrustedChecker.check(cert, Collections.&lt;String&gt;emptySet());</span>
+
+        /*
+         * check for looping - abort a loop if
+         * ((we encounter the same certificate twice) AND
+         * ((policyMappingInhibited = true) OR (no policy mapping
+         * extensions can be found between the occurrences of the same
+         * certificate)))
+         */
+<span class="pc bpc" id="L681" title="1 of 2 branches missed.">        if (certPathList != null) {</span>
+<span class="fc" id="L682">            boolean policyMappingFound = false;</span>
+<span class="fc bfc" id="L683" title="All 2 branches covered.">            for (X509Certificate cpListCert : certPathList) {</span>
+<span class="fc" id="L684">                X509CertImpl cpListCertImpl = X509CertImpl.toImpl(cpListCert);</span>
+<span class="fc" id="L685">                PolicyMappingsExtension policyMappingsExt</span>
+<span class="fc" id="L686">                    = cpListCertImpl.getPolicyMappingsExtension();</span>
+<span class="pc bpc" id="L687" title="1 of 2 branches missed.">                if (policyMappingsExt != null) {</span>
+<span class="nc" id="L688">                    policyMappingFound = true;</span>
+                }
+<span class="pc bpc" id="L690" title="1 of 2 branches missed.">                if (debug != null) {</span>
+<span class="nc" id="L691">                    debug.println(&quot;policyMappingFound = &quot; + policyMappingFound);</span>
+                }
+<span class="pc bpc" id="L693" title="1 of 2 branches missed.">                if (cert.equals(cpListCert)) {</span>
+<span class="nc bnc" id="L694" title="All 4 branches missed.">                    if ((buildParams.policyMappingInhibited()) ||</span>
+                        (!policyMappingFound)) {
+<span class="nc bnc" id="L696" title="All 2 branches missed.">                        if (debug != null) {</span>
+<span class="nc" id="L697">                            debug.println(&quot;loop detected!!&quot;);</span>
+                        }
+<span class="nc" id="L699">                        throw new CertPathValidatorException(&quot;loop detected&quot;);</span>
+                    }
+                }
+<span class="fc" id="L702">            }</span>
+        }
+
+        /* check if trusted cert */
+<span class="fc" id="L706">        boolean isTrustedCert = trustedCerts.contains(cert);</span>
+
+        /* we don't perform any validation of the trusted cert */
+<span class="fc bfc" id="L709" title="All 2 branches covered.">        if (!isTrustedCert) {</span>
+            /*
+             * Check CRITICAL private extensions for user checkers that
+             * support forward checking (forwardCheckers) and remove
+             * ones we know how to check.
+             */
+<span class="fc" id="L715">            Set&lt;String&gt; unresCritExts = cert.getCriticalExtensionOIDs();</span>
+<span class="pc bpc" id="L716" title="1 of 2 branches missed.">            if (unresCritExts == null) {</span>
+<span class="nc" id="L717">                unresCritExts = Collections.&lt;String&gt;emptySet();</span>
+            }
+<span class="pc bpc" id="L719" title="1 of 2 branches missed.">            for (PKIXCertPathChecker checker : currState.forwardCheckers) {</span>
+<span class="nc" id="L720">                checker.check(cert, unresCritExts);</span>
+<span class="nc" id="L721">            }</span>
+
+            /*
+             * Remove extensions from user checkers that don't support
+             * forward checking. After this step, we will have removed
+             * all extensions that all user checkers are capable of
+             * processing.
+             */
+<span class="pc bpc" id="L729" title="1 of 2 branches missed.">            for (PKIXCertPathChecker checker : buildParams.certPathCheckers()) {</span>
+<span class="nc bnc" id="L730" title="All 2 branches missed.">                if (!checker.isForwardCheckingSupported()) {</span>
+<span class="nc" id="L731">                    Set&lt;String&gt; supportedExts = checker.getSupportedExtensions();</span>
+<span class="nc bnc" id="L732" title="All 2 branches missed.">                    if (supportedExts != null) {</span>
+<span class="nc" id="L733">                        unresCritExts.removeAll(supportedExts);</span>
+                    }
+                }
+<span class="nc" id="L736">            }</span>
+
+            /*
+             * Look at the remaining extensions and remove any ones we know how
+             * to check. If there are any left, throw an exception!
+             */
+<span class="fc bfc" id="L742" title="All 2 branches covered.">            if (!unresCritExts.isEmpty()) {</span>
+<span class="fc" id="L743">                unresCritExts.remove(BasicConstraints_Id.toString());</span>
+<span class="fc" id="L744">                unresCritExts.remove(NameConstraints_Id.toString());</span>
+<span class="fc" id="L745">                unresCritExts.remove(CertificatePolicies_Id.toString());</span>
+<span class="fc" id="L746">                unresCritExts.remove(PolicyMappings_Id.toString());</span>
+<span class="fc" id="L747">                unresCritExts.remove(PolicyConstraints_Id.toString());</span>
+<span class="fc" id="L748">                unresCritExts.remove(InhibitAnyPolicy_Id.toString());</span>
+<span class="fc" id="L749">                unresCritExts.remove(SubjectAlternativeName_Id.toString());</span>
+<span class="fc" id="L750">                unresCritExts.remove(KeyUsage_Id.toString());</span>
+<span class="fc" id="L751">                unresCritExts.remove(ExtendedKeyUsage_Id.toString());</span>
+
+<span class="pc bpc" id="L753" title="1 of 2 branches missed.">                if (!unresCritExts.isEmpty())</span>
+<span class="nc" id="L754">                    throw new CertPathValidatorException</span>
+                        (&quot;Unrecognized critical extension(s)&quot;, null, null, -1,
+                         PKIXReason.UNRECOGNIZED_CRIT_EXT);
+            }
+        }
+
+        /*
+         * if this is the target certificate (init=true), then we are
+         * not able to do any more verification, so just return
+         */
+<span class="fc bfc" id="L764" title="All 2 branches covered.">        if (currState.isInitial()) {</span>
+<span class="fc" id="L765">            return;</span>
+        }
+
+        /* we don't perform any validation of the trusted cert */
+<span class="fc bfc" id="L769" title="All 2 branches covered.">        if (!isTrustedCert) {</span>
+            /* Make sure this is a CA cert */
+<span class="pc bpc" id="L771" title="1 of 2 branches missed.">            if (cert.getBasicConstraints() == -1) {</span>
+<span class="nc" id="L772">                throw new CertificateException(&quot;cert is NOT a CA cert&quot;);</span>
+            }
+
+            /*
+             * Check keyUsage extension
+             */
+<span class="fc" id="L778">            KeyChecker.verifyCAKeyUsage(cert);</span>
+        }
+
+        /*
+         * the following checks are performed even when the cert
+         * is a trusted cert, since we are only extracting the
+         * subjectDN, and publicKey from the cert
+         * in order to verify a previous cert
+         */
+
+        /*
+         * Check signature only if no key requiring key parameters has been
+         * encountered.
+         */
+<span class="pc bpc" id="L792" title="1 of 2 branches missed.">        if (!currState.keyParamsNeeded()) {</span>
+<span class="fc" id="L793">            (currState.cert).verify(cert.getPublicKey(),</span>
+<span class="fc" id="L794">                                    buildParams.sigProvider());</span>
+        }
+<span class="fc" id="L796">    }</span>
+
+    /**
+     * Verifies whether the input certificate completes the path.
+     * Checks the cert against each trust anchor that was specified, in order,
+     * and returns true as soon as it finds a valid anchor.
+     * Returns true if the cert matches a trust anchor specified as a
+     * certificate or if the cert verifies with a trust anchor that
+     * was specified as a trusted {pubkey, caname} pair. Returns false if none
+     * of the trust anchors are valid for this cert.
+     *
+     * @param cert the certificate to test
+     * @return a boolean value indicating whether the cert completes the path.
+     */
+    @Override
+    boolean isPathCompleted(X509Certificate cert) {
+<span class="fc bfc" id="L812" title="All 2 branches covered.">        for (TrustAnchor anchor : trustAnchors) {</span>
+<span class="fc bfc" id="L813" title="All 2 branches covered.">            if (anchor.getTrustedCert() != null) {</span>
+<span class="fc bfc" id="L814" title="All 2 branches covered.">                if (cert.equals(anchor.getTrustedCert())) {</span>
+<span class="fc" id="L815">                    this.trustAnchor = anchor;</span>
+<span class="fc" id="L816">                    return true;</span>
+                } else {
+                    continue;
+                }
+            }
+<span class="fc" id="L821">            X500Principal principal = anchor.getCA();</span>
+<span class="fc" id="L822">            PublicKey publicKey = anchor.getCAPublicKey();</span>
+
+<span class="pc bpc" id="L824" title="2 of 4 branches missed.">            if (principal != null &amp;&amp; publicKey != null &amp;&amp;</span>
+<span class="pc bpc" id="L825" title="1 of 2 branches missed.">                    principal.equals(cert.getSubjectX500Principal())) {</span>
+<span class="nc bnc" id="L826" title="All 2 branches missed.">                if (publicKey.equals(cert.getPublicKey())) {</span>
+                    // the cert itself is a trust anchor
+<span class="nc" id="L828">                    this.trustAnchor = anchor;</span>
+<span class="nc" id="L829">                    return true;</span>
+                }
+                // else, it is a self-issued certificate of the anchor
+            }
+
+            // Check subject/issuer name chaining
+<span class="pc bpc" id="L835" title="1 of 2 branches missed.">            if (principal == null ||</span>
+<span class="fc bfc" id="L836" title="All 2 branches covered.">                    !principal.equals(cert.getIssuerX500Principal())) {</span>
+<span class="fc" id="L837">                continue;</span>
+            }
+
+            // skip anchor if it contains a DSA key with no DSA params
+<span class="pc bpc" id="L841" title="1 of 2 branches missed.">            if (PKIX.isDSAPublicKeyWithoutParams(publicKey)) {</span>
+<span class="nc" id="L842">                continue;</span>
+            }
+
+            /*
+             * Check signature
+             */
+            try {
+<span class="fc" id="L849">                cert.verify(publicKey, buildParams.sigProvider());</span>
+<span class="nc" id="L850">            } catch (InvalidKeyException ike) {</span>
+<span class="nc bnc" id="L851" title="All 2 branches missed.">                if (debug != null) {</span>
+<span class="nc" id="L852">                    debug.println(&quot;ForwardBuilder.isPathCompleted() invalid &quot;</span>
+                                  + &quot;DSA key found&quot;);
+                }
+<span class="nc" id="L855">                continue;</span>
+<span class="nc" id="L856">            } catch (GeneralSecurityException e){</span>
+<span class="nc bnc" id="L857" title="All 2 branches missed.">                if (debug != null) {</span>
+<span class="nc" id="L858">                    debug.println(&quot;ForwardBuilder.isPathCompleted() &quot; +</span>
+                                  &quot;unexpected exception&quot;);
+<span class="nc" id="L860">                    e.printStackTrace();</span>
+                }
+<span class="nc" id="L862">                continue;</span>
+<span class="fc" id="L863">            }</span>
+
+<span class="fc" id="L865">            this.trustAnchor = anchor;</span>
+<span class="fc" id="L866">            return true;</span>
+        }
+
+<span class="fc" id="L869">        return false;</span>
+    }
+
+    /** Adds the certificate to the certPathList
+     *
+     * @param cert the certificate to be added
+     * @param certPathList the certification path list
+     */
+    @Override
+    void addCertToPath(X509Certificate cert,
+                       LinkedList&lt;X509Certificate&gt; certPathList)
+    {
+<span class="fc" id="L881">        certPathList.addFirst(cert);</span>
+<span class="fc" id="L882">    }</span>
+
+    /** Removes final certificate from the certPathList
+     *
+     * @param certPathList the certification path list
+     */
+    @Override
+    void removeFinalCertFromPath(LinkedList&lt;X509Certificate&gt; certPathList) {
+<span class="fc" id="L890">        certPathList.removeFirst();</span>
+<span class="fc" id="L891">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

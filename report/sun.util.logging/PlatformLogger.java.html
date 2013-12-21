@@ -1,0 +1,660 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>PlatformLogger.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.util.logging</a> &gt; <span class="el_source">PlatformLogger.java</span></div><h1>PlatformLogger.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2009, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+
+package sun.util.logging;
+
+import java.lang.ref.WeakReference;
+import java.io.PrintStream;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
+import java.util.Arrays;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+import sun.misc.JavaLangAccess;
+import sun.misc.SharedSecrets;
+
+/**
+ * Platform logger provides an API for the JRE components to log
+ * messages.  This enables the runtime components to eliminate the
+ * static dependency of the logging facility and also defers the
+ * java.util.logging initialization until it is enabled.
+ * In addition, the PlatformLogger API can be used if the logging
+ * module does not exist.
+ *
+ * If the logging facility is not enabled, the platform loggers
+ * will output log messages per the default logging configuration
+ * (see below). In this implementation, it does not log the
+ * the stack frame information issuing the log message.
+ *
+ * When the logging facility is enabled (at startup or runtime),
+ * the java.util.logging.Logger will be created for each platform
+ * logger and all log messages will be forwarded to the Logger
+ * to handle.
+ *
+ * Logging facility is &quot;enabled&quot; when one of the following
+ * conditions is met:
+ * 1) a system property &quot;java.util.logging.config.class&quot; or
+ *    &quot;java.util.logging.config.file&quot; is set
+ * 2) java.util.logging.LogManager or java.util.logging.Logger
+ *    is referenced that will trigger the logging initialization.
+ *
+ * Default logging configuration:
+ *   global logging level = INFO
+ *   handlers = java.util.logging.ConsoleHandler
+ *   java.util.logging.ConsoleHandler.level = INFO
+ *   java.util.logging.ConsoleHandler.formatter = java.util.logging.SimpleFormatter
+ *
+ * Limitation:
+ * &lt;JAVA_HOME&gt;/lib/logging.properties is the system-wide logging
+ * configuration defined in the specification and read in the
+ * default case to configure any java.util.logging.Logger instances.
+ * Platform loggers will not detect if &lt;JAVA_HOME&gt;/lib/logging.properties
+ * is modified. In other words, unless the java.util.logging API
+ * is used at runtime or the logging system properties is set,
+ * the platform loggers will use the default setting described above.
+ * The platform loggers are designed for JDK developers use and
+ * this limitation can be workaround with setting
+ * -Djava.util.logging.config.file system property.
+ *
+ * @since 1.7
+ */
+public class PlatformLogger {
+
+    // The integer values must match that of {@code java.util.logging.Level}
+    // objects.
+    private static final int OFF     = Integer.MAX_VALUE;
+    private static final int SEVERE  = 1000;
+    private static final int WARNING = 900;
+    private static final int INFO    = 800;
+    private static final int CONFIG  = 700;
+    private static final int FINE    = 500;
+    private static final int FINER   = 400;
+    private static final int FINEST  = 300;
+    private static final int ALL     = Integer.MIN_VALUE;
+
+    /**
+     * PlatformLogger logging levels.
+     */
+<span class="fc" id="L104">    public static enum Level {</span>
+        // The name and value must match that of {@code java.util.logging.Level}s.
+        // Declare in ascending order of the given value for binary search.
+<span class="fc" id="L107">        ALL,</span>
+<span class="fc" id="L108">        FINEST,</span>
+<span class="fc" id="L109">        FINER,</span>
+<span class="fc" id="L110">        FINE,</span>
+<span class="fc" id="L111">        CONFIG,</span>
+<span class="fc" id="L112">        INFO,</span>
+<span class="fc" id="L113">        WARNING,</span>
+<span class="fc" id="L114">        SEVERE,</span>
+<span class="fc" id="L115">        OFF;</span>
+
+        /**
+         * Associated java.util.logging.Level lazily initialized in
+         * JavaLoggerProxy's static initializer only once
+         * when java.util.logging is available and enabled.
+         * Only accessed by JavaLoggerProxy.
+         */
+        /* java.util.logging.Level */ Object javaLevel;
+
+        // ascending order for binary search matching the list of enum constants
+<span class="fc" id="L126">        private static final int[] LEVEL_VALUES = new int[] {</span>
+            PlatformLogger.ALL, PlatformLogger.FINEST, PlatformLogger.FINER,
+            PlatformLogger.FINE, PlatformLogger.CONFIG, PlatformLogger.INFO,
+            PlatformLogger.WARNING, PlatformLogger.SEVERE, PlatformLogger.OFF
+        };
+
+        public int intValue() {
+<span class="fc" id="L133">            return LEVEL_VALUES[this.ordinal()];</span>
+        }
+
+        static Level valueOf(int level) {
+<span class="pc bpc" id="L137" title="9 of 10 branches missed.">            switch (level) {</span>
+                // ordering per the highest occurrences in the jdk source
+                // finest, fine, finer, info first
+<span class="nc" id="L140">                case PlatformLogger.FINEST  : return Level.FINEST;</span>
+<span class="nc" id="L141">                case PlatformLogger.FINE    : return Level.FINE;</span>
+<span class="nc" id="L142">                case PlatformLogger.FINER   : return Level.FINER;</span>
+<span class="nc" id="L143">                case PlatformLogger.INFO    : return Level.INFO;</span>
+<span class="nc" id="L144">                case PlatformLogger.WARNING : return Level.WARNING;</span>
+<span class="nc" id="L145">                case PlatformLogger.CONFIG  : return Level.CONFIG;</span>
+<span class="nc" id="L146">                case PlatformLogger.SEVERE  : return Level.SEVERE;</span>
+<span class="nc" id="L147">                case PlatformLogger.OFF     : return Level.OFF;</span>
+<span class="nc" id="L148">                case PlatformLogger.ALL     : return Level.ALL;</span>
+            }
+            // return the nearest Level value &gt;= the given level,
+            // for level &gt; SEVERE, return SEVERE and exclude OFF
+<span class="fc" id="L152">            int i = Arrays.binarySearch(LEVEL_VALUES, 0, LEVEL_VALUES.length-2, level);</span>
+<span class="pc bpc" id="L153" title="1 of 2 branches missed.">            return values()[i &gt;= 0 ? i : (-i-1)];</span>
+        }
+    }
+
+<span class="fc" id="L157">    private static final Level DEFAULT_LEVEL = Level.INFO;</span>
+    private static boolean loggingEnabled;
+    static {
+<span class="fc" id="L160">        loggingEnabled = AccessController.doPrivileged(</span>
+<span class="fc" id="L161">            new PrivilegedAction&lt;Boolean&gt;() {</span>
+                public Boolean run() {
+<span class="fc" id="L163">                    String cname = System.getProperty(&quot;java.util.logging.config.class&quot;);</span>
+<span class="fc" id="L164">                    String fname = System.getProperty(&quot;java.util.logging.config.file&quot;);</span>
+<span class="pc bpc" id="L165" title="1 of 4 branches missed.">                    return (cname != null || fname != null);</span>
+                }
+            });
+
+        // force loading of all JavaLoggerProxy (sub)classes to make JIT de-optimizations
+        // less probable.  Don't initialize JavaLoggerProxy class since
+        // java.util.logging may not be enabled.
+        try {
+<span class="fc" id="L173">            Class.forName(&quot;sun.util.logging.PlatformLogger$DefaultLoggerProxy&quot;,</span>
+                          false,
+<span class="fc" id="L175">                          PlatformLogger.class.getClassLoader());</span>
+<span class="fc" id="L176">            Class.forName(&quot;sun.util.logging.PlatformLogger$JavaLoggerProxy&quot;,</span>
+                          false,   // do not invoke class initializer
+<span class="fc" id="L178">                          PlatformLogger.class.getClassLoader());</span>
+<span class="nc" id="L179">        } catch (ClassNotFoundException ex) {</span>
+<span class="nc" id="L180">            throw new InternalError(ex);</span>
+<span class="fc" id="L181">        }</span>
+    }
+
+    // Table of known loggers.  Maps names to PlatformLoggers.
+<span class="fc" id="L185">    private static Map&lt;String,WeakReference&lt;PlatformLogger&gt;&gt; loggers =</span>
+        new HashMap&lt;&gt;();
+
+    /**
+     * Returns a PlatformLogger of a given name.
+     */
+    public static synchronized PlatformLogger getLogger(String name) {
+<span class="fc" id="L192">        PlatformLogger log = null;</span>
+<span class="fc" id="L193">        WeakReference&lt;PlatformLogger&gt; ref = loggers.get(name);</span>
+<span class="fc bfc" id="L194" title="All 2 branches covered.">        if (ref != null) {</span>
+<span class="fc" id="L195">            log = ref.get();</span>
+        }
+<span class="fc bfc" id="L197" title="All 2 branches covered.">        if (log == null) {</span>
+<span class="fc" id="L198">            log = new PlatformLogger(name);</span>
+<span class="fc" id="L199">            loggers.put(name, new WeakReference&lt;&gt;(log));</span>
+        }
+<span class="fc" id="L201">        return log;</span>
+    }
+
+    /**
+     * Initialize java.util.logging.Logger objects for all platform loggers.
+     * This method is called from LogManager.readPrimordialConfiguration().
+     */
+    public static synchronized void redirectPlatformLoggers() {
+<span class="pc bpc" id="L209" title="1 of 4 branches missed.">        if (loggingEnabled || !LoggingSupport.isAvailable()) return;</span>
+
+<span class="fc" id="L211">        loggingEnabled = true;</span>
+<span class="fc bfc" id="L212" title="All 2 branches covered.">        for (Map.Entry&lt;String, WeakReference&lt;PlatformLogger&gt;&gt; entry : loggers.entrySet()) {</span>
+<span class="fc" id="L213">            WeakReference&lt;PlatformLogger&gt; ref = entry.getValue();</span>
+<span class="fc" id="L214">            PlatformLogger plog = ref.get();</span>
+<span class="pc bpc" id="L215" title="1 of 2 branches missed.">            if (plog != null) {</span>
+<span class="fc" id="L216">                plog.redirectToJavaLoggerProxy();</span>
+            }
+<span class="fc" id="L218">        }</span>
+<span class="fc" id="L219">    }</span>
+
+    /**
+     * Creates a new JavaLoggerProxy and redirects the platform logger to it
+     */
+    private void redirectToJavaLoggerProxy() {
+<span class="fc" id="L225">        DefaultLoggerProxy lp = DefaultLoggerProxy.class.cast(this.loggerProxy);</span>
+<span class="fc" id="L226">        JavaLoggerProxy jlp = new JavaLoggerProxy(lp.name, lp.level);</span>
+        // the order of assignments is important
+<span class="fc" id="L228">        this.javaLoggerProxy = jlp;   // isLoggable checks javaLoggerProxy if set</span>
+<span class="fc" id="L229">        this.loggerProxy = jlp;</span>
+<span class="fc" id="L230">    }</span>
+
+    // DefaultLoggerProxy may be replaced with a JavaLoggerProxy object
+    // when the java.util.logging facility is enabled
+    private volatile LoggerProxy loggerProxy;
+    // javaLoggerProxy is only set when the java.util.logging facility is enabled
+    private volatile JavaLoggerProxy javaLoggerProxy;
+<span class="fc" id="L237">    private PlatformLogger(String name) {</span>
+<span class="fc bfc" id="L238" title="All 2 branches covered.">        if (loggingEnabled) {</span>
+<span class="fc" id="L239">            this.loggerProxy = this.javaLoggerProxy = new JavaLoggerProxy(name);</span>
+        } else {
+<span class="fc" id="L241">            this.loggerProxy = new DefaultLoggerProxy(name);</span>
+        }
+<span class="fc" id="L243">    }</span>
+
+    /**
+     * A convenience method to test if the logger is turned off.
+     * (i.e. its level is OFF).
+     */
+    public boolean isEnabled() {
+<span class="nc" id="L250">        return loggerProxy.isEnabled();</span>
+    }
+
+    /**
+     * Gets the name for this platform logger.
+     */
+    public String getName() {
+<span class="fc" id="L257">        return loggerProxy.name;</span>
+    }
+
+    /**
+     * Returns true if a message of the given level would actually
+     * be logged by this logger.
+     */
+    public boolean isLoggable(Level level) {
+<span class="pc bpc" id="L265" title="1 of 2 branches missed.">        if (level == null) {</span>
+<span class="nc" id="L266">            throw new NullPointerException();</span>
+        }
+        // performance-sensitive method: use two monomorphic call-sites
+<span class="fc" id="L269">        JavaLoggerProxy jlp = javaLoggerProxy;</span>
+<span class="fc bfc" id="L270" title="All 2 branches covered.">        return jlp != null ? jlp.isLoggable(level) : loggerProxy.isLoggable(level);</span>
+    }
+
+    /**
+     * Get the log level that has been specified for this PlatformLogger.
+     * The result may be null, which means that this logger's
+     * effective level will be inherited from its parent.
+     *
+     * @return  this PlatformLogger's level
+     */
+    public Level level() {
+<span class="fc" id="L281">        return loggerProxy.getLevel();</span>
+    }
+
+    /**
+     * Set the log level specifying which message levels will be
+     * logged by this logger.  Message levels lower than this
+     * value will be discarded.  The level value {@link #OFF}
+     * can be used to turn off logging.
+     * &lt;p&gt;
+     * If the new level is null, it means that this node should
+     * inherit its level from its nearest ancestor with a specific
+     * (non-null) level value.
+     *
+     * @param newLevel the new value for the log level (may be null)
+     */
+    public void setLevel(Level newLevel) {
+<span class="fc" id="L297">        loggerProxy.setLevel(newLevel);</span>
+<span class="fc" id="L298">    }</span>
+
+    /**
+     * Logs a SEVERE message.
+     */
+    public void severe(String msg) {
+<span class="nc" id="L304">        loggerProxy.doLog(Level.SEVERE, msg);</span>
+<span class="nc" id="L305">    }</span>
+
+    public void severe(String msg, Throwable t) {
+<span class="nc" id="L308">        loggerProxy.doLog(Level.SEVERE, msg, t);</span>
+<span class="nc" id="L309">    }</span>
+
+    public void severe(String msg, Object... params) {
+<span class="fc" id="L312">        loggerProxy.doLog(Level.SEVERE, msg, params);</span>
+<span class="fc" id="L313">    }</span>
+
+    /**
+     * Logs a WARNING message.
+     */
+    public void warning(String msg) {
+<span class="fc" id="L319">        loggerProxy.doLog(Level.WARNING, msg);</span>
+<span class="fc" id="L320">    }</span>
+
+    public void warning(String msg, Throwable t) {
+<span class="fc" id="L323">        loggerProxy.doLog(Level.WARNING, msg, t);</span>
+<span class="fc" id="L324">    }</span>
+
+    public void warning(String msg, Object... params) {
+<span class="nc" id="L327">        loggerProxy.doLog(Level.WARNING, msg, params);</span>
+<span class="nc" id="L328">    }</span>
+
+    /**
+     * Logs an INFO message.
+     */
+    public void info(String msg) {
+<span class="fc" id="L334">        loggerProxy.doLog(Level.INFO, msg);</span>
+<span class="fc" id="L335">    }</span>
+
+    public void info(String msg, Throwable t) {
+<span class="nc" id="L338">        loggerProxy.doLog(Level.INFO, msg, t);</span>
+<span class="nc" id="L339">    }</span>
+
+    public void info(String msg, Object... params) {
+<span class="nc" id="L342">        loggerProxy.doLog(Level.INFO, msg, params);</span>
+<span class="nc" id="L343">    }</span>
+
+    /**
+     * Logs a CONFIG message.
+     */
+    public void config(String msg) {
+<span class="fc" id="L349">        loggerProxy.doLog(Level.CONFIG, msg);</span>
+<span class="fc" id="L350">    }</span>
+
+    public void config(String msg, Throwable t) {
+<span class="nc" id="L353">        loggerProxy.doLog(Level.CONFIG, msg, t);</span>
+<span class="nc" id="L354">    }</span>
+
+    public void config(String msg, Object... params) {
+<span class="nc" id="L357">        loggerProxy.doLog(Level.CONFIG, msg, params);</span>
+<span class="nc" id="L358">    }</span>
+
+    /**
+     * Logs a FINE message.
+     */
+    public void fine(String msg) {
+<span class="nc" id="L364">        loggerProxy.doLog(Level.FINE, msg);</span>
+<span class="nc" id="L365">    }</span>
+
+    public void fine(String msg, Throwable t) {
+<span class="nc" id="L368">        loggerProxy.doLog(Level.FINE, msg, t);</span>
+<span class="nc" id="L369">    }</span>
+
+    public void fine(String msg, Object... params) {
+<span class="nc" id="L372">        loggerProxy.doLog(Level.FINE, msg, params);</span>
+<span class="nc" id="L373">    }</span>
+
+    /**
+     * Logs a FINER message.
+     */
+    public void finer(String msg) {
+<span class="nc" id="L379">        loggerProxy.doLog(Level.FINER, msg);</span>
+<span class="nc" id="L380">    }</span>
+
+    public void finer(String msg, Throwable t) {
+<span class="nc" id="L383">        loggerProxy.doLog(Level.FINER, msg, t);</span>
+<span class="nc" id="L384">    }</span>
+
+    public void finer(String msg, Object... params) {
+<span class="nc" id="L387">        loggerProxy.doLog(Level.FINER, msg, params);</span>
+<span class="nc" id="L388">    }</span>
+
+    /**
+     * Logs a FINEST message.
+     */
+    public void finest(String msg) {
+<span class="nc" id="L394">        loggerProxy.doLog(Level.FINEST, msg);</span>
+<span class="nc" id="L395">    }</span>
+
+    public void finest(String msg, Throwable t) {
+<span class="nc" id="L398">        loggerProxy.doLog(Level.FINEST, msg, t);</span>
+<span class="nc" id="L399">    }</span>
+
+    public void finest(String msg, Object... params) {
+<span class="nc" id="L402">        loggerProxy.doLog(Level.FINEST, msg, params);</span>
+<span class="nc" id="L403">    }</span>
+
+    /**
+     * Abstract base class for logging support, defining the API and common field.
+     */
+    private static abstract class LoggerProxy {
+        final String name;
+
+<span class="fc" id="L411">        protected LoggerProxy(String name) {</span>
+<span class="fc" id="L412">            this.name = name;</span>
+<span class="fc" id="L413">        }</span>
+
+        abstract boolean isEnabled();
+
+        abstract Level getLevel();
+        abstract void setLevel(Level newLevel);
+
+        abstract void doLog(Level level, String msg);
+        abstract void doLog(Level level, String msg, Throwable thrown);
+        abstract void doLog(Level level, String msg, Object... params);
+
+        abstract boolean isLoggable(Level level);
+    }
+
+
+    private static final class DefaultLoggerProxy extends LoggerProxy {
+        /**
+         * Default platform logging support - output messages to System.err -
+         * equivalent to ConsoleHandler with SimpleFormatter.
+         */
+        private static PrintStream outputStream() {
+<span class="fc" id="L434">            return System.err;</span>
+        }
+
+        volatile Level effectiveLevel; // effective level (never null)
+        volatile Level level;          // current level set for this node (may be null)
+
+        DefaultLoggerProxy(String name) {
+<span class="fc" id="L441">            super(name);</span>
+<span class="fc" id="L442">            this.effectiveLevel = deriveEffectiveLevel(null);</span>
+<span class="fc" id="L443">            this.level = null;</span>
+<span class="fc" id="L444">        }</span>
+
+        boolean isEnabled() {
+<span class="nc bnc" id="L447" title="All 2 branches missed.">            return effectiveLevel != Level.OFF;</span>
+        }
+
+        Level getLevel() {
+<span class="fc" id="L451">            return level;</span>
+        }
+
+        void setLevel(Level newLevel) {
+<span class="fc" id="L455">            Level oldLevel = level;</span>
+<span class="pc bpc" id="L456" title="1 of 2 branches missed.">            if (oldLevel != newLevel) {</span>
+<span class="fc" id="L457">                level = newLevel;</span>
+<span class="fc" id="L458">                effectiveLevel = deriveEffectiveLevel(newLevel);</span>
+            }
+<span class="fc" id="L460">        }</span>
+
+        void doLog(Level level, String msg) {
+<span class="fc bfc" id="L463" title="All 2 branches covered.">            if (isLoggable(level)) {</span>
+<span class="fc" id="L464">                outputStream().print(format(level, msg, null));</span>
+            }
+<span class="fc" id="L466">        }</span>
+
+        void doLog(Level level, String msg, Throwable thrown) {
+<span class="pc bpc" id="L469" title="1 of 2 branches missed.">            if (isLoggable(level)) {</span>
+<span class="fc" id="L470">                outputStream().print(format(level, msg, thrown));</span>
+            }
+<span class="fc" id="L472">        }</span>
+
+        void doLog(Level level, String msg, Object... params) {
+<span class="pc bpc" id="L475" title="1 of 2 branches missed.">            if (isLoggable(level)) {</span>
+<span class="fc" id="L476">                String newMsg = formatMessage(msg, params);</span>
+<span class="fc" id="L477">                outputStream().print(format(level, newMsg, null));</span>
+            }
+<span class="fc" id="L479">        }</span>
+
+        boolean isLoggable(Level level) {
+<span class="fc" id="L482">            Level effectiveLevel = this.effectiveLevel;</span>
+<span class="pc bpc" id="L483" title="1 of 4 branches missed.">            return level.intValue() &gt;= effectiveLevel.intValue() &amp;&amp; effectiveLevel != Level.OFF;</span>
+        }
+
+        // derive effective level (could do inheritance search like j.u.l.Logger)
+        private Level deriveEffectiveLevel(Level level) {
+<span class="fc bfc" id="L488" title="All 2 branches covered.">            return level == null ? DEFAULT_LEVEL : level;</span>
+        }
+
+        // Copied from java.util.logging.Formatter.formatMessage
+        private String formatMessage(String format, Object... parameters) {
+            // Do the formatting.
+            try {
+<span class="pc bpc" id="L495" title="2 of 4 branches missed.">                if (parameters == null || parameters.length == 0) {</span>
+                    // No parameters.  Just return format string.
+<span class="nc" id="L497">                    return format;</span>
+                }
+                // Is it a java.text style format?
+                // Ideally we could match with
+                // Pattern.compile(&quot;\\{\\d&quot;).matcher(format).find())
+                // However the cost is 14% higher, so we cheaply check for
+                // 1 of the first 4 parameters
+<span class="pc bpc" id="L504" title="3 of 4 branches missed.">                if (format.indexOf(&quot;{0&quot;) &gt;= 0 || format.indexOf(&quot;{1&quot;) &gt;=0 ||</span>
+<span class="nc bnc" id="L505" title="All 4 branches missed.">                            format.indexOf(&quot;{2&quot;) &gt;=0|| format.indexOf(&quot;{3&quot;) &gt;=0) {</span>
+<span class="fc" id="L506">                    return java.text.MessageFormat.format(format, parameters);</span>
+                }
+<span class="nc" id="L508">                return format;</span>
+<span class="nc" id="L509">            } catch (Exception ex) {</span>
+                // Formatting failed: use format string.
+<span class="nc" id="L511">                return format;</span>
+            }
+        }
+
+<span class="fc" id="L515">        private static final String formatString =</span>
+<span class="fc" id="L516">            LoggingSupport.getSimpleFormat(false); // don't check logging.properties</span>
+
+        // minimize memory allocation
+<span class="fc" id="L519">        private Date date = new Date();</span>
+        private synchronized String format(Level level, String msg, Throwable thrown) {
+<span class="fc" id="L521">            date.setTime(System.currentTimeMillis());</span>
+<span class="fc" id="L522">            String throwable = &quot;&quot;;</span>
+<span class="fc bfc" id="L523" title="All 2 branches covered.">            if (thrown != null) {</span>
+<span class="fc" id="L524">                StringWriter sw = new StringWriter();</span>
+<span class="fc" id="L525">                PrintWriter pw = new PrintWriter(sw);</span>
+<span class="fc" id="L526">                pw.println();</span>
+<span class="fc" id="L527">                thrown.printStackTrace(pw);</span>
+<span class="fc" id="L528">                pw.close();</span>
+<span class="fc" id="L529">                throwable = sw.toString();</span>
+            }
+
+<span class="fc" id="L532">            return String.format(formatString,</span>
+                                 date,
+<span class="fc" id="L534">                                 getCallerInfo(),</span>
+                                 name,
+<span class="fc" id="L536">                                 level.name(),</span>
+                                 msg,
+                                 throwable);
+        }
+
+        // Returns the caller's class and method's name; best effort
+        // if cannot infer, return the logger's name.
+        private String getCallerInfo() {
+<span class="fc" id="L544">            String sourceClassName = null;</span>
+<span class="fc" id="L545">            String sourceMethodName = null;</span>
+
+<span class="fc" id="L547">            JavaLangAccess access = SharedSecrets.getJavaLangAccess();</span>
+<span class="fc" id="L548">            Throwable throwable = new Throwable();</span>
+<span class="fc" id="L549">            int depth = access.getStackTraceDepth(throwable);</span>
+
+<span class="fc" id="L551">            String logClassName = &quot;sun.util.logging.PlatformLogger&quot;;</span>
+<span class="fc" id="L552">            boolean lookingForLogger = true;</span>
+<span class="pc bpc" id="L553" title="1 of 2 branches missed.">            for (int ix = 0; ix &lt; depth; ix++) {</span>
+                // Calling getStackTraceElement directly prevents the VM
+                // from paying the cost of building the entire stack frame.
+<span class="fc" id="L556">                StackTraceElement frame =</span>
+<span class="fc" id="L557">                    access.getStackTraceElement(throwable, ix);</span>
+<span class="fc" id="L558">                String cname = frame.getClassName();</span>
+<span class="fc bfc" id="L559" title="All 2 branches covered.">                if (lookingForLogger) {</span>
+                    // Skip all frames until we have found the first logger frame.
+<span class="fc bfc" id="L561" title="All 2 branches covered.">                    if (cname.equals(logClassName)) {</span>
+<span class="fc" id="L562">                        lookingForLogger = false;</span>
+                    }
+                } else {
+<span class="pc bpc" id="L565" title="1 of 2 branches missed.">                    if (!cname.equals(logClassName)) {</span>
+                        // We've found the relevant frame.
+<span class="fc" id="L567">                        sourceClassName = cname;</span>
+<span class="fc" id="L568">                        sourceMethodName = frame.getMethodName();</span>
+<span class="fc" id="L569">                        break;</span>
+                    }
+                }
+            }
+
+<span class="pc bpc" id="L574" title="1 of 2 branches missed.">            if (sourceClassName != null) {</span>
+<span class="fc" id="L575">                return sourceClassName + &quot; &quot; + sourceMethodName;</span>
+            } else {
+<span class="nc" id="L577">                return name;</span>
+            }
+        }
+    }
+
+    /**
+     * JavaLoggerProxy forwards all the calls to its corresponding
+     * java.util.logging.Logger object.
+     */
+    private static final class JavaLoggerProxy extends LoggerProxy {
+        // initialize javaLevel fields for mapping from Level enum -&gt; j.u.l.Level object
+        static {
+<span class="fc bfc" id="L589" title="All 2 branches covered.">            for (Level level : Level.values()) {</span>
+<span class="fc" id="L590">                level.javaLevel = LoggingSupport.parseLevel(level.name());</span>
+            }
+<span class="fc" id="L592">        }</span>
+
+        private final /* java.util.logging.Logger */ Object javaLogger;
+
+        JavaLoggerProxy(String name) {
+<span class="fc" id="L597">            this(name, null);</span>
+<span class="fc" id="L598">        }</span>
+
+        JavaLoggerProxy(String name, Level level) {
+<span class="fc" id="L601">            super(name);</span>
+<span class="fc" id="L602">            this.javaLogger = LoggingSupport.getLogger(name);</span>
+<span class="fc bfc" id="L603" title="All 2 branches covered.">            if (level != null) {</span>
+                // level has been updated and so set the Logger's level
+<span class="fc" id="L605">                LoggingSupport.setLevel(javaLogger, level.javaLevel);</span>
+            }
+<span class="fc" id="L607">        }</span>
+
+        void doLog(Level level, String msg) {
+<span class="fc" id="L610">            LoggingSupport.log(javaLogger, level.javaLevel, msg);</span>
+<span class="fc" id="L611">        }</span>
+
+        void doLog(Level level, String msg, Throwable t) {
+<span class="fc" id="L614">            LoggingSupport.log(javaLogger, level.javaLevel, msg, t);</span>
+<span class="fc" id="L615">        }</span>
+
+        void doLog(Level level, String msg, Object... params) {
+<span class="pc bpc" id="L618" title="1 of 2 branches missed.">            if (!isLoggable(level)) {</span>
+<span class="nc" id="L619">                return;</span>
+            }
+            // only pass String objects to the j.u.l.Logger which may
+            // be created by untrusted code
+<span class="pc bpc" id="L623" title="1 of 2 branches missed.">            int len = (params != null) ? params.length : 0;</span>
+<span class="fc" id="L624">            Object[] sparams = new String[len];</span>
+<span class="fc bfc" id="L625" title="All 2 branches covered.">            for (int i = 0; i &lt; len; i++) {</span>
+<span class="fc" id="L626">                sparams [i] = String.valueOf(params[i]);</span>
+            }
+<span class="fc" id="L628">            LoggingSupport.log(javaLogger, level.javaLevel, msg, sparams);</span>
+<span class="fc" id="L629">        }</span>
+
+        boolean isEnabled() {
+<span class="nc" id="L632">            return LoggingSupport.isLoggable(javaLogger, Level.OFF.javaLevel);</span>
+        }
+
+        /**
+         * Returns the PlatformLogger.Level mapped from j.u.l.Level
+         * set in the logger.  If the j.u.l.Logger is set to a custom Level,
+         * this method will return the nearest Level.
+         */
+        Level getLevel() {
+<span class="fc" id="L641">            Object javaLevel = LoggingSupport.getLevel(javaLogger);</span>
+<span class="fc bfc" id="L642" title="All 2 branches covered.">            if (javaLevel == null) return null;</span>
+
+            try {
+<span class="fc" id="L645">                return Level.valueOf(LoggingSupport.getLevelName(javaLevel));</span>
+<span class="fc" id="L646">            } catch (IllegalArgumentException e) {</span>
+<span class="fc" id="L647">                return Level.valueOf(LoggingSupport.getLevelValue(javaLevel));</span>
+            }
+        }
+
+        void setLevel(Level level) {
+<span class="pc bpc" id="L652" title="1 of 2 branches missed.">            LoggingSupport.setLevel(javaLogger, level == null ? null : level.javaLevel);</span>
+<span class="fc" id="L653">        }</span>
+
+        boolean isLoggable(Level level) {
+<span class="fc" id="L656">            return LoggingSupport.isLoggable(javaLogger, level.javaLevel);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

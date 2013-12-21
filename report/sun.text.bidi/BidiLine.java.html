@@ -1,0 +1,850 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>BidiLine.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.text.bidi</a> &gt; <span class="el_source">BidiLine.java</span></div><h1>BidiLine.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2009, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+/*
+ *******************************************************************************
+ * (C) Copyright IBM Corp. and others, 1996-2009 - All Rights Reserved         *
+ *                                                                             *
+ * The original version of this source code and documentation is copyrighted   *
+ * and owned by IBM, These materials are provided under terms of a License     *
+ * Agreement between IBM and Sun. This technology is protected by multiple     *
+ * US and International patents. This notice and attribution to IBM may not    *
+ * to removed.                                                                 *
+ *******************************************************************************
+ */
+/* Written by Simon Montagu, Matitiahu Allouche
+ * (ported from C code written by Markus W. Scherer)
+ */
+
+package sun.text.bidi;
+
+import java.text.Bidi;
+import java.util.Arrays;
+
+<span class="nc" id="L45">public final class BidiLine {</span>
+
+    /*
+     * General remarks about the functions in this file:
+     *
+     * These functions deal with the aspects of potentially mixed-directional
+     * text in a single paragraph or in a line of a single paragraph
+     * which has already been processed according to
+     * the Unicode 3.0 Bidi algorithm as defined in
+     * http://www.unicode.org/unicode/reports/tr9/ , version 13,
+     * also described in The Unicode Standard, Version 4.0.1 .
+     *
+     * This means that there is a Bidi object with a levels
+     * and a dirProps array.
+     * paraLevel and direction are also set.
+     * Only if the length of the text is zero, then levels==dirProps==NULL.
+     *
+     * The overall directionality of the paragraph
+     * or line is used to bypass the reordering steps if possible.
+     * Even purely RTL text does not need reordering there because
+     * the getLogical/VisualIndex() methods can compute the
+     * index on the fly in such a case.
+     *
+     * The implementation of the access to same-level-runs and of the reordering
+     * do attempt to provide better performance and less memory usage compared to
+     * a direct implementation of especially rule (L2) with an array of
+     * one (32-bit) integer per text character.
+     *
+     * Here, the levels array is scanned as soon as necessary, and a vector of
+     * same-level-runs is created. Reordering then is done on this vector.
+     * For each run of text positions that were resolved to the same level,
+     * only 8 bytes are stored: the first text position of the run and the visual
+     * position behind the run after reordering.
+     * One sign bit is used to hold the directionality of the run.
+     * This is inefficient if there are many very short runs. If the average run
+     * length is &lt;2, then this uses more memory.
+     *
+     * In a further attempt to save memory, the levels array is never changed
+     * after all the resolution rules (Xn, Wn, Nn, In).
+     * Many methods have to consider the field trailingWSStart:
+     * if it is less than length, then there is an implicit trailing run
+     * at the paraLevel,
+     * which is not reflected in the levels array.
+     * This allows a line Bidi object to use the same levels array as
+     * its paragraph parent object.
+     *
+     * When a Bidi object is created for a line of a paragraph, then the
+     * paragraph's levels and dirProps arrays are reused by way of setting
+     * a pointer into them, not by copying. This again saves memory and forbids to
+     * change the now shared levels for (L1).
+     */
+
+    /* handle trailing WS (L1) -------------------------------------------------- */
+
+    /*
+     * setTrailingWSStart() sets the start index for a trailing
+     * run of WS in the line. This is necessary because we do not modify
+     * the paragraph's levels array that we just point into.
+     * Using trailingWSStart is another form of performing (L1).
+     *
+     * To make subsequent operations easier, we also include the run
+     * before the WS if it is at the paraLevel - we merge the two here.
+     *
+     * This method is called only from setLine(), so paraLevel is
+     * set correctly for the line even when contextual multiple paragraphs.
+     */
+
+    static void setTrailingWSStart(BidiBase bidiBase)
+    {
+<span class="nc" id="L114">        byte[] dirProps = bidiBase.dirProps;</span>
+<span class="nc" id="L115">        byte[] levels = bidiBase.levels;</span>
+<span class="nc" id="L116">        int start = bidiBase.length;</span>
+<span class="nc" id="L117">        byte paraLevel = bidiBase.paraLevel;</span>
+
+        /* If the line is terminated by a block separator, all preceding WS etc...
+           are already set to paragraph level.
+           Setting trailingWSStart to pBidi-&gt;length will avoid changing the
+           level of B chars from 0 to paraLevel in getLevels when
+           orderParagraphsLTR==TRUE
+        */
+<span class="nc bnc" id="L125" title="All 2 branches missed.">        if (BidiBase.NoContextRTL(dirProps[start - 1]) == BidiBase.B) {</span>
+<span class="nc" id="L126">            bidiBase.trailingWSStart = start;   /* currently == bidiBase.length */</span>
+<span class="nc" id="L127">            return;</span>
+        }
+        /* go backwards across all WS, BN, explicit codes */
+<span class="nc bnc" id="L130" title="All 2 branches missed.">        while (start &gt; 0 &amp;&amp;</span>
+<span class="nc bnc" id="L131" title="All 2 branches missed.">                (BidiBase.DirPropFlagNC(dirProps[start - 1]) &amp; BidiBase.MASK_WS) != 0) {</span>
+<span class="nc" id="L132">            --start;</span>
+        }
+
+        /* if the WS run can be merged with the previous run then do so here */
+<span class="nc bnc" id="L136" title="All 4 branches missed.">        while (start &gt; 0 &amp;&amp; levels[start - 1] == paraLevel) {</span>
+<span class="nc" id="L137">            --start;</span>
+        }
+
+<span class="nc" id="L140">        bidiBase.trailingWSStart=start;</span>
+<span class="nc" id="L141">    }</span>
+
+    public static Bidi setLine(Bidi bidi, BidiBase paraBidi,
+                               Bidi newBidi, BidiBase newBidiBase,
+                               int start, int limit) {
+        int length;
+
+<span class="nc" id="L148">        BidiBase lineBidi = newBidiBase;</span>
+
+        /* set the values in lineBidi from its paraBidi parent */
+        /* class members are already initialized to 0 */
+        // lineBidi.paraBidi = null;        /* mark unfinished setLine */
+        // lineBidi.flags = 0;
+        // lineBidi.controlCount = 0;
+
+<span class="nc" id="L156">        length = lineBidi.length = lineBidi.originalLength =</span>
+                lineBidi.resultLength = limit - start;
+
+<span class="nc" id="L159">        lineBidi.text = new char[length];</span>
+<span class="nc" id="L160">        System.arraycopy(paraBidi.text, start, lineBidi.text, 0, length);</span>
+<span class="nc" id="L161">        lineBidi.paraLevel = paraBidi.GetParaLevelAt(start);</span>
+<span class="nc" id="L162">        lineBidi.paraCount = paraBidi.paraCount;</span>
+<span class="nc" id="L163">        lineBidi.runs = new BidiRun[0];</span>
+<span class="nc bnc" id="L164" title="All 2 branches missed.">        if (paraBidi.controlCount &gt; 0) {</span>
+            int j;
+<span class="nc bnc" id="L166" title="All 2 branches missed.">            for (j = start; j &lt; limit; j++) {</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">                if (BidiBase.IsBidiControlChar(paraBidi.text[j])) {</span>
+<span class="nc" id="L168">                    lineBidi.controlCount++;</span>
+                }
+            }
+<span class="nc" id="L171">            lineBidi.resultLength -= lineBidi.controlCount;</span>
+        }
+        /* copy proper subset of DirProps */
+<span class="nc" id="L174">        lineBidi.getDirPropsMemory(length);</span>
+<span class="nc" id="L175">        lineBidi.dirProps = lineBidi.dirPropsMemory;</span>
+<span class="nc" id="L176">        System.arraycopy(paraBidi.dirProps, start, lineBidi.dirProps, 0,</span>
+                         length);
+        /* copy proper subset of Levels */
+<span class="nc" id="L179">        lineBidi.getLevelsMemory(length);</span>
+<span class="nc" id="L180">        lineBidi.levels = lineBidi.levelsMemory;</span>
+<span class="nc" id="L181">        System.arraycopy(paraBidi.levels, start, lineBidi.levels, 0,</span>
+                         length);
+<span class="nc" id="L183">        lineBidi.runCount = -1;</span>
+
+<span class="nc bnc" id="L185" title="All 2 branches missed.">        if (paraBidi.direction != BidiBase.MIXED) {</span>
+            /* the parent is already trivial */
+<span class="nc" id="L187">            lineBidi.direction = paraBidi.direction;</span>
+
+            /*
+             * The parent's levels are all either
+             * implicitly or explicitly ==paraLevel;
+             * do the same here.
+             */
+<span class="nc bnc" id="L194" title="All 2 branches missed.">            if (paraBidi.trailingWSStart &lt;= start) {</span>
+<span class="nc" id="L195">                lineBidi.trailingWSStart = 0;</span>
+<span class="nc bnc" id="L196" title="All 2 branches missed.">            } else if (paraBidi.trailingWSStart &lt; limit) {</span>
+<span class="nc" id="L197">                lineBidi.trailingWSStart = paraBidi.trailingWSStart - start;</span>
+            } else {
+<span class="nc" id="L199">                lineBidi.trailingWSStart = length;</span>
+            }
+        } else {
+<span class="nc" id="L202">            byte[] levels = lineBidi.levels;</span>
+            int i, trailingWSStart;
+            byte level;
+
+<span class="nc" id="L206">            setTrailingWSStart(lineBidi);</span>
+<span class="nc" id="L207">            trailingWSStart = lineBidi.trailingWSStart;</span>
+
+            /* recalculate lineBidi.direction */
+<span class="nc bnc" id="L210" title="All 2 branches missed.">            if (trailingWSStart == 0) {</span>
+                /* all levels are at paraLevel */
+<span class="nc" id="L212">                lineBidi.direction = (byte)(lineBidi.paraLevel &amp; 1);</span>
+            } else {
+                /* get the level of the first character */
+<span class="nc" id="L215">                level = (byte)(levels[0] &amp; 1);</span>
+
+                /* if there is anything of a different level, then the line
+                   is mixed */
+<span class="nc bnc" id="L219" title="All 4 branches missed.">                if (trailingWSStart &lt; length &amp;&amp;</span>
+                    (lineBidi.paraLevel &amp; 1) != level) {
+                    /* the trailing WS is at paraLevel, which differs from
+                       levels[0] */
+<span class="nc" id="L223">                    lineBidi.direction = BidiBase.MIXED;</span>
+                } else {
+                    /* see if levels[1..trailingWSStart-1] have the same
+                       direction as levels[0] and paraLevel */
+<span class="nc" id="L227">                    for (i = 1; ; i++) {</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">                        if (i == trailingWSStart) {</span>
+                            /* the direction values match those in level */
+<span class="nc" id="L230">                            lineBidi.direction = level;</span>
+<span class="nc" id="L231">                            break;</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">                        } else if ((levels[i] &amp; 1) != level) {</span>
+<span class="nc" id="L233">                            lineBidi.direction = BidiBase.MIXED;</span>
+<span class="nc" id="L234">                            break;</span>
+                        }
+                    }
+                }
+            }
+
+<span class="nc bnc" id="L240" title="All 3 branches missed.">            switch(lineBidi.direction) {</span>
+                case Bidi.DIRECTION_LEFT_TO_RIGHT:
+                    /* make sure paraLevel is even */
+<span class="nc" id="L243">                    lineBidi.paraLevel = (byte)</span>
+                        ((lineBidi.paraLevel + 1) &amp; ~1);
+
+                    /* all levels are implicitly at paraLevel (important for
+                       getLevels()) */
+<span class="nc" id="L248">                    lineBidi.trailingWSStart = 0;</span>
+<span class="nc" id="L249">                    break;</span>
+                case Bidi.DIRECTION_RIGHT_TO_LEFT:
+                    /* make sure paraLevel is odd */
+<span class="nc" id="L252">                    lineBidi.paraLevel |= 1;</span>
+
+                    /* all levels are implicitly at paraLevel (important for
+                       getLevels()) */
+<span class="nc" id="L256">                    lineBidi.trailingWSStart = 0;</span>
+<span class="nc" id="L257">                    break;</span>
+                default:
+                    break;
+            }
+        }
+
+<span class="nc" id="L263">        newBidiBase.paraBidi = paraBidi; /* mark successful setLine */</span>
+<span class="nc" id="L264">        return newBidi;</span>
+    }
+
+    static byte getLevelAt(BidiBase bidiBase, int charIndex)
+    {
+        /* return paraLevel if in the trailing WS run, otherwise the real level */
+<span class="nc bnc" id="L270" title="All 4 branches missed.">        if (bidiBase.direction != BidiBase.MIXED || charIndex &gt;= bidiBase.trailingWSStart) {</span>
+<span class="nc" id="L271">            return bidiBase.GetParaLevelAt(charIndex);</span>
+        } else {
+<span class="nc" id="L273">            return bidiBase.levels[charIndex];</span>
+        }
+    }
+
+    static byte[] getLevels(BidiBase bidiBase)
+    {
+<span class="nc" id="L279">        int start = bidiBase.trailingWSStart;</span>
+<span class="nc" id="L280">        int length = bidiBase.length;</span>
+
+<span class="nc bnc" id="L282" title="All 2 branches missed.">        if (start != length) {</span>
+            /* the current levels array does not reflect the WS run */
+            /*
+             * After the previous if(), we know that the levels array
+             * has an implicit trailing WS run and therefore does not fully
+             * reflect itself all the levels.
+             * This must be a Bidi object for a line, and
+             * we need to create a new levels array.
+             */
+            /* bidiBase.paraLevel is ok even if contextual multiple paragraphs,
+               since bidiBase is a line object                                     */
+<span class="nc" id="L293">            Arrays.fill(bidiBase.levels, start, length, bidiBase.paraLevel);</span>
+
+            /* this new levels array is set for the line and reflects the WS run */
+<span class="nc" id="L296">            bidiBase.trailingWSStart = length;</span>
+        }
+<span class="nc bnc" id="L298" title="All 2 branches missed.">        if (length &lt; bidiBase.levels.length) {</span>
+<span class="nc" id="L299">            byte[] levels = new byte[length];</span>
+<span class="nc" id="L300">            System.arraycopy(bidiBase.levels, 0, levels, 0, length);</span>
+<span class="nc" id="L301">            return levels;</span>
+        }
+<span class="nc" id="L303">        return bidiBase.levels;</span>
+    }
+
+    static BidiRun getLogicalRun(BidiBase bidiBase, int logicalPosition)
+    {
+        /* this is done based on runs rather than on levels since levels have
+           a special interpretation when REORDER_RUNS_ONLY
+         */
+<span class="nc" id="L311">        BidiRun newRun = new BidiRun(), iRun;</span>
+<span class="nc" id="L312">        getRuns(bidiBase);</span>
+<span class="nc" id="L313">        int runCount = bidiBase.runCount;</span>
+<span class="nc" id="L314">        int visualStart = 0, logicalLimit = 0;</span>
+<span class="nc" id="L315">        iRun = bidiBase.runs[0];</span>
+
+<span class="nc bnc" id="L317" title="All 2 branches missed.">        for (int i = 0; i &lt; runCount; i++) {</span>
+<span class="nc" id="L318">            iRun = bidiBase.runs[i];</span>
+<span class="nc" id="L319">            logicalLimit = iRun.start + iRun.limit - visualStart;</span>
+<span class="nc bnc" id="L320" title="All 4 branches missed.">            if ((logicalPosition &gt;= iRun.start) &amp;&amp;</span>
+                (logicalPosition &lt; logicalLimit)) {
+<span class="nc" id="L322">                break;</span>
+            }
+<span class="nc" id="L324">            visualStart = iRun.limit;</span>
+        }
+<span class="nc" id="L326">        newRun.start = iRun.start;</span>
+<span class="nc" id="L327">        newRun.limit = logicalLimit;</span>
+<span class="nc" id="L328">        newRun.level = iRun.level;</span>
+<span class="nc" id="L329">        return newRun;</span>
+    }
+
+    /* in trivial cases there is only one trivial run; called by getRuns() */
+    private static void getSingleRun(BidiBase bidiBase, byte level) {
+        /* simple, single-run case */
+<span class="nc" id="L335">        bidiBase.runs = bidiBase.simpleRuns;</span>
+<span class="nc" id="L336">        bidiBase.runCount = 1;</span>
+
+        /* fill and reorder the single run */
+<span class="nc" id="L339">        bidiBase.runs[0] = new BidiRun(0, bidiBase.length, level);</span>
+<span class="nc" id="L340">    }</span>
+
+    /* reorder the runs array (L2) ---------------------------------------------- */
+
+    /*
+     * Reorder the same-level runs in the runs array.
+     * Here, runCount&gt;1 and maxLevel&gt;=minLevel&gt;=paraLevel.
+     * All the visualStart fields=logical start before reordering.
+     * The &quot;odd&quot; bits are not set yet.
+     *
+     * Reordering with this data structure lends itself to some handy shortcuts:
+     *
+     * Since each run is moved but not modified, and since at the initial maxLevel
+     * each sequence of same-level runs consists of only one run each, we
+     * don't need to do anything there and can predecrement maxLevel.
+     * In many simple cases, the reordering is thus done entirely in the
+     * index mapping.
+     * Also, reordering occurs only down to the lowest odd level that occurs,
+     * which is minLevel|1. However, if the lowest level itself is odd, then
+     * in the last reordering the sequence of the runs at this level or higher
+     * will be all runs, and we don't need the elaborate loop to search for them.
+     * This is covered by ++minLevel instead of minLevel|=1 followed
+     * by an extra reorder-all after the reorder-some loop.
+     * About a trailing WS run:
+     * Such a run would need special treatment because its level is not
+     * reflected in levels[] if this is not a paragraph object.
+     * Instead, all characters from trailingWSStart on are implicitly at
+     * paraLevel.
+     * However, for all maxLevel&gt;paraLevel, this run will never be reordered
+     * and does not need to be taken into account. maxLevel==paraLevel is only reordered
+     * if minLevel==paraLevel is odd, which is done in the extra segment.
+     * This means that for the main reordering loop we don't need to consider
+     * this run and can --runCount. If it is later part of the all-runs
+     * reordering, then runCount is adjusted accordingly.
+     */
+    private static void reorderLine(BidiBase bidiBase, byte minLevel, byte maxLevel) {
+
+        /* nothing to do? */
+<span class="nc bnc" id="L378" title="All 2 branches missed.">        if (maxLevel&lt;=(minLevel|1)) {</span>
+<span class="nc" id="L379">            return;</span>
+        }
+
+        BidiRun[] runs;
+        BidiRun tempRun;
+        byte[] levels;
+        int firstRun, endRun, limitRun, runCount;
+
+        /*
+         * Reorder only down to the lowest odd level
+         * and reorder at an odd minLevel in a separate, simpler loop.
+         * See comments above for why minLevel is always incremented.
+         */
+<span class="nc" id="L392">        ++minLevel;</span>
+
+<span class="nc" id="L394">        runs = bidiBase.runs;</span>
+<span class="nc" id="L395">        levels = bidiBase.levels;</span>
+<span class="nc" id="L396">        runCount = bidiBase.runCount;</span>
+
+        /* do not include the WS run at paraLevel&lt;=old minLevel except in the simple loop */
+<span class="nc bnc" id="L399" title="All 2 branches missed.">        if (bidiBase.trailingWSStart &lt; bidiBase.length) {</span>
+<span class="nc" id="L400">            --runCount;</span>
+        }
+
+<span class="nc bnc" id="L403" title="All 2 branches missed.">        while (--maxLevel &gt;= minLevel) {</span>
+<span class="nc" id="L404">            firstRun = 0;</span>
+
+            /* loop for all sequences of runs */
+            for ( ; ; ) {
+                /* look for a sequence of runs that are all at &gt;=maxLevel */
+                /* look for the first run of such a sequence */
+<span class="nc bnc" id="L410" title="All 4 branches missed.">                while (firstRun &lt; runCount &amp;&amp; levels[runs[firstRun].start] &lt; maxLevel) {</span>
+<span class="nc" id="L411">                    ++firstRun;</span>
+                }
+<span class="nc bnc" id="L413" title="All 2 branches missed.">                if (firstRun &gt;= runCount) {</span>
+<span class="nc" id="L414">                    break;  /* no more such runs */</span>
+                }
+
+                /* look for the limit run of such a sequence (the run behind it) */
+<span class="nc bnc" id="L418" title="All 4 branches missed.">                for (limitRun = firstRun; ++limitRun &lt; runCount &amp;&amp;</span>
+                      levels[runs[limitRun].start]&gt;=maxLevel; ) {}
+
+                /* Swap the entire sequence of runs from firstRun to limitRun-1. */
+<span class="nc" id="L422">                endRun = limitRun - 1;</span>
+<span class="nc bnc" id="L423" title="All 2 branches missed.">                while (firstRun &lt; endRun) {</span>
+<span class="nc" id="L424">                    tempRun = runs[firstRun];</span>
+<span class="nc" id="L425">                    runs[firstRun] = runs[endRun];</span>
+<span class="nc" id="L426">                    runs[endRun] = tempRun;</span>
+<span class="nc" id="L427">                    ++firstRun;</span>
+<span class="nc" id="L428">                    --endRun;</span>
+                }
+
+<span class="nc bnc" id="L431" title="All 2 branches missed.">                if (limitRun == runCount) {</span>
+<span class="nc" id="L432">                    break;  /* no more such runs */</span>
+                } else {
+<span class="nc" id="L434">                    firstRun = limitRun + 1;</span>
+                }
+            }
+        }
+
+        /* now do maxLevel==old minLevel (==odd!), see above */
+<span class="nc bnc" id="L440" title="All 2 branches missed.">        if ((minLevel &amp; 1) == 0) {</span>
+<span class="nc" id="L441">            firstRun = 0;</span>
+
+            /* include the trailing WS run in this complete reordering */
+<span class="nc bnc" id="L444" title="All 2 branches missed.">            if (bidiBase.trailingWSStart == bidiBase.length) {</span>
+<span class="nc" id="L445">                --runCount;</span>
+            }
+
+            /* Swap the entire sequence of all runs. (endRun==runCount) */
+<span class="nc bnc" id="L449" title="All 2 branches missed.">            while (firstRun &lt; runCount) {</span>
+<span class="nc" id="L450">                tempRun = runs[firstRun];</span>
+<span class="nc" id="L451">                runs[firstRun] = runs[runCount];</span>
+<span class="nc" id="L452">                runs[runCount] = tempRun;</span>
+<span class="nc" id="L453">                ++firstRun;</span>
+<span class="nc" id="L454">                --runCount;</span>
+            }
+        }
+<span class="nc" id="L457">    }</span>
+
+    /* compute the runs array --------------------------------------------------- */
+
+    static int getRunFromLogicalIndex(BidiBase bidiBase, int logicalIndex) {
+<span class="nc" id="L462">        BidiRun[] runs = bidiBase.runs;</span>
+<span class="nc" id="L463">        int runCount = bidiBase.runCount, visualStart = 0, i, length, logicalStart;</span>
+
+<span class="nc bnc" id="L465" title="All 2 branches missed.">        for (i = 0; i &lt; runCount; i++) {</span>
+<span class="nc" id="L466">            length = runs[i].limit - visualStart;</span>
+<span class="nc" id="L467">            logicalStart = runs[i].start;</span>
+<span class="nc bnc" id="L468" title="All 4 branches missed.">            if ((logicalIndex &gt;= logicalStart) &amp;&amp; (logicalIndex &lt; (logicalStart+length))) {</span>
+<span class="nc" id="L469">                return i;</span>
+            }
+<span class="nc" id="L471">            visualStart += length;</span>
+        }
+        /* we should never get here */
+<span class="nc" id="L474">        throw new IllegalStateException(&quot;Internal ICU error in getRunFromLogicalIndex&quot;);</span>
+    }
+
+    /*
+     * Compute the runs array from the levels array.
+     * After getRuns() returns true, runCount is guaranteed to be &gt;0
+     * and the runs are reordered.
+     * Odd-level runs have visualStart on their visual right edge and
+     * they progress visually to the left.
+     * If option OPTION_INSERT_MARKS is set, insertRemove will contain the
+     * sum of appropriate LRM/RLM_BEFORE/AFTER flags.
+     * If option OPTION_REMOVE_CONTROLS is set, insertRemove will contain the
+     * negative number of BiDi control characters within this run.
+     */
+    static void getRuns(BidiBase bidiBase) {
+        /*
+         * This method returns immediately if the runs are already set. This
+         * includes the case of length==0 (handled in setPara)..
+         */
+<span class="nc bnc" id="L493" title="All 2 branches missed.">        if (bidiBase.runCount &gt;= 0) {</span>
+<span class="nc" id="L494">            return;</span>
+        }
+<span class="nc bnc" id="L496" title="All 2 branches missed.">        if (bidiBase.direction != BidiBase.MIXED) {</span>
+            /* simple, single-run case - this covers length==0 */
+            /* bidiBase.paraLevel is ok even for contextual multiple paragraphs */
+<span class="nc" id="L499">            getSingleRun(bidiBase, bidiBase.paraLevel);</span>
+        } else /* BidiBase.MIXED, length&gt;0 */ {
+            /* mixed directionality */
+<span class="nc" id="L502">            int length = bidiBase.length, limit;</span>
+<span class="nc" id="L503">            byte[] levels = bidiBase.levels;</span>
+            int i, runCount;
+<span class="nc" id="L505">            byte level = BidiBase.INTERNAL_LEVEL_DEFAULT_LTR;   /* initialize with no valid level */</span>
+            /*
+             * If there are WS characters at the end of the line
+             * and the run preceding them has a level different from
+             * paraLevel, then they will form their own run at paraLevel (L1).
+             * Count them separately.
+             * We need some special treatment for this in order to not
+             * modify the levels array which a line Bidi object shares
+             * with its paragraph parent and its other line siblings.
+             * In other words, for the trailing WS, it may be
+             * levels[]!=paraLevel but we have to treat it like it were so.
+             */
+<span class="nc" id="L517">            limit = bidiBase.trailingWSStart;</span>
+            /* count the runs, there is at least one non-WS run, and limit&gt;0 */
+<span class="nc" id="L519">            runCount = 0;</span>
+<span class="nc bnc" id="L520" title="All 2 branches missed.">            for (i = 0; i &lt; limit; ++i) {</span>
+                /* increment runCount at the start of each run */
+<span class="nc bnc" id="L522" title="All 2 branches missed.">                if (levels[i] != level) {</span>
+<span class="nc" id="L523">                    ++runCount;</span>
+<span class="nc" id="L524">                    level = levels[i];</span>
+                }
+            }
+
+            /*
+             * We don't need to see if the last run can be merged with a trailing
+             * WS run because setTrailingWSStart() would have done that.
+             */
+<span class="nc bnc" id="L532" title="All 4 branches missed.">            if (runCount == 1 &amp;&amp; limit == length) {</span>
+                /* There is only one non-WS run and no trailing WS-run. */
+<span class="nc" id="L534">                getSingleRun(bidiBase, levels[0]);</span>
+            } else /* runCount&gt;1 || limit&lt;length */ {
+                /* allocate and set the runs */
+                BidiRun[] runs;
+                int runIndex, start;
+<span class="nc" id="L539">                byte minLevel = BidiBase.MAX_EXPLICIT_LEVEL + 1;</span>
+<span class="nc" id="L540">                byte maxLevel=0;</span>
+
+                /* now, count a (non-mergeable) WS run */
+<span class="nc bnc" id="L543" title="All 2 branches missed.">                if (limit &lt; length) {</span>
+<span class="nc" id="L544">                    ++runCount;</span>
+                }
+
+                /* runCount &gt; 1 */
+<span class="nc" id="L548">                bidiBase.getRunsMemory(runCount);</span>
+<span class="nc" id="L549">                runs = bidiBase.runsMemory;</span>
+
+                /* set the runs */
+                /* FOOD FOR THOUGHT: this could be optimized, e.g.:
+                 * 464-&gt;444, 484-&gt;444, 575-&gt;555, 595-&gt;555
+                 * However, that would take longer. Check also how it would
+                 * interact with BiDi control removal and inserting Marks.
+                 */
+<span class="nc" id="L557">                runIndex = 0;</span>
+
+                /* search for the run limits and initialize visualLimit values with the run lengths */
+<span class="nc" id="L560">                i = 0;</span>
+                do {
+                    /* prepare this run */
+<span class="nc" id="L563">                    start = i;</span>
+<span class="nc" id="L564">                    level = levels[i];</span>
+<span class="nc bnc" id="L565" title="All 2 branches missed.">                    if (level &lt; minLevel) {</span>
+<span class="nc" id="L566">                        minLevel = level;</span>
+                    }
+<span class="nc bnc" id="L568" title="All 2 branches missed.">                    if (level &gt; maxLevel) {</span>
+<span class="nc" id="L569">                        maxLevel = level;</span>
+                    }
+
+                    /* look for the run limit */
+<span class="nc bnc" id="L573" title="All 4 branches missed.">                    while (++i &lt; limit &amp;&amp; levels[i] == level) {}</span>
+
+                    /* i is another run limit */
+<span class="nc" id="L576">                    runs[runIndex] = new BidiRun(start, i - start, level);</span>
+<span class="nc" id="L577">                    ++runIndex;</span>
+<span class="nc bnc" id="L578" title="All 2 branches missed.">                } while (i &lt; limit);</span>
+
+<span class="nc bnc" id="L580" title="All 2 branches missed.">                if (limit &lt; length) {</span>
+                    /* there is a separate WS run */
+<span class="nc" id="L582">                    runs[runIndex] = new BidiRun(limit, length - limit, bidiBase.paraLevel);</span>
+                    /* For the trailing WS run, bidiBase.paraLevel is ok even
+                       if contextual multiple paragraphs.                   */
+<span class="nc bnc" id="L585" title="All 2 branches missed.">                    if (bidiBase.paraLevel &lt; minLevel) {</span>
+<span class="nc" id="L586">                        minLevel = bidiBase.paraLevel;</span>
+                    }
+                }
+
+                /* set the object fields */
+<span class="nc" id="L591">                bidiBase.runs = runs;</span>
+<span class="nc" id="L592">                bidiBase.runCount = runCount;</span>
+
+<span class="nc" id="L594">                reorderLine(bidiBase, minLevel, maxLevel);</span>
+
+                /* now add the direction flags and adjust the visualLimit's to be just that */
+                /* this loop will also handle the trailing WS run */
+<span class="nc" id="L598">                limit = 0;</span>
+<span class="nc bnc" id="L599" title="All 2 branches missed.">                for (i = 0; i &lt; runCount; ++i) {</span>
+<span class="nc" id="L600">                    runs[i].level = levels[runs[i].start];</span>
+<span class="nc" id="L601">                    limit = (runs[i].limit += limit);</span>
+                }
+
+                /* Set the embedding level for the trailing WS run. */
+                /* For a RTL paragraph, it will be the *first* run in visual order. */
+                /* For the trailing WS run, bidiBase.paraLevel is ok even if
+                   contextual multiple paragraphs.                          */
+<span class="nc bnc" id="L608" title="All 2 branches missed.">                if (runIndex &lt; runCount) {</span>
+<span class="nc bnc" id="L609" title="All 2 branches missed.">                    int trailingRun = ((bidiBase.paraLevel &amp; 1) != 0)? 0 : runIndex;</span>
+<span class="nc" id="L610">                    runs[trailingRun].level = bidiBase.paraLevel;</span>
+                }
+            }
+        }
+
+        /* handle insert LRM/RLM BEFORE/AFTER run */
+<span class="nc bnc" id="L616" title="All 2 branches missed.">        if (bidiBase.insertPoints.size &gt; 0) {</span>
+            BidiBase.Point point;
+            int runIndex, ip;
+<span class="nc bnc" id="L619" title="All 2 branches missed.">            for (ip = 0; ip &lt; bidiBase.insertPoints.size; ip++) {</span>
+<span class="nc" id="L620">                point = bidiBase.insertPoints.points[ip];</span>
+<span class="nc" id="L621">                runIndex = getRunFromLogicalIndex(bidiBase, point.pos);</span>
+<span class="nc" id="L622">                bidiBase.runs[runIndex].insertRemove |= point.flag;</span>
+            }
+        }
+
+        /* handle remove BiDi control characters */
+<span class="nc bnc" id="L627" title="All 2 branches missed.">        if (bidiBase.controlCount &gt; 0) {</span>
+            int runIndex, ic;
+            char c;
+<span class="nc bnc" id="L630" title="All 2 branches missed.">            for (ic = 0; ic &lt; bidiBase.length; ic++) {</span>
+<span class="nc" id="L631">                c = bidiBase.text[ic];</span>
+<span class="nc bnc" id="L632" title="All 2 branches missed.">                if (BidiBase.IsBidiControlChar(c)) {</span>
+<span class="nc" id="L633">                    runIndex = getRunFromLogicalIndex(bidiBase, ic);</span>
+<span class="nc" id="L634">                    bidiBase.runs[runIndex].insertRemove--;</span>
+                }
+            }
+        }
+<span class="nc" id="L638">    }</span>
+
+    static int[] prepareReorder(byte[] levels, byte[] pMinLevel, byte[] pMaxLevel)
+    {
+        int start;
+        byte level, minLevel, maxLevel;
+
+<span class="nc bnc" id="L645" title="All 4 branches missed.">        if (levels == null || levels.length &lt;= 0) {</span>
+<span class="nc" id="L646">            return null;</span>
+        }
+
+        /* determine minLevel and maxLevel */
+<span class="nc" id="L650">        minLevel = BidiBase.MAX_EXPLICIT_LEVEL + 1;</span>
+<span class="nc" id="L651">        maxLevel = 0;</span>
+<span class="nc bnc" id="L652" title="All 2 branches missed.">        for (start = levels.length; start&gt;0; ) {</span>
+<span class="nc" id="L653">            level = levels[--start];</span>
+<span class="nc bnc" id="L654" title="All 2 branches missed.">            if (level &gt; BidiBase.MAX_EXPLICIT_LEVEL + 1) {</span>
+<span class="nc" id="L655">                return null;</span>
+            }
+<span class="nc bnc" id="L657" title="All 2 branches missed.">            if (level &lt; minLevel) {</span>
+<span class="nc" id="L658">                minLevel = level;</span>
+            }
+<span class="nc bnc" id="L660" title="All 2 branches missed.">            if (level &gt; maxLevel) {</span>
+<span class="nc" id="L661">                maxLevel = level;</span>
+            }
+        }
+<span class="nc" id="L664">        pMinLevel[0] = minLevel;</span>
+<span class="nc" id="L665">        pMaxLevel[0] = maxLevel;</span>
+
+        /* initialize the index map */
+<span class="nc" id="L668">        int[] indexMap = new int[levels.length];</span>
+<span class="nc bnc" id="L669" title="All 2 branches missed.">        for (start = levels.length; start &gt; 0; ) {</span>
+<span class="nc" id="L670">            --start;</span>
+<span class="nc" id="L671">            indexMap[start] = start;</span>
+        }
+
+<span class="nc" id="L674">        return indexMap;</span>
+    }
+
+    static int[] reorderVisual(byte[] levels)
+    {
+<span class="nc" id="L679">        byte[] aMinLevel = new byte[1];</span>
+<span class="nc" id="L680">        byte[] aMaxLevel = new byte[1];</span>
+        int start, end, limit, temp;
+        byte minLevel, maxLevel;
+
+<span class="nc" id="L684">        int[] indexMap = prepareReorder(levels, aMinLevel, aMaxLevel);</span>
+<span class="nc bnc" id="L685" title="All 2 branches missed.">        if (indexMap == null) {</span>
+<span class="nc" id="L686">            return null;</span>
+        }
+
+<span class="nc" id="L689">        minLevel = aMinLevel[0];</span>
+<span class="nc" id="L690">        maxLevel = aMaxLevel[0];</span>
+
+        /* nothing to do? */
+<span class="nc bnc" id="L693" title="All 4 branches missed.">        if (minLevel == maxLevel &amp;&amp; (minLevel &amp; 1) == 0) {</span>
+<span class="nc" id="L694">            return indexMap;</span>
+        }
+
+        /* reorder only down to the lowest odd level */
+<span class="nc" id="L698">        minLevel |= 1;</span>
+
+        /* loop maxLevel..minLevel */
+        do {
+<span class="nc" id="L702">            start = 0;</span>
+
+            /* loop for all sequences of levels to reorder at the current maxLevel */
+            for ( ; ; ) {
+                /* look for a sequence of levels that are all at &gt;=maxLevel */
+                /* look for the first index of such a sequence */
+<span class="nc bnc" id="L708" title="All 4 branches missed.">                while (start &lt; levels.length &amp;&amp; levels[start] &lt; maxLevel) {</span>
+<span class="nc" id="L709">                    ++start;</span>
+                }
+<span class="nc bnc" id="L711" title="All 2 branches missed.">                if (start &gt;= levels.length) {</span>
+<span class="nc" id="L712">                    break;  /* no more such runs */</span>
+                }
+
+                /* look for the limit of such a sequence (the index behind it) */
+<span class="nc bnc" id="L716" title="All 4 branches missed.">                for (limit = start; ++limit &lt; levels.length &amp;&amp; levels[limit] &gt;= maxLevel; ) {}</span>
+
+                /*
+                 * Swap the entire interval of indexes from start to limit-1.
+                 * We don't need to swap the levels for the purpose of this
+                 * algorithm: the sequence of levels that we look at does not
+                 * move anyway.
+                 */
+<span class="nc" id="L724">                end = limit - 1;</span>
+<span class="nc bnc" id="L725" title="All 2 branches missed.">                while (start &lt; end) {</span>
+<span class="nc" id="L726">                    temp = indexMap[start];</span>
+<span class="nc" id="L727">                    indexMap[start] = indexMap[end];</span>
+<span class="nc" id="L728">                    indexMap[end] = temp;</span>
+
+<span class="nc" id="L730">                    ++start;</span>
+<span class="nc" id="L731">                    --end;</span>
+                }
+
+<span class="nc bnc" id="L734" title="All 2 branches missed.">                if (limit == levels.length) {</span>
+<span class="nc" id="L735">                    break;  /* no more such sequences */</span>
+                } else {
+<span class="nc" id="L737">                    start = limit + 1;</span>
+                }
+            }
+<span class="nc bnc" id="L740" title="All 2 branches missed.">        } while (--maxLevel &gt;= minLevel);</span>
+
+<span class="nc" id="L742">        return indexMap;</span>
+    }
+
+    static int[] getVisualMap(BidiBase bidiBase)
+    {
+        /* fill a visual-to-logical index map using the runs[] */
+<span class="nc" id="L748">        BidiRun[] runs = bidiBase.runs;</span>
+        int logicalStart, visualStart, visualLimit;
+<span class="nc bnc" id="L750" title="All 2 branches missed.">        int allocLength = bidiBase.length &gt; bidiBase.resultLength ? bidiBase.length</span>
+                                                          : bidiBase.resultLength;
+<span class="nc" id="L752">        int[] indexMap = new int[allocLength];</span>
+
+<span class="nc" id="L754">        visualStart = 0;</span>
+<span class="nc" id="L755">        int idx = 0;</span>
+<span class="nc bnc" id="L756" title="All 2 branches missed.">        for (int j = 0; j &lt; bidiBase.runCount; ++j) {</span>
+<span class="nc" id="L757">            logicalStart = runs[j].start;</span>
+<span class="nc" id="L758">            visualLimit = runs[j].limit;</span>
+<span class="nc bnc" id="L759" title="All 2 branches missed.">            if (runs[j].isEvenRun()) {</span>
+                do { /* LTR */
+<span class="nc" id="L761">                    indexMap[idx++] = logicalStart++;</span>
+<span class="nc bnc" id="L762" title="All 2 branches missed.">                } while (++visualStart &lt; visualLimit);</span>
+            } else {
+<span class="nc" id="L764">                logicalStart += visualLimit - visualStart;  /* logicalLimit */</span>
+                do { /* RTL */
+<span class="nc" id="L766">                    indexMap[idx++] = --logicalStart;</span>
+<span class="nc bnc" id="L767" title="All 2 branches missed.">                } while (++visualStart &lt; visualLimit);</span>
+            }
+            /* visualStart==visualLimit; */
+        }
+
+<span class="nc bnc" id="L772" title="All 2 branches missed.">        if (bidiBase.insertPoints.size &gt; 0) {</span>
+<span class="nc" id="L773">            int markFound = 0, runCount = bidiBase.runCount;</span>
+            int insertRemove, i, j, k;
+<span class="nc" id="L775">            runs = bidiBase.runs;</span>
+            /* count all inserted marks */
+<span class="nc bnc" id="L777" title="All 2 branches missed.">            for (i = 0; i &lt; runCount; i++) {</span>
+<span class="nc" id="L778">                insertRemove = runs[i].insertRemove;</span>
+<span class="nc bnc" id="L779" title="All 2 branches missed.">                if ((insertRemove &amp; (BidiBase.LRM_BEFORE|BidiBase.RLM_BEFORE)) &gt; 0) {</span>
+<span class="nc" id="L780">                    markFound++;</span>
+                }
+<span class="nc bnc" id="L782" title="All 2 branches missed.">                if ((insertRemove &amp; (BidiBase.LRM_AFTER|BidiBase.RLM_AFTER)) &gt; 0) {</span>
+<span class="nc" id="L783">                    markFound++;</span>
+                }
+            }
+            /* move back indexes by number of preceding marks */
+<span class="nc" id="L787">            k = bidiBase.resultLength;</span>
+<span class="nc bnc" id="L788" title="All 4 branches missed.">            for (i = runCount - 1; i &gt;= 0 &amp;&amp; markFound &gt; 0; i--) {</span>
+<span class="nc" id="L789">                insertRemove = runs[i].insertRemove;</span>
+<span class="nc bnc" id="L790" title="All 2 branches missed.">                if ((insertRemove &amp; (BidiBase.LRM_AFTER|BidiBase.RLM_AFTER)) &gt; 0) {</span>
+<span class="nc" id="L791">                    indexMap[--k] = BidiBase.MAP_NOWHERE;</span>
+<span class="nc" id="L792">                    markFound--;</span>
+                }
+<span class="nc bnc" id="L794" title="All 2 branches missed.">                visualStart = i &gt; 0 ? runs[i-1].limit : 0;</span>
+<span class="nc bnc" id="L795" title="All 4 branches missed.">                for (j = runs[i].limit - 1; j &gt;= visualStart &amp;&amp; markFound &gt; 0; j--) {</span>
+<span class="nc" id="L796">                    indexMap[--k] = indexMap[j];</span>
+                }
+<span class="nc bnc" id="L798" title="All 2 branches missed.">                if ((insertRemove &amp; (BidiBase.LRM_BEFORE|BidiBase.RLM_BEFORE)) &gt; 0) {</span>
+<span class="nc" id="L799">                    indexMap[--k] = BidiBase.MAP_NOWHERE;</span>
+<span class="nc" id="L800">                    markFound--;</span>
+                }
+            }
+<span class="nc" id="L803">        }</span>
+<span class="nc bnc" id="L804" title="All 2 branches missed.">        else if (bidiBase.controlCount &gt; 0) {</span>
+<span class="nc" id="L805">            int runCount = bidiBase.runCount, logicalEnd;</span>
+            int insertRemove, length, i, j, k, m;
+            char uchar;
+            boolean evenRun;
+<span class="nc" id="L809">            runs = bidiBase.runs;</span>
+<span class="nc" id="L810">            visualStart = 0;</span>
+            /* move forward indexes by number of preceding controls */
+<span class="nc" id="L812">            k = 0;</span>
+<span class="nc bnc" id="L813" title="All 2 branches missed.">            for (i = 0; i &lt; runCount; i++, visualStart += length) {</span>
+<span class="nc" id="L814">                length = runs[i].limit - visualStart;</span>
+<span class="nc" id="L815">                insertRemove = runs[i].insertRemove;</span>
+                /* if no control found yet, nothing to do in this run */
+<span class="nc bnc" id="L817" title="All 4 branches missed.">                if ((insertRemove == 0) &amp;&amp; (k == visualStart)) {</span>
+<span class="nc" id="L818">                    k += length;</span>
+<span class="nc" id="L819">                    continue;</span>
+                }
+                /* if no control in this run */
+<span class="nc bnc" id="L822" title="All 2 branches missed.">                if (insertRemove == 0) {</span>
+<span class="nc" id="L823">                    visualLimit = runs[i].limit;</span>
+<span class="nc bnc" id="L824" title="All 2 branches missed.">                    for (j = visualStart; j &lt; visualLimit; j++) {</span>
+<span class="nc" id="L825">                        indexMap[k++] = indexMap[j];</span>
+                    }
+                    continue;
+                }
+<span class="nc" id="L829">                logicalStart = runs[i].start;</span>
+<span class="nc" id="L830">                evenRun = runs[i].isEvenRun();</span>
+<span class="nc" id="L831">                logicalEnd = logicalStart + length - 1;</span>
+<span class="nc bnc" id="L832" title="All 2 branches missed.">                for (j = 0; j &lt; length; j++) {</span>
+<span class="nc bnc" id="L833" title="All 2 branches missed.">                    m = evenRun ? logicalStart + j : logicalEnd - j;</span>
+<span class="nc" id="L834">                    uchar = bidiBase.text[m];</span>
+<span class="nc bnc" id="L835" title="All 2 branches missed.">                    if (!BidiBase.IsBidiControlChar(uchar)) {</span>
+<span class="nc" id="L836">                        indexMap[k++] = m;</span>
+                    }
+                }
+            }
+        }
+<span class="nc bnc" id="L841" title="All 2 branches missed.">        if (allocLength == bidiBase.resultLength) {</span>
+<span class="nc" id="L842">            return indexMap;</span>
+        }
+<span class="nc" id="L844">        int[] newMap = new int[bidiBase.resultLength];</span>
+<span class="nc" id="L845">        System.arraycopy(indexMap, 0, newMap, 0, bidiBase.resultLength);</span>
+<span class="nc" id="L846">        return newMap;</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

@@ -1,0 +1,239 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>Pool.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">com.sun.jndi.ldap.pool</a> &gt; <span class="el_source">Pool.java</span></div><h1>Pool.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2002, 2011, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package com.sun.jndi.ldap.pool;
+
+import java.util.Map;
+import java.util.WeakHashMap;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.LinkedList;
+
+import java.io.PrintStream;
+import java.lang.ref.Reference;
+import java.lang.ref.ReferenceQueue;
+import javax.naming.NamingException;
+
+/**
+ * A map of pool ids to Connections.
+ * Key is an object that uniquely identifies a PooledConnection request
+ * (typically information needed to create the connection).
+ * The definitions of the key's equals() and hashCode() methods are
+ * vital to its unique identification in a Pool.
+ *
+ * Value is a ConnectionsRef, which is a reference to Connections,
+ * a list of equivalent connections.
+ *
+ * Supports methods that
+ * - retrieves (or creates as necessary) a connection from the pool
+ * - removes expired connections from the pool
+ *
+ * Connections cleanup:
+ * A WeakHashMap is used for mapping the pool ids and Connections.
+ * A SoftReference from the value to the key is kept to hold the map
+ * entry as long as possible. This allows the GC to remove Connections
+ * from the Pool under situations of VM running out of resources.
+ * To take an appropriate action of 'closing the connections' before the GC
+ * reclaims the ConnectionsRef objects, the ConnectionsRef objects are made
+ * weakly reachable through a list of weak references registered with
+ * a reference queue.
+ * Upon an entry gets removed from the WeakHashMap, the ConnectionsRef (value
+ * in the map) object is weakly reachable. When another sweep of
+ * clearing the weak references is made by the GC it puts the corresponding
+ * ConnectionsWeakRef object into the reference queue.
+ * The reference queue is monitored lazily for reclaimable Connections
+ * whenever a pooled connection is requested or a call to remove the expired
+ * connections is made. The monitoring is done regularly when idle connection
+ * timeout is set as the PoolCleaner removes expired connections periodically.
+ * As determined by the experiements, cleanup of resources using the
+ * ReferenceQueue mechanism is reliable and has immidiate effect than the
+ * finalizer approach.
+ *
+ * @author Rosanna Lee
+ */
+
+final public class Pool {
+
+<span class="nc" id="L80">    static final boolean debug = com.sun.jndi.ldap.LdapPoolManager.debug;</span>
+
+    /*
+     * Used for connections cleanup
+     */
+<span class="nc" id="L85">    private static final ReferenceQueue&lt;ConnectionsRef&gt; queue =</span>
+        new ReferenceQueue&lt;&gt;();
+<span class="nc" id="L87">    private static final Collection&lt;Reference&lt;ConnectionsRef&gt;&gt; weakRefs =</span>
+<span class="nc" id="L88">        Collections.synchronizedList(new LinkedList&lt;Reference&lt;ConnectionsRef&gt;&gt;());</span>
+
+    final private int maxSize;    // max num of identical conn per pool
+    final private int prefSize;   // preferred num of identical conn per pool
+    final private int initSize;   // initial number of identical conn to create
+    final private Map&lt;Object, ConnectionsRef&gt; map;
+
+<span class="nc" id="L95">    public Pool(int initSize, int prefSize, int maxSize) {</span>
+<span class="nc" id="L96">        map = new WeakHashMap&lt;&gt;();</span>
+<span class="nc" id="L97">        this.prefSize = prefSize;</span>
+<span class="nc" id="L98">        this.maxSize = maxSize;</span>
+<span class="nc" id="L99">        this.initSize = initSize;</span>
+<span class="nc" id="L100">    }</span>
+
+    /**
+     * Gets a pooled connection for id. The pooled connection might be
+     * newly created, as governed by the maxSize and prefSize settings.
+     * If a pooled connection is unavailable and cannot be created due
+     * to the maxSize constraint, this call blocks until the constraint
+     * is removed or until 'timeout' ms has elapsed.
+     *
+     * @param id identity of the connection to get
+     * @param timeout the number of milliseconds to wait before giving up
+     * @param factory the factory to use for creating the connection if
+     *          creation is necessary
+     * @return a pooled connection
+     * @throws NamingException the connection could not be created due to
+     *                          an error.
+     */
+    public PooledConnection getPooledConnection(Object id, long timeout,
+        PooledConnectionFactory factory) throws NamingException {
+
+<span class="nc" id="L120">        d(&quot;get(): &quot;, id);</span>
+<span class="nc" id="L121">        d(&quot;size: &quot;, map.size());</span>
+
+<span class="nc" id="L123">        expungeStaleConnections();</span>
+
+        Connections conns;
+<span class="nc" id="L126">        synchronized (map) {</span>
+<span class="nc" id="L127">            conns = getConnections(id);</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">            if (conns == null) {</span>
+<span class="nc" id="L129">                d(&quot;get(): creating new connections list for &quot;, id);</span>
+
+                // No connections for this id so create a new list
+<span class="nc" id="L132">                conns = new Connections(id, initSize, prefSize, maxSize,</span>
+                    factory);
+<span class="nc" id="L134">                ConnectionsRef connsRef = new ConnectionsRef(conns);</span>
+<span class="nc" id="L135">                map.put(id, connsRef);</span>
+
+                // Create a weak reference to ConnectionsRef
+<span class="nc" id="L138">                Reference&lt;ConnectionsRef&gt; weakRef =</span>
+                        new ConnectionsWeakRef(connsRef, queue);
+
+                // Keep the weak reference through the element of a linked list
+<span class="nc" id="L142">                weakRefs.add(weakRef);</span>
+            }
+<span class="nc" id="L144">        }</span>
+
+<span class="nc" id="L146">        d(&quot;get(): size after: &quot;, map.size());</span>
+
+<span class="nc" id="L148">        return conns.get(timeout, factory); // get one connection from list</span>
+    }
+
+    private Connections getConnections(Object id) {
+<span class="nc" id="L152">        ConnectionsRef ref = map.get(id);</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">        return (ref != null) ? ref.getConnections() : null;</span>
+    }
+
+    /**
+     * Goes through the connections in this Pool and expires ones that
+     * have been idle before 'threshold'. An expired connection is closed
+     * and then removed from the pool (removePooledConnection() will eventually
+     * be called, and the list of pools itself removed if it becomes empty).
+     *
+     * @param threshold connections idle before 'threshold' should be closed
+     *          and removed.
+     */
+    public void expire(long threshold) {
+<span class="nc" id="L166">        synchronized (map) {</span>
+<span class="nc" id="L167">            Iterator&lt;ConnectionsRef&gt; iter = map.values().iterator();</span>
+            Connections conns;
+<span class="nc bnc" id="L169" title="All 2 branches missed.">            while (iter.hasNext()) {</span>
+<span class="nc" id="L170">                conns = iter.next().getConnections();</span>
+<span class="nc bnc" id="L171" title="All 2 branches missed.">                if (conns.expire(threshold)) {</span>
+<span class="nc" id="L172">                    d(&quot;expire(): removing &quot;, conns);</span>
+<span class="nc" id="L173">                    iter.remove();</span>
+                }
+            }
+<span class="nc" id="L176">        }</span>
+<span class="nc" id="L177">        expungeStaleConnections();</span>
+<span class="nc" id="L178">    }</span>
+
+    /*
+     * Closes the connections contained in the ConnectionsRef object that
+     * is going to be reclaimed by the GC. Called by getPooledConnection()
+     * and expire() methods of this class.
+     */
+    private static void expungeStaleConnections() {
+<span class="nc" id="L186">        ConnectionsWeakRef releaseRef = null;</span>
+<span class="nc bnc" id="L187" title="All 2 branches missed.">        while ((releaseRef = (ConnectionsWeakRef) queue.poll())</span>
+                                        != null) {
+<span class="nc" id="L189">            Connections conns = releaseRef.getConnections();</span>
+
+<span class="nc bnc" id="L191" title="All 2 branches missed.">            if (debug) {</span>
+<span class="nc" id="L192">                System.err.println(</span>
+                        &quot;weak reference cleanup: Closing Connections:&quot; + conns);
+            }
+
+            // cleanup
+<span class="nc" id="L197">            conns.close();</span>
+<span class="nc" id="L198">            weakRefs.remove(releaseRef);</span>
+<span class="nc" id="L199">            releaseRef.clear();</span>
+<span class="nc" id="L200">         }</span>
+<span class="nc" id="L201">    }</span>
+
+
+    public void showStats(PrintStream out) {
+        Object id;
+        Connections conns;
+
+<span class="nc" id="L208">        out.println(&quot;===== Pool start ======================&quot;);</span>
+<span class="nc" id="L209">        out.println(&quot;maximum pool size: &quot; + maxSize);</span>
+<span class="nc" id="L210">        out.println(&quot;preferred pool size: &quot; + prefSize);</span>
+<span class="nc" id="L211">        out.println(&quot;initial pool size: &quot; + initSize);</span>
+<span class="nc" id="L212">        out.println(&quot;current pool size: &quot; + map.size());</span>
+
+<span class="nc bnc" id="L214" title="All 2 branches missed.">        for (Map.Entry&lt;Object, ConnectionsRef&gt; entry : map.entrySet()) {</span>
+<span class="nc" id="L215">            id = entry.getKey();</span>
+<span class="nc" id="L216">            conns = entry.getValue().getConnections();</span>
+<span class="nc" id="L217">            out.println(&quot;   &quot; + id + &quot;:&quot; + conns.getStats());</span>
+<span class="nc" id="L218">        }</span>
+
+<span class="nc" id="L220">        out.println(&quot;====== Pool end =====================&quot;);</span>
+<span class="nc" id="L221">    }</span>
+
+    public String toString() {
+<span class="nc" id="L224">        return super.toString() + &quot; &quot; + map.toString();</span>
+    }
+
+    private void d(String msg, int i) {
+<span class="nc bnc" id="L228" title="All 2 branches missed.">        if (debug) {</span>
+<span class="nc" id="L229">            System.err.println(this + &quot;.&quot; + msg + i);</span>
+        }
+<span class="nc" id="L231">    }</span>
+
+    private void d(String msg, Object obj) {
+<span class="nc bnc" id="L234" title="All 2 branches missed.">        if (debug) {</span>
+<span class="nc" id="L235">            System.err.println(this + &quot;.&quot; + msg + obj);</span>
+        }
+<span class="nc" id="L237">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

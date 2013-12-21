@@ -1,0 +1,881 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ServerImpl.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.net.httpserver</a> &gt; <span class="el_source">ServerImpl.java</span></div><h1>ServerImpl.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2005, 2011, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.net.httpserver;
+
+import java.net.*;
+import java.io.*;
+import java.nio.channels.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.logging.Logger;
+import java.util.logging.Level;
+import javax.net.ssl.*;
+import com.sun.net.httpserver.*;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
+import sun.net.httpserver.HttpConnection.State;
+
+/**
+ * Provides implementation for both HTTP and HTTPS
+ */
+<span class="pc bpc" id="L44" title="1 of 2 branches missed.">class ServerImpl implements TimeSource {</span>
+
+    private String protocol;
+    private boolean https;
+    private Executor executor;
+    private HttpsConfigurator httpsConfig;
+    private SSLContext sslContext;
+    private ContextList contexts;
+    private InetSocketAddress address;
+    private ServerSocketChannel schan;
+    private Selector selector;
+    private SelectionKey listenerKey;
+    private Set&lt;HttpConnection&gt; idleConnections;
+    private Set&lt;HttpConnection&gt; allConnections;
+    /* following two are used to keep track of the times
+     * when a connection/request is first received
+     * and when we start to send the response
+     */
+    private Set&lt;HttpConnection&gt; reqConnections;
+    private Set&lt;HttpConnection&gt; rspConnections;
+    private List&lt;Event&gt; events;
+<span class="fc" id="L65">    private Object lolock = new Object();</span>
+<span class="fc" id="L66">    private volatile boolean finished = false;</span>
+<span class="fc" id="L67">    private volatile boolean terminating = false;</span>
+<span class="fc" id="L68">    private boolean bound = false;</span>
+<span class="fc" id="L69">    private boolean started = false;</span>
+    private volatile long time;  /* current time */
+<span class="fc" id="L71">    private volatile long subticks = 0;</span>
+    private volatile long ticks; /* number of clock ticks since server started */
+    private HttpServer wrapper;
+
+<span class="fc" id="L75">    final static int CLOCK_TICK = ServerConfig.getClockTick();</span>
+<span class="fc" id="L76">    final static long IDLE_INTERVAL = ServerConfig.getIdleInterval();</span>
+<span class="fc" id="L77">    final static int MAX_IDLE_CONNECTIONS = ServerConfig.getMaxIdleConnections();</span>
+<span class="fc" id="L78">    final static long TIMER_MILLIS = ServerConfig.getTimerMillis ();</span>
+<span class="fc" id="L79">    final static long MAX_REQ_TIME=getTimeMillis(ServerConfig.getMaxReqTime());</span>
+<span class="fc" id="L80">    final static long MAX_RSP_TIME=getTimeMillis(ServerConfig.getMaxRspTime());</span>
+<span class="pc bpc" id="L81" title="1 of 4 branches missed.">    final static boolean timer1Enabled = MAX_REQ_TIME != -1 || MAX_RSP_TIME != -1;</span>
+
+    private Timer timer, timer1;
+    private Logger logger;
+
+    ServerImpl (
+        HttpServer wrapper, String protocol, InetSocketAddress addr, int backlog
+<span class="fc" id="L88">    ) throws IOException {</span>
+
+<span class="fc" id="L90">        this.protocol = protocol;</span>
+<span class="fc" id="L91">        this.wrapper = wrapper;</span>
+<span class="fc" id="L92">        this.logger = Logger.getLogger (&quot;com.sun.net.httpserver&quot;);</span>
+<span class="fc" id="L93">        ServerConfig.checkLegacyProperties (logger);</span>
+<span class="fc" id="L94">        https = protocol.equalsIgnoreCase (&quot;https&quot;);</span>
+<span class="fc" id="L95">        this.address = addr;</span>
+<span class="fc" id="L96">        contexts = new ContextList();</span>
+<span class="fc" id="L97">        schan = ServerSocketChannel.open();</span>
+<span class="fc bfc" id="L98" title="All 2 branches covered.">        if (addr != null) {</span>
+<span class="fc" id="L99">            ServerSocket socket = schan.socket();</span>
+<span class="fc" id="L100">            socket.bind (addr, backlog);</span>
+<span class="fc" id="L101">            bound = true;</span>
+        }
+<span class="fc" id="L103">        selector = Selector.open ();</span>
+<span class="fc" id="L104">        schan.configureBlocking (false);</span>
+<span class="fc" id="L105">        listenerKey = schan.register (selector, SelectionKey.OP_ACCEPT);</span>
+<span class="fc" id="L106">        dispatcher = new Dispatcher();</span>
+<span class="fc" id="L107">        idleConnections = Collections.synchronizedSet (new HashSet&lt;HttpConnection&gt;());</span>
+<span class="fc" id="L108">        allConnections = Collections.synchronizedSet (new HashSet&lt;HttpConnection&gt;());</span>
+<span class="fc" id="L109">        reqConnections = Collections.synchronizedSet (new HashSet&lt;HttpConnection&gt;());</span>
+<span class="fc" id="L110">        rspConnections = Collections.synchronizedSet (new HashSet&lt;HttpConnection&gt;());</span>
+<span class="fc" id="L111">        time = System.currentTimeMillis();</span>
+<span class="fc" id="L112">        timer = new Timer (&quot;server-timer&quot;, true);</span>
+<span class="fc" id="L113">        timer.schedule (new ServerTimerTask(), CLOCK_TICK, CLOCK_TICK);</span>
+<span class="fc bfc" id="L114" title="All 2 branches covered.">        if (timer1Enabled) {</span>
+<span class="fc" id="L115">            timer1 = new Timer (&quot;server-timer1&quot;, true);</span>
+<span class="fc" id="L116">            timer1.schedule (new ServerTimerTask1(),TIMER_MILLIS,TIMER_MILLIS);</span>
+<span class="fc" id="L117">            logger.config (&quot;HttpServer timer1 enabled period in ms:  &quot;+TIMER_MILLIS);</span>
+<span class="fc" id="L118">            logger.config (&quot;MAX_REQ_TIME:  &quot;+MAX_REQ_TIME);</span>
+<span class="fc" id="L119">            logger.config (&quot;MAX_RSP_TIME:  &quot;+MAX_RSP_TIME);</span>
+        }
+<span class="fc" id="L121">        events = new LinkedList&lt;Event&gt;();</span>
+<span class="fc" id="L122">        logger.config (&quot;HttpServer created &quot;+protocol+&quot; &quot;+ addr);</span>
+<span class="fc" id="L123">    }</span>
+
+    public void bind (InetSocketAddress addr, int backlog) throws IOException {
+<span class="nc bnc" id="L126" title="All 2 branches missed.">        if (bound) {</span>
+<span class="nc" id="L127">            throw new BindException (&quot;HttpServer already bound&quot;);</span>
+        }
+<span class="nc bnc" id="L129" title="All 2 branches missed.">        if (addr == null) {</span>
+<span class="nc" id="L130">            throw new NullPointerException (&quot;null address&quot;);</span>
+        }
+<span class="nc" id="L132">        ServerSocket socket = schan.socket();</span>
+<span class="nc" id="L133">        socket.bind (addr, backlog);</span>
+<span class="nc" id="L134">        bound = true;</span>
+<span class="nc" id="L135">    }</span>
+
+    public void start () {
+<span class="pc bpc" id="L138" title="3 of 6 branches missed.">        if (!bound || started || finished) {</span>
+<span class="nc" id="L139">            throw new IllegalStateException (&quot;server in wrong state&quot;);</span>
+        }
+<span class="fc bfc" id="L141" title="All 2 branches covered.">        if (executor == null) {</span>
+<span class="fc" id="L142">            executor = new DefaultExecutor();</span>
+        }
+<span class="fc" id="L144">        Thread t = new Thread (dispatcher);</span>
+<span class="fc" id="L145">        started = true;</span>
+<span class="fc" id="L146">        t.start();</span>
+<span class="fc" id="L147">    }</span>
+
+    public void setExecutor (Executor executor) {
+<span class="pc bpc" id="L150" title="1 of 2 branches missed.">        if (started) {</span>
+<span class="nc" id="L151">            throw new IllegalStateException (&quot;server already started&quot;);</span>
+        }
+<span class="fc" id="L153">        this.executor = executor;</span>
+<span class="fc" id="L154">    }</span>
+
+<span class="fc" id="L156">    private static class DefaultExecutor implements Executor {</span>
+        public void execute (Runnable task) {
+<span class="fc" id="L158">            task.run();</span>
+<span class="fc" id="L159">        }</span>
+    }
+
+    public Executor getExecutor () {
+<span class="fc" id="L163">        return executor;</span>
+    }
+
+    public void setHttpsConfigurator (HttpsConfigurator config) {
+<span class="pc bpc" id="L167" title="1 of 2 branches missed.">        if (config == null) {</span>
+<span class="nc" id="L168">            throw new NullPointerException (&quot;null HttpsConfigurator&quot;);</span>
+        }
+<span class="pc bpc" id="L170" title="1 of 2 branches missed.">        if (started) {</span>
+<span class="nc" id="L171">            throw new IllegalStateException (&quot;server already started&quot;);</span>
+        }
+<span class="fc" id="L173">        this.httpsConfig = config;</span>
+<span class="fc" id="L174">        sslContext = config.getSSLContext();</span>
+<span class="fc" id="L175">    }</span>
+
+    public HttpsConfigurator getHttpsConfigurator () {
+<span class="fc" id="L178">        return httpsConfig;</span>
+    }
+
+    public void stop (int delay) {
+<span class="pc bpc" id="L182" title="1 of 2 branches missed.">        if (delay &lt; 0) {</span>
+<span class="nc" id="L183">            throw new IllegalArgumentException (&quot;negative delay parameter&quot;);</span>
+        }
+<span class="fc" id="L185">        terminating = true;</span>
+<span class="pc" id="L186">        try { schan.close(); } catch (IOException e) {}</span>
+<span class="fc" id="L187">        selector.wakeup();</span>
+<span class="fc" id="L188">        long latest = System.currentTimeMillis() + delay * 1000;</span>
+<span class="fc bfc" id="L189" title="All 2 branches covered.">        while (System.currentTimeMillis() &lt; latest) {</span>
+<span class="fc" id="L190">            delay();</span>
+<span class="fc bfc" id="L191" title="All 2 branches covered.">            if (finished) {</span>
+<span class="fc" id="L192">                break;</span>
+            }
+        }
+<span class="fc" id="L195">        finished = true;</span>
+<span class="fc" id="L196">        selector.wakeup();</span>
+<span class="fc" id="L197">        synchronized (allConnections) {</span>
+<span class="fc bfc" id="L198" title="All 2 branches covered.">            for (HttpConnection c : allConnections) {</span>
+<span class="fc" id="L199">                c.close();</span>
+<span class="fc" id="L200">            }</span>
+<span class="pc" id="L201">        }</span>
+<span class="fc" id="L202">        allConnections.clear();</span>
+<span class="fc" id="L203">        idleConnections.clear();</span>
+<span class="fc" id="L204">        timer.cancel();</span>
+<span class="fc bfc" id="L205" title="All 2 branches covered.">        if (timer1Enabled) {</span>
+<span class="fc" id="L206">            timer1.cancel();</span>
+        }
+<span class="fc" id="L208">    }</span>
+
+    Dispatcher dispatcher;
+
+    public synchronized HttpContextImpl createContext (String path, HttpHandler handler) {
+<span class="pc bpc" id="L213" title="2 of 4 branches missed.">        if (handler == null || path == null) {</span>
+<span class="nc" id="L214">            throw new NullPointerException (&quot;null handler, or path parameter&quot;);</span>
+        }
+<span class="fc" id="L216">        HttpContextImpl context = new HttpContextImpl (protocol, path, handler, this);</span>
+<span class="fc" id="L217">        contexts.add (context);</span>
+<span class="fc" id="L218">        logger.config (&quot;context created: &quot; + path);</span>
+<span class="fc" id="L219">        return context;</span>
+    }
+
+    public synchronized HttpContextImpl createContext (String path) {
+<span class="pc bpc" id="L223" title="1 of 2 branches missed.">        if (path == null) {</span>
+<span class="nc" id="L224">            throw new NullPointerException (&quot;null path parameter&quot;);</span>
+        }
+<span class="fc" id="L226">        HttpContextImpl context = new HttpContextImpl (protocol, path, null, this);</span>
+<span class="fc" id="L227">        contexts.add (context);</span>
+<span class="fc" id="L228">        logger.config (&quot;context created: &quot; + path);</span>
+<span class="fc" id="L229">        return context;</span>
+    }
+
+    public synchronized void removeContext (String path) throws IllegalArgumentException {
+<span class="nc bnc" id="L233" title="All 2 branches missed.">        if (path == null) {</span>
+<span class="nc" id="L234">            throw new NullPointerException (&quot;null path parameter&quot;);</span>
+        }
+<span class="nc" id="L236">        contexts.remove (protocol, path);</span>
+<span class="nc" id="L237">        logger.config (&quot;context removed: &quot; + path);</span>
+<span class="nc" id="L238">    }</span>
+
+    public synchronized void removeContext (HttpContext context) throws IllegalArgumentException {
+<span class="nc bnc" id="L241" title="All 2 branches missed.">        if (!(context instanceof HttpContextImpl)) {</span>
+<span class="nc" id="L242">            throw new IllegalArgumentException (&quot;wrong HttpContext type&quot;);</span>
+        }
+<span class="nc" id="L244">        contexts.remove ((HttpContextImpl)context);</span>
+<span class="nc" id="L245">        logger.config (&quot;context removed: &quot; + context.getPath());</span>
+<span class="nc" id="L246">    }</span>
+
+    public InetSocketAddress getAddress() {
+<span class="fc" id="L249">        return AccessController.doPrivileged(</span>
+<span class="fc" id="L250">                new PrivilegedAction&lt;InetSocketAddress&gt;() {</span>
+                    public InetSocketAddress run() {
+<span class="fc" id="L252">                        return</span>
+<span class="fc" id="L253">                            (InetSocketAddress)schan.socket()</span>
+<span class="fc" id="L254">                                .getLocalSocketAddress();</span>
+                    }
+                });
+    }
+
+    Selector getSelector () {
+<span class="nc" id="L260">        return selector;</span>
+    }
+
+    void addEvent (Event r) {
+<span class="fc" id="L264">        synchronized (lolock) {</span>
+<span class="fc" id="L265">            events.add (r);</span>
+<span class="fc" id="L266">            selector.wakeup();</span>
+<span class="pc" id="L267">        }</span>
+<span class="fc" id="L268">    }</span>
+
+    /* main server listener task */
+
+<span class="pc bpc" id="L272" title="1 of 2 branches missed.">    class Dispatcher implements Runnable {</span>
+
+        private void handleEvent (Event r) {
+<span class="fc" id="L275">            ExchangeImpl t = r.exchange;</span>
+<span class="fc" id="L276">            HttpConnection c = t.getConnection();</span>
+            try {
+<span class="pc bpc" id="L278" title="1 of 2 branches missed.">                if (r instanceof WriteFinishedEvent) {</span>
+
+<span class="fc" id="L280">                    int exchanges = endExchange();</span>
+<span class="pc bpc" id="L281" title="1 of 4 branches missed.">                    if (terminating &amp;&amp; exchanges == 0) {</span>
+<span class="fc" id="L282">                        finished = true;</span>
+                    }
+<span class="fc" id="L284">                    responseCompleted (c);</span>
+<span class="fc" id="L285">                    LeftOverInputStream is = t.getOriginalInputStream();</span>
+<span class="fc bfc" id="L286" title="All 2 branches covered.">                    if (!is.isEOF()) {</span>
+<span class="fc" id="L287">                        t.close = true;</span>
+                    }
+<span class="pc bpc" id="L289" title="1 of 4 branches missed.">                    if (t.close || idleConnections.size() &gt;= MAX_IDLE_CONNECTIONS) {</span>
+<span class="fc" id="L290">                        c.close();</span>
+<span class="fc" id="L291">                        allConnections.remove (c);</span>
+                    } else {
+<span class="fc bfc" id="L293" title="All 2 branches covered.">                        if (is.isDataBuffered()) {</span>
+                            /* don't re-enable the interestops, just handle it */
+<span class="fc" id="L295">                            requestStarted (c);</span>
+<span class="fc" id="L296">                            handle (c.getChannel(), c);</span>
+                        } else {
+<span class="fc" id="L298">                            connsToRegister.add (c);</span>
+                        }
+                    }
+                }
+<span class="nc" id="L302">            } catch (IOException e) {</span>
+<span class="nc" id="L303">                logger.log (</span>
+                    Level.FINER, &quot;Dispatcher (1)&quot;, e
+                );
+<span class="nc" id="L306">                c.close();</span>
+<span class="fc" id="L307">            }</span>
+<span class="fc" id="L308">        }</span>
+
+<span class="fc" id="L310">        final LinkedList&lt;HttpConnection&gt; connsToRegister =</span>
+                new LinkedList&lt;HttpConnection&gt;();
+
+        void reRegister (HttpConnection c) {
+            /* re-register with selector */
+            try {
+<span class="fc" id="L316">                SocketChannel chan = c.getChannel();</span>
+<span class="fc" id="L317">                chan.configureBlocking (false);</span>
+<span class="fc" id="L318">                SelectionKey key = chan.register (selector, SelectionKey.OP_READ);</span>
+<span class="fc" id="L319">                key.attach (c);</span>
+<span class="fc" id="L320">                c.selectionKey = key;</span>
+<span class="fc" id="L321">                c.time = getTime() + IDLE_INTERVAL;</span>
+<span class="fc" id="L322">                idleConnections.add (c);</span>
+<span class="nc" id="L323">            } catch (IOException e) {</span>
+<span class="nc" id="L324">                dprint(e);</span>
+<span class="nc" id="L325">                logger.log(Level.FINER, &quot;Dispatcher(8)&quot;, e);</span>
+<span class="nc" id="L326">                c.close();</span>
+<span class="fc" id="L327">            }</span>
+<span class="fc" id="L328">        }</span>
+
+        public void run() {
+<span class="fc bfc" id="L331" title="All 2 branches covered.">            while (!finished) {</span>
+                try {
+<span class="fc" id="L333">                    List&lt;Event&gt; list = null;</span>
+<span class="fc" id="L334">                    synchronized (lolock) {</span>
+<span class="fc bfc" id="L335" title="All 2 branches covered.">                        if (events.size() &gt; 0) {</span>
+<span class="fc" id="L336">                            list = events;</span>
+<span class="fc" id="L337">                            events = new LinkedList&lt;Event&gt;();</span>
+                        }
+<span class="pc" id="L339">                    }</span>
+
+<span class="fc bfc" id="L341" title="All 2 branches covered.">                    if (list != null) {</span>
+<span class="fc bfc" id="L342" title="All 2 branches covered.">                        for (Event r: list) {</span>
+<span class="fc" id="L343">                            handleEvent (r);</span>
+<span class="fc" id="L344">                        }</span>
+                    }
+
+<span class="fc bfc" id="L347" title="All 2 branches covered.">                    for (HttpConnection c : connsToRegister) {</span>
+<span class="fc" id="L348">                        reRegister(c);</span>
+<span class="fc" id="L349">                    }</span>
+<span class="fc" id="L350">                    connsToRegister.clear();</span>
+
+<span class="fc" id="L352">                    selector.select(1000);</span>
+
+                    /* process the selected list now  */
+<span class="fc" id="L355">                    Set&lt;SelectionKey&gt; selected = selector.selectedKeys();</span>
+<span class="fc" id="L356">                    Iterator&lt;SelectionKey&gt; iter = selected.iterator();</span>
+<span class="fc bfc" id="L357" title="All 2 branches covered.">                    while (iter.hasNext()) {</span>
+<span class="fc" id="L358">                        SelectionKey key = iter.next();</span>
+<span class="fc" id="L359">                        iter.remove ();</span>
+<span class="fc bfc" id="L360" title="All 2 branches covered.">                        if (key.equals (listenerKey)) {</span>
+<span class="pc bpc" id="L361" title="1 of 2 branches missed.">                            if (terminating) {</span>
+<span class="nc" id="L362">                                continue;</span>
+                            }
+<span class="fc" id="L364">                            SocketChannel chan = schan.accept();</span>
+
+                            // Set TCP_NODELAY, if appropriate
+<span class="fc bfc" id="L367" title="All 2 branches covered.">                            if (ServerConfig.noDelay()) {</span>
+<span class="fc" id="L368">                                chan.socket().setTcpNoDelay(true);</span>
+                            }
+
+<span class="pc bpc" id="L371" title="1 of 2 branches missed.">                            if (chan == null) {</span>
+<span class="nc" id="L372">                                continue; /* cancel something ? */</span>
+                            }
+<span class="fc" id="L374">                            chan.configureBlocking (false);</span>
+<span class="fc" id="L375">                            SelectionKey newkey = chan.register (selector, SelectionKey.OP_READ);</span>
+<span class="fc" id="L376">                            HttpConnection c = new HttpConnection ();</span>
+<span class="fc" id="L377">                            c.selectionKey = newkey;</span>
+<span class="fc" id="L378">                            c.setChannel (chan);</span>
+<span class="fc" id="L379">                            newkey.attach (c);</span>
+<span class="fc" id="L380">                            requestStarted (c);</span>
+<span class="fc" id="L381">                            allConnections.add (c);</span>
+<span class="fc" id="L382">                        } else {</span>
+                            try {
+<span class="pc bpc" id="L384" title="1 of 2 branches missed.">                                if (key.isReadable()) {</span>
+                                    boolean closed;
+<span class="fc" id="L386">                                    SocketChannel chan = (SocketChannel)key.channel();</span>
+<span class="fc" id="L387">                                    HttpConnection conn = (HttpConnection)key.attachment();</span>
+
+<span class="fc" id="L389">                                    key.cancel();</span>
+<span class="fc" id="L390">                                    chan.configureBlocking (true);</span>
+<span class="fc bfc" id="L391" title="All 2 branches covered.">                                    if (idleConnections.remove(conn)) {</span>
+                                        // was an idle connection so add it
+                                        // to reqConnections set.
+<span class="fc" id="L394">                                        requestStarted (conn);</span>
+                                    }
+<span class="fc" id="L396">                                    handle (chan, conn);</span>
+<span class="fc" id="L397">                                } else {</span>
+<span class="nc bnc" id="L398" title="All 2 branches missed.">                                    assert false;</span>
+                                }
+<span class="nc" id="L400">                            } catch (CancelledKeyException e) {</span>
+<span class="nc" id="L401">                                handleException(key, null);</span>
+<span class="nc" id="L402">                            } catch (IOException e) {</span>
+<span class="nc" id="L403">                                handleException(key, e);</span>
+<span class="pc" id="L404">                            }</span>
+                        }
+<span class="fc" id="L406">                    }</span>
+                    // call the selector just to process the cancelled keys
+<span class="fc" id="L408">                    selector.selectNow();</span>
+<span class="nc" id="L409">                } catch (IOException e) {</span>
+<span class="nc" id="L410">                    logger.log (Level.FINER, &quot;Dispatcher (4)&quot;, e);</span>
+<span class="fc" id="L411">                } catch (Exception e) {</span>
+<span class="fc" id="L412">                    logger.log (Level.FINER, &quot;Dispatcher (7)&quot;, e);</span>
+<span class="pc" id="L413">                }</span>
+            }
+<span class="pc" id="L415">            try {selector.close(); } catch (Exception e) {}</span>
+<span class="fc" id="L416">        }</span>
+
+        private void handleException (SelectionKey key, Exception e) {
+<span class="nc" id="L419">            HttpConnection conn = (HttpConnection)key.attachment();</span>
+<span class="nc bnc" id="L420" title="All 2 branches missed.">            if (e != null) {</span>
+<span class="nc" id="L421">                logger.log (Level.FINER, &quot;Dispatcher (2)&quot;, e);</span>
+            }
+<span class="nc" id="L423">            closeConnection(conn);</span>
+<span class="nc" id="L424">        }</span>
+
+        public void handle (SocketChannel chan, HttpConnection conn)
+        throws IOException
+        {
+            try {
+<span class="fc" id="L430">                Exchange t = new Exchange (chan, protocol, conn);</span>
+<span class="fc" id="L431">                executor.execute (t);</span>
+<span class="nc" id="L432">            } catch (HttpError e1) {</span>
+<span class="nc" id="L433">                logger.log (Level.FINER, &quot;Dispatcher (4)&quot;, e1);</span>
+<span class="nc" id="L434">                closeConnection(conn);</span>
+<span class="nc" id="L435">            } catch (IOException e) {</span>
+<span class="nc" id="L436">                logger.log (Level.FINER, &quot;Dispatcher (5)&quot;, e);</span>
+<span class="nc" id="L437">                closeConnection(conn);</span>
+<span class="pc" id="L438">            }</span>
+<span class="fc" id="L439">        }</span>
+    }
+
+<span class="fc" id="L442">    static boolean debug = ServerConfig.debugEnabled ();</span>
+
+    static synchronized void dprint (String s) {
+<span class="nc bnc" id="L445" title="All 2 branches missed.">        if (debug) {</span>
+<span class="nc" id="L446">            System.out.println (s);</span>
+        }
+<span class="nc" id="L448">    }</span>
+
+    static synchronized void dprint (Exception e) {
+<span class="pc bpc" id="L451" title="1 of 2 branches missed.">        if (debug) {</span>
+<span class="nc" id="L452">            System.out.println (e);</span>
+<span class="nc" id="L453">            e.printStackTrace();</span>
+        }
+<span class="fc" id="L455">    }</span>
+
+    Logger getLogger () {
+<span class="fc" id="L458">        return logger;</span>
+    }
+
+    private void closeConnection(HttpConnection conn) {
+<span class="fc" id="L462">        conn.close();</span>
+<span class="fc" id="L463">        allConnections.remove(conn);</span>
+<span class="pc bpc" id="L464" title="2 of 4 branches missed.">        switch (conn.getState()) {</span>
+        case REQUEST:
+<span class="fc" id="L466">            reqConnections.remove(conn);</span>
+<span class="fc" id="L467">            break;</span>
+        case RESPONSE:
+<span class="fc" id="L469">            rspConnections.remove(conn);</span>
+<span class="fc" id="L470">            break;</span>
+        case IDLE:
+<span class="nc" id="L472">            idleConnections.remove(conn);</span>
+            break;
+        }
+<span class="pc bpc" id="L475" title="2 of 4 branches missed.">        assert !reqConnections.remove(conn);</span>
+<span class="pc bpc" id="L476" title="2 of 4 branches missed.">        assert !rspConnections.remove(conn);</span>
+<span class="pc bpc" id="L477" title="2 of 4 branches missed.">        assert !idleConnections.remove(conn);</span>
+<span class="fc" id="L478">    }</span>
+
+        /* per exchange task */
+
+    class Exchange implements Runnable {
+        SocketChannel chan;
+        HttpConnection connection;
+        HttpContextImpl context;
+        InputStream rawin;
+        OutputStream rawout;
+        String protocol;
+        ExchangeImpl tx;
+        HttpContextImpl ctx;
+<span class="fc" id="L491">        boolean rejected = false;</span>
+
+<span class="fc" id="L493">        Exchange (SocketChannel chan, String protocol, HttpConnection conn) throws IOException {</span>
+<span class="fc" id="L494">            this.chan = chan;</span>
+<span class="fc" id="L495">            this.connection = conn;</span>
+<span class="fc" id="L496">            this.protocol = protocol;</span>
+<span class="fc" id="L497">        }</span>
+
+        public void run () {
+            /* context will be null for new connections */
+<span class="fc" id="L501">            context = connection.getHttpContext();</span>
+            boolean newconnection;
+<span class="fc" id="L503">            SSLEngine engine = null;</span>
+<span class="fc" id="L504">            String requestLine = null;</span>
+<span class="fc" id="L505">            SSLStreams sslStreams = null;</span>
+            try {
+<span class="fc bfc" id="L507" title="All 2 branches covered.">                if (context != null ) {</span>
+<span class="fc" id="L508">                    this.rawin = connection.getInputStream();</span>
+<span class="fc" id="L509">                    this.rawout = connection.getRawOutputStream();</span>
+<span class="fc" id="L510">                    newconnection = false;</span>
+                } else {
+                    /* figure out what kind of connection this is */
+<span class="fc" id="L513">                    newconnection = true;</span>
+<span class="fc bfc" id="L514" title="All 2 branches covered.">                    if (https) {</span>
+<span class="pc bpc" id="L515" title="1 of 2 branches missed.">                        if (sslContext == null) {</span>
+<span class="nc" id="L516">                            logger.warning (&quot;SSL connection received. No https contxt created&quot;);</span>
+<span class="nc" id="L517">                            throw new HttpError (&quot;No SSL context established&quot;);</span>
+                        }
+<span class="fc" id="L519">                        sslStreams = new SSLStreams (ServerImpl.this, sslContext, chan);</span>
+<span class="fc" id="L520">                        rawin = sslStreams.getInputStream();</span>
+<span class="fc" id="L521">                        rawout = sslStreams.getOutputStream();</span>
+<span class="fc" id="L522">                        engine = sslStreams.getSSLEngine();</span>
+<span class="fc" id="L523">                        connection.sslStreams = sslStreams;</span>
+                    } else {
+<span class="fc" id="L525">                        rawin = new BufferedInputStream(</span>
+                            new Request.ReadStream (
+                                ServerImpl.this, chan
+                        ));
+<span class="fc" id="L529">                        rawout = new Request.WriteStream (</span>
+                            ServerImpl.this, chan
+                        );
+                    }
+<span class="fc" id="L533">                    connection.raw = rawin;</span>
+<span class="fc" id="L534">                    connection.rawout = rawout;</span>
+                }
+<span class="fc" id="L536">                Request req = new Request (rawin, rawout);</span>
+<span class="fc" id="L537">                requestLine = req.requestLine();</span>
+<span class="fc bfc" id="L538" title="All 2 branches covered.">                if (requestLine == null) {</span>
+                    /* connection closed */
+<span class="fc" id="L540">                    closeConnection(connection);</span>
+<span class="fc" id="L541">                    return;</span>
+                }
+<span class="fc" id="L543">                int space = requestLine.indexOf (' ');</span>
+<span class="pc bpc" id="L544" title="1 of 2 branches missed.">                if (space == -1) {</span>
+<span class="nc" id="L545">                    reject (Code.HTTP_BAD_REQUEST,</span>
+                            requestLine, &quot;Bad request line&quot;);
+<span class="nc" id="L547">                    return;</span>
+                }
+<span class="fc" id="L549">                String method = requestLine.substring (0, space);</span>
+<span class="fc" id="L550">                int start = space+1;</span>
+<span class="fc" id="L551">                space = requestLine.indexOf(' ', start);</span>
+<span class="pc bpc" id="L552" title="1 of 2 branches missed.">                if (space == -1) {</span>
+<span class="nc" id="L553">                    reject (Code.HTTP_BAD_REQUEST,</span>
+                            requestLine, &quot;Bad request line&quot;);
+<span class="nc" id="L555">                    return;</span>
+                }
+<span class="fc" id="L557">                String uriStr = requestLine.substring (start, space);</span>
+<span class="fc" id="L558">                URI uri = new URI (uriStr);</span>
+<span class="fc" id="L559">                start = space+1;</span>
+<span class="fc" id="L560">                String version = requestLine.substring (start);</span>
+<span class="fc" id="L561">                Headers headers = req.headers();</span>
+<span class="fc" id="L562">                String s = headers.getFirst (&quot;Transfer-encoding&quot;);</span>
+<span class="fc" id="L563">                long clen = 0L;</span>
+<span class="pc bpc" id="L564" title="1 of 4 branches missed.">                if (s !=null &amp;&amp; s.equalsIgnoreCase (&quot;chunked&quot;)) {</span>
+<span class="fc" id="L565">                    clen = -1L;</span>
+                } else {
+<span class="fc" id="L567">                    s = headers.getFirst (&quot;Content-Length&quot;);</span>
+<span class="fc bfc" id="L568" title="All 2 branches covered.">                    if (s != null) {</span>
+<span class="fc" id="L569">                        clen = Long.parseLong(s);</span>
+                    }
+<span class="fc bfc" id="L571" title="All 2 branches covered.">                    if (clen == 0) {</span>
+<span class="fc" id="L572">                        requestCompleted (connection);</span>
+                    }
+                }
+<span class="fc" id="L575">                ctx = contexts.findContext (protocol, uri.getPath());</span>
+<span class="fc bfc" id="L576" title="All 2 branches covered.">                if (ctx == null) {</span>
+<span class="fc" id="L577">                    reject (Code.HTTP_NOT_FOUND,</span>
+                            requestLine, &quot;No context found for request&quot;);
+<span class="fc" id="L579">                    return;</span>
+                }
+<span class="fc" id="L581">                connection.setContext (ctx);</span>
+<span class="pc bpc" id="L582" title="1 of 2 branches missed.">                if (ctx.getHandler() == null) {</span>
+<span class="nc" id="L583">                    reject (Code.HTTP_INTERNAL_ERROR,</span>
+                            requestLine, &quot;No handler for context&quot;);
+<span class="nc" id="L585">                    return;</span>
+                }
+<span class="fc" id="L587">                tx = new ExchangeImpl (</span>
+                    method, uri, req, clen, connection
+                );
+<span class="fc" id="L590">                String chdr = headers.getFirst(&quot;Connection&quot;);</span>
+<span class="fc" id="L591">                Headers rheaders = tx.getResponseHeaders();</span>
+
+<span class="fc bfc" id="L593" title="All 4 branches covered.">                if (chdr != null &amp;&amp; chdr.equalsIgnoreCase (&quot;close&quot;)) {</span>
+<span class="fc" id="L594">                    tx.close = true;</span>
+                }
+<span class="fc bfc" id="L596" title="All 2 branches covered.">                if (version.equalsIgnoreCase (&quot;http/1.0&quot;)) {</span>
+<span class="fc" id="L597">                    tx.http10 = true;</span>
+<span class="pc bpc" id="L598" title="1 of 2 branches missed.">                    if (chdr == null) {</span>
+<span class="nc" id="L599">                        tx.close = true;</span>
+<span class="nc" id="L600">                        rheaders.set (&quot;Connection&quot;, &quot;close&quot;);</span>
+<span class="pc bpc" id="L601" title="1 of 2 branches missed.">                    } else if (chdr.equalsIgnoreCase (&quot;keep-alive&quot;)) {</span>
+<span class="fc" id="L602">                        rheaders.set (&quot;Connection&quot;, &quot;keep-alive&quot;);</span>
+<span class="fc" id="L603">                        int idle=(int)(ServerConfig.getIdleInterval()/1000);</span>
+<span class="fc" id="L604">                        int max=ServerConfig.getMaxIdleConnections();</span>
+<span class="fc" id="L605">                        String val = &quot;timeout=&quot;+idle+&quot;, max=&quot;+max;</span>
+<span class="fc" id="L606">                        rheaders.set (&quot;Keep-Alive&quot;, val);</span>
+                    }
+                }
+
+<span class="fc bfc" id="L610" title="All 2 branches covered.">                if (newconnection) {</span>
+<span class="fc" id="L611">                    connection.setParameters (</span>
+                        rawin, rawout, chan, engine, sslStreams,
+<span class="fc" id="L613">                        sslContext, protocol, ctx, rawin</span>
+                    );
+                }
+                /* check if client sent an Expect 100 Continue.
+                 * In that case, need to send an interim response.
+                 * In future API may be modified to allow app to
+                 * be involved in this process.
+                 */
+<span class="fc" id="L621">                String exp = headers.getFirst(&quot;Expect&quot;);</span>
+<span class="pc bpc" id="L622" title="1 of 4 branches missed.">                if (exp != null &amp;&amp; exp.equalsIgnoreCase (&quot;100-continue&quot;)) {</span>
+<span class="fc" id="L623">                    logReply (100, requestLine, null);</span>
+<span class="fc" id="L624">                    sendReply (</span>
+                        Code.HTTP_CONTINUE, false, null
+                    );
+                }
+                /* uf is the list of filters seen/set by the user.
+                 * sf is the list of filters established internally
+                 * and which are not visible to the user. uc and sc
+                 * are the corresponding Filter.Chains.
+                 * They are linked together by a LinkHandler
+                 * so that they can both be invoked in one call.
+                 */
+<span class="fc" id="L635">                List&lt;Filter&gt; sf = ctx.getSystemFilters();</span>
+<span class="fc" id="L636">                List&lt;Filter&gt; uf = ctx.getFilters();</span>
+
+<span class="fc" id="L638">                Filter.Chain sc = new Filter.Chain(sf, ctx.getHandler());</span>
+<span class="fc" id="L639">                Filter.Chain uc = new Filter.Chain(uf, new LinkHandler (sc));</span>
+
+                /* set up the two stream references */
+<span class="fc" id="L642">                tx.getRequestBody();</span>
+<span class="fc" id="L643">                tx.getResponseBody();</span>
+<span class="fc bfc" id="L644" title="All 2 branches covered.">                if (https) {</span>
+<span class="fc" id="L645">                    uc.doFilter (new HttpsExchangeImpl (tx));</span>
+                } else {
+<span class="fc" id="L647">                    uc.doFilter (new HttpExchangeImpl (tx));</span>
+                }
+
+<span class="fc" id="L650">            } catch (IOException e1) {</span>
+<span class="fc" id="L651">                logger.log (Level.FINER, &quot;ServerImpl.Exchange (1)&quot;, e1);</span>
+<span class="fc" id="L652">                closeConnection(connection);</span>
+<span class="nc" id="L653">            } catch (NumberFormatException e3) {</span>
+<span class="nc" id="L654">                reject (Code.HTTP_BAD_REQUEST,</span>
+                        requestLine, &quot;NumberFormatException thrown&quot;);
+<span class="nc" id="L656">            } catch (URISyntaxException e) {</span>
+<span class="nc" id="L657">                reject (Code.HTTP_BAD_REQUEST,</span>
+                        requestLine, &quot;URISyntaxException thrown&quot;);
+<span class="fc" id="L659">            } catch (Exception e4) {</span>
+<span class="fc" id="L660">                logger.log (Level.FINER, &quot;ServerImpl.Exchange (2)&quot;, e4);</span>
+<span class="fc" id="L661">                closeConnection(connection);</span>
+<span class="pc" id="L662">            }</span>
+<span class="fc" id="L663">        }</span>
+
+        /* used to link to 2 or more Filter.Chains together */
+
+        class LinkHandler implements HttpHandler {
+            Filter.Chain nextChain;
+
+<span class="fc" id="L670">            LinkHandler (Filter.Chain nextChain) {</span>
+<span class="fc" id="L671">                this.nextChain = nextChain;</span>
+<span class="fc" id="L672">            }</span>
+
+            public void handle (HttpExchange exchange) throws IOException {
+<span class="fc" id="L675">                nextChain.doFilter (exchange);</span>
+<span class="fc" id="L676">            }</span>
+        }
+
+        void reject (int code, String requestStr, String message) {
+<span class="fc" id="L680">            rejected = true;</span>
+<span class="fc" id="L681">            logReply (code, requestStr, message);</span>
+<span class="fc" id="L682">            sendReply (</span>
+<span class="fc" id="L683">                code, false, &quot;&lt;h1&gt;&quot;+code+Code.msg(code)+&quot;&lt;/h1&gt;&quot;+message</span>
+            );
+<span class="fc" id="L685">            closeConnection(connection);</span>
+<span class="fc" id="L686">        }</span>
+
+        void sendReply (
+            int code, boolean closeNow, String text)
+        {
+            try {
+<span class="fc" id="L692">                StringBuilder builder = new StringBuilder (512);</span>
+<span class="fc" id="L693">                builder.append (&quot;HTTP/1.1 &quot;)</span>
+<span class="fc" id="L694">                    .append (code).append (Code.msg(code)).append (&quot;\r\n&quot;);</span>
+
+<span class="pc bpc" id="L696" title="1 of 4 branches missed.">                if (text != null &amp;&amp; text.length() != 0) {</span>
+<span class="fc" id="L697">                    builder.append (&quot;Content-Length: &quot;)</span>
+<span class="fc" id="L698">                        .append (text.length()).append (&quot;\r\n&quot;)</span>
+<span class="fc" id="L699">                        .append (&quot;Content-Type: text/html\r\n&quot;);</span>
+                } else {
+<span class="fc" id="L701">                    builder.append (&quot;Content-Length: 0\r\n&quot;);</span>
+<span class="fc" id="L702">                    text = &quot;&quot;;</span>
+                }
+<span class="pc bpc" id="L704" title="1 of 2 branches missed.">                if (closeNow) {</span>
+<span class="nc" id="L705">                    builder.append (&quot;Connection: close\r\n&quot;);</span>
+                }
+<span class="fc" id="L707">                builder.append (&quot;\r\n&quot;).append (text);</span>
+<span class="fc" id="L708">                String s = builder.toString();</span>
+<span class="fc" id="L709">                byte[] b = s.getBytes(&quot;ISO8859_1&quot;);</span>
+<span class="fc" id="L710">                rawout.write (b);</span>
+<span class="fc" id="L711">                rawout.flush();</span>
+<span class="pc bpc" id="L712" title="1 of 2 branches missed.">                if (closeNow) {</span>
+<span class="nc" id="L713">                    closeConnection(connection);</span>
+                }
+<span class="nc" id="L715">            } catch (IOException e) {</span>
+<span class="nc" id="L716">                logger.log (Level.FINER, &quot;ServerImpl.sendReply&quot;, e);</span>
+<span class="nc" id="L717">                closeConnection(connection);</span>
+<span class="fc" id="L718">            }</span>
+<span class="fc" id="L719">        }</span>
+
+    }
+
+    void logReply (int code, String requestStr, String text) {
+<span class="fc bfc" id="L724" title="All 2 branches covered.">        if (!logger.isLoggable(Level.FINE)) {</span>
+<span class="fc" id="L725">            return;</span>
+        }
+<span class="fc bfc" id="L727" title="All 2 branches covered.">        if (text == null) {</span>
+<span class="fc" id="L728">            text = &quot;&quot;;</span>
+        }
+        String r;
+<span class="pc bpc" id="L731" title="1 of 2 branches missed.">        if (requestStr.length() &gt; 80) {</span>
+<span class="nc" id="L732">           r = requestStr.substring (0, 80) + &quot;&lt;TRUNCATED&gt;&quot;;</span>
+        } else {
+<span class="fc" id="L734">           r = requestStr;</span>
+        }
+<span class="fc" id="L736">        String message = r + &quot; [&quot; + code + &quot; &quot; +</span>
+<span class="fc" id="L737">                    Code.msg(code) + &quot;] (&quot;+text+&quot;)&quot;;</span>
+<span class="fc" id="L738">        logger.fine (message);</span>
+<span class="fc" id="L739">    }</span>
+
+    long getTicks() {
+<span class="nc" id="L742">        return ticks;</span>
+    }
+
+    public long getTime() {
+<span class="fc" id="L746">        return time;</span>
+    }
+
+    void delay () {
+<span class="fc" id="L750">        Thread.yield();</span>
+        try {
+<span class="fc" id="L752">            Thread.sleep (200);</span>
+<span class="pc" id="L753">        } catch (InterruptedException e) {}</span>
+<span class="fc" id="L754">    }</span>
+
+<span class="fc" id="L756">    private int exchangeCount = 0;</span>
+
+    synchronized void startExchange () {
+<span class="fc" id="L759">        exchangeCount ++;</span>
+<span class="fc" id="L760">    }</span>
+
+    synchronized int endExchange () {
+<span class="fc" id="L763">        exchangeCount --;</span>
+<span class="pc bpc" id="L764" title="2 of 4 branches missed.">        assert exchangeCount &gt;= 0;</span>
+<span class="fc" id="L765">        return exchangeCount;</span>
+    }
+
+    HttpServer getWrapper () {
+<span class="nc" id="L769">        return wrapper;</span>
+    }
+
+    void requestStarted (HttpConnection c) {
+<span class="fc" id="L773">        c.creationTime = getTime();</span>
+<span class="fc" id="L774">        c.setState (State.REQUEST);</span>
+<span class="fc" id="L775">        reqConnections.add (c);</span>
+<span class="fc" id="L776">    }</span>
+
+    // called after a request has been completely read
+    // by the server. This stops the timer which would
+    // close the connection if the request doesn't arrive
+    // quickly enough. It then starts the timer
+    // that ensures the client reads the response in a timely
+    // fashion.
+
+    void requestCompleted (HttpConnection c) {
+<span class="pc bpc" id="L786" title="2 of 4 branches missed.">        assert c.getState() == State.REQUEST;</span>
+<span class="fc" id="L787">        reqConnections.remove (c);</span>
+<span class="fc" id="L788">        c.rspStartedTime = getTime();</span>
+<span class="fc" id="L789">        rspConnections.add (c);</span>
+<span class="fc" id="L790">        c.setState (State.RESPONSE);</span>
+<span class="fc" id="L791">    }</span>
+
+    // called after response has been sent
+    void responseCompleted (HttpConnection c) {
+<span class="pc bpc" id="L795" title="2 of 4 branches missed.">        assert c.getState() == State.RESPONSE;</span>
+<span class="fc" id="L796">        rspConnections.remove (c);</span>
+<span class="fc" id="L797">        c.setState (State.IDLE);</span>
+<span class="fc" id="L798">    }</span>
+
+    /**
+     * TimerTask run every CLOCK_TICK ms
+     */
+<span class="fc" id="L803">    class ServerTimerTask extends TimerTask {</span>
+        public void run () {
+<span class="fc" id="L805">            LinkedList&lt;HttpConnection&gt; toClose = new LinkedList&lt;HttpConnection&gt;();</span>
+<span class="fc" id="L806">            time = System.currentTimeMillis();</span>
+<span class="fc" id="L807">            ticks ++;</span>
+<span class="fc" id="L808">            synchronized (idleConnections) {</span>
+<span class="fc bfc" id="L809" title="All 2 branches covered.">                for (HttpConnection c : idleConnections) {</span>
+<span class="fc bfc" id="L810" title="All 2 branches covered.">                    if (c.time &lt;= time) {</span>
+<span class="fc" id="L811">                        toClose.add (c);</span>
+                    }
+<span class="fc" id="L813">                }</span>
+<span class="fc bfc" id="L814" title="All 2 branches covered.">                for (HttpConnection c : toClose) {</span>
+<span class="fc" id="L815">                    idleConnections.remove (c);</span>
+<span class="fc" id="L816">                    allConnections.remove (c);</span>
+<span class="fc" id="L817">                    c.close();</span>
+<span class="fc" id="L818">                }</span>
+<span class="pc" id="L819">            }</span>
+<span class="fc" id="L820">        }</span>
+    }
+
+<span class="fc" id="L823">    class ServerTimerTask1 extends TimerTask {</span>
+
+        // runs every TIMER_MILLIS
+        public void run () {
+<span class="fc" id="L827">            LinkedList&lt;HttpConnection&gt; toClose = new LinkedList&lt;HttpConnection&gt;();</span>
+<span class="fc" id="L828">            time = System.currentTimeMillis();</span>
+<span class="fc" id="L829">            synchronized (reqConnections) {</span>
+<span class="pc bpc" id="L830" title="1 of 2 branches missed.">                if (MAX_REQ_TIME != -1) {</span>
+<span class="fc bfc" id="L831" title="All 2 branches covered.">                    for (HttpConnection c : reqConnections) {</span>
+<span class="pc bpc" id="L832" title="1 of 2 branches missed.">                        if (c.creationTime + TIMER_MILLIS + MAX_REQ_TIME &lt;= time) {</span>
+<span class="nc" id="L833">                            toClose.add (c);</span>
+                        }
+<span class="fc" id="L835">                    }</span>
+<span class="pc bpc" id="L836" title="1 of 2 branches missed.">                    for (HttpConnection c : toClose) {</span>
+<span class="nc" id="L837">                        logger.log (Level.FINE, &quot;closing: no request: &quot; + c);</span>
+<span class="nc" id="L838">                        reqConnections.remove (c);</span>
+<span class="nc" id="L839">                        allConnections.remove (c);</span>
+<span class="nc" id="L840">                        c.close();</span>
+<span class="nc" id="L841">                    }</span>
+                }
+<span class="pc" id="L843">            }</span>
+<span class="fc" id="L844">            toClose = new LinkedList&lt;HttpConnection&gt;();</span>
+<span class="fc" id="L845">            synchronized (rspConnections) {</span>
+<span class="pc bpc" id="L846" title="1 of 2 branches missed.">                if (MAX_RSP_TIME != -1) {</span>
+<span class="nc bnc" id="L847" title="All 2 branches missed.">                    for (HttpConnection c : rspConnections) {</span>
+<span class="nc bnc" id="L848" title="All 2 branches missed.">                        if (c.rspStartedTime + TIMER_MILLIS +MAX_RSP_TIME &lt;= time) {</span>
+<span class="nc" id="L849">                            toClose.add (c);</span>
+                        }
+<span class="nc" id="L851">                    }</span>
+<span class="nc bnc" id="L852" title="All 2 branches missed.">                    for (HttpConnection c : toClose) {</span>
+<span class="nc" id="L853">                        logger.log (Level.FINE, &quot;closing: no response: &quot; + c);</span>
+<span class="nc" id="L854">                        rspConnections.remove (c);</span>
+<span class="nc" id="L855">                        allConnections.remove (c);</span>
+<span class="nc" id="L856">                        c.close();</span>
+<span class="nc" id="L857">                    }</span>
+                }
+<span class="pc" id="L859">            }</span>
+<span class="fc" id="L860">        }</span>
+    }
+
+    void logStackTrace (String s) {
+<span class="nc" id="L864">        logger.finest (s);</span>
+<span class="nc" id="L865">        StringBuilder b = new StringBuilder ();</span>
+<span class="nc" id="L866">        StackTraceElement[] e = Thread.currentThread().getStackTrace();</span>
+<span class="nc bnc" id="L867" title="All 2 branches missed.">        for (int i=0; i&lt;e.length; i++) {</span>
+<span class="nc" id="L868">            b.append (e[i].toString()).append(&quot;\n&quot;);</span>
+        }
+<span class="nc" id="L870">        logger.finest (b.toString());</span>
+<span class="nc" id="L871">    }</span>
+
+    static long getTimeMillis(long secs) {
+<span class="fc bfc" id="L874" title="All 2 branches covered.">        if (secs == -1) {</span>
+<span class="fc" id="L875">            return -1;</span>
+        } else {
+<span class="fc" id="L877">            return secs * 1000;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

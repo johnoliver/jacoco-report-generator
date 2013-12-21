@@ -1,0 +1,665 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>Exchanger.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">java.util.concurrent</a> &gt; <span class="el_source">Exchanger.java</span></div><h1>Exchanger.java</h1><pre class="source lang-java linenums">/*
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+/*
+ * This file is available under and governed by the GNU General Public
+ * License version 2 only, as published by the Free Software Foundation.
+ * However, the following notice accompanied the original version of this
+ * file:
+ *
+ * Written by Doug Lea, Bill Scherer, and Michael Scott with
+ * assistance from members of JCP JSR-166 Expert Group and released to
+ * the public domain, as explained at
+ * http://creativecommons.org/publicdomain/zero/1.0/
+ */
+
+package java.util.concurrent;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
+
+/**
+ * A synchronization point at which threads can pair and swap elements
+ * within pairs.  Each thread presents some object on entry to the
+ * {@link #exchange exchange} method, matches with a partner thread,
+ * and receives its partner's object on return.  An Exchanger may be
+ * viewed as a bidirectional form of a {@link SynchronousQueue}.
+ * Exchangers may be useful in applications such as genetic algorithms
+ * and pipeline designs.
+ *
+ * &lt;p&gt;&lt;b&gt;Sample Usage:&lt;/b&gt;
+ * Here are the highlights of a class that uses an {@code Exchanger}
+ * to swap buffers between threads so that the thread filling the
+ * buffer gets a freshly emptied one when it needs it, handing off the
+ * filled one to the thread emptying the buffer.
+ *  &lt;pre&gt; {@code
+ * class FillAndEmpty {
+ *   Exchanger&lt;DataBuffer&gt; exchanger = new Exchanger&lt;DataBuffer&gt;();
+ *   DataBuffer initialEmptyBuffer = ... a made-up type
+ *   DataBuffer initialFullBuffer = ...
+ *
+ *   class FillingLoop implements Runnable {
+ *     public void run() {
+ *       DataBuffer currentBuffer = initialEmptyBuffer;
+ *       try {
+ *         while (currentBuffer != null) {
+ *           addToBuffer(currentBuffer);
+ *           if (currentBuffer.isFull())
+ *             currentBuffer = exchanger.exchange(currentBuffer);
+ *         }
+ *       } catch (InterruptedException ex) { ... handle ... }
+ *     }
+ *   }
+ *
+ *   class EmptyingLoop implements Runnable {
+ *     public void run() {
+ *       DataBuffer currentBuffer = initialFullBuffer;
+ *       try {
+ *         while (currentBuffer != null) {
+ *           takeFromBuffer(currentBuffer);
+ *           if (currentBuffer.isEmpty())
+ *             currentBuffer = exchanger.exchange(currentBuffer);
+ *         }
+ *       } catch (InterruptedException ex) { ... handle ...}
+ *     }
+ *   }
+ *
+ *   void start() {
+ *     new Thread(new FillingLoop()).start();
+ *     new Thread(new EmptyingLoop()).start();
+ *   }
+ * }}&lt;/pre&gt;
+ *
+ * &lt;p&gt;Memory consistency effects: For each pair of threads that
+ * successfully exchange objects via an {@code Exchanger}, actions
+ * prior to the {@code exchange()} in each thread
+ * &lt;a href=&quot;package-summary.html#MemoryVisibility&quot;&gt;&lt;i&gt;happen-before&lt;/i&gt;&lt;/a&gt;
+ * those subsequent to a return from the corresponding {@code exchange()}
+ * in the other thread.
+ *
+ * @since 1.5
+ * @author Doug Lea and Bill Scherer and Michael Scott
+ * @param &lt;V&gt; The type of objects that may be exchanged
+ */
+public class Exchanger&lt;V&gt; {
+
+    /*
+     * Overview: The core algorithm is, for an exchange &quot;slot&quot;,
+     * and a participant (caller) with an item:
+     *
+     * for (;;) {
+     *   if (slot is empty) {                       // offer
+     *     place item in a Node;
+     *     if (can CAS slot from empty to node) {
+     *       wait for release;
+     *       return matching item in node;
+     *     }
+     *   }
+     *   else if (can CAS slot from node to empty) { // release
+     *     get the item in node;
+     *     set matching item in node;
+     *     release waiting thread;
+     *   }
+     *   // else retry on CAS failure
+     * }
+     *
+     * This is among the simplest forms of a &quot;dual data structure&quot; --
+     * see Scott and Scherer's DISC 04 paper and
+     * http://www.cs.rochester.edu/research/synchronization/pseudocode/duals.html
+     *
+     * This works great in principle. But in practice, like many
+     * algorithms centered on atomic updates to a single location, it
+     * scales horribly when there are more than a few participants
+     * using the same Exchanger. So the implementation instead uses a
+     * form of elimination arena, that spreads out this contention by
+     * arranging that some threads typically use different slots,
+     * while still ensuring that eventually, any two parties will be
+     * able to exchange items. That is, we cannot completely partition
+     * across threads, but instead give threads arena indices that
+     * will on average grow under contention and shrink under lack of
+     * contention. We approach this by defining the Nodes that we need
+     * anyway as ThreadLocals, and include in them per-thread index
+     * and related bookkeeping state. (We can safely reuse per-thread
+     * nodes rather than creating them fresh each time because slots
+     * alternate between pointing to a node vs null, so cannot
+     * encounter ABA problems. However, we do need some care in
+     * resetting them between uses.)
+     *
+     * Implementing an effective arena requires allocating a bunch of
+     * space, so we only do so upon detecting contention (except on
+     * uniprocessors, where they wouldn't help, so aren't used).
+     * Otherwise, exchanges use the single-slot slotExchange method.
+     * On contention, not only must the slots be in different
+     * locations, but the locations must not encounter memory
+     * contention due to being on the same cache line (or more
+     * generally, the same coherence unit).  Because, as of this
+     * writing, there is no way to determine cacheline size, we define
+     * a value that is enough for common platforms.  Additionally,
+     * extra care elsewhere is taken to avoid other false/unintended
+     * sharing and to enhance locality, including adding padding (via
+     * sun.misc.Contended) to Nodes, embedding &quot;bound&quot; as an Exchanger
+     * field, and reworking some park/unpark mechanics compared to
+     * LockSupport versions.
+     *
+     * The arena starts out with only one used slot. We expand the
+     * effective arena size by tracking collisions; i.e., failed CASes
+     * while trying to exchange. By nature of the above algorithm, the
+     * only kinds of collision that reliably indicate contention are
+     * when two attempted releases collide -- one of two attempted
+     * offers can legitimately fail to CAS without indicating
+     * contention by more than one other thread. (Note: it is possible
+     * but not worthwhile to more precisely detect contention by
+     * reading slot values after CAS failures.)  When a thread has
+     * collided at each slot within the current arena bound, it tries
+     * to expand the arena size by one. We track collisions within
+     * bounds by using a version (sequence) number on the &quot;bound&quot;
+     * field, and conservatively reset collision counts when a
+     * participant notices that bound has been updated (in either
+     * direction).
+     *
+     * The effective arena size is reduced (when there is more than
+     * one slot) by giving up on waiting after a while and trying to
+     * decrement the arena size on expiration. The value of &quot;a while&quot;
+     * is an empirical matter.  We implement by piggybacking on the
+     * use of spin-&gt;yield-&gt;block that is essential for reasonable
+     * waiting performance anyway -- in a busy exchanger, offers are
+     * usually almost immediately released, in which case context
+     * switching on multiprocessors is extremely slow/wasteful.  Arena
+     * waits just omit the blocking part, and instead cancel. The spin
+     * count is empirically chosen to be a value that avoids blocking
+     * 99% of the time under maximum sustained exchange rates on a
+     * range of test machines. Spins and yields entail some limited
+     * randomness (using a cheap xorshift) to avoid regular patterns
+     * that can induce unproductive grow/shrink cycles. (Using a
+     * pseudorandom also helps regularize spin cycle duration by
+     * making branches unpredictable.)  Also, during an offer, a
+     * waiter can &quot;know&quot; that it will be released when its slot has
+     * changed, but cannot yet proceed until match is set.  In the
+     * mean time it cannot cancel the offer, so instead spins/yields.
+     * Note: It is possible to avoid this secondary check by changing
+     * the linearization point to be a CAS of the match field (as done
+     * in one case in the Scott &amp; Scherer DISC paper), which also
+     * increases asynchrony a bit, at the expense of poorer collision
+     * detection and inability to always reuse per-thread nodes. So
+     * the current scheme is typically a better tradeoff.
+     *
+     * On collisions, indices traverse the arena cyclically in reverse
+     * order, restarting at the maximum index (which will tend to be
+     * sparsest) when bounds change. (On expirations, indices instead
+     * are halved until reaching 0.) It is possible (and has been
+     * tried) to use randomized, prime-value-stepped, or double-hash
+     * style traversal instead of simple cyclic traversal to reduce
+     * bunching.  But empirically, whatever benefits these may have
+     * don't overcome their added overhead: We are managing operations
+     * that occur very quickly unless there is sustained contention,
+     * so simpler/faster control policies work better than more
+     * accurate but slower ones.
+     *
+     * Because we use expiration for arena size control, we cannot
+     * throw TimeoutExceptions in the timed version of the public
+     * exchange method until the arena size has shrunken to zero (or
+     * the arena isn't enabled). This may delay response to timeout
+     * but is still within spec.
+     *
+     * Essentially all of the implementation is in methods
+     * slotExchange and arenaExchange. These have similar overall
+     * structure, but differ in too many details to combine. The
+     * slotExchange method uses the single Exchanger field &quot;slot&quot;
+     * rather than arena array elements. However, it still needs
+     * minimal collision detection to trigger arena construction.
+     * (The messiest part is making sure interrupt status and
+     * InterruptedExceptions come out right during transitions when
+     * both methods may be called. This is done by using null return
+     * as a sentinel to recheck interrupt status.)
+     *
+     * As is too common in this sort of code, methods are monolithic
+     * because most of the logic relies on reads of fields that are
+     * maintained as local variables so can't be nicely factored --
+     * mainly, here, bulky spin-&gt;yield-&gt;block/cancel code), and
+     * heavily dependent on intrinsics (Unsafe) to use inlined
+     * embedded CAS and related memory access operations (that tend
+     * not to be as readily inlined by dynamic compilers when they are
+     * hidden behind other methods that would more nicely name and
+     * encapsulate the intended effects). This includes the use of
+     * putOrderedX to clear fields of the per-thread Nodes between
+     * uses. Note that field Node.item is not declared as volatile
+     * even though it is read by releasing threads, because they only
+     * do so after CAS operations that must precede access, and all
+     * uses by the owning thread are otherwise acceptably ordered by
+     * other operations. (Because the actual points of atomicity are
+     * slot CASes, it would also be legal for the write to Node.match
+     * in a release to be weaker than a full volatile write. However,
+     * this is not done because it could allow further postponement of
+     * the write, delaying progress.)
+     */
+
+    /**
+     * The byte distance (as a shift value) between any two used slots
+     * in the arena.  1 &lt;&lt; ASHIFT should be at least cacheline size.
+     */
+    private static final int ASHIFT = 7;
+
+    /**
+     * The maximum supported arena index. The maximum allocatable
+     * arena size is MMASK + 1. Must be a power of two minus one, less
+     * than (1&lt;&lt;(31-ASHIFT)). The cap of 255 (0xff) more than suffices
+     * for the expected scaling limits of the main algorithms.
+     */
+    private static final int MMASK = 0xff;
+
+    /**
+     * Unit for sequence/version bits of bound field. Each successful
+     * change to the bound also adds SEQ.
+     */
+    private static final int SEQ = MMASK + 1;
+
+    /** The number of CPUs, for sizing and spin control */
+<span class="fc" id="L278">    private static final int NCPU = Runtime.getRuntime().availableProcessors();</span>
+
+    /**
+     * The maximum slot index of the arena: The number of slots that
+     * can in principle hold all threads without contention, or at
+     * most the maximum indexable value.
+     */
+<span class="pc bpc" id="L285" title="1 of 2 branches missed.">    static final int FULL = (NCPU &gt;= (MMASK &lt;&lt; 1)) ? MMASK : NCPU &gt;&gt;&gt; 1;</span>
+
+    /**
+     * The bound for spins while waiting for a match. The actual
+     * number of iterations will on average be about twice this value
+     * due to randomization. Note: Spinning is disabled when NCPU==1.
+     */
+    private static final int SPINS = 1 &lt;&lt; 10;
+
+    /**
+     * Value representing null arguments/returns from public
+     * methods. Needed because the API originally didn't disallow null
+     * arguments, which it should have.
+     */
+<span class="fc" id="L299">    private static final Object NULL_ITEM = new Object();</span>
+
+    /**
+     * Sentinel value returned by internal exchange methods upon
+     * timeout, to avoid need for separate timed versions of these
+     * methods.
+     */
+<span class="fc" id="L306">    private static final Object TIMED_OUT = new Object();</span>
+
+    /**
+     * Nodes hold partially exchanged data, plus other per-thread
+     * bookkeeping. Padded via @sun.misc.Contended to reduce memory
+     * contention.
+     */
+<span class="fc" id="L313">    @sun.misc.Contended static final class Node {</span>
+        int index;              // Arena index
+        int bound;              // Last recorded value of Exchanger.bound
+        int collides;           // Number of CAS failures at current bound
+        int hash;               // Pseudo-random for spins
+        Object item;            // This thread's current item
+        volatile Object match;  // Item provided by releasing thread
+        volatile Thread parked; // Set to this thread when parked, else null
+    }
+
+    /** The corresponding thread local class */
+<span class="fc" id="L324">    static final class Participant extends ThreadLocal&lt;Node&gt; {</span>
+<span class="fc" id="L325">        public Node initialValue() { return new Node(); }</span>
+    }
+
+    /**
+     * Per-thread state
+     */
+    private final Participant participant;
+
+    /**
+     * Elimination array; null until enabled (within slotExchange).
+     * Element accesses use emulation of volatile gets and CAS.
+     */
+    private volatile Node[] arena;
+
+    /**
+     * Slot used until contention detected.
+     */
+    private volatile Node slot;
+
+    /**
+     * The index of the largest valid arena position, OR'ed with SEQ
+     * number in high bits, incremented on each update.  The initial
+     * update from 0 to SEQ is used to ensure that the arena array is
+     * constructed only once.
+     */
+    private volatile int bound;
+
+    /**
+     * Exchange function when arenas enabled. See above for explanation.
+     *
+     * @param item the (non-null) item to exchange
+     * @param timed true if the wait is timed
+     * @param ns if timed, the maximum wait time, else 0L
+     * @return the other thread's item; or null if interrupted; or
+     * TIMED_OUT if timed and timed out
+     */
+    private final Object arenaExchange(Object item, boolean timed, long ns) {
+<span class="nc" id="L362">        Node[] a = arena;</span>
+<span class="nc" id="L363">        Node p = participant.get();</span>
+<span class="nc" id="L364">        for (int i = p.index;;) {                      // access slot at i</span>
+            int b, m, c; long j;                       // j is raw array offset
+<span class="nc" id="L366">            Node q = (Node)U.getObjectVolatile(a, j = (i &lt;&lt; ASHIFT) + ABASE);</span>
+<span class="nc bnc" id="L367" title="All 4 branches missed.">            if (q != null &amp;&amp; U.compareAndSwapObject(a, j, q, null)) {</span>
+<span class="nc" id="L368">                Object v = q.item;                     // release</span>
+<span class="nc" id="L369">                q.match = item;</span>
+<span class="nc" id="L370">                Thread w = q.parked;</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">                if (w != null)</span>
+<span class="nc" id="L372">                    U.unpark(w);</span>
+<span class="nc" id="L373">                return v;</span>
+            }
+<span class="nc bnc" id="L375" title="All 4 branches missed.">            else if (i &lt;= (m = (b = bound) &amp; MMASK) &amp;&amp; q == null) {</span>
+<span class="nc" id="L376">                p.item = item;                         // offer</span>
+<span class="nc bnc" id="L377" title="All 2 branches missed.">                if (U.compareAndSwapObject(a, j, null, p)) {</span>
+<span class="nc bnc" id="L378" title="All 4 branches missed.">                    long end = (timed &amp;&amp; m == 0) ? System.nanoTime() + ns : 0L;</span>
+<span class="nc" id="L379">                    Thread t = Thread.currentThread(); // wait</span>
+<span class="nc" id="L380">                    for (int h = p.hash, spins = SPINS;;) {</span>
+<span class="nc" id="L381">                        Object v = p.match;</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">                        if (v != null) {</span>
+<span class="nc" id="L383">                            U.putOrderedObject(p, MATCH, null);</span>
+<span class="nc" id="L384">                            p.item = null;             // clear for next use</span>
+<span class="nc" id="L385">                            p.hash = h;</span>
+<span class="nc" id="L386">                            return v;</span>
+                        }
+<span class="nc bnc" id="L388" title="All 2 branches missed.">                        else if (spins &gt; 0) {</span>
+<span class="nc" id="L389">                            h ^= h &lt;&lt; 1; h ^= h &gt;&gt;&gt; 3; h ^= h &lt;&lt; 10; // xorshift</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">                            if (h == 0)                // initialize hash</span>
+<span class="nc" id="L391">                                h = SPINS | (int)t.getId();</span>
+<span class="nc bnc" id="L392" title="All 4 branches missed.">                            else if (h &lt; 0 &amp;&amp;          // approx 50% true</span>
+                                     (--spins &amp; ((SPINS &gt;&gt;&gt; 1) - 1)) == 0)
+<span class="nc" id="L394">                                Thread.yield();        // two yields per wait</span>
+                        }
+<span class="nc bnc" id="L396" title="All 2 branches missed.">                        else if (U.getObjectVolatile(a, j) != p)</span>
+<span class="nc" id="L397">                            spins = SPINS;       // releaser hasn't set match yet</span>
+<span class="nc bnc" id="L398" title="All 6 branches missed.">                        else if (!t.isInterrupted() &amp;&amp; m == 0 &amp;&amp;</span>
+                                 (!timed ||
+<span class="nc bnc" id="L400" title="All 2 branches missed.">                                  (ns = end - System.nanoTime()) &gt; 0L)) {</span>
+<span class="nc" id="L401">                            U.putObject(t, BLOCKER, this); // emulate LockSupport</span>
+<span class="nc" id="L402">                            p.parked = t;              // minimize window</span>
+<span class="nc bnc" id="L403" title="All 2 branches missed.">                            if (U.getObjectVolatile(a, j) == p)</span>
+<span class="nc" id="L404">                                U.park(false, ns);</span>
+<span class="nc" id="L405">                            p.parked = null;</span>
+<span class="nc" id="L406">                            U.putObject(t, BLOCKER, null);</span>
+                        }
+<span class="nc bnc" id="L408" title="All 2 branches missed.">                        else if (U.getObjectVolatile(a, j) == p &amp;&amp;</span>
+<span class="nc bnc" id="L409" title="All 2 branches missed.">                                 U.compareAndSwapObject(a, j, p, null)) {</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">                            if (m != 0)                // try to shrink</span>
+<span class="nc" id="L411">                                U.compareAndSwapInt(this, BOUND, b, b + SEQ - 1);</span>
+<span class="nc" id="L412">                            p.item = null;</span>
+<span class="nc" id="L413">                            p.hash = h;</span>
+<span class="nc" id="L414">                            i = p.index &gt;&gt;&gt;= 1;        // descend</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">                            if (Thread.interrupted())</span>
+<span class="nc" id="L416">                                return null;</span>
+<span class="nc bnc" id="L417" title="All 6 branches missed.">                            if (timed &amp;&amp; m == 0 &amp;&amp; ns &lt;= 0L)</span>
+<span class="nc" id="L418">                                return TIMED_OUT;</span>
+                            break;                     // expired; restart
+                        }
+<span class="nc" id="L421">                    }</span>
+<span class="nc" id="L422">                }</span>
+                else
+<span class="nc" id="L424">                    p.item = null;                     // clear offer</span>
+            }
+            else {
+<span class="nc bnc" id="L427" title="All 2 branches missed.">                if (p.bound != b) {                    // stale; reset</span>
+<span class="nc" id="L428">                    p.bound = b;</span>
+<span class="nc" id="L429">                    p.collides = 0;</span>
+<span class="nc bnc" id="L430" title="All 4 branches missed.">                    i = (i != m || m == 0) ? m : m - 1;</span>
+                }
+<span class="nc bnc" id="L432" title="All 4 branches missed.">                else if ((c = p.collides) &lt; m || m == FULL ||</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">                         !U.compareAndSwapInt(this, BOUND, b, b + SEQ + 1)) {</span>
+<span class="nc" id="L434">                    p.collides = c + 1;</span>
+<span class="nc bnc" id="L435" title="All 2 branches missed.">                    i = (i == 0) ? m : i - 1;          // cyclically traverse</span>
+                }
+                else
+<span class="nc" id="L438">                    i = m + 1;                         // grow</span>
+<span class="nc" id="L439">                p.index = i;</span>
+            }
+<span class="nc" id="L441">        }</span>
+    }
+
+    /**
+     * Exchange function used until arenas enabled. See above for explanation.
+     *
+     * @param item the item to exchange
+     * @param timed true if the wait is timed
+     * @param ns if timed, the maximum wait time, else 0L
+     * @return the other thread's item; or null if either the arena
+     * was enabled or the thread was interrupted before completion; or
+     * TIMED_OUT if timed and timed out
+     */
+    private final Object slotExchange(Object item, boolean timed, long ns) {
+<span class="fc" id="L455">        Node p = participant.get();</span>
+<span class="fc" id="L456">        Thread t = Thread.currentThread();</span>
+<span class="pc bpc" id="L457" title="1 of 2 branches missed.">        if (t.isInterrupted()) // preserve interrupt status so caller can recheck</span>
+<span class="nc" id="L458">            return null;</span>
+
+        for (Node q;;) {
+<span class="fc bfc" id="L461" title="All 2 branches covered.">            if ((q = slot) != null) {</span>
+<span class="pc bpc" id="L462" title="1 of 2 branches missed.">                if (U.compareAndSwapObject(this, SLOT, q, null)) {</span>
+<span class="fc" id="L463">                    Object v = q.item;</span>
+<span class="fc" id="L464">                    q.match = item;</span>
+<span class="fc" id="L465">                    Thread w = q.parked;</span>
+<span class="fc bfc" id="L466" title="All 2 branches covered.">                    if (w != null)</span>
+<span class="fc" id="L467">                        U.unpark(w);</span>
+<span class="fc" id="L468">                    return v;</span>
+                }
+                // create arena on contention, but continue until slot null
+<span class="nc bnc" id="L471" title="All 4 branches missed.">                if (NCPU &gt; 1 &amp;&amp; bound == 0 &amp;&amp;</span>
+<span class="nc bnc" id="L472" title="All 2 branches missed.">                    U.compareAndSwapInt(this, BOUND, 0, SEQ))</span>
+<span class="nc" id="L473">                    arena = new Node[(FULL + 2) &lt;&lt; ASHIFT];</span>
+            }
+<span class="pc bpc" id="L475" title="1 of 2 branches missed.">            else if (arena != null)</span>
+<span class="nc" id="L476">                return null; // caller must reroute to arenaExchange</span>
+            else {
+<span class="fc" id="L478">                p.item = item;</span>
+<span class="fc bfc" id="L479" title="All 2 branches covered.">                if (U.compareAndSwapObject(this, SLOT, null, p))</span>
+<span class="fc" id="L480">                    break;</span>
+<span class="fc" id="L481">                p.item = null;</span>
+            }
+        }
+
+        // await release
+<span class="fc" id="L486">        int h = p.hash;</span>
+<span class="pc bpc" id="L487" title="1 of 2 branches missed.">        long end = timed ? System.nanoTime() + ns : 0L;</span>
+<span class="pc bpc" id="L488" title="1 of 2 branches missed.">        int spins = (NCPU &gt; 1) ? SPINS : 1;</span>
+        Object v;
+<span class="fc bfc" id="L490" title="All 2 branches covered.">        while ((v = p.match) == null) {</span>
+<span class="fc bfc" id="L491" title="All 2 branches covered.">            if (spins &gt; 0) {</span>
+<span class="fc" id="L492">                h ^= h &lt;&lt; 1; h ^= h &gt;&gt;&gt; 3; h ^= h &lt;&lt; 10;</span>
+<span class="fc bfc" id="L493" title="All 2 branches covered.">                if (h == 0)</span>
+<span class="fc" id="L494">                    h = SPINS | (int)t.getId();</span>
+<span class="fc bfc" id="L495" title="All 4 branches covered.">                else if (h &lt; 0 &amp;&amp; (--spins &amp; ((SPINS &gt;&gt;&gt; 1) - 1)) == 0)</span>
+<span class="fc" id="L496">                    Thread.yield();</span>
+            }
+<span class="fc bfc" id="L498" title="All 2 branches covered.">            else if (slot != p)</span>
+<span class="fc" id="L499">                spins = SPINS;</span>
+<span class="pc bpc" id="L500" title="3 of 6 branches missed.">            else if (!t.isInterrupted() &amp;&amp; arena == null &amp;&amp;</span>
+<span class="nc bnc" id="L501" title="All 2 branches missed.">                     (!timed || (ns = end - System.nanoTime()) &gt; 0L)) {</span>
+<span class="fc" id="L502">                U.putObject(t, BLOCKER, this);</span>
+<span class="fc" id="L503">                p.parked = t;</span>
+<span class="fc bfc" id="L504" title="All 2 branches covered.">                if (slot == p)</span>
+<span class="fc" id="L505">                    U.park(false, ns);</span>
+<span class="fc" id="L506">                p.parked = null;</span>
+<span class="fc" id="L507">                U.putObject(t, BLOCKER, null);</span>
+            }
+<span class="nc bnc" id="L509" title="All 2 branches missed.">            else if (U.compareAndSwapObject(this, SLOT, p, null)) {</span>
+<span class="nc bnc" id="L510" title="All 6 branches missed.">                v = timed &amp;&amp; ns &lt;= 0L &amp;&amp; !t.isInterrupted() ? TIMED_OUT : null;</span>
+<span class="nc" id="L511">                break;</span>
+            }
+        }
+<span class="fc" id="L514">        U.putOrderedObject(p, MATCH, null);</span>
+<span class="fc" id="L515">        p.item = null;</span>
+<span class="fc" id="L516">        p.hash = h;</span>
+<span class="fc" id="L517">        return v;</span>
+    }
+
+    /**
+     * Creates a new Exchanger.
+     */
+<span class="fc" id="L523">    public Exchanger() {</span>
+<span class="fc" id="L524">        participant = new Participant();</span>
+<span class="fc" id="L525">    }</span>
+
+    /**
+     * Waits for another thread to arrive at this exchange point (unless
+     * the current thread is {@linkplain Thread#interrupt interrupted}),
+     * and then transfers the given object to it, receiving its object
+     * in return.
+     *
+     * &lt;p&gt;If another thread is already waiting at the exchange point then
+     * it is resumed for thread scheduling purposes and receives the object
+     * passed in by the current thread.  The current thread returns immediately,
+     * receiving the object passed to the exchange by that other thread.
+     *
+     * &lt;p&gt;If no other thread is already waiting at the exchange then the
+     * current thread is disabled for thread scheduling purposes and lies
+     * dormant until one of two things happens:
+     * &lt;ul&gt;
+     * &lt;li&gt;Some other thread enters the exchange; or
+     * &lt;li&gt;Some other thread {@linkplain Thread#interrupt interrupts}
+     * the current thread.
+     * &lt;/ul&gt;
+     * &lt;p&gt;If the current thread:
+     * &lt;ul&gt;
+     * &lt;li&gt;has its interrupted status set on entry to this method; or
+     * &lt;li&gt;is {@linkplain Thread#interrupt interrupted} while waiting
+     * for the exchange,
+     * &lt;/ul&gt;
+     * then {@link InterruptedException} is thrown and the current thread's
+     * interrupted status is cleared.
+     *
+     * @param x the object to exchange
+     * @return the object provided by the other thread
+     * @throws InterruptedException if the current thread was
+     *         interrupted while waiting
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public V exchange(V x) throws InterruptedException {
+        Object v;
+<span class="pc bpc" id="L563" title="1 of 2 branches missed.">        Object item = (x == null) ? NULL_ITEM : x; // translate null args</span>
+<span class="pc bpc" id="L564" title="1 of 2 branches missed.">        if ((arena != null ||</span>
+<span class="pc bpc" id="L565" title="1 of 2 branches missed.">             (v = slotExchange(item, false, 0L)) == null) &amp;&amp;</span>
+<span class="nc bnc" id="L566" title="All 2 branches missed.">            ((Thread.interrupted() || // disambiguates null return</span>
+<span class="nc bnc" id="L567" title="All 2 branches missed.">              (v = arenaExchange(item, false, 0L)) == null)))</span>
+<span class="nc" id="L568">            throw new InterruptedException();</span>
+<span class="pc bpc" id="L569" title="1 of 2 branches missed.">        return (v == NULL_ITEM) ? null : (V)v;</span>
+    }
+
+    /**
+     * Waits for another thread to arrive at this exchange point (unless
+     * the current thread is {@linkplain Thread#interrupt interrupted} or
+     * the specified waiting time elapses), and then transfers the given
+     * object to it, receiving its object in return.
+     *
+     * &lt;p&gt;If another thread is already waiting at the exchange point then
+     * it is resumed for thread scheduling purposes and receives the object
+     * passed in by the current thread.  The current thread returns immediately,
+     * receiving the object passed to the exchange by that other thread.
+     *
+     * &lt;p&gt;If no other thread is already waiting at the exchange then the
+     * current thread is disabled for thread scheduling purposes and lies
+     * dormant until one of three things happens:
+     * &lt;ul&gt;
+     * &lt;li&gt;Some other thread enters the exchange; or
+     * &lt;li&gt;Some other thread {@linkplain Thread#interrupt interrupts}
+     * the current thread; or
+     * &lt;li&gt;The specified waiting time elapses.
+     * &lt;/ul&gt;
+     * &lt;p&gt;If the current thread:
+     * &lt;ul&gt;
+     * &lt;li&gt;has its interrupted status set on entry to this method; or
+     * &lt;li&gt;is {@linkplain Thread#interrupt interrupted} while waiting
+     * for the exchange,
+     * &lt;/ul&gt;
+     * then {@link InterruptedException} is thrown and the current thread's
+     * interrupted status is cleared.
+     *
+     * &lt;p&gt;If the specified waiting time elapses then {@link
+     * TimeoutException} is thrown.  If the time is less than or equal
+     * to zero, the method will not wait at all.
+     *
+     * @param x the object to exchange
+     * @param timeout the maximum time to wait
+     * @param unit the time unit of the {@code timeout} argument
+     * @return the object provided by the other thread
+     * @throws InterruptedException if the current thread was
+     *         interrupted while waiting
+     * @throws TimeoutException if the specified waiting time elapses
+     *         before another thread enters the exchange
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public V exchange(V x, long timeout, TimeUnit unit)
+        throws InterruptedException, TimeoutException {
+        Object v;
+<span class="nc bnc" id="L618" title="All 2 branches missed.">        Object item = (x == null) ? NULL_ITEM : x;</span>
+<span class="nc" id="L619">        long ns = unit.toNanos(timeout);</span>
+<span class="nc bnc" id="L620" title="All 2 branches missed.">        if ((arena != null ||</span>
+<span class="nc bnc" id="L621" title="All 2 branches missed.">             (v = slotExchange(item, true, ns)) == null) &amp;&amp;</span>
+<span class="nc bnc" id="L622" title="All 2 branches missed.">            ((Thread.interrupted() ||</span>
+<span class="nc bnc" id="L623" title="All 2 branches missed.">              (v = arenaExchange(item, true, ns)) == null)))</span>
+<span class="nc" id="L624">            throw new InterruptedException();</span>
+<span class="nc bnc" id="L625" title="All 2 branches missed.">        if (v == TIMED_OUT)</span>
+<span class="nc" id="L626">            throw new TimeoutException();</span>
+<span class="nc bnc" id="L627" title="All 2 branches missed.">        return (v == NULL_ITEM) ? null : (V)v;</span>
+    }
+
+    // Unsafe mechanics
+    private static final sun.misc.Unsafe U;
+    private static final long BOUND;
+    private static final long SLOT;
+    private static final long MATCH;
+    private static final long BLOCKER;
+    private static final int ABASE;
+    static {
+        int s;
+        try {
+<span class="fc" id="L640">            U = sun.misc.Unsafe.getUnsafe();</span>
+<span class="fc" id="L641">            Class&lt;?&gt; ek = Exchanger.class;</span>
+<span class="fc" id="L642">            Class&lt;?&gt; nk = Node.class;</span>
+<span class="fc" id="L643">            Class&lt;?&gt; ak = Node[].class;</span>
+<span class="fc" id="L644">            Class&lt;?&gt; tk = Thread.class;</span>
+<span class="fc" id="L645">            BOUND = U.objectFieldOffset</span>
+<span class="fc" id="L646">                (ek.getDeclaredField(&quot;bound&quot;));</span>
+<span class="fc" id="L647">            SLOT = U.objectFieldOffset</span>
+<span class="fc" id="L648">                (ek.getDeclaredField(&quot;slot&quot;));</span>
+<span class="fc" id="L649">            MATCH = U.objectFieldOffset</span>
+<span class="fc" id="L650">                (nk.getDeclaredField(&quot;match&quot;));</span>
+<span class="fc" id="L651">            BLOCKER = U.objectFieldOffset</span>
+<span class="fc" id="L652">                (tk.getDeclaredField(&quot;parkBlocker&quot;));</span>
+<span class="fc" id="L653">            s = U.arrayIndexScale(ak);</span>
+            // ABASE absorbs padding in front of element 0
+<span class="fc" id="L655">            ABASE = U.arrayBaseOffset(ak) + (1 &lt;&lt; ASHIFT);</span>
+
+<span class="nc" id="L657">        } catch (Exception e) {</span>
+<span class="nc" id="L658">            throw new Error(e);</span>
+<span class="fc" id="L659">        }</span>
+<span class="pc bpc" id="L660" title="2 of 4 branches missed.">        if ((s &amp; (s-1)) != 0 || s &gt; (1 &lt;&lt; ASHIFT))</span>
+<span class="nc" id="L661">            throw new Error(&quot;Unsupported array scale&quot;);</span>
+<span class="fc" id="L662">    }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

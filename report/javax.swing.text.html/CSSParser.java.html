@@ -1,0 +1,855 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>CSSParser.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">javax.swing.text.html</a> &gt; <span class="el_source">CSSParser.java</span></div><h1>CSSParser.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1999, 2000, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package javax.swing.text.html;
+
+import java.io.*;
+
+/**
+ * A CSS parser. This works by way of a delegate that implements the
+ * CSSParserCallback interface. The delegate is notified of the following
+ * events:
+ * &lt;ul&gt;
+ *   &lt;li&gt;Import statement: &lt;code&gt;handleImport&lt;/code&gt;
+ *   &lt;li&gt;Selectors &lt;code&gt;handleSelector&lt;/code&gt;. This is invoked for each
+ *       string. For example if the Reader contained p, bar , a {}, the delegate
+ *       would be notified 4 times, for 'p,' 'bar' ',' and 'a'.
+ *   &lt;li&gt;When a rule starts, &lt;code&gt;startRule&lt;/code&gt;
+ *   &lt;li&gt;Properties in the rule via the &lt;code&gt;handleProperty&lt;/code&gt;. This
+ *       is invoked one per property/value key, eg font size: foo;, would
+ *       cause the delegate to be notified once with a value of 'font size'.
+ *   &lt;li&gt;Values in the rule via the &lt;code&gt;handleValue&lt;/code&gt;, this is notified
+ *       for the total value.
+ *   &lt;li&gt;When a rule ends, &lt;code&gt;endRule&lt;/code&gt;
+ * &lt;/ul&gt;
+ * This will parse much more than CSS 1, and loosely implements the
+ * recommendation for &lt;i&gt;Forward-compatible parsing&lt;/i&gt; in section
+ * 7.1 of the CSS spec found at:
+ * &lt;a href=http://www.w3.org/TR/REC-CSS1&gt;http://www.w3.org/TR/REC-CSS1&lt;/a&gt;.
+ * If an error results in parsing, a RuntimeException will be thrown.
+ * &lt;p&gt;
+ * This will preserve case. If the callback wishes to treat certain poritions
+ * case insensitively (such as selectors), it should use toLowerCase, or
+ * something similar.
+ *
+ * @author Scott Violet
+ */
+class CSSParser {
+    // Parsing something like the following:
+    // (@rule | ruleset | block)*
+    //
+    // @rule       (block | identifier)*; (block with {} ends @rule)
+    // block       matching [] () {} (that is, [()] is a block, [(){}{[]}]
+    //                                is a block, ()[] is two blocks)
+    // identifier  &quot;*&quot; | '*' | anything but a [](){} and whitespace
+    //
+    // ruleset     selector decblock
+    // selector    (identifier | (block, except block '{}') )*
+    // declblock   declaration* block*
+    // declaration (identifier* stopping when identifier ends with :)
+    //             (identifier* stopping when identifier ends with ;)
+    //
+    // comments /* */ can appear any where, and are stripped.
+
+
+    // identifier - letters, digits, dashes and escaped characters
+    // block starts with { ends with matching }, () [] and {} always occur
+    //   in matching pairs, '' and &quot;&quot; also occur in pairs, except &quot; may be
+
+
+    // Indicates the type of token being parsed.
+    private static final int   IDENTIFIER = 1;
+    private static final int   BRACKET_OPEN = 2;
+    private static final int   BRACKET_CLOSE = 3;
+    private static final int   BRACE_OPEN = 4;
+    private static final int   BRACE_CLOSE = 5;
+    private static final int   PAREN_OPEN = 6;
+    private static final int   PAREN_CLOSE = 7;
+    private static final int   END = -1;
+
+<span class="nc" id="L91">    private static final char[] charMapping = { 0, 0, '[', ']', '{', '}', '(',</span>
+                                               ')', 0};
+
+
+    /** Set to true if one character has been read ahead. */
+    private boolean        didPushChar;
+    /** The read ahead character. */
+    private int            pushedChar;
+    /** Temporary place to hold identifiers. */
+    private StringBuffer   unitBuffer;
+    /** Used to indicate blocks. */
+    private int[]          unitStack;
+    /** Number of valid blocks. */
+    private int            stackCount;
+    /** Holds the incoming CSS rules. */
+    private Reader         reader;
+    /** Set to true when the first non @ rule is encountered. */
+    private boolean        encounteredRuleSet;
+    /** Notified of state. */
+    private CSSParserCallback callback;
+    /** nextToken() inserts the string here. */
+    private char[]         tokenBuffer;
+    /** Current number of chars in tokenBufferLength. */
+    private int            tokenBufferLength;
+    /** Set to true if any whitespace is read. */
+    private boolean        readWS;
+
+
+    // The delegate interface.
+    static interface CSSParserCallback {
+        /** Called when an @import is encountered. */
+        void handleImport(String importString);
+        // There is currently no way to distinguish between '&quot;foo,&quot;' and
+        // 'foo,'. But this generally isn't valid CSS. If it becomes
+        // a problem, handleSelector will have to be told if the string is
+        // quoted.
+        void handleSelector(String selector);
+        void startRule();
+        // Property names are mapped to lower case before being passed to
+        // the delegate.
+        void handleProperty(String property);
+        void handleValue(String value);
+        void endRule();
+    }
+
+<span class="nc" id="L136">    CSSParser() {</span>
+<span class="nc" id="L137">        unitStack = new int[2];</span>
+<span class="nc" id="L138">        tokenBuffer = new char[80];</span>
+<span class="nc" id="L139">        unitBuffer = new StringBuffer();</span>
+<span class="nc" id="L140">    }</span>
+
+    void parse(Reader reader, CSSParserCallback callback,
+               boolean inRule) throws IOException {
+<span class="nc" id="L144">        this.callback = callback;</span>
+<span class="nc" id="L145">        stackCount = tokenBufferLength = 0;</span>
+<span class="nc" id="L146">        this.reader = reader;</span>
+<span class="nc" id="L147">        encounteredRuleSet = false;</span>
+        try {
+<span class="nc bnc" id="L149" title="All 2 branches missed.">            if (inRule) {</span>
+<span class="nc" id="L150">                parseDeclarationBlock();</span>
+            }
+            else {
+<span class="nc bnc" id="L153" title="All 2 branches missed.">                while (getNextStatement());</span>
+            }
+        } finally {
+<span class="nc" id="L156">            callback = null;</span>
+<span class="nc" id="L157">            reader = null;</span>
+<span class="nc" id="L158">        }</span>
+<span class="nc" id="L159">    }</span>
+
+    /**
+     * Gets the next statement, returning false if the end is reached. A
+     * statement is either an @rule, or a ruleset.
+     */
+    private boolean getNextStatement() throws IOException {
+<span class="nc" id="L166">        unitBuffer.setLength(0);</span>
+
+<span class="nc" id="L168">        int token = nextToken((char)0);</span>
+
+<span class="nc bnc" id="L170" title="All 5 branches missed.">        switch (token) {</span>
+        case IDENTIFIER:
+<span class="nc bnc" id="L172" title="All 2 branches missed.">            if (tokenBufferLength &gt; 0) {</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">                if (tokenBuffer[0] == '@') {</span>
+<span class="nc" id="L174">                    parseAtRule();</span>
+                }
+                else {
+<span class="nc" id="L177">                    encounteredRuleSet = true;</span>
+<span class="nc" id="L178">                    parseRuleSet();</span>
+                }
+            }
+<span class="nc" id="L181">            return true;</span>
+        case BRACKET_OPEN:
+        case BRACE_OPEN:
+        case PAREN_OPEN:
+<span class="nc" id="L185">            parseTillClosed(token);</span>
+<span class="nc" id="L186">            return true;</span>
+
+        case BRACKET_CLOSE:
+        case BRACE_CLOSE:
+        case PAREN_CLOSE:
+            // Shouldn't happen...
+<span class="nc" id="L192">            throw new RuntimeException(&quot;Unexpected top level block close&quot;);</span>
+
+        case END:
+<span class="nc" id="L195">            return false;</span>
+        }
+<span class="nc" id="L197">        return true;</span>
+    }
+
+    /**
+     * Parses an @ rule, stopping at a matching brace pair, or ;.
+     */
+    private void parseAtRule() throws IOException {
+        // PENDING: make this more effecient.
+<span class="nc" id="L205">        boolean        done = false;</span>
+<span class="nc bnc" id="L206" title="All 16 branches missed.">        boolean isImport = (tokenBufferLength == 7 &amp;&amp;</span>
+                            tokenBuffer[0] == '@' &amp;&amp; tokenBuffer[1] == 'i' &amp;&amp;
+                            tokenBuffer[2] == 'm' &amp;&amp; tokenBuffer[3] == 'p' &amp;&amp;
+                            tokenBuffer[4] == 'o' &amp;&amp; tokenBuffer[5] == 'r' &amp;&amp;
+                            tokenBuffer[6] == 't');
+
+<span class="nc" id="L212">        unitBuffer.setLength(0);</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">        while (!done) {</span>
+<span class="nc" id="L214">            int       nextToken = nextToken(';');</span>
+
+<span class="nc bnc" id="L216" title="All 6 branches missed.">            switch (nextToken) {</span>
+            case IDENTIFIER:
+<span class="nc bnc" id="L218" title="All 4 branches missed.">                if (tokenBufferLength &gt; 0 &amp;&amp;</span>
+                    tokenBuffer[tokenBufferLength - 1] == ';') {
+<span class="nc" id="L220">                    --tokenBufferLength;</span>
+<span class="nc" id="L221">                    done = true;</span>
+                }
+<span class="nc bnc" id="L223" title="All 2 branches missed.">                if (tokenBufferLength &gt; 0) {</span>
+<span class="nc bnc" id="L224" title="All 4 branches missed.">                    if (unitBuffer.length() &gt; 0 &amp;&amp; readWS) {</span>
+<span class="nc" id="L225">                        unitBuffer.append(' ');</span>
+                    }
+<span class="nc" id="L227">                    unitBuffer.append(tokenBuffer, 0, tokenBufferLength);</span>
+                }
+                break;
+
+            case BRACE_OPEN:
+<span class="nc bnc" id="L232" title="All 4 branches missed.">                if (unitBuffer.length() &gt; 0 &amp;&amp; readWS) {</span>
+<span class="nc" id="L233">                    unitBuffer.append(' ');</span>
+                }
+<span class="nc" id="L235">                unitBuffer.append(charMapping[nextToken]);</span>
+<span class="nc" id="L236">                parseTillClosed(nextToken);</span>
+<span class="nc" id="L237">                done = true;</span>
+                // Skip a tailing ';', not really to spec.
+                {
+<span class="nc" id="L240">                    int nextChar = readWS();</span>
+<span class="nc bnc" id="L241" title="All 4 branches missed.">                    if (nextChar != -1 &amp;&amp; nextChar != ';') {</span>
+<span class="nc" id="L242">                        pushChar(nextChar);</span>
+                    }
+                }
+<span class="nc" id="L245">                break;</span>
+
+            case BRACKET_OPEN: case PAREN_OPEN:
+<span class="nc" id="L248">                unitBuffer.append(charMapping[nextToken]);</span>
+<span class="nc" id="L249">                parseTillClosed(nextToken);</span>
+<span class="nc" id="L250">                break;</span>
+
+            case BRACKET_CLOSE: case BRACE_CLOSE: case PAREN_CLOSE:
+<span class="nc" id="L253">                throw new RuntimeException(&quot;Unexpected close in @ rule&quot;);</span>
+
+            case END:
+<span class="nc" id="L256">                done = true;</span>
+                break;
+            }
+<span class="nc" id="L259">        }</span>
+<span class="nc bnc" id="L260" title="All 4 branches missed.">        if (isImport &amp;&amp; !encounteredRuleSet) {</span>
+<span class="nc" id="L261">            callback.handleImport(unitBuffer.toString());</span>
+        }
+<span class="nc" id="L263">    }</span>
+
+    /**
+     * Parses the next rule set, which is a selector followed by a
+     * declaration block.
+     */
+    private void parseRuleSet() throws IOException {
+<span class="nc bnc" id="L270" title="All 2 branches missed.">        if (parseSelectors()) {</span>
+<span class="nc" id="L271">            callback.startRule();</span>
+<span class="nc" id="L272">            parseDeclarationBlock();</span>
+<span class="nc" id="L273">            callback.endRule();</span>
+        }
+<span class="nc" id="L275">    }</span>
+
+    /**
+     * Parses a set of selectors, returning false if the end of the stream
+     * is reached.
+     */
+    private boolean parseSelectors() throws IOException {
+        // Parse the selectors
+        int       nextToken;
+
+<span class="nc bnc" id="L285" title="All 2 branches missed.">        if (tokenBufferLength &gt; 0) {</span>
+<span class="nc" id="L286">            callback.handleSelector(new String(tokenBuffer, 0,</span>
+                                               tokenBufferLength));
+        }
+
+<span class="nc" id="L290">        unitBuffer.setLength(0);</span>
+        for (;;) {
+<span class="nc bnc" id="L292" title="All 2 branches missed.">            while ((nextToken = nextToken((char)0)) == IDENTIFIER) {</span>
+<span class="nc bnc" id="L293" title="All 2 branches missed.">                if (tokenBufferLength &gt; 0) {</span>
+<span class="nc" id="L294">                    callback.handleSelector(new String(tokenBuffer, 0,</span>
+                                                       tokenBufferLength));
+                }
+            }
+<span class="nc bnc" id="L298" title="All 5 branches missed.">            switch (nextToken) {</span>
+            case BRACE_OPEN:
+<span class="nc" id="L300">                return true;</span>
+
+            case BRACKET_OPEN: case PAREN_OPEN:
+<span class="nc" id="L303">                parseTillClosed(nextToken);</span>
+                // Not too sure about this, how we handle this isn't very
+                // well spec'd.
+<span class="nc" id="L306">                unitBuffer.setLength(0);</span>
+<span class="nc" id="L307">                break;</span>
+
+            case BRACKET_CLOSE: case BRACE_CLOSE: case PAREN_CLOSE:
+<span class="nc" id="L310">                throw new RuntimeException(&quot;Unexpected block close in selector&quot;);</span>
+
+            case END:
+                // Prematurely hit end.
+<span class="nc" id="L314">                return false;</span>
+            }
+        }
+    }
+
+    /**
+     * Parses a declaration block. Which a number of declarations followed
+     * by a })].
+     */
+    private void parseDeclarationBlock() throws IOException {
+        for (;;) {
+<span class="nc" id="L325">            int token = parseDeclaration();</span>
+<span class="nc bnc" id="L326" title="All 3 branches missed.">            switch (token) {</span>
+            case END: case BRACE_CLOSE:
+<span class="nc" id="L328">                return;</span>
+
+            case BRACKET_CLOSE: case PAREN_CLOSE:
+                // Bail
+<span class="nc" id="L332">                throw new RuntimeException(&quot;Unexpected close in declaration block&quot;);</span>
+            case IDENTIFIER:
+                break;
+            }
+<span class="nc" id="L336">        }</span>
+    }
+
+    /**
+     * Parses a single declaration, which is an identifier a : and another
+     * identifier. This returns the last token seen.
+     */
+    // identifier+: identifier* ;|}
+    private int parseDeclaration() throws IOException {
+        int    token;
+
+<span class="nc bnc" id="L347" title="All 2 branches missed.">        if ((token = parseIdentifiers(':', false)) != IDENTIFIER) {</span>
+<span class="nc" id="L348">            return token;</span>
+        }
+        // Make the property name to lowercase
+<span class="nc bnc" id="L351" title="All 2 branches missed.">        for (int counter = unitBuffer.length() - 1; counter &gt;= 0; counter--) {</span>
+<span class="nc" id="L352">            unitBuffer.setCharAt(counter, Character.toLowerCase</span>
+<span class="nc" id="L353">                                 (unitBuffer.charAt(counter)));</span>
+        }
+<span class="nc" id="L355">        callback.handleProperty(unitBuffer.toString());</span>
+
+<span class="nc" id="L357">        token = parseIdentifiers(';', true);</span>
+<span class="nc" id="L358">        callback.handleValue(unitBuffer.toString());</span>
+<span class="nc" id="L359">        return token;</span>
+    }
+
+    /**
+     * Parses identifiers until &lt;code&gt;extraChar&lt;/code&gt; is encountered,
+     * returning the ending token, which will be IDENTIFIER if extraChar
+     * is found.
+     */
+    private int parseIdentifiers(char extraChar,
+                                 boolean wantsBlocks) throws IOException {
+        int   nextToken;
+        int   ubl;
+
+<span class="nc" id="L372">        unitBuffer.setLength(0);</span>
+        for (;;) {
+<span class="nc" id="L374">            nextToken = nextToken(extraChar);</span>
+
+<span class="nc bnc" id="L376" title="All 4 branches missed.">            switch (nextToken) {</span>
+            case IDENTIFIER:
+<span class="nc bnc" id="L378" title="All 2 branches missed.">                if (tokenBufferLength &gt; 0) {</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">                    if (tokenBuffer[tokenBufferLength - 1] == extraChar) {</span>
+<span class="nc bnc" id="L380" title="All 2 branches missed.">                        if (--tokenBufferLength &gt; 0) {</span>
+<span class="nc bnc" id="L381" title="All 4 branches missed.">                            if (readWS &amp;&amp; unitBuffer.length() &gt; 0) {</span>
+<span class="nc" id="L382">                                unitBuffer.append(' ');</span>
+                            }
+<span class="nc" id="L384">                            unitBuffer.append(tokenBuffer, 0,</span>
+                                              tokenBufferLength);
+                        }
+<span class="nc" id="L387">                        return IDENTIFIER;</span>
+                    }
+<span class="nc bnc" id="L389" title="All 4 branches missed.">                    if (readWS &amp;&amp; unitBuffer.length() &gt; 0) {</span>
+<span class="nc" id="L390">                        unitBuffer.append(' ');</span>
+                    }
+<span class="nc" id="L392">                    unitBuffer.append(tokenBuffer, 0, tokenBufferLength);</span>
+                }
+                break;
+
+            case BRACKET_OPEN:
+            case BRACE_OPEN:
+            case PAREN_OPEN:
+<span class="nc" id="L399">                ubl = unitBuffer.length();</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">                if (wantsBlocks) {</span>
+<span class="nc" id="L401">                    unitBuffer.append(charMapping[nextToken]);</span>
+                }
+<span class="nc" id="L403">                parseTillClosed(nextToken);</span>
+<span class="nc bnc" id="L404" title="All 2 branches missed.">                if (!wantsBlocks) {</span>
+<span class="nc" id="L405">                    unitBuffer.setLength(ubl);</span>
+                }
+                break;
+
+            case BRACE_CLOSE:
+                // No need to throw for these two, we return token and
+                // caller can do whatever.
+            case BRACKET_CLOSE:
+            case PAREN_CLOSE:
+            case END:
+                // Hit the end
+<span class="nc" id="L416">                return nextToken;</span>
+            }
+        }
+    }
+
+    /**
+     * Parses till a matching block close is encountered. This is only
+     * appropriate to be called at the top level (no nesting).
+     */
+    private void parseTillClosed(int openToken) throws IOException {
+        int       nextToken;
+<span class="nc" id="L427">        boolean   done = false;</span>
+
+<span class="nc" id="L429">        startBlock(openToken);</span>
+<span class="nc bnc" id="L430" title="All 2 branches missed.">        while (!done) {</span>
+<span class="nc" id="L431">            nextToken = nextToken((char)0);</span>
+<span class="nc bnc" id="L432" title="All 5 branches missed.">            switch (nextToken) {</span>
+            case IDENTIFIER:
+<span class="nc bnc" id="L434" title="All 4 branches missed.">                if (unitBuffer.length() &gt; 0 &amp;&amp; readWS) {</span>
+<span class="nc" id="L435">                    unitBuffer.append(' ');</span>
+                }
+<span class="nc bnc" id="L437" title="All 2 branches missed.">                if (tokenBufferLength &gt; 0) {</span>
+<span class="nc" id="L438">                    unitBuffer.append(tokenBuffer, 0, tokenBufferLength);</span>
+                }
+                break;
+
+            case BRACKET_OPEN: case BRACE_OPEN: case PAREN_OPEN:
+<span class="nc bnc" id="L443" title="All 4 branches missed.">                if (unitBuffer.length() &gt; 0 &amp;&amp; readWS) {</span>
+<span class="nc" id="L444">                    unitBuffer.append(' ');</span>
+                }
+<span class="nc" id="L446">                unitBuffer.append(charMapping[nextToken]);</span>
+<span class="nc" id="L447">                startBlock(nextToken);</span>
+<span class="nc" id="L448">                break;</span>
+
+            case BRACKET_CLOSE: case BRACE_CLOSE: case PAREN_CLOSE:
+<span class="nc bnc" id="L451" title="All 4 branches missed.">                if (unitBuffer.length() &gt; 0 &amp;&amp; readWS) {</span>
+<span class="nc" id="L452">                    unitBuffer.append(' ');</span>
+                }
+<span class="nc" id="L454">                unitBuffer.append(charMapping[nextToken]);</span>
+<span class="nc" id="L455">                endBlock(nextToken);</span>
+<span class="nc bnc" id="L456" title="All 2 branches missed.">                if (!inBlock()) {</span>
+<span class="nc" id="L457">                    done = true;</span>
+                }
+                break;
+
+            case END:
+                // Prematurely hit end.
+<span class="nc" id="L463">                throw new RuntimeException(&quot;Unclosed block&quot;);</span>
+            }
+        }
+<span class="nc" id="L466">    }</span>
+
+    /**
+     * Fetches the next token.
+     */
+    private int nextToken(char idChar) throws IOException {
+<span class="nc" id="L472">        readWS = false;</span>
+
+<span class="nc" id="L474">        int     nextChar = readWS();</span>
+
+<span class="nc bnc" id="L476" title="All 10 branches missed.">        switch (nextChar) {</span>
+        case '\'':
+<span class="nc" id="L478">            readTill('\'');</span>
+<span class="nc bnc" id="L479" title="All 2 branches missed.">            if (tokenBufferLength &gt; 0) {</span>
+<span class="nc" id="L480">                tokenBufferLength--;</span>
+            }
+<span class="nc" id="L482">            return IDENTIFIER;</span>
+        case '&quot;':
+<span class="nc" id="L484">            readTill('&quot;');</span>
+<span class="nc bnc" id="L485" title="All 2 branches missed.">            if (tokenBufferLength &gt; 0) {</span>
+<span class="nc" id="L486">                tokenBufferLength--;</span>
+            }
+<span class="nc" id="L488">            return IDENTIFIER;</span>
+        case '[':
+<span class="nc" id="L490">            return BRACKET_OPEN;</span>
+        case ']':
+<span class="nc" id="L492">            return BRACKET_CLOSE;</span>
+        case '{':
+<span class="nc" id="L494">            return BRACE_OPEN;</span>
+        case '}':
+<span class="nc" id="L496">            return BRACE_CLOSE;</span>
+        case '(':
+<span class="nc" id="L498">            return PAREN_OPEN;</span>
+        case ')':
+<span class="nc" id="L500">            return PAREN_CLOSE;</span>
+        case -1:
+<span class="nc" id="L502">            return END;</span>
+        default:
+<span class="nc" id="L504">            pushChar(nextChar);</span>
+<span class="nc" id="L505">            getIdentifier(idChar);</span>
+<span class="nc" id="L506">            return IDENTIFIER;</span>
+        }
+    }
+
+    /**
+     * Gets an identifier, returning true if the length of the string is greater than 0,
+     * stopping when &lt;code&gt;stopChar&lt;/code&gt;, whitespace, or one of {}()[] is
+     * hit.
+     */
+    // NOTE: this could be combined with readTill, as they contain somewhat
+    // similar functionality.
+    private boolean getIdentifier(char stopChar) throws IOException {
+<span class="nc" id="L518">        boolean lastWasEscape = false;</span>
+<span class="nc" id="L519">        boolean done = false;</span>
+<span class="nc" id="L520">        int escapeCount = 0;</span>
+<span class="nc" id="L521">        int escapeChar = 0;</span>
+        int nextChar;
+<span class="nc" id="L523">        int intStopChar = (int)stopChar;</span>
+        // 1 for '\', 2 for valid escape char [0-9a-fA-F], 3 for
+        // stop character (white space, ()[]{}) 0 otherwise
+        short type;
+<span class="nc" id="L527">        int escapeOffset = 0;</span>
+
+<span class="nc" id="L529">        tokenBufferLength = 0;</span>
+<span class="nc bnc" id="L530" title="All 2 branches missed.">        while (!done) {</span>
+<span class="nc" id="L531">            nextChar = readChar();</span>
+<span class="nc bnc" id="L532" title="All 8 branches missed.">            switch (nextChar) {</span>
+            case '\\':
+<span class="nc" id="L534">                type = 1;</span>
+<span class="nc" id="L535">                break;</span>
+
+            case '0': case '1': case '2': case '3': case '4': case '5':
+            case '6': case '7': case '8': case '9':
+<span class="nc" id="L539">                type = 2;</span>
+<span class="nc" id="L540">                escapeOffset = nextChar - '0';</span>
+<span class="nc" id="L541">                break;</span>
+
+            case 'a': case 'b': case 'c': case 'd': case 'e': case 'f':
+<span class="nc" id="L544">                type = 2;</span>
+<span class="nc" id="L545">                escapeOffset = nextChar - 'a' + 10;</span>
+<span class="nc" id="L546">                break;</span>
+
+            case 'A': case 'B': case 'C': case 'D': case 'E': case 'F':
+<span class="nc" id="L549">                type = 2;</span>
+<span class="nc" id="L550">                escapeOffset = nextChar - 'A' + 10;</span>
+<span class="nc" id="L551">                break;</span>
+
+            case '\'': case '&quot;': case '[': case ']': case '{': case '}':
+            case '(': case ')':
+            case ' ': case '\n': case '\t': case '\r':
+<span class="nc" id="L556">                type = 3;</span>
+<span class="nc" id="L557">                break;</span>
+
+            case '/':
+<span class="nc" id="L560">                type = 4;</span>
+<span class="nc" id="L561">                break;</span>
+
+            case -1:
+                // Reached the end
+<span class="nc" id="L565">                done = true;</span>
+<span class="nc" id="L566">                type = 0;</span>
+<span class="nc" id="L567">                break;</span>
+
+            default:
+<span class="nc" id="L570">                type = 0;</span>
+                break;
+            }
+<span class="nc bnc" id="L573" title="All 2 branches missed.">            if (lastWasEscape) {</span>
+<span class="nc bnc" id="L574" title="All 2 branches missed.">                if (type == 2) {</span>
+                    // Continue with escape.
+<span class="nc" id="L576">                    escapeChar = escapeChar * 16 + escapeOffset;</span>
+<span class="nc bnc" id="L577" title="All 2 branches missed.">                    if (++escapeCount == 4) {</span>
+<span class="nc" id="L578">                        lastWasEscape = false;</span>
+<span class="nc" id="L579">                        append((char)escapeChar);</span>
+                    }
+                }
+                else {
+                    // no longer escaped
+<span class="nc" id="L584">                    lastWasEscape = false;</span>
+<span class="nc bnc" id="L585" title="All 2 branches missed.">                    if (escapeCount &gt; 0) {</span>
+<span class="nc" id="L586">                        append((char)escapeChar);</span>
+                        // Make this simpler, reprocess the character.
+<span class="nc" id="L588">                        pushChar(nextChar);</span>
+                    }
+<span class="nc bnc" id="L590" title="All 2 branches missed.">                    else if (!done) {</span>
+<span class="nc" id="L591">                        append((char)nextChar);</span>
+                    }
+                }
+            }
+<span class="nc bnc" id="L595" title="All 2 branches missed.">            else if (!done) {</span>
+<span class="nc bnc" id="L596" title="All 2 branches missed.">                if (type == 1) {</span>
+<span class="nc" id="L597">                    lastWasEscape = true;</span>
+<span class="nc" id="L598">                    escapeChar = escapeCount = 0;</span>
+                }
+<span class="nc bnc" id="L600" title="All 2 branches missed.">                else if (type == 3) {</span>
+<span class="nc" id="L601">                    done = true;</span>
+<span class="nc" id="L602">                    pushChar(nextChar);</span>
+                }
+<span class="nc bnc" id="L604" title="All 2 branches missed.">                else if (type == 4) {</span>
+                    // Potential comment
+<span class="nc" id="L606">                    nextChar = readChar();</span>
+<span class="nc bnc" id="L607" title="All 2 branches missed.">                    if (nextChar == '*') {</span>
+<span class="nc" id="L608">                        done = true;</span>
+<span class="nc" id="L609">                        readComment();</span>
+<span class="nc" id="L610">                        readWS = true;</span>
+                    }
+                    else {
+<span class="nc" id="L613">                        append('/');</span>
+<span class="nc bnc" id="L614" title="All 2 branches missed.">                        if (nextChar == -1) {</span>
+<span class="nc" id="L615">                            done = true;</span>
+                        }
+                        else {
+<span class="nc" id="L618">                            pushChar(nextChar);</span>
+                        }
+                    }
+                }
+                else {
+<span class="nc" id="L623">                    append((char)nextChar);</span>
+<span class="nc bnc" id="L624" title="All 2 branches missed.">                    if (nextChar == intStopChar) {</span>
+<span class="nc" id="L625">                        done = true;</span>
+                    }
+                }
+            }
+        }
+<span class="nc bnc" id="L630" title="All 2 branches missed.">        return (tokenBufferLength &gt; 0);</span>
+    }
+
+    /**
+     * Reads till a &lt;code&gt;stopChar&lt;/code&gt; is encountered, escaping characters
+     * as necessary.
+     */
+    private void readTill(char stopChar) throws IOException {
+<span class="nc" id="L638">        boolean lastWasEscape = false;</span>
+<span class="nc" id="L639">        int escapeCount = 0;</span>
+<span class="nc" id="L640">        int escapeChar = 0;</span>
+        int nextChar;
+<span class="nc" id="L642">        boolean done = false;</span>
+<span class="nc" id="L643">        int intStopChar = (int)stopChar;</span>
+        // 1 for '\', 2 for valid escape char [0-9a-fA-F], 0 otherwise
+        short type;
+<span class="nc" id="L646">        int escapeOffset = 0;</span>
+
+<span class="nc" id="L648">        tokenBufferLength = 0;</span>
+<span class="nc bnc" id="L649" title="All 2 branches missed.">        while (!done) {</span>
+<span class="nc" id="L650">            nextChar = readChar();</span>
+<span class="nc bnc" id="L651" title="All 6 branches missed.">            switch (nextChar) {</span>
+            case '\\':
+<span class="nc" id="L653">                type = 1;</span>
+<span class="nc" id="L654">                break;</span>
+
+            case '0': case '1': case '2': case '3': case '4':case '5':
+            case '6': case '7': case '8': case '9':
+<span class="nc" id="L658">                type = 2;</span>
+<span class="nc" id="L659">                escapeOffset = nextChar - '0';</span>
+<span class="nc" id="L660">                break;</span>
+
+            case 'a': case 'b': case 'c': case 'd': case 'e': case 'f':
+<span class="nc" id="L663">                type = 2;</span>
+<span class="nc" id="L664">                escapeOffset = nextChar - 'a' + 10;</span>
+<span class="nc" id="L665">                break;</span>
+
+            case 'A': case 'B': case 'C': case 'D': case 'E': case 'F':
+<span class="nc" id="L668">                type = 2;</span>
+<span class="nc" id="L669">                escapeOffset = nextChar - 'A' + 10;</span>
+<span class="nc" id="L670">                break;</span>
+
+            case -1:
+                // Prematurely reached the end!
+<span class="nc" id="L674">                throw new RuntimeException(&quot;Unclosed &quot; + stopChar);</span>
+
+            default:
+<span class="nc" id="L677">                type = 0;</span>
+                break;
+            }
+<span class="nc bnc" id="L680" title="All 2 branches missed.">            if (lastWasEscape) {</span>
+<span class="nc bnc" id="L681" title="All 2 branches missed.">                if (type == 2) {</span>
+                    // Continue with escape.
+<span class="nc" id="L683">                    escapeChar = escapeChar * 16 + escapeOffset;</span>
+<span class="nc bnc" id="L684" title="All 2 branches missed.">                    if (++escapeCount == 4) {</span>
+<span class="nc" id="L685">                        lastWasEscape = false;</span>
+<span class="nc" id="L686">                        append((char)escapeChar);</span>
+                    }
+                }
+                else {
+                    // no longer escaped
+<span class="nc bnc" id="L691" title="All 2 branches missed.">                    if (escapeCount &gt; 0) {</span>
+<span class="nc" id="L692">                        append((char)escapeChar);</span>
+<span class="nc bnc" id="L693" title="All 2 branches missed.">                        if (type == 1) {</span>
+<span class="nc" id="L694">                            lastWasEscape = true;</span>
+<span class="nc" id="L695">                            escapeChar = escapeCount = 0;</span>
+                        }
+                        else {
+<span class="nc bnc" id="L698" title="All 2 branches missed.">                            if (nextChar == intStopChar) {</span>
+<span class="nc" id="L699">                                done = true;</span>
+                            }
+<span class="nc" id="L701">                            append((char)nextChar);</span>
+<span class="nc" id="L702">                            lastWasEscape = false;</span>
+                        }
+                    }
+                    else {
+<span class="nc" id="L706">                        append((char)nextChar);</span>
+<span class="nc" id="L707">                        lastWasEscape = false;</span>
+                    }
+                }
+            }
+<span class="nc bnc" id="L711" title="All 2 branches missed.">            else if (type == 1) {</span>
+<span class="nc" id="L712">                lastWasEscape = true;</span>
+<span class="nc" id="L713">                escapeChar = escapeCount = 0;</span>
+            }
+            else {
+<span class="nc bnc" id="L716" title="All 2 branches missed.">                if (nextChar == intStopChar) {</span>
+<span class="nc" id="L717">                    done = true;</span>
+                }
+<span class="nc" id="L719">                append((char)nextChar);</span>
+            }
+        }
+<span class="nc" id="L722">    }</span>
+
+    private void append(char character) {
+<span class="nc bnc" id="L725" title="All 2 branches missed.">        if (tokenBufferLength == tokenBuffer.length) {</span>
+<span class="nc" id="L726">            char[] newBuffer = new char[tokenBuffer.length * 2];</span>
+<span class="nc" id="L727">            System.arraycopy(tokenBuffer, 0, newBuffer, 0, tokenBuffer.length);</span>
+<span class="nc" id="L728">            tokenBuffer = newBuffer;</span>
+        }
+<span class="nc" id="L730">        tokenBuffer[tokenBufferLength++] = character;</span>
+<span class="nc" id="L731">    }</span>
+
+    /**
+     * Parses a comment block.
+     */
+    private void readComment() throws IOException {
+        int nextChar;
+
+        for(;;) {
+<span class="nc" id="L740">            nextChar = readChar();</span>
+<span class="nc bnc" id="L741" title="All 3 branches missed.">            switch (nextChar) {</span>
+            case -1:
+<span class="nc" id="L743">                throw new RuntimeException(&quot;Unclosed comment&quot;);</span>
+            case '*':
+<span class="nc" id="L745">                nextChar = readChar();</span>
+<span class="nc bnc" id="L746" title="All 2 branches missed.">                if (nextChar == '/') {</span>
+<span class="nc" id="L747">                    return;</span>
+                }
+<span class="nc bnc" id="L749" title="All 2 branches missed.">                else if (nextChar == -1) {</span>
+<span class="nc" id="L750">                    throw new RuntimeException(&quot;Unclosed comment&quot;);</span>
+                }
+                else {
+<span class="nc" id="L753">                    pushChar(nextChar);</span>
+                }
+<span class="nc" id="L755">                break;</span>
+            default:
+<span class="nc" id="L757">                break;</span>
+            }
+        }
+    }
+
+    /**
+     * Called when a block start is encountered ({[.
+     */
+    private void startBlock(int startToken) {
+<span class="nc bnc" id="L766" title="All 2 branches missed.">        if (stackCount == unitStack.length) {</span>
+<span class="nc" id="L767">            int[]     newUS = new int[stackCount * 2];</span>
+
+<span class="nc" id="L769">            System.arraycopy(unitStack, 0, newUS, 0, stackCount);</span>
+<span class="nc" id="L770">            unitStack = newUS;</span>
+        }
+<span class="nc" id="L772">        unitStack[stackCount++] = startToken;</span>
+<span class="nc" id="L773">    }</span>
+
+    /**
+     * Called when an end block is encountered )]}
+     */
+    private void endBlock(int endToken) {
+        int    startToken;
+
+<span class="nc bnc" id="L781" title="All 4 branches missed.">        switch (endToken) {</span>
+        case BRACKET_CLOSE:
+<span class="nc" id="L783">            startToken = BRACKET_OPEN;</span>
+<span class="nc" id="L784">            break;</span>
+        case BRACE_CLOSE:
+<span class="nc" id="L786">            startToken = BRACE_OPEN;</span>
+<span class="nc" id="L787">            break;</span>
+        case PAREN_CLOSE:
+<span class="nc" id="L789">            startToken = PAREN_OPEN;</span>
+<span class="nc" id="L790">            break;</span>
+        default:
+            // Will never happen.
+<span class="nc" id="L793">            startToken = -1;</span>
+            break;
+        }
+<span class="nc bnc" id="L796" title="All 4 branches missed.">        if (stackCount &gt; 0 &amp;&amp; unitStack[stackCount - 1] == startToken) {</span>
+<span class="nc" id="L797">            stackCount--;</span>
+        }
+        else {
+            // Invalid state, should do something.
+<span class="nc" id="L801">            throw new RuntimeException(&quot;Unmatched block&quot;);</span>
+        }
+<span class="nc" id="L803">    }</span>
+
+    /**
+     * @return true if currently in a block.
+     */
+    private boolean inBlock() {
+<span class="nc bnc" id="L809" title="All 2 branches missed.">        return (stackCount &gt; 0);</span>
+    }
+
+    /**
+     * Skips any white space, returning the character after the white space.
+     */
+    private int readWS() throws IOException {
+        int nextChar;
+<span class="nc bnc" id="L817" title="All 2 branches missed.">        while ((nextChar = readChar()) != -1 &amp;&amp;</span>
+<span class="nc bnc" id="L818" title="All 2 branches missed.">               Character.isWhitespace((char)nextChar)) {</span>
+<span class="nc" id="L819">            readWS = true;</span>
+        }
+<span class="nc" id="L821">        return nextChar;</span>
+    }
+
+    /**
+     * Reads a character from the stream.
+     */
+    private int readChar() throws IOException {
+<span class="nc bnc" id="L828" title="All 2 branches missed.">        if (didPushChar) {</span>
+<span class="nc" id="L829">            didPushChar = false;</span>
+<span class="nc" id="L830">            return pushedChar;</span>
+        }
+<span class="nc" id="L832">        return reader.read();</span>
+        // Uncomment the following to do case insensitive parsing.
+        /*
+        if (retValue != -1) {
+            return (int)Character.toLowerCase((char)retValue);
+        }
+        return retValue;
+        */
+    }
+
+    /**
+     * Supports one character look ahead, this will throw if called twice
+     * in a row.
+     */
+    private void pushChar(int tempChar) {
+<span class="nc bnc" id="L847" title="All 2 branches missed.">        if (didPushChar) {</span>
+            // Should never happen.
+<span class="nc" id="L849">            throw new RuntimeException(&quot;Can not handle look ahead of more than one character&quot;);</span>
+        }
+<span class="nc" id="L851">        didPushChar = true;</span>
+<span class="nc" id="L852">        pushedChar = tempChar;</span>
+<span class="nc" id="L853">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

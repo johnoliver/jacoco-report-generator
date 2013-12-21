@@ -1,0 +1,353 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>AbstractTask.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">java.util.stream</a> &gt; <span class="el_source">AbstractTask.java</span></div><h1>AbstractTask.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2012, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package java.util.stream;
+
+import java.util.Spliterator;
+import java.util.concurrent.CountedCompleter;
+import java.util.concurrent.ForkJoinPool;
+
+/**
+ * Abstract base class for most fork-join tasks used to implement stream ops.
+ * Manages splitting logic, tracking of child tasks, and intermediate results.
+ * Each task is associated with a {@link Spliterator} that describes the portion
+ * of the input associated with the subtree rooted at this task.
+ * Tasks may be leaf nodes (which will traverse the elements of
+ * the {@code Spliterator}) or internal nodes (which split the
+ * {@code Spliterator} into multiple child tasks).
+ *
+ * @implNote
+ * &lt;p&gt;This class is based on {@link CountedCompleter}, a form of fork-join task
+ * where each task has a semaphore-like count of uncompleted children, and the
+ * task is implicitly completed and notified when its last child completes.
+ * Internal node tasks will likely override the {@code onCompletion} method from
+ * {@code CountedCompleter} to merge the results from child tasks into the
+ * current task's result.
+ *
+ * &lt;p&gt;Splitting and setting up the child task links is done by {@code compute()}
+ * for internal nodes.  At {@code compute()} time for leaf nodes, it is
+ * guaranteed that the parent's child-related fields (including sibling links
+ * for the parent's children) will be set up for all children.
+ *
+ * &lt;p&gt;For example, a task that performs a reduce would override {@code doLeaf()}
+ * to perform a reduction on that leaf node's chunk using the
+ * {@code Spliterator}, and override {@code onCompletion()} to merge the results
+ * of the child tasks for internal nodes:
+ *
+ * &lt;pre&gt;{@code
+ *     protected S doLeaf() {
+ *         spliterator.forEach(...);
+ *         return localReductionResult;
+ *     }
+ *
+ *     public void onCompletion(CountedCompleter caller) {
+ *         if (!isLeaf()) {
+ *             ReduceTask&lt;P_IN, P_OUT, T, R&gt; child = children;
+ *             R result = child.getLocalResult();
+ *             child = child.nextSibling;
+ *             for (; child != null; child = child.nextSibling)
+ *                 result = combine(result, child.getLocalResult());
+ *             setLocalResult(result);
+ *         }
+ *     }
+ * }&lt;/pre&gt;
+ *
+ * &lt;p&gt;Serialization is not supported as there is no intention to serialize
+ * tasks managed by stream ops.
+ *
+ * @param &lt;P_IN&gt; Type of elements input to the pipeline
+ * @param &lt;P_OUT&gt; Type of elements output from the pipeline
+ * @param &lt;R&gt; Type of intermediate result, which may be different from operation
+ *        result type
+ * @param &lt;K&gt; Type of parent, child and sibling tasks
+ * @since 1.8
+ */
+@SuppressWarnings(&quot;serial&quot;)
+abstract class AbstractTask&lt;P_IN, P_OUT, R,
+                            K extends AbstractTask&lt;P_IN, P_OUT, R, K&gt;&gt;
+        extends CountedCompleter&lt;R&gt; {
+
+    /**
+     * Default target factor of leaf tasks for parallel decomposition.
+     * To allow load balancing, we over-partition, currently to approximately
+     * four tasks per processor, which enables others to help out
+     * if leaf tasks are uneven or some processors are otherwise busy.
+     */
+<span class="fc" id="L97">    static final int LEAF_TARGET = ForkJoinPool.getCommonPoolParallelism() &lt;&lt; 2;</span>
+
+    /** The pipeline helper, common to all tasks in a computation */
+    protected final PipelineHelper&lt;P_OUT&gt; helper;
+
+    /**
+     * The spliterator for the portion of the input associated with the subtree
+     * rooted at this task
+     */
+    protected Spliterator&lt;P_IN&gt; spliterator;
+
+    /** Target leaf size, common to all tasks in a computation */
+    protected long targetSize; // may be laziliy initialized
+
+    /**
+     * The left child.
+     * null if no children
+     * if non-null rightChild is non-null
+     */
+    protected K leftChild;
+
+    /**
+     * The right child.
+     * null if no children
+     * if non-null leftChild is non-null
+     */
+    protected K rightChild;
+
+    /** The result of this node, if completed */
+    private R localResult;
+
+    /**
+     * Constructor for root nodes.
+     *
+     * @param helper The {@code PipelineHelper} describing the stream pipeline
+     *               up to this operation
+     * @param spliterator The {@code Spliterator} describing the source for this
+     *                    pipeline
+     */
+    protected AbstractTask(PipelineHelper&lt;P_OUT&gt; helper,
+                           Spliterator&lt;P_IN&gt; spliterator) {
+<span class="fc" id="L138">        super(null);</span>
+<span class="fc" id="L139">        this.helper = helper;</span>
+<span class="fc" id="L140">        this.spliterator = spliterator;</span>
+<span class="fc" id="L141">        this.targetSize = 0L;</span>
+<span class="fc" id="L142">    }</span>
+
+    /**
+     * Constructor for non-root nodes.
+     *
+     * @param parent this node's parent task
+     * @param spliterator {@code Spliterator} describing the subtree rooted at
+     *        this node, obtained by splitting the parent {@code Spliterator}
+     */
+    protected AbstractTask(K parent,
+                           Spliterator&lt;P_IN&gt; spliterator) {
+<span class="fc" id="L153">        super(parent);</span>
+<span class="fc" id="L154">        this.spliterator = spliterator;</span>
+<span class="fc" id="L155">        this.helper = parent.helper;</span>
+<span class="fc" id="L156">        this.targetSize = parent.targetSize;</span>
+<span class="fc" id="L157">    }</span>
+
+    /**
+     * Constructs a new node of type T whose parent is the receiver; must call
+     * the AbstractTask(T, Spliterator) constructor with the receiver and the
+     * provided Spliterator.
+     *
+     * @param spliterator {@code Spliterator} describing the subtree rooted at
+     *        this node, obtained by splitting the parent {@code Spliterator}
+     * @return newly constructed child node
+     */
+    protected abstract K makeChild(Spliterator&lt;P_IN&gt; spliterator);
+
+    /**
+     * Computes the result associated with a leaf node.  Will be called by
+     * {@code compute()} and the result passed to @{code setLocalResult()}
+     *
+     * @return the computed result of a leaf node
+     */
+    protected abstract R doLeaf();
+
+    /**
+     * Returns a suggested target leaf size based on the initial size estimate.
+     *
+     * @return suggested target leaf size
+     */
+    public static long suggestTargetSize(long sizeEstimate) {
+<span class="fc" id="L184">        long est = sizeEstimate / LEAF_TARGET;</span>
+<span class="fc bfc" id="L185" title="All 2 branches covered.">        return est &gt; 0L ? est : 1L;</span>
+    }
+
+    /**
+     * Returns the targetSize, initializing it via the supplied
+     * size estimate if not already initialized.
+     */
+    protected final long getTargetSize(long sizeEstimate) {
+        long s;
+<span class="fc bfc" id="L194" title="All 2 branches covered.">        return ((s = targetSize) != 0 ? s :</span>
+<span class="fc" id="L195">                (targetSize = suggestTargetSize(sizeEstimate)));</span>
+    }
+
+    /**
+     * Returns the local result, if any. Subclasses should use
+     * {@link #setLocalResult(Object)} and {@link #getLocalResult()} to manage
+     * results.  This returns the local result so that calls from within the
+     * fork-join framework will return the correct result.
+     *
+     * @return local result for this node previously stored with
+     * {@link #setLocalResult}
+     */
+    @Override
+    public R getRawResult() {
+<span class="nc" id="L209">        return localResult;</span>
+    }
+
+    /**
+     * Does nothing; instead, subclasses should use
+     * {@link #setLocalResult(Object)}} to manage results.
+     *
+     * @param result must be null, or an exception is thrown (this is a safety
+     *        tripwire to detect when {@code setRawResult()} is being used
+     *        instead of {@code setLocalResult()}
+     */
+    @Override
+    protected void setRawResult(R result) {
+<span class="nc bnc" id="L222" title="All 2 branches missed.">        if (result != null)</span>
+<span class="nc" id="L223">            throw new IllegalStateException();</span>
+<span class="nc" id="L224">    }</span>
+
+    /**
+     * Retrieves a result previously stored with {@link #setLocalResult}
+     *
+     * @return local result for this node previously stored with
+     * {@link #setLocalResult}
+     */
+    protected R getLocalResult() {
+<span class="nc" id="L233">        return localResult;</span>
+    }
+
+    /**
+     * Associates the result with the task, can be retrieved with
+     * {@link #getLocalResult}
+     *
+     * @param localResult local result for this node
+     */
+    protected void setLocalResult(R localResult) {
+<span class="nc" id="L243">        this.localResult = localResult;</span>
+<span class="nc" id="L244">    }</span>
+
+    /**
+     * Indicates whether this task is a leaf node.  (Only valid after
+     * {@link #compute} has been called on this node).  If the node is not a
+     * leaf node, then children will be non-null and numChildren will be
+     * positive.
+     *
+     * @return {@code true} if this task is a leaf node
+     */
+    protected boolean isLeaf() {
+<span class="nc bnc" id="L255" title="All 2 branches missed.">        return leftChild == null;</span>
+    }
+
+    /**
+     * Indicates whether this task is the root node
+     *
+     * @return {@code true} if this task is the root node.
+     */
+    protected boolean isRoot() {
+<span class="pc bpc" id="L264" title="1 of 2 branches missed.">        return getParent() == null;</span>
+    }
+
+    /**
+     * Returns the parent of this task, or null if this task is the root
+     *
+     * @return the parent of this task, or null if this task is the root
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    protected K getParent() {
+<span class="fc" id="L274">        return (K) getCompleter();</span>
+    }
+
+    /**
+     * Decides whether or not to split a task further or compute it
+     * directly. If computing directly, calls {@code doLeaf} and pass
+     * the result to {@code setRawResult}. Otherwise splits off
+     * subtasks, forking one and continuing as the other.
+     *
+     * &lt;p&gt; The method is structured to conserve resources across a
+     * range of uses.  The loop continues with one of the child tasks
+     * when split, to avoid deep recursion. To cope with spliterators
+     * that may be systematically biased toward left-heavy or
+     * right-heavy splits, we alternate which child is forked versus
+     * continued in the loop.
+     */
+    @Override
+    public void compute() {
+<span class="fc" id="L292">        Spliterator&lt;P_IN&gt; rs = spliterator, ls; // right, left spliterators</span>
+<span class="fc" id="L293">        long sizeEstimate = rs.estimateSize();</span>
+<span class="fc" id="L294">        long sizeThreshold = getTargetSize(sizeEstimate);</span>
+<span class="fc" id="L295">        boolean forkRight = false;</span>
+<span class="fc" id="L296">        @SuppressWarnings(&quot;unchecked&quot;) K task = (K) this;</span>
+<span class="fc bfc" id="L297" title="All 4 branches covered.">        while (sizeEstimate &gt; sizeThreshold &amp;&amp; (ls = rs.trySplit()) != null) {</span>
+            K leftChild, rightChild, taskToFork;
+<span class="fc" id="L299">            task.leftChild  = leftChild = task.makeChild(ls);</span>
+<span class="fc" id="L300">            task.rightChild = rightChild = task.makeChild(rs);</span>
+<span class="fc" id="L301">            task.setPendingCount(1);</span>
+<span class="fc bfc" id="L302" title="All 2 branches covered.">            if (forkRight) {</span>
+<span class="fc" id="L303">                forkRight = false;</span>
+<span class="fc" id="L304">                rs = ls;</span>
+<span class="fc" id="L305">                task = leftChild;</span>
+<span class="fc" id="L306">                taskToFork = rightChild;</span>
+            }
+            else {
+<span class="fc" id="L309">                forkRight = true;</span>
+<span class="fc" id="L310">                task = rightChild;</span>
+<span class="fc" id="L311">                taskToFork = leftChild;</span>
+            }
+<span class="fc" id="L313">            taskToFork.fork();</span>
+<span class="fc" id="L314">            sizeEstimate = rs.estimateSize();</span>
+<span class="fc" id="L315">        }</span>
+<span class="nc" id="L316">        task.setLocalResult(task.doLeaf());</span>
+<span class="nc" id="L317">        task.tryComplete();</span>
+<span class="nc" id="L318">    }</span>
+
+    /**
+     * {@inheritDoc}
+     *
+     * @implNote
+     * Clears spliterator and children fields.  Overriders MUST call
+     * {@code super.onCompletion} as the last thing they do if they want these
+     * cleared.
+     */
+    @Override
+    public void onCompletion(CountedCompleter&lt;?&gt; caller) {
+<span class="nc" id="L330">        spliterator = null;</span>
+<span class="nc" id="L331">        leftChild = rightChild = null;</span>
+<span class="nc" id="L332">    }</span>
+
+    /**
+     * Returns whether this node is a &quot;leftmost&quot; node -- whether the path from
+     * the root to this node involves only traversing leftmost child links.  For
+     * a leaf node, this means it is the first leaf node in the encounter order.
+     *
+     * @return {@code true} if this node is a &quot;leftmost&quot; node
+     */
+    protected boolean isLeftmostNode() {
+        @SuppressWarnings(&quot;unchecked&quot;)
+<span class="nc" id="L343">        K node = (K) this;</span>
+<span class="nc bnc" id="L344" title="All 2 branches missed.">        while (node != null) {</span>
+<span class="nc" id="L345">            K parent = node.getParent();</span>
+<span class="nc bnc" id="L346" title="All 4 branches missed.">            if (parent != null &amp;&amp; parent.leftChild != node)</span>
+<span class="nc" id="L347">                return false;</span>
+<span class="nc" id="L348">            node = parent;</span>
+<span class="nc" id="L349">        }</span>
+<span class="nc" id="L350">        return true;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

@@ -1,0 +1,402 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>KrbAsReqBuilder.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.krb5</a> &gt; <span class="el_source">KrbAsReqBuilder.java</span></div><h1>KrbAsReqBuilder.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2010, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.security.krb5;
+
+import java.io.IOException;
+import java.util.Arrays;
+import javax.security.auth.kerberos.KeyTab;
+import sun.security.jgss.krb5.Krb5Util;
+import sun.security.krb5.internal.HostAddresses;
+import sun.security.krb5.internal.KDCOptions;
+import sun.security.krb5.internal.KRBError;
+import sun.security.krb5.internal.KerberosTime;
+import sun.security.krb5.internal.Krb5;
+import sun.security.krb5.internal.PAData;
+import sun.security.krb5.internal.crypto.EType;
+
+/**
+ * A manager class for AS-REQ communications.
+ *
+ * This class does:
+ * 1. Gather information to create AS-REQ
+ * 2. Create and send AS-REQ
+ * 3. Receive AS-REP and KRB-ERROR (-KRB_ERR_RESPONSE_TOO_BIG) and parse them
+ * 4. Emit credentials and secret keys (for JAAS storeKey=true with password)
+ *
+ * This class does not:
+ * 1. Deal with real communications (KdcComm does it, and TGS-REQ)
+ *    a. Name of KDCs for a realm
+ *    b. Server availability, timeout, UDP or TCP
+ *    d. KRB_ERR_RESPONSE_TOO_BIG
+ * 2. Stores its own copy of password, this means:
+ *    a. Do not change/wipe it before Builder finish
+ *    b. Builder will not wipe it for you
+ *
+ * With this class:
+ * 1. KrbAsReq has only one constructor
+ * 2. Krb5LoginModule and Kinit call a single builder
+ * 3. Better handling of sensitive info
+ *
+ * @since 1.7
+ */
+
+public final class KrbAsReqBuilder {
+
+    // Common data for AS-REQ fields
+    private KDCOptions options;
+    private PrincipalName cname;
+    private PrincipalName sname;
+    private KerberosTime from;
+    private KerberosTime till;
+    private KerberosTime rtime;
+    private HostAddresses addresses;
+
+    // Secret source: can't be changed once assigned, only one (of the two
+    // sources) can be set to non-null
+    private final char[] password;
+    private final KeyTab ktab;
+
+    // Used to create a ENC-TIMESTAMP in the 2nd AS-REQ
+    private PAData[] paList;        // PA-DATA from both KRB-ERROR and AS-REP.
+                                    // Used by getKeys() only.
+                                    // Only AS-REP should be enough per RFC,
+                                    // combined in case etypes are different.
+
+    // The generated and received:
+    private KrbAsReq req;
+    private KrbAsRep rep;
+
+<span class="pc" id="L92">    private static enum State {</span>
+<span class="fc" id="L93">        INIT,       // Initialized, can still add more initialization info</span>
+<span class="fc" id="L94">        REQ_OK,     // AS-REQ performed</span>
+<span class="fc" id="L95">        DESTROYED,  // Destroyed, not usable anymore</span>
+    }
+    private State state;
+
+    // Called by other constructors
+    private void init(PrincipalName cname)
+            throws KrbException {
+<span class="fc" id="L102">        this.cname = cname;</span>
+<span class="fc" id="L103">        state = State.INIT;</span>
+<span class="fc" id="L104">    }</span>
+
+    /**
+     * Creates a builder to be used by {@code cname} with existing keys.
+     *
+     * @param cname the client of the AS-REQ. Must not be null. Might have no
+     * realm, where default realm will be used. This realm will be the target
+     * realm for AS-REQ. I believe a client should only get initial TGT from
+     * its own realm.
+     * @param keys must not be null. if empty, might be quite useless.
+     * This argument will neither be modified nor stored by the method.
+     * @throws KrbException
+     */
+    public KrbAsReqBuilder(PrincipalName cname, KeyTab ktab)
+<span class="fc" id="L118">            throws KrbException {</span>
+<span class="fc" id="L119">        init(cname);</span>
+<span class="fc" id="L120">        this.ktab = ktab;</span>
+<span class="fc" id="L121">        this.password = null;</span>
+<span class="fc" id="L122">    }</span>
+
+    /**
+     * Creates a builder to be used by {@code cname} with a known password.
+     *
+     * @param cname the client of the AS-REQ. Must not be null. Might have no
+     * realm, where default realm will be used. This realm will be the target
+     * realm for AS-REQ. I believe a client should only get initial TGT from
+     * its own realm.
+     * @param pass must not be null. This argument will neither be modified
+     * nor stored by the method.
+     * @throws KrbException
+     */
+    public KrbAsReqBuilder(PrincipalName cname, char[] pass)
+<span class="fc" id="L136">            throws KrbException {</span>
+<span class="fc" id="L137">        init(cname);</span>
+<span class="fc" id="L138">        this.password = pass.clone();</span>
+<span class="fc" id="L139">        this.ktab = null;</span>
+<span class="fc" id="L140">    }</span>
+
+    /**
+     * Retrieves an array of secret keys for the client. This is used when
+     * the client supplies password but need keys to act as an acceptor. For
+     * an initiator, it must be called after AS-REQ is performed (state is OK).
+     * For an acceptor, it can be called when this KrbAsReqBuilder object is
+     * constructed (state is INIT).
+     * @param isInitiator if the caller is an initiator
+     * @return generated keys from password. PA-DATA from server might be used.
+     * All &quot;default_tkt_enctypes&quot; keys will be generated, Never null.
+     * @throws IllegalStateException if not constructed from a password
+     * @throws KrbException
+     */
+    public EncryptionKey[] getKeys(boolean isInitiator) throws KrbException {
+<span class="nc bnc" id="L155" title="All 2 branches missed.">        checkState(isInitiator?State.REQ_OK:State.INIT, &quot;Cannot get keys&quot;);</span>
+<span class="nc bnc" id="L156" title="All 2 branches missed.">        if (password != null) {</span>
+<span class="nc" id="L157">            int[] eTypes = EType.getDefaults(&quot;default_tkt_enctypes&quot;);</span>
+<span class="nc" id="L158">            EncryptionKey[] result = new EncryptionKey[eTypes.length];</span>
+
+            /*
+             * Returns an array of keys. Before KrbAsReqBuilder, all etypes
+             * use the same salt which is either the default one or a new salt
+             * coming from PA-DATA. After KrbAsReqBuilder, each etype uses its
+             * own new salt from PA-DATA. For an etype with no PA-DATA new salt
+             * at all, what salt should it use?
+             *
+             * Commonly, the stored keys are only to be used by an acceptor to
+             * decrypt service ticket in AP-REQ. Most impls only allow keys
+             * from a keytab on acceptor, but unfortunately (?) Java supports
+             * acceptor using password. In this case, if the service ticket is
+             * encrypted using an etype which we don't have PA-DATA new salt,
+             * using the default salt might be wrong (say, case-insensitive
+             * user name). Instead, we would use the new salt of another etype.
+             */
+
+<span class="nc" id="L176">            String salt = null;     // the saved new salt</span>
+            try {
+<span class="nc bnc" id="L178" title="All 2 branches missed.">                for (int i=0; i&lt;eTypes.length; i++) {</span>
+                    // First round, only calculate those have a PA entry
+<span class="nc" id="L180">                    PAData.SaltAndParams snp =</span>
+<span class="nc" id="L181">                            PAData.getSaltAndParams(eTypes[i], paList);</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">                    if (snp != null) {</span>
+                        // Never uses a salt for rc4-hmac, it does not use
+                        // a salt at all
+<span class="nc bnc" id="L185" title="All 4 branches missed.">                        if (eTypes[i] != EncryptedData.ETYPE_ARCFOUR_HMAC &amp;&amp;</span>
+                                snp.salt != null) {
+<span class="nc" id="L187">                            salt = snp.salt;</span>
+                        }
+<span class="nc" id="L189">                        result[i] = EncryptionKey.acquireSecretKey(cname,</span>
+                                password,
+                                eTypes[i],
+                                snp);
+                    }
+                }
+                // No new salt from PA, maybe empty, maybe only rc4-hmac
+<span class="nc bnc" id="L196" title="All 2 branches missed.">                if (salt == null) salt = cname.getSalt();</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">                for (int i=0; i&lt;eTypes.length; i++) {</span>
+                    // Second round, calculate those with no PA entry
+<span class="nc bnc" id="L199" title="All 2 branches missed.">                    if (result[i] == null) {</span>
+<span class="nc" id="L200">                        result[i] = EncryptionKey.acquireSecretKey(password,</span>
+                                salt,
+                                eTypes[i],
+                                null);
+                    }
+                }
+<span class="nc" id="L206">            } catch (IOException ioe) {</span>
+<span class="nc" id="L207">                KrbException ke = new KrbException(Krb5.ASN1_PARSE_ERROR);</span>
+<span class="nc" id="L208">                ke.initCause(ioe);</span>
+<span class="nc" id="L209">                throw ke;</span>
+<span class="nc" id="L210">            }</span>
+<span class="nc" id="L211">            return result;</span>
+        } else {
+<span class="nc" id="L213">            throw new IllegalStateException(&quot;Required password not provided&quot;);</span>
+        }
+    }
+
+    /**
+     * Sets or clears options. If cleared, default options will be used
+     * at creation time.
+     * @param options
+     */
+    public void setOptions(KDCOptions options) {
+<span class="nc" id="L223">        checkState(State.INIT, &quot;Cannot specify options&quot;);</span>
+<span class="nc" id="L224">        this.options = options;</span>
+<span class="nc" id="L225">    }</span>
+
+    /**
+     * Sets or clears target. If cleared, KrbAsReq might choose krbtgt
+     * for cname realm
+     * @param sname
+     */
+    public void setTarget(PrincipalName sname) {
+<span class="nc" id="L233">        checkState(State.INIT, &quot;Cannot specify target&quot;);</span>
+<span class="nc" id="L234">        this.sname = sname;</span>
+<span class="nc" id="L235">    }</span>
+
+    /**
+     * Adds or clears addresses. KrbAsReq might add some if empty
+     * field not allowed
+     * @param addresses
+     */
+    public void setAddresses(HostAddresses addresses) {
+<span class="nc" id="L243">        checkState(State.INIT, &quot;Cannot specify addresses&quot;);</span>
+<span class="nc" id="L244">        this.addresses = addresses;</span>
+<span class="nc" id="L245">    }</span>
+
+    /**
+     * Build a KrbAsReq object from all info fed above. Normally this method
+     * will be called twice: initial AS-REQ and second with pakey
+     * @param key null (initial AS-REQ) or pakey (with preauth)
+     * @return the KrbAsReq object
+     * @throws KrbException
+     * @throws IOException
+     */
+    private KrbAsReq build(EncryptionKey key) throws KrbException, IOException {
+        int[] eTypes;
+<span class="fc bfc" id="L257" title="All 2 branches covered.">        if (password != null) {</span>
+<span class="fc" id="L258">            eTypes = EType.getDefaults(&quot;default_tkt_enctypes&quot;);</span>
+        } else {
+<span class="fc" id="L260">            EncryptionKey[] ks = Krb5Util.keysFromJavaxKeyTab(ktab, cname);</span>
+<span class="fc" id="L261">            eTypes = EType.getDefaults(&quot;default_tkt_enctypes&quot;,</span>
+                    ks);
+<span class="fc bfc" id="L263" title="All 2 branches covered.">            for (EncryptionKey k: ks) k.destroy();</span>
+        }
+<span class="fc" id="L265">        return new KrbAsReq(key,</span>
+            options,
+            cname,
+            sname,
+            from,
+            till,
+            rtime,
+            eTypes,
+            addresses);
+    }
+
+    /**
+     * Parses AS-REP, decrypts enc-part, retrieves ticket and session key
+     * @throws KrbException
+     * @throws Asn1Exception
+     * @throws IOException
+     */
+    private KrbAsReqBuilder resolve()
+            throws KrbException, Asn1Exception, IOException {
+<span class="pc bpc" id="L284" title="1 of 2 branches missed.">        if (ktab != null) {</span>
+<span class="nc" id="L285">            rep.decryptUsingKeyTab(ktab, req, cname);</span>
+        } else {
+<span class="fc" id="L287">            rep.decryptUsingPassword(password, req, cname);</span>
+        }
+<span class="pc bpc" id="L289" title="1 of 2 branches missed.">        if (rep.getPA() != null) {</span>
+<span class="pc bpc" id="L290" title="2 of 4 branches missed.">            if (paList == null || paList.length == 0) {</span>
+<span class="nc" id="L291">                paList = rep.getPA();</span>
+            } else {
+<span class="fc" id="L293">                int extraLen = rep.getPA().length;</span>
+<span class="pc bpc" id="L294" title="1 of 2 branches missed.">                if (extraLen &gt; 0) {</span>
+<span class="fc" id="L295">                    int oldLen = paList.length;</span>
+<span class="fc" id="L296">                    paList = Arrays.copyOf(paList, paList.length + extraLen);</span>
+<span class="fc" id="L297">                    System.arraycopy(rep.getPA(), 0, paList, oldLen, extraLen);</span>
+                }
+            }
+        }
+<span class="fc" id="L301">        return this;</span>
+    }
+
+    /**
+     * Communication until AS-REP or non preauth-related KRB-ERROR received
+     * @throws KrbException
+     * @throws IOException
+     */
+    private KrbAsReqBuilder send() throws KrbException, IOException {
+<span class="fc" id="L310">        boolean preAuthFailedOnce = false;</span>
+<span class="fc" id="L311">        KdcComm comm = new KdcComm(cname.getRealmAsString());</span>
+<span class="fc" id="L312">        EncryptionKey pakey = null;</span>
+        while (true) {
+            try {
+<span class="fc" id="L315">                req = build(pakey);</span>
+<span class="fc" id="L316">                rep = new KrbAsRep(comm.send(req.encoding()));</span>
+<span class="fc" id="L317">                return this;</span>
+<span class="fc" id="L318">            } catch (KrbException ke) {</span>
+<span class="pc bpc" id="L319" title="1 of 2 branches missed.">                if (!preAuthFailedOnce &amp;&amp; (</span>
+<span class="pc bpc" id="L320" title="1 of 2 branches missed.">                        ke.returnCode() == Krb5.KDC_ERR_PREAUTH_FAILED ||</span>
+<span class="fc bfc" id="L321" title="All 2 branches covered.">                        ke.returnCode() == Krb5.KDC_ERR_PREAUTH_REQUIRED)) {</span>
+<span class="pc bpc" id="L322" title="1 of 2 branches missed.">                    if (Krb5.DEBUG) {</span>
+<span class="nc" id="L323">                        System.out.println(&quot;KrbAsReqBuilder: &quot; +</span>
+                                &quot;PREAUTH FAILED/REQ, re-send AS-REQ&quot;);
+                    }
+<span class="fc" id="L326">                    preAuthFailedOnce = true;</span>
+<span class="fc" id="L327">                    KRBError kerr = ke.getError();</span>
+<span class="fc" id="L328">                    int paEType = PAData.getPreferredEType(kerr.getPA(),</span>
+<span class="fc" id="L329">                            EType.getDefaults(&quot;default_tkt_enctypes&quot;)[0]);</span>
+<span class="pc bpc" id="L330" title="1 of 2 branches missed.">                    if (password == null) {</span>
+<span class="nc" id="L331">                        EncryptionKey[] ks = Krb5Util.keysFromJavaxKeyTab(ktab, cname);</span>
+<span class="nc" id="L332">                        pakey = EncryptionKey.findKey(paEType, ks);</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">                        if (pakey != null) pakey = (EncryptionKey)pakey.clone();</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">                        for (EncryptionKey k: ks) k.destroy();</span>
+<span class="nc" id="L335">                    } else {</span>
+<span class="fc" id="L336">                        pakey = EncryptionKey.acquireSecretKey(cname,</span>
+                                password,
+                                paEType,
+<span class="fc" id="L339">                                PAData.getSaltAndParams(</span>
+<span class="fc" id="L340">                                    paEType, kerr.getPA()));</span>
+                    }
+<span class="fc" id="L342">                    paList = kerr.getPA();  // Update current paList</span>
+<span class="fc" id="L343">                } else {</span>
+<span class="fc" id="L344">                    throw ke;</span>
+                }
+<span class="fc" id="L346">            }</span>
+        }
+    }
+
+    /**
+     * Performs AS-REQ send and AS-REP receive.
+     * Maybe a state is needed here, to divide prepare process and getCreds.
+     * @throws KrbException
+     * @throws Asn1Exception
+     * @throws IOException
+     */
+    public KrbAsReqBuilder action()
+            throws KrbException, Asn1Exception, IOException {
+<span class="fc" id="L359">        checkState(State.INIT, &quot;Cannot call action&quot;);</span>
+<span class="fc" id="L360">        state = State.REQ_OK;</span>
+<span class="fc" id="L361">        return send().resolve();</span>
+    }
+
+    /**
+     * Gets Credentials object after action
+     */
+    public Credentials getCreds() {
+<span class="fc" id="L368">        checkState(State.REQ_OK, &quot;Cannot retrieve creds&quot;);</span>
+<span class="fc" id="L369">        return rep.getCreds();</span>
+    }
+
+    /**
+     * Gets another type of Credentials after action
+     */
+    public sun.security.krb5.internal.ccache.Credentials getCCreds() {
+<span class="nc" id="L376">        checkState(State.REQ_OK, &quot;Cannot retrieve CCreds&quot;);</span>
+<span class="nc" id="L377">        return rep.getCCreds();</span>
+    }
+
+    /**
+     * Destroys the object and clears keys and password info.
+     */
+    public void destroy() {
+<span class="fc" id="L384">        state = State.DESTROYED;</span>
+<span class="fc bfc" id="L385" title="All 2 branches covered.">        if (password != null) {</span>
+<span class="fc" id="L386">            Arrays.fill(password, (char)0);</span>
+        }
+<span class="fc" id="L388">    }</span>
+
+    /**
+     * Checks if the current state is the specified one.
+     * @param st the expected state
+     * @param msg error message if state is not correct
+     * @throws IllegalStateException if state is not correct
+     */
+    private void checkState(State st, String msg) {
+<span class="pc bpc" id="L397" title="1 of 2 branches missed.">        if (state != st) {</span>
+<span class="nc" id="L398">            throw new IllegalStateException(msg + &quot; at &quot; + st + &quot; state&quot;);</span>
+        }
+<span class="fc" id="L400">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

@@ -1,0 +1,644 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>MessageToken_v2.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.jgss.krb5</a> &gt; <span class="el_source">MessageToken_v2.java</span></div><h1>MessageToken_v2.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2004, 2011, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.security.jgss.krb5;
+
+import org.ietf.jgss.*;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.IOException;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.security.MessageDigest;
+import java.util.Arrays;
+
+/**
+ * This class is a base class for new GSS token definitions, as defined
+ * in RFC 4121, that pertain to per-message GSS-API calls. Conceptually
+ * GSS-API has two types of per-message tokens: WrapToken and MicToken.
+ * They differ in the respect that a WrapToken carries additional plaintext
+ * or ciphertext application data besides just the sequence number and
+ * checksum. This class encapsulates the commonality in the structure of
+ * the WrapToken and the MicToken. This structure can be represented as:
+ * &lt;p&gt;
+ * &lt;pre&gt;
+ * Wrap Tokens
+ *
+ *     Octet no   Name        Description
+ *    ---------------------------------------------------------------
+ *      0..1     TOK_ID     Identification field.  Tokens emitted by
+ *                          GSS_Wrap() contain the hex value 05 04
+ *                          expressed in big-endian order in this field.
+ *      2        Flags      Attributes field, as described in section
+ *                          4.2.2.
+ *      3        Filler     Contains the hex value FF.
+ *      4..5     EC         Contains the &quot;extra count&quot; field, in big-
+ *                          endian order as described in section 4.2.3.
+ *      6..7     RRC        Contains the &quot;right rotation count&quot; in big
+ *                          endian order, as described in section 4.2.5.
+ *      8..15    SND_SEQ    Sequence number field in clear text,
+ *                          expressed in big-endian order.
+ *      16..last Data       Encrypted data for Wrap tokens with
+ *                          confidentiality, or plaintext data followed
+ *                          by the checksum for Wrap tokens without
+ *                          confidentiality, as described in section
+ *                          4.2.4.
+ * MIC Tokens
+ *
+ *     Octet no   Name        Description
+ *     -----------------------------------------------------------------
+ *      0..1     TOK_ID     Identification field.  Tokens emitted by
+ *                          GSS_GetMIC() contain the hex value 04 04
+ *                          expressed in big-endian order in this field.
+ *      2        Flags      Attributes field, as described in section
+ *                          4.2.2.
+ *      3..7     Filler     Contains five octets of hex value FF.
+ *      8..15    SND_SEQ    Sequence number field in clear text,
+ *                          expressed in big-endian order.
+ *      16..last SGN_CKSUM  Checksum of the &quot;to-be-signed&quot; data and
+ *                          octet 0..15, as described in section 4.2.4.
+ *
+ * &lt;/pre&gt;
+ * &lt;p&gt;
+ * This class is the super class of WrapToken_v2 and MicToken_v2. The token's
+ * header (bytes[0..15]) and data (byte[16..]) are saved in tokenHeader and
+ * tokenData fields. Since there is no easy way to find out the exact length
+ * of a WrapToken_v2 token from any header info, in the case of reading from
+ * stream, we read all available() bytes into the token.
+ * &lt;p&gt;
+ * All read actions are performed in this super class. On the write part, the
+ * super class only write the tokenHeader, and the content writing is inside
+ * child classes.
+ *
+ * @author Seema Malkani
+ */
+
+abstract class MessageToken_v2 extends Krb5Token {
+
+    protected static final int TOKEN_HEADER_SIZE = 16;
+    private static final int TOKEN_ID_POS = 0;
+    private static final int TOKEN_FLAG_POS = 2;
+    private static final int TOKEN_EC_POS = 4;
+    private static final int TOKEN_RRC_POS = 6;
+
+    /**
+     * The size of the random confounder used in a WrapToken.
+     */
+    protected static final int CONFOUNDER_SIZE = 16;
+
+    // RFC 4121, key usage values
+    static final int KG_USAGE_ACCEPTOR_SEAL = 22;
+    static final int KG_USAGE_ACCEPTOR_SIGN = 23;
+    static final int KG_USAGE_INITIATOR_SEAL = 24;
+    static final int KG_USAGE_INITIATOR_SIGN = 25;
+
+    // RFC 4121, Flags Field
+    private static final int FLAG_SENDER_IS_ACCEPTOR = 1;
+    private static final int FLAG_WRAP_CONFIDENTIAL  = 2;
+    private static final int FLAG_ACCEPTOR_SUBKEY    = 4;
+    private static final int FILLER = 0xff;
+
+<span class="fc" id="L123">    private MessageTokenHeader tokenHeader = null;</span>
+
+    // Common field
+<span class="fc" id="L126">    private int tokenId = 0;</span>
+    private int seqNumber;
+    protected byte[] tokenData; // content of token, without the header
+    protected int tokenDataLen;
+
+    // Key usage number for crypto action
+<span class="fc" id="L132">    private int key_usage = 0;</span>
+
+    // EC and RRC fields, WrapToken only
+<span class="fc" id="L135">    private int ec = 0;</span>
+<span class="fc" id="L136">    private int rrc = 0;</span>
+
+    // Checksum. Always in MicToken, might be in WrapToken
+<span class="fc" id="L139">    byte[] checksum = null;</span>
+
+    // Context properties
+<span class="fc" id="L142">    private boolean confState = true;</span>
+<span class="fc" id="L143">    private boolean initiator = true;</span>
+<span class="fc" id="L144">    private boolean have_acceptor_subkey = false;</span>
+
+    /* cipher instance used by the corresponding GSSContext */
+<span class="fc" id="L147">    CipherHelper cipherHelper = null;</span>
+
+    /**
+     * Constructs a MessageToken from a byte array.
+     *
+     * @param tokenId the token id that should be contained in this token as
+     * it is read.
+     * @param context the Kerberos context associated with this token
+     * @param tokenBytes the byte array containing the token
+     * @param tokenOffset the offset where the token begins
+     * @param tokenLen the length of the token
+     * @param prop the MessageProp structure in which the properties of the
+     * token should be stored.
+     * @throws GSSException if there is a problem parsing the token
+     */
+    MessageToken_v2(int tokenId, Krb5Context context,
+                 byte[] tokenBytes, int tokenOffset, int tokenLen,
+                 MessageProp prop) throws GSSException {
+<span class="fc" id="L165">        this(tokenId, context,</span>
+             new ByteArrayInputStream(tokenBytes, tokenOffset, tokenLen),
+             prop);
+<span class="fc" id="L168">    }</span>
+
+    /**
+     * Constructs a MessageToken from an InputStream. Bytes will be read on
+     * demand and the thread might block if there are not enough bytes to
+     * complete the token. Please note there is no accurate way to find out
+     * the size of a token, but we try our best to make sure there is
+     * enough bytes to construct one.
+     *
+     * @param tokenId the token id that should be contained in this token as
+     * it is read.
+     * @param context the Kerberos context associated with this token
+     * @param is the InputStream from which to read
+     * @param prop the MessageProp structure in which the properties of the
+     * token should be stored.
+     * @throws GSSException if there is a problem reading from the
+     * InputStream or parsing the token
+     */
+    MessageToken_v2(int tokenId, Krb5Context context, InputStream is,
+<span class="fc" id="L187">                 MessageProp prop) throws GSSException {</span>
+<span class="fc" id="L188">        init(tokenId, context);</span>
+
+        try {
+<span class="pc bpc" id="L191" title="1 of 2 branches missed.">            if (!confState) {</span>
+<span class="nc" id="L192">                prop.setPrivacy(false);</span>
+            }
+<span class="fc" id="L194">            tokenHeader = new MessageTokenHeader(is, prop, tokenId);</span>
+
+            // set key_usage
+<span class="fc bfc" id="L197" title="All 2 branches covered.">            if (tokenId == Krb5Token.WRAP_ID_v2) {</span>
+<span class="pc bpc" id="L198" title="1 of 2 branches missed.">                key_usage = (!initiator ? KG_USAGE_INITIATOR_SEAL</span>
+                                : KG_USAGE_ACCEPTOR_SEAL);
+<span class="pc bpc" id="L200" title="1 of 2 branches missed.">            } else if (tokenId == Krb5Token.MIC_ID_v2) {</span>
+<span class="pc bpc" id="L201" title="1 of 2 branches missed.">                key_usage = (!initiator ? KG_USAGE_INITIATOR_SIGN</span>
+                                : KG_USAGE_ACCEPTOR_SIGN);
+            }
+
+<span class="fc" id="L205">            int minSize = 0;    // minimal size for token data</span>
+<span class="pc bpc" id="L206" title="1 of 4 branches missed.">            if (tokenId == Krb5Token.WRAP_ID_v2 &amp;&amp; prop.getPrivacy()) {</span>
+<span class="fc" id="L207">                minSize = CONFOUNDER_SIZE +</span>
+<span class="fc" id="L208">                        TOKEN_HEADER_SIZE + cipherHelper.getChecksumLength();</span>
+            } else {
+<span class="fc" id="L210">                minSize = cipherHelper.getChecksumLength();</span>
+            }
+
+            // Read token data
+<span class="fc bfc" id="L214" title="All 2 branches covered.">            if (tokenId == Krb5Token.MIC_ID_v2) {</span>
+                // The only case we can precisely predict the token data length
+<span class="fc" id="L216">                tokenDataLen = minSize;</span>
+<span class="fc" id="L217">                tokenData = new byte[minSize];</span>
+<span class="fc" id="L218">                readFully(is, tokenData);</span>
+            } else {
+<span class="fc" id="L220">                tokenDataLen = is.available();</span>
+<span class="pc bpc" id="L221" title="1 of 2 branches missed.">                if (tokenDataLen &gt;= minSize) {  // read in one shot</span>
+<span class="fc" id="L222">                    tokenData = new byte[tokenDataLen];</span>
+<span class="fc" id="L223">                    readFully(is, tokenData);</span>
+                } else {
+<span class="nc" id="L225">                    byte[] tmp = new byte[minSize];</span>
+<span class="nc" id="L226">                    readFully(is, tmp);</span>
+                    // Hope while blocked in the read above, more data would
+                    // come and is.available() below contains the whole token.
+<span class="nc" id="L229">                    int more = is.available();</span>
+<span class="nc" id="L230">                    tokenDataLen = minSize + more;</span>
+<span class="nc" id="L231">                    tokenData = Arrays.copyOf(tmp, tokenDataLen);</span>
+<span class="nc" id="L232">                    readFully(is, tokenData, minSize, more);</span>
+                }
+            }
+
+<span class="fc bfc" id="L236" title="All 2 branches covered.">            if (tokenId == Krb5Token.WRAP_ID_v2) {</span>
+<span class="fc" id="L237">                rotate();</span>
+            }
+
+<span class="pc bpc" id="L240" title="1 of 4 branches missed.">            if (tokenId == Krb5Token.MIC_ID_v2 ||</span>
+<span class="pc bpc" id="L241" title="1 of 2 branches missed.">                    (tokenId == Krb5Token.WRAP_ID_v2 &amp;&amp; !prop.getPrivacy())) {</span>
+                // Read checksum
+<span class="fc" id="L243">                int chkLen = cipherHelper.getChecksumLength();</span>
+<span class="fc" id="L244">                checksum = new byte[chkLen];</span>
+<span class="fc" id="L245">                System.arraycopy(tokenData, tokenDataLen-chkLen,</span>
+                        checksum, 0, chkLen);
+
+                // validate EC for Wrap tokens without confidentiality
+<span class="pc bpc" id="L249" title="3 of 4 branches missed.">                if (tokenId == Krb5Token.WRAP_ID_v2 &amp;&amp; !prop.getPrivacy()) {</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">                    if (chkLen != ec) {</span>
+<span class="nc" id="L251">                        throw new GSSException(GSSException.DEFECTIVE_TOKEN, -1,</span>
+<span class="nc" id="L252">                            getTokenName(tokenId) + &quot;:&quot; + &quot;EC incorrect!&quot;);</span>
+                    }
+                }
+            }
+<span class="nc" id="L256">        } catch (IOException e) {</span>
+<span class="nc" id="L257">            throw new GSSException(GSSException.DEFECTIVE_TOKEN, -1,</span>
+<span class="nc" id="L258">                getTokenName(tokenId) + &quot;:&quot; + e.getMessage());</span>
+<span class="fc" id="L259">        }</span>
+<span class="fc" id="L260">    }</span>
+
+    /**
+     * Used to obtain the token id that was contained in this token.
+     * @return the token id in the token
+     */
+    public final int getTokenId() {
+<span class="nc" id="L267">        return tokenId;</span>
+    }
+
+    /**
+     * Used to obtain the key_usage type for this token.
+     * @return the key_usage for the token
+     */
+    public final int getKeyUsage() {
+<span class="fc" id="L275">        return key_usage;</span>
+    }
+
+    /**
+     * Used to determine if this token contains any encrypted data.
+     * @return true if it contains any encrypted data, false if there is only
+     * plaintext data or if there is no data.
+     */
+    public final boolean getConfState() {
+<span class="nc" id="L284">        return confState;</span>
+    }
+
+    /**
+     * Generates the checksum field and the sequence number field.
+     *
+     * @param prop the MessageProp structure
+     * @param data the application data to checksum
+     * @param offset the offset where the data starts
+     * @param len the length of the data
+     *
+     * @throws GSSException if an error occurs in the checksum calculation or
+     * sequence number calculation.
+     */
+    public void genSignAndSeqNumber(MessageProp prop,
+                                    byte[] data, int offset, int len)
+        throws GSSException {
+
+        //    debug(&quot;Inside MessageToken.genSignAndSeqNumber:\n&quot;);
+
+<span class="fc" id="L304">        int qop = prop.getQOP();</span>
+<span class="pc bpc" id="L305" title="1 of 2 branches missed.">        if (qop != 0) {</span>
+<span class="nc" id="L306">            qop = 0;</span>
+<span class="nc" id="L307">            prop.setQOP(qop);</span>
+        }
+
+<span class="pc bpc" id="L310" title="1 of 2 branches missed.">        if (!confState) {</span>
+<span class="nc" id="L311">            prop.setPrivacy(false);</span>
+        }
+
+        // Create a new gss token header as defined in RFC 4121
+<span class="fc" id="L315">        tokenHeader = new MessageTokenHeader(tokenId, prop.getPrivacy());</span>
+        // debug(&quot;\n\t Message Header = &quot; +
+        // getHexBytes(tokenHeader.getBytes(), tokenHeader.getBytes().length));
+
+        // set key_usage
+<span class="fc bfc" id="L320" title="All 2 branches covered.">        if (tokenId == Krb5Token.WRAP_ID_v2) {</span>
+<span class="pc bpc" id="L321" title="1 of 2 branches missed.">            key_usage = (initiator ? KG_USAGE_INITIATOR_SEAL</span>
+                                : KG_USAGE_ACCEPTOR_SEAL);
+<span class="pc bpc" id="L323" title="1 of 2 branches missed.">        } else if (tokenId == Krb5Token.MIC_ID_v2) {</span>
+<span class="pc bpc" id="L324" title="1 of 2 branches missed.">            key_usage = (initiator ? KG_USAGE_INITIATOR_SIGN</span>
+                                : KG_USAGE_ACCEPTOR_SIGN);
+        }
+
+        // Calculate SGN_CKSUM
+<span class="fc bfc" id="L329" title="All 2 branches covered.">        if ((tokenId == MIC_ID_v2) ||</span>
+<span class="pc bpc" id="L330" title="3 of 4 branches missed.">            (!prop.getPrivacy() &amp;&amp; (tokenId == WRAP_ID_v2))) {</span>
+<span class="fc" id="L331">           checksum = getChecksum(data, offset, len);</span>
+           // debug(&quot;\n\tCalc checksum=&quot; +
+           //  getHexBytes(checksum, checksum.length));
+        }
+
+        // In Wrap tokens without confidentiality, the EC field SHALL be used
+        // to encode the number of octets in the trailing checksum
+<span class="pc bpc" id="L338" title="3 of 4 branches missed.">        if (!prop.getPrivacy() &amp;&amp; (tokenId == WRAP_ID_v2)) {</span>
+<span class="nc" id="L339">            byte[] tok_header = tokenHeader.getBytes();</span>
+<span class="nc" id="L340">            tok_header[4] = (byte) (checksum.length &gt;&gt;&gt; 8);</span>
+<span class="nc" id="L341">            tok_header[5] = (byte) (checksum.length);</span>
+        }
+<span class="fc" id="L343">    }</span>
+
+    /**
+     * Verifies the validity of checksum field
+     *
+     * @param data the application data
+     * @param offset the offset where the data begins
+     * @param len the length of the application data
+     *
+     * @throws GSSException if an error occurs in the checksum calculation
+     */
+    public final boolean verifySign(byte[] data, int offset, int len)
+        throws GSSException {
+
+        // debug(&quot;\t====In verifySign:====\n&quot;);
+        // debug(&quot;\t\t checksum:   [&quot; + getHexBytes(checksum) + &quot;]\n&quot;);
+        // debug(&quot;\t\t data = [&quot; + getHexBytes(data) + &quot;]\n&quot;);
+
+<span class="fc" id="L361">        byte[] myChecksum = getChecksum(data, offset, len);</span>
+        // debug(&quot;\t\t mychecksum: [&quot; + getHexBytes(myChecksum) +&quot;]\n&quot;);
+
+<span class="pc bpc" id="L364" title="1 of 2 branches missed.">        if (MessageDigest.isEqual(checksum, myChecksum)) {</span>
+            // debug(&quot;\t\t====Checksum PASS:====\n&quot;);
+<span class="fc" id="L366">            return true;</span>
+        }
+<span class="nc" id="L368">        return false;</span>
+    }
+
+    /**
+     * Rotate bytes as per the &quot;RRC&quot; (Right Rotation Count) received.
+     * Our implementation does not do any rotates when sending, only
+     * when receiving, we rotate left as per the RRC count, to revert it.
+     */
+    private void rotate() {
+<span class="pc bpc" id="L377" title="1 of 2 branches missed.">        if (rrc % tokenDataLen != 0) {</span>
+<span class="nc" id="L378">           rrc = rrc % tokenDataLen;</span>
+<span class="nc" id="L379">           byte[] newBytes = new byte[tokenDataLen];</span>
+
+<span class="nc" id="L381">           System.arraycopy(tokenData, rrc, newBytes, 0, tokenDataLen-rrc);</span>
+<span class="nc" id="L382">           System.arraycopy(tokenData, 0, newBytes, tokenDataLen-rrc, rrc);</span>
+
+<span class="nc" id="L384">           tokenData = newBytes;</span>
+        }
+<span class="fc" id="L386">    }</span>
+
+    public final int getSequenceNumber() {
+<span class="fc" id="L389">        return seqNumber;</span>
+    }
+
+    /**
+     * Computes the checksum based on the algorithm stored in the
+     * tokenHeader.
+     *
+     * @param data the application data
+     * @param offset the offset where the data begins
+     * @param len the length of the application data
+     *
+     * @throws GSSException if an error occurs in the checksum calculation.
+     */
+    byte[] getChecksum(byte[] data, int offset, int len)
+        throws GSSException {
+
+        //      debug(&quot;Will do getChecksum:\n&quot;);
+
+        /*
+         * For checksum calculation the token header bytes i.e., the first 16
+         * bytes following the GSSHeader, are logically prepended to the
+         * application data to bind the data to this particular token.
+         *
+         * Note: There is no such requirement wrt adding padding to the
+         * application data for checksumming, although the cryptographic
+         * algorithm used might itself apply some padding.
+         */
+
+<span class="fc" id="L417">        byte[] tokenHeaderBytes = tokenHeader.getBytes();</span>
+
+        // check confidentiality
+<span class="fc" id="L420">        int conf_flag = tokenHeaderBytes[TOKEN_FLAG_POS] &amp;</span>
+                                FLAG_WRAP_CONFIDENTIAL;
+
+        // clear EC and RRC in token header for checksum calculation
+<span class="pc bpc" id="L424" title="2 of 4 branches missed.">        if ((conf_flag == 0) &amp;&amp; (tokenId == WRAP_ID_v2)) {</span>
+<span class="nc" id="L425">            tokenHeaderBytes[4] = 0;</span>
+<span class="nc" id="L426">            tokenHeaderBytes[5] = 0;</span>
+<span class="nc" id="L427">            tokenHeaderBytes[6] = 0;</span>
+<span class="nc" id="L428">            tokenHeaderBytes[7] = 0;</span>
+        }
+<span class="fc" id="L430">        return cipherHelper.calculateChecksum(tokenHeaderBytes, data,</span>
+                                                offset, len, key_usage);
+    }
+
+
+    /**
+     * Constructs an empty MessageToken for the local context to send to
+     * the peer. It also increments the local sequence number in the
+     * Krb5Context instance it uses after obtaining the object lock for
+     * it.
+     *
+     * @param tokenId the token id that should be contained in this token
+     * @param context the Kerberos context associated with this token
+     */
+<span class="fc" id="L444">    MessageToken_v2(int tokenId, Krb5Context context) throws GSSException {</span>
+        /*
+          debug(&quot;\n============================&quot;);
+          debug(&quot;\nMySessionKey=&quot; +
+          getHexBytes(context.getMySessionKey().getBytes()));
+          debug(&quot;\nPeerSessionKey=&quot; +
+          getHexBytes(context.getPeerSessionKey().getBytes()));
+          debug(&quot;\n============================\n&quot;);
+        */
+<span class="fc" id="L453">        init(tokenId, context);</span>
+<span class="fc" id="L454">        this.seqNumber = context.incrementMySequenceNumber();</span>
+<span class="fc" id="L455">    }</span>
+
+    private void init(int tokenId, Krb5Context context) throws GSSException {
+<span class="fc" id="L458">        this.tokenId = tokenId;</span>
+        // Just for consistency check in Wrap
+<span class="fc" id="L460">        this.confState = context.getConfState();</span>
+
+<span class="fc" id="L462">        this.initiator = context.isInitiator();</span>
+
+<span class="pc bpc" id="L464" title="1 of 2 branches missed.">        this.have_acceptor_subkey = context.getKeySrc() == Krb5Context.ACCEPTOR_SUBKEY;</span>
+
+<span class="fc" id="L466">        this.cipherHelper = context.getCipherHelper(null);</span>
+        //    debug(&quot;In MessageToken.Cons&quot;);
+<span class="fc" id="L468">    }</span>
+
+    /**
+     * Encodes a MessageTokenHeader onto an OutputStream.
+     *
+     * @param os the OutputStream to which this should be written
+     * @throws IOException is an error occurs while writing to the OutputStream
+     */
+    protected void encodeHeader(OutputStream os) throws IOException {
+<span class="fc" id="L477">        tokenHeader.encode(os);</span>
+<span class="fc" id="L478">    }</span>
+
+    /**
+     * Encodes a MessageToken_v2 onto an OutputStream.
+     *
+     * @param os the OutputStream to which this should be written
+     * @throws IOException is an error occurs while encoding the token
+     */
+    public abstract void encode(OutputStream os) throws IOException;
+
+    protected final byte[] getTokenHeader() {
+<span class="fc" id="L489">        return (tokenHeader.getBytes());</span>
+    }
+
+    // ******************************************* //
+    //  I N N E R    C L A S S E S    F O L L O W
+    // ******************************************* //
+
+    /**
+     * This inner class represents the initial portion of the message token.
+     * It constitutes the first 16 bytes of the message token.
+     */
+    class MessageTokenHeader {
+
+         private int tokenId;
+<span class="fc" id="L503">         private byte[] bytes = new byte[TOKEN_HEADER_SIZE];</span>
+
+         // Writes a new token header
+<span class="fc" id="L506">         public MessageTokenHeader(int tokenId, boolean conf) throws GSSException {</span>
+
+<span class="fc" id="L508">            this.tokenId = tokenId;</span>
+
+<span class="fc" id="L510">            bytes[0] = (byte) (tokenId &gt;&gt;&gt; 8);</span>
+<span class="fc" id="L511">            bytes[1] = (byte) (tokenId);</span>
+
+            // Flags (Note: MIT impl requires subkey)
+<span class="fc" id="L514">            int flags = 0;</span>
+<span class="pc bpc" id="L515" title="1 of 6 branches missed.">            flags = (initiator ? 0 : FLAG_SENDER_IS_ACCEPTOR) |</span>
+                     ((conf &amp;&amp; tokenId != MIC_ID_v2) ?
+                                FLAG_WRAP_CONFIDENTIAL : 0) |
+<span class="pc bpc" id="L518" title="1 of 2 branches missed.">                     (have_acceptor_subkey ? FLAG_ACCEPTOR_SUBKEY : 0);</span>
+<span class="fc" id="L519">            bytes[2] = (byte) flags;</span>
+
+            // filler
+<span class="fc" id="L522">            bytes[3] = (byte) FILLER;</span>
+
+<span class="fc bfc" id="L524" title="All 2 branches covered.">            if (tokenId == WRAP_ID_v2) {</span>
+                // EC field
+<span class="fc" id="L526">                bytes[4] = (byte) 0;</span>
+<span class="fc" id="L527">                bytes[5] = (byte) 0;</span>
+                // RRC field
+<span class="fc" id="L529">                bytes[6] = (byte) 0;</span>
+<span class="fc" id="L530">                bytes[7] = (byte) 0;</span>
+<span class="pc bpc" id="L531" title="1 of 2 branches missed.">            } else if (tokenId == MIC_ID_v2) {</span>
+                // more filler for MicToken
+<span class="fc bfc" id="L533" title="All 2 branches covered.">                for (int i = 4; i &lt; 8; i++) {</span>
+<span class="fc" id="L534">                    bytes[i] = (byte) FILLER;</span>
+                }
+            }
+
+            // Calculate SND_SEQ, only write 4 bytes from the 12th position
+<span class="fc" id="L539">            writeBigEndian(seqNumber, bytes, 12);</span>
+<span class="fc" id="L540">        }</span>
+
+        /**
+         * Reads a MessageTokenHeader from an InputStream and sets the
+         * appropriate confidentiality and quality of protection
+         * values in a MessageProp structure.
+         *
+         * @param is the InputStream to read from
+         * @param prop the MessageProp to populate
+         * @throws IOException is an error occurs while reading from the
+         * InputStream
+         */
+        public MessageTokenHeader(InputStream is, MessageProp prop, int tokId)
+<span class="fc" id="L553">            throws IOException, GSSException {</span>
+
+<span class="fc" id="L555">            readFully(is, bytes, 0, TOKEN_HEADER_SIZE);</span>
+<span class="fc" id="L556">            tokenId = readInt(bytes, TOKEN_ID_POS);</span>
+
+            // validate Token ID
+<span class="pc bpc" id="L559" title="1 of 2 branches missed.">            if (tokenId != tokId) {</span>
+<span class="nc" id="L560">                throw new GSSException(GSSException.DEFECTIVE_TOKEN, -1,</span>
+<span class="nc" id="L561">                    getTokenName(tokenId) + &quot;:&quot; + &quot;Defective Token ID!&quot;);</span>
+            }
+
+            /*
+             * Validate new GSS TokenHeader
+             */
+
+            // valid acceptor_flag
+            // If I am initiator, the received token should have ACCEPTOR on
+<span class="fc bfc" id="L570" title="All 2 branches covered.">            int acceptor_flag = (initiator ? FLAG_SENDER_IS_ACCEPTOR : 0);</span>
+<span class="fc" id="L571">            int flag = bytes[TOKEN_FLAG_POS] &amp; FLAG_SENDER_IS_ACCEPTOR;</span>
+<span class="pc bpc" id="L572" title="1 of 2 branches missed.">            if (flag != acceptor_flag) {</span>
+<span class="nc" id="L573">                throw new GSSException(GSSException.DEFECTIVE_TOKEN, -1,</span>
+<span class="nc" id="L574">                        getTokenName(tokenId) + &quot;:&quot; + &quot;Acceptor Flag Error!&quot;);</span>
+            }
+
+            // check for confidentiality
+<span class="fc" id="L578">            int conf_flag = bytes[TOKEN_FLAG_POS] &amp; FLAG_WRAP_CONFIDENTIAL;</span>
+<span class="pc bpc" id="L579" title="1 of 4 branches missed.">            if ((conf_flag == FLAG_WRAP_CONFIDENTIAL) &amp;&amp;</span>
+                (tokenId == WRAP_ID_v2)) {
+<span class="fc" id="L581">                prop.setPrivacy(true);</span>
+            } else {
+<span class="fc" id="L583">                prop.setPrivacy(false);</span>
+            }
+
+<span class="fc bfc" id="L586" title="All 2 branches covered.">            if (tokenId == WRAP_ID_v2) {</span>
+                // validate filler
+<span class="pc bpc" id="L588" title="1 of 2 branches missed.">                if ((bytes[3] &amp; 0xff) != FILLER) {</span>
+<span class="nc" id="L589">                    throw new GSSException(GSSException.DEFECTIVE_TOKEN, -1,</span>
+<span class="nc" id="L590">                        getTokenName(tokenId) + &quot;:&quot; + &quot;Defective Token Filler!&quot;);</span>
+                }
+
+                // read EC field
+<span class="fc" id="L594">                ec = readBigEndian(bytes, TOKEN_EC_POS, 2);</span>
+
+                // read RRC field
+<span class="fc" id="L597">                rrc = readBigEndian(bytes, TOKEN_RRC_POS, 2);</span>
+<span class="pc bpc" id="L598" title="1 of 2 branches missed.">            } else if (tokenId == MIC_ID_v2) {</span>
+<span class="fc bfc" id="L599" title="All 2 branches covered.">                for (int i = 3; i &lt; 8; i++) {</span>
+<span class="pc bpc" id="L600" title="1 of 2 branches missed.">                    if ((bytes[i] &amp; 0xff) != FILLER) {</span>
+<span class="nc" id="L601">                        throw new GSSException(GSSException.DEFECTIVE_TOKEN,</span>
+<span class="nc" id="L602">                                -1, getTokenName(tokenId) + &quot;:&quot; +</span>
+                                &quot;Defective Token Filler!&quot;);
+                    }
+                }
+            }
+
+            // set default QOP
+<span class="fc" id="L609">            prop.setQOP(0);</span>
+
+            // sequence number
+<span class="fc" id="L612">            seqNumber = readBigEndian(bytes, 0, 8);</span>
+<span class="fc" id="L613">        }</span>
+
+        /**
+         * Encodes this MessageTokenHeader onto an OutputStream
+         * @param os the OutputStream to write to
+         * @throws IOException is an error occurs while writing
+         */
+        public final void encode(OutputStream os) throws IOException {
+<span class="fc" id="L621">            os.write(bytes);</span>
+<span class="fc" id="L622">        }</span>
+
+
+        /**
+         * Returns the token id for the message token.
+         * @return the token id
+         * @see sun.security.jgss.krb5.Krb5Token#MIC_ID_v2
+         * @see sun.security.jgss.krb5.Krb5Token#WRAP_ID_v2
+         */
+        public final int getTokenId() {
+<span class="nc" id="L632">            return tokenId;</span>
+        }
+
+        /**
+         * Returns the bytes of this header.
+         * @return 8 bytes that form this header
+         */
+        public final byte[] getBytes() {
+<span class="fc" id="L640">            return bytes;</span>
+        }
+    } // end of class MessageTokenHeader
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

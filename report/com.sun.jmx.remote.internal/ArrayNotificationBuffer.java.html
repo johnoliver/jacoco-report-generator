@@ -1,0 +1,853 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ArrayNotificationBuffer.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">com.sun.jmx.remote.internal</a> &gt; <span class="el_source">ArrayNotificationBuffer.java</span></div><h1>ArrayNotificationBuffer.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2003, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package com.sun.jmx.remote.internal;
+
+import java.security.AccessController;
+import java.security.PrivilegedAction;
+import java.security.PrivilegedActionException;
+import java.security.PrivilegedExceptionAction;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.HashMap;
+import java.util.Map;
+
+import javax.management.InstanceNotFoundException;
+import javax.management.MBeanServer;
+import javax.management.MBeanServerDelegate;
+import javax.management.MBeanServerNotification;
+import javax.management.Notification;
+import javax.management.NotificationBroadcaster;
+import javax.management.NotificationFilter;
+import javax.management.NotificationFilterSupport;
+import javax.management.NotificationListener;
+import javax.management.ObjectName;
+import javax.management.QueryEval;
+import javax.management.QueryExp;
+
+import javax.management.remote.NotificationResult;
+import javax.management.remote.TargetedNotification;
+
+import com.sun.jmx.remote.util.EnvHelp;
+import com.sun.jmx.remote.util.ClassLogger;
+
+/** A circular buffer of notifications received from an MBean server. */
+/*
+  There is one instance of ArrayNotificationBuffer for every
+  MBeanServer object that has an attached ConnectorServer.  Then, for
+  every ConnectorServer attached to a given MBeanServer, there is an
+  instance of the inner class ShareBuffer.  So for example with two
+  ConnectorServers it looks like this:
+
+  ConnectorServer1 -&gt; ShareBuffer1 -\
+                                     }-&gt; ArrayNotificationBuffer
+  ConnectorServer2 -&gt; ShareBuffer2 -/              |
+                                                   |
+                                                   v
+                                              MBeanServer
+
+  The ArrayNotificationBuffer has a circular buffer of
+  NamedNotification objects.  Each ConnectorServer defines a
+  notification buffer size, and this size is recorded by the
+  corresponding ShareBuffer.  The buffer size of the
+  ArrayNotificationBuffer is the maximum of all of its ShareBuffers.
+  When a ShareBuffer is added or removed, the ArrayNotificationBuffer
+  size is adjusted accordingly.
+
+  An ArrayNotificationBuffer also has a BufferListener (which is a
+  NotificationListener) registered on every NotificationBroadcaster
+  MBean in the MBeanServer to which it is attached.  The cost of this
+  potentially large set of listeners is the principal motivation for
+  sharing the ArrayNotificationBuffer between ConnectorServers, and
+  also the reason that we are careful to discard the
+  ArrayNotificationBuffer (and its BufferListeners) when there are no
+  longer any ConnectorServers using it.
+
+  The synchronization of this class is inherently complex.  In an attempt
+  to limit the complexity, we use just two locks:
+
+  - globalLock controls access to the mapping between an MBeanServer
+    and its ArrayNotificationBuffer and to the set of ShareBuffers for
+    each ArrayNotificationBuffer.
+
+  - the instance lock of each ArrayNotificationBuffer controls access
+    to the array of notifications, including its size, and to the
+    dispose flag of the ArrayNotificationBuffer.  The wait/notify
+    mechanism is used to indicate changes to the array.
+
+  If both locks are held at the same time, the globalLock must be
+  taken first.
+
+  Since adding or removing a BufferListener to an MBean can involve
+  calling user code, we are careful not to hold any locks while it is
+  done.
+ */
+public class ArrayNotificationBuffer implements NotificationBuffer {
+<span class="nc" id="L112">    private boolean disposed = false;</span>
+
+    // FACTORY STUFF, INCLUDING SHARING
+
+<span class="nc" id="L116">    private static final Object globalLock = new Object();</span>
+    private static final
+<span class="nc" id="L118">        HashMap&lt;MBeanServer,ArrayNotificationBuffer&gt; mbsToBuffer =</span>
+        new HashMap&lt;MBeanServer,ArrayNotificationBuffer&gt;(1);
+<span class="nc" id="L120">    private final Collection&lt;ShareBuffer&gt; sharers = new HashSet&lt;ShareBuffer&gt;(1);</span>
+
+    public static NotificationBuffer getNotificationBuffer(
+            MBeanServer mbs, Map&lt;String, ?&gt; env) {
+
+<span class="nc bnc" id="L125" title="All 2 branches missed.">        if (env == null)</span>
+<span class="nc" id="L126">            env = Collections.emptyMap();</span>
+
+        //Find out queue size
+<span class="nc" id="L129">        int queueSize = EnvHelp.getNotifBufferSize(env);</span>
+
+        ArrayNotificationBuffer buf;
+        boolean create;
+        NotificationBuffer sharer;
+<span class="nc" id="L134">        synchronized (globalLock) {</span>
+<span class="nc" id="L135">            buf = mbsToBuffer.get(mbs);</span>
+<span class="nc bnc" id="L136" title="All 2 branches missed.">            create = (buf == null);</span>
+<span class="nc bnc" id="L137" title="All 2 branches missed.">            if (create) {</span>
+<span class="nc" id="L138">                buf = new ArrayNotificationBuffer(mbs, queueSize);</span>
+<span class="nc" id="L139">                mbsToBuffer.put(mbs, buf);</span>
+            }
+<span class="nc" id="L141">            sharer = buf.new ShareBuffer(queueSize);</span>
+<span class="nc" id="L142">        }</span>
+        /* We avoid holding any locks while calling createListeners.
+         * This prevents possible deadlocks involving user code, but
+         * does mean that a second ConnectorServer created and started
+         * in this window will return before all the listeners are ready,
+         * which could lead to surprising behaviour.  The alternative
+         * would be to block the second ConnectorServer until the first
+         * one has finished adding all the listeners, but that would then
+         * be subject to deadlock.
+         */
+<span class="nc bnc" id="L152" title="All 2 branches missed.">        if (create)</span>
+<span class="nc" id="L153">            buf.createListeners();</span>
+<span class="nc" id="L154">        return sharer;</span>
+    }
+
+    /* Ensure that this buffer is no longer the one that will be returned by
+     * getNotificationBuffer.  This method is idempotent - calling it more
+     * than once has no effect beyond that of calling it once.
+     */
+    static void removeNotificationBuffer(MBeanServer mbs) {
+<span class="nc" id="L162">        synchronized (globalLock) {</span>
+<span class="nc" id="L163">            mbsToBuffer.remove(mbs);</span>
+<span class="nc" id="L164">        }</span>
+<span class="nc" id="L165">    }</span>
+
+    void addSharer(ShareBuffer sharer) {
+<span class="nc" id="L168">        synchronized (globalLock) {</span>
+<span class="nc" id="L169">            synchronized (this) {</span>
+<span class="nc bnc" id="L170" title="All 2 branches missed.">                if (sharer.getSize() &gt; queueSize)</span>
+<span class="nc" id="L171">                    resize(sharer.getSize());</span>
+<span class="nc" id="L172">            }</span>
+<span class="nc" id="L173">            sharers.add(sharer);</span>
+<span class="nc" id="L174">        }</span>
+<span class="nc" id="L175">    }</span>
+
+    private void removeSharer(ShareBuffer sharer) {
+        boolean empty;
+<span class="nc" id="L179">        synchronized (globalLock) {</span>
+<span class="nc" id="L180">            sharers.remove(sharer);</span>
+<span class="nc" id="L181">            empty = sharers.isEmpty();</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">            if (empty)</span>
+<span class="nc" id="L183">                removeNotificationBuffer(mBeanServer);</span>
+            else {
+<span class="nc" id="L185">                int max = 0;</span>
+<span class="nc bnc" id="L186" title="All 2 branches missed.">                for (ShareBuffer buf : sharers) {</span>
+<span class="nc" id="L187">                    int bufsize = buf.getSize();</span>
+<span class="nc bnc" id="L188" title="All 2 branches missed.">                    if (bufsize &gt; max)</span>
+<span class="nc" id="L189">                        max = bufsize;</span>
+<span class="nc" id="L190">                }</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">                if (max &lt; queueSize)</span>
+<span class="nc" id="L192">                    resize(max);</span>
+            }
+<span class="nc" id="L194">        }</span>
+<span class="nc bnc" id="L195" title="All 2 branches missed.">        if (empty) {</span>
+<span class="nc" id="L196">            synchronized (this) {</span>
+<span class="nc" id="L197">                disposed = true;</span>
+                // Notify potential waiting fetchNotification call
+<span class="nc" id="L199">                notifyAll();</span>
+<span class="nc" id="L200">            }</span>
+<span class="nc" id="L201">            destroyListeners();</span>
+        }
+<span class="nc" id="L203">    }</span>
+
+    private synchronized void resize(int newSize) {
+<span class="nc bnc" id="L206" title="All 2 branches missed.">        if (newSize == queueSize)</span>
+<span class="nc" id="L207">            return;</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">        while (queue.size() &gt; newSize)</span>
+<span class="nc" id="L209">            dropNotification();</span>
+<span class="nc" id="L210">        queue.resize(newSize);</span>
+<span class="nc" id="L211">        queueSize = newSize;</span>
+<span class="nc" id="L212">    }</span>
+
+    private class ShareBuffer implements NotificationBuffer {
+<span class="nc" id="L215">        ShareBuffer(int size) {</span>
+<span class="nc" id="L216">            this.size = size;</span>
+<span class="nc" id="L217">            addSharer(this);</span>
+<span class="nc" id="L218">        }</span>
+
+        public NotificationResult
+            fetchNotifications(NotificationBufferFilter filter,
+                               long startSequenceNumber,
+                               long timeout,
+                               int maxNotifications)
+                throws InterruptedException {
+<span class="nc" id="L226">            NotificationBuffer buf = ArrayNotificationBuffer.this;</span>
+<span class="nc" id="L227">            return buf.fetchNotifications(filter, startSequenceNumber,</span>
+                                          timeout, maxNotifications);
+        }
+
+        public void dispose() {
+<span class="nc" id="L232">            ArrayNotificationBuffer.this.removeSharer(this);</span>
+<span class="nc" id="L233">        }</span>
+
+        int getSize() {
+<span class="nc" id="L236">            return size;</span>
+        }
+
+        private final int size;
+    }
+
+
+    // ARRAYNOTIFICATIONBUFFER IMPLEMENTATION
+
+<span class="nc" id="L245">    private ArrayNotificationBuffer(MBeanServer mbs, int queueSize) {</span>
+<span class="nc bnc" id="L246" title="All 2 branches missed.">        if (logger.traceOn())</span>
+<span class="nc" id="L247">            logger.trace(&quot;Constructor&quot;, &quot;queueSize=&quot; + queueSize);</span>
+
+<span class="nc bnc" id="L249" title="All 4 branches missed.">        if (mbs == null || queueSize &lt; 1)</span>
+<span class="nc" id="L250">            throw new IllegalArgumentException(&quot;Bad args&quot;);</span>
+
+<span class="nc" id="L252">        this.mBeanServer = mbs;</span>
+<span class="nc" id="L253">        this.queueSize = queueSize;</span>
+<span class="nc" id="L254">        this.queue = new ArrayQueue&lt;NamedNotification&gt;(queueSize);</span>
+<span class="nc" id="L255">        this.earliestSequenceNumber = System.currentTimeMillis();</span>
+<span class="nc" id="L256">        this.nextSequenceNumber = this.earliestSequenceNumber;</span>
+
+<span class="nc" id="L258">        logger.trace(&quot;Constructor&quot;, &quot;ends&quot;);</span>
+<span class="nc" id="L259">    }</span>
+
+    private synchronized boolean isDisposed() {
+<span class="nc" id="L262">        return disposed;</span>
+    }
+
+    // We no longer support calling this method from outside.
+    // The JDK doesn't contain any such calls and users are not
+    // supposed to be accessing this class.
+    public void dispose() {
+<span class="nc" id="L269">        throw new UnsupportedOperationException();</span>
+    }
+
+    /**
+     * &lt;p&gt;Fetch notifications that match the given listeners.&lt;/p&gt;
+     *
+     * &lt;p&gt;The operation only considers notifications with a sequence
+     * number at least &lt;code&gt;startSequenceNumber&lt;/code&gt;.  It will take
+     * no longer than &lt;code&gt;timeout&lt;/code&gt;, and will return no more
+     * than &lt;code&gt;maxNotifications&lt;/code&gt; different notifications.&lt;/p&gt;
+     *
+     * &lt;p&gt;If there are no notifications matching the criteria, the
+     * operation will block until one arrives, subject to the
+     * timeout.&lt;/p&gt;
+     *
+     * @param filter an object that will add notifications to a
+     * {@code List&lt;TargetedNotification&gt;} if they match the current
+     * listeners with their filters.
+     * @param startSequenceNumber the first sequence number to
+     * consider.
+     * @param timeout the maximum time to wait.  May be 0 to indicate
+     * not to wait if there are no notifications.
+     * @param maxNotifications the maximum number of notifications to
+     * return.  May be 0 to indicate a wait for eligible notifications
+     * that will return a usable &lt;code&gt;nextSequenceNumber&lt;/code&gt;.  The
+     * {@link TargetedNotification} array in the returned {@link
+     * NotificationResult} may contain more than this number of
+     * elements but will not contain more than this number of
+     * different notifications.
+     */
+    public NotificationResult
+        fetchNotifications(NotificationBufferFilter filter,
+                           long startSequenceNumber,
+                           long timeout,
+                           int maxNotifications)
+            throws InterruptedException {
+
+<span class="nc" id="L306">        logger.trace(&quot;fetchNotifications&quot;, &quot;starts&quot;);</span>
+
+<span class="nc bnc" id="L308" title="All 4 branches missed.">        if (startSequenceNumber &lt; 0 || isDisposed()) {</span>
+<span class="nc" id="L309">            synchronized(this) {</span>
+<span class="nc" id="L310">                return new NotificationResult(earliestSequenceNumber(),</span>
+<span class="nc" id="L311">                                              nextSequenceNumber(),</span>
+                                              new TargetedNotification[0]);
+<span class="nc" id="L313">            }</span>
+        }
+
+        // Check arg validity
+<span class="nc bnc" id="L317" title="All 8 branches missed.">        if (filter == null</span>
+            || startSequenceNumber &lt; 0 || timeout &lt; 0
+            || maxNotifications &lt; 0) {
+<span class="nc" id="L320">            logger.trace(&quot;fetchNotifications&quot;, &quot;Bad args&quot;);</span>
+<span class="nc" id="L321">            throw new IllegalArgumentException(&quot;Bad args to fetch&quot;);</span>
+        }
+
+<span class="nc bnc" id="L324" title="All 2 branches missed.">        if (logger.debugOn()) {</span>
+<span class="nc" id="L325">            logger.trace(&quot;fetchNotifications&quot;,</span>
+                  &quot;filter=&quot; + filter + &quot;; startSeq=&quot; +
+                  startSequenceNumber + &quot;; timeout=&quot; + timeout +
+                  &quot;; max=&quot; + maxNotifications);
+        }
+
+<span class="nc bnc" id="L331" title="All 2 branches missed.">        if (startSequenceNumber &gt; nextSequenceNumber()) {</span>
+<span class="nc" id="L332">            final String msg = &quot;Start sequence number too big: &quot; +</span>
+<span class="nc" id="L333">                startSequenceNumber + &quot; &gt; &quot; + nextSequenceNumber();</span>
+<span class="nc" id="L334">            logger.trace(&quot;fetchNotifications&quot;, msg);</span>
+<span class="nc" id="L335">            throw new IllegalArgumentException(msg);</span>
+        }
+
+        /* Determine the end time corresponding to the timeout value.
+           Caller may legitimately supply Long.MAX_VALUE to indicate no
+           timeout.  In that case the addition will overflow and produce
+           a negative end time.  Set end time to Long.MAX_VALUE in that
+           case.  We assume System.currentTimeMillis() is positive.  */
+<span class="nc" id="L343">        long endTime = System.currentTimeMillis() + timeout;</span>
+<span class="nc bnc" id="L344" title="All 2 branches missed.">        if (endTime &lt; 0) // overflow</span>
+<span class="nc" id="L345">            endTime = Long.MAX_VALUE;</span>
+
+<span class="nc bnc" id="L347" title="All 2 branches missed.">        if (logger.debugOn())</span>
+<span class="nc" id="L348">            logger.debug(&quot;fetchNotifications&quot;, &quot;endTime=&quot; + endTime);</span>
+
+        /* We set earliestSeq the first time through the loop.  If we
+           set it here, notifications could be dropped before we
+           started examining them, so earliestSeq might not correspond
+           to the earliest notification we examined.  */
+<span class="nc" id="L354">        long earliestSeq = -1;</span>
+<span class="nc" id="L355">        long nextSeq = startSequenceNumber;</span>
+<span class="nc" id="L356">        List&lt;TargetedNotification&gt; notifs =</span>
+            new ArrayList&lt;TargetedNotification&gt;();
+
+        /* On exit from this loop, notifs, earliestSeq, and nextSeq must
+           all be correct values for the returned NotificationResult.  */
+        while (true) {
+<span class="nc" id="L362">            logger.debug(&quot;fetchNotifications&quot;, &quot;main loop starts&quot;);</span>
+
+            NamedNotification candidate;
+
+            /* Get the next available notification regardless of filters,
+               or wait for one to arrive if there is none.  */
+<span class="nc" id="L368">            synchronized (this) {</span>
+
+                /* First time through.  The current earliestSequenceNumber
+                   is the first one we could have examined.  */
+<span class="nc bnc" id="L372" title="All 2 branches missed.">                if (earliestSeq &lt; 0) {</span>
+<span class="nc" id="L373">                    earliestSeq = earliestSequenceNumber();</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">                    if (logger.debugOn()) {</span>
+<span class="nc" id="L375">                        logger.debug(&quot;fetchNotifications&quot;,</span>
+                              &quot;earliestSeq=&quot; + earliestSeq);
+                    }
+<span class="nc bnc" id="L378" title="All 2 branches missed.">                    if (nextSeq &lt; earliestSeq) {</span>
+<span class="nc" id="L379">                        nextSeq = earliestSeq;</span>
+<span class="nc" id="L380">                        logger.debug(&quot;fetchNotifications&quot;,</span>
+                                     &quot;nextSeq=earliestSeq&quot;);
+                    }
+                } else
+<span class="nc" id="L384">                    earliestSeq = earliestSequenceNumber();</span>
+
+                /* If many notifications have been dropped since the
+                   last time through, nextSeq could now be earlier
+                   than the current earliest.  If so, notifications
+                   may have been lost and we return now so the caller
+                   can see this next time it calls.  */
+<span class="nc bnc" id="L391" title="All 2 branches missed.">                if (nextSeq &lt; earliestSeq) {</span>
+<span class="nc" id="L392">                    logger.trace(&quot;fetchNotifications&quot;,</span>
+                          &quot;nextSeq=&quot; + nextSeq + &quot; &lt; &quot; + &quot;earliestSeq=&quot; +
+                          earliestSeq + &quot; so may have lost notifs&quot;);
+<span class="nc" id="L395">                    break;</span>
+                }
+
+<span class="nc bnc" id="L398" title="All 2 branches missed.">                if (nextSeq &lt; nextSequenceNumber()) {</span>
+<span class="nc" id="L399">                    candidate = notificationAt(nextSeq);</span>
+                    // Skip security check if NotificationBufferFilter is not overloaded
+<span class="nc bnc" id="L401" title="All 2 branches missed.">                    if (!(filter instanceof ServerNotifForwarder.NotifForwarderBufferFilter)) {</span>
+                        try {
+<span class="nc" id="L403">                            ServerNotifForwarder.checkMBeanPermission(this.mBeanServer,</span>
+<span class="nc" id="L404">                                                      candidate.getObjectName(),&quot;addNotificationListener&quot;);</span>
+<span class="nc" id="L405">                        } catch (InstanceNotFoundException | SecurityException e) {</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">                            if (logger.debugOn()) {</span>
+<span class="nc" id="L407">                                logger.debug(&quot;fetchNotifications&quot;, &quot;candidate: &quot; + candidate + &quot; skipped. exception &quot; + e);</span>
+                            }
+<span class="nc" id="L409">                            ++nextSeq;</span>
+<span class="nc" id="L410">                            continue;</span>
+<span class="nc" id="L411">                        }</span>
+                    }
+
+<span class="nc bnc" id="L414" title="All 2 branches missed.">                    if (logger.debugOn()) {</span>
+<span class="nc" id="L415">                        logger.debug(&quot;fetchNotifications&quot;, &quot;candidate: &quot; +</span>
+                                     candidate);
+<span class="nc" id="L417">                        logger.debug(&quot;fetchNotifications&quot;, &quot;nextSeq now &quot; +</span>
+                                     nextSeq);
+                    }
+                } else {
+                    /* nextSeq is the largest sequence number.  If we
+                       already got notifications, return them now.
+                       Otherwise wait for some to arrive, with
+                       timeout.  */
+<span class="nc bnc" id="L425" title="All 2 branches missed.">                    if (notifs.size() &gt; 0) {</span>
+<span class="nc" id="L426">                        logger.debug(&quot;fetchNotifications&quot;,</span>
+                              &quot;no more notifs but have some so don't wait&quot;);
+<span class="nc" id="L428">                        break;</span>
+                    }
+<span class="nc" id="L430">                    long toWait = endTime - System.currentTimeMillis();</span>
+<span class="nc bnc" id="L431" title="All 2 branches missed.">                    if (toWait &lt;= 0) {</span>
+<span class="nc" id="L432">                        logger.debug(&quot;fetchNotifications&quot;, &quot;timeout&quot;);</span>
+<span class="nc" id="L433">                        break;</span>
+                    }
+
+                    /* dispose called */
+<span class="nc bnc" id="L437" title="All 2 branches missed.">                    if (isDisposed()) {</span>
+<span class="nc bnc" id="L438" title="All 2 branches missed.">                        if (logger.debugOn())</span>
+<span class="nc" id="L439">                            logger.debug(&quot;fetchNotifications&quot;,</span>
+                                         &quot;dispose callled, no wait&quot;);
+<span class="nc" id="L441">                        return new NotificationResult(earliestSequenceNumber(),</span>
+<span class="nc" id="L442">                                                  nextSequenceNumber(),</span>
+                                                  new TargetedNotification[0]);
+                    }
+
+<span class="nc bnc" id="L446" title="All 2 branches missed.">                    if (logger.debugOn())</span>
+<span class="nc" id="L447">                        logger.debug(&quot;fetchNotifications&quot;,</span>
+                                     &quot;wait(&quot; + toWait + &quot;)&quot;);
+<span class="nc" id="L449">                    wait(toWait);</span>
+
+<span class="nc" id="L451">                    continue;</span>
+                }
+<span class="nc" id="L453">            }</span>
+
+            /* We have a candidate notification.  See if it matches
+               our filters.  We do this outside the synchronized block
+               so we don't hold up everyone accessing the buffer
+               (including notification senders) while we evaluate
+               potentially slow filters.  */
+<span class="nc" id="L460">            ObjectName name = candidate.getObjectName();</span>
+<span class="nc" id="L461">            Notification notif = candidate.getNotification();</span>
+<span class="nc" id="L462">            List&lt;TargetedNotification&gt; matchedNotifs =</span>
+                new ArrayList&lt;TargetedNotification&gt;();
+<span class="nc" id="L464">            logger.debug(&quot;fetchNotifications&quot;,</span>
+                         &quot;applying filter to candidate&quot;);
+<span class="nc" id="L466">            filter.apply(matchedNotifs, name, notif);</span>
+
+<span class="nc bnc" id="L468" title="All 2 branches missed.">            if (matchedNotifs.size() &gt; 0) {</span>
+                /* We only check the max size now, so that our
+                   returned nextSeq is as large as possible.  This
+                   prevents the caller from thinking it missed
+                   interesting notifications when in fact we knew they
+                   weren't.  */
+<span class="nc bnc" id="L474" title="All 2 branches missed.">                if (maxNotifications &lt;= 0) {</span>
+<span class="nc" id="L475">                    logger.debug(&quot;fetchNotifications&quot;,</span>
+                                 &quot;reached maxNotifications&quot;);
+<span class="nc" id="L477">                    break;</span>
+                }
+<span class="nc" id="L479">                --maxNotifications;</span>
+<span class="nc bnc" id="L480" title="All 2 branches missed.">                if (logger.debugOn())</span>
+<span class="nc" id="L481">                    logger.debug(&quot;fetchNotifications&quot;, &quot;add: &quot; +</span>
+                                 matchedNotifs);
+<span class="nc" id="L483">                notifs.addAll(matchedNotifs);</span>
+            }
+
+<span class="nc" id="L486">            ++nextSeq;</span>
+<span class="nc" id="L487">        } // end while</span>
+
+        /* Construct and return the result.  */
+<span class="nc" id="L490">        int nnotifs = notifs.size();</span>
+<span class="nc" id="L491">        TargetedNotification[] resultNotifs =</span>
+            new TargetedNotification[nnotifs];
+<span class="nc" id="L493">        notifs.toArray(resultNotifs);</span>
+<span class="nc" id="L494">        NotificationResult nr =</span>
+            new NotificationResult(earliestSeq, nextSeq, resultNotifs);
+<span class="nc bnc" id="L496" title="All 2 branches missed.">        if (logger.debugOn())</span>
+<span class="nc" id="L497">            logger.debug(&quot;fetchNotifications&quot;, nr.toString());</span>
+<span class="nc" id="L498">        logger.trace(&quot;fetchNotifications&quot;, &quot;ends&quot;);</span>
+
+<span class="nc" id="L500">        return nr;</span>
+    }
+
+    synchronized long earliestSequenceNumber() {
+<span class="nc" id="L504">        return earliestSequenceNumber;</span>
+    }
+
+    synchronized long nextSequenceNumber() {
+<span class="nc" id="L508">        return nextSequenceNumber;</span>
+    }
+
+    synchronized void addNotification(NamedNotification notif) {
+<span class="nc bnc" id="L512" title="All 2 branches missed.">        if (logger.traceOn())</span>
+<span class="nc" id="L513">            logger.trace(&quot;addNotification&quot;, notif.toString());</span>
+
+<span class="nc bnc" id="L515" title="All 2 branches missed.">        while (queue.size() &gt;= queueSize) {</span>
+<span class="nc" id="L516">            dropNotification();</span>
+<span class="nc bnc" id="L517" title="All 2 branches missed.">            if (logger.debugOn()) {</span>
+<span class="nc" id="L518">                logger.debug(&quot;addNotification&quot;,</span>
+                      &quot;dropped oldest notif, earliestSeq=&quot; +
+                      earliestSequenceNumber);
+            }
+        }
+<span class="nc" id="L523">        queue.add(notif);</span>
+<span class="nc" id="L524">        nextSequenceNumber++;</span>
+<span class="nc bnc" id="L525" title="All 2 branches missed.">        if (logger.debugOn())</span>
+<span class="nc" id="L526">            logger.debug(&quot;addNotification&quot;, &quot;nextSeq=&quot; + nextSequenceNumber);</span>
+<span class="nc" id="L527">        notifyAll();</span>
+<span class="nc" id="L528">    }</span>
+
+    private void dropNotification() {
+<span class="nc" id="L531">        queue.remove(0);</span>
+<span class="nc" id="L532">        earliestSequenceNumber++;</span>
+<span class="nc" id="L533">    }</span>
+
+    synchronized NamedNotification notificationAt(long seqNo) {
+<span class="nc" id="L536">        long index = seqNo - earliestSequenceNumber;</span>
+<span class="nc bnc" id="L537" title="All 4 branches missed.">        if (index &lt; 0 || index &gt; Integer.MAX_VALUE) {</span>
+<span class="nc" id="L538">            final String msg = &quot;Bad sequence number: &quot; + seqNo + &quot; (earliest &quot;</span>
+                + earliestSequenceNumber + &quot;)&quot;;
+<span class="nc" id="L540">            logger.trace(&quot;notificationAt&quot;, msg);</span>
+<span class="nc" id="L541">            throw new IllegalArgumentException(msg);</span>
+        }
+<span class="nc" id="L543">        return queue.get((int) index);</span>
+    }
+
+    private static class NamedNotification {
+<span class="nc" id="L547">        NamedNotification(ObjectName sender, Notification notif) {</span>
+<span class="nc" id="L548">            this.sender = sender;</span>
+<span class="nc" id="L549">            this.notification = notif;</span>
+<span class="nc" id="L550">        }</span>
+
+        ObjectName getObjectName() {
+<span class="nc" id="L553">            return sender;</span>
+        }
+
+        Notification getNotification() {
+<span class="nc" id="L557">            return notification;</span>
+        }
+
+        public String toString() {
+<span class="nc" id="L561">            return &quot;NamedNotification(&quot; + sender + &quot;, &quot; + notification + &quot;)&quot;;</span>
+        }
+
+        private final ObjectName sender;
+        private final Notification notification;
+    }
+
+    /*
+     * Add our listener to every NotificationBroadcaster MBean
+     * currently in the MBean server and to every
+     * NotificationBroadcaster later created.
+     *
+     * It would be really nice if we could just do
+     * mbs.addNotificationListener(new ObjectName(&quot;*:*&quot;), ...);
+     * Definitely something for the next version of JMX.
+     *
+     * There is a nasty race condition that we must handle.  We
+     * first register for MBean-creation notifications so we can add
+     * listeners to new MBeans, then we query the existing MBeans to
+     * add listeners to them.  The problem is that a new MBean could
+     * arrive after we register for creations but before the query has
+     * completed.  Then we could see the MBean both in the query and
+     * in an MBean-creation notification, and we would end up
+     * registering our listener twice.
+     *
+     * To solve this problem, we arrange for new MBeans that arrive
+     * while the query is being done to be added to the Set createdDuringQuery
+     * and we do not add a listener immediately.  When the query is done,
+     * we atomically turn off the addition of new names to createdDuringQuery
+     * and add all the names that were there to the result of the query.
+     * Since we are dealing with Sets, the result is the same whether or not
+     * the newly-created MBean was included in the query result.
+     *
+     * It is important not to hold any locks during the operation of adding
+     * listeners to MBeans.  An MBean's addNotificationListener can be
+     * arbitrary user code, and this could deadlock with any locks we hold
+     * (see bug 6239400).  The corollary is that we must not do any operations
+     * in this method or the methods it calls that require locks.
+     */
+    private void createListeners() {
+<span class="nc" id="L601">        logger.debug(&quot;createListeners&quot;, &quot;starts&quot;);</span>
+
+<span class="nc" id="L603">        synchronized (this) {</span>
+<span class="nc" id="L604">            createdDuringQuery = new HashSet&lt;ObjectName&gt;();</span>
+<span class="nc" id="L605">        }</span>
+
+        try {
+<span class="nc" id="L608">            addNotificationListener(MBeanServerDelegate.DELEGATE_NAME,</span>
+                                    creationListener, creationFilter, null);
+<span class="nc" id="L610">            logger.debug(&quot;createListeners&quot;, &quot;added creationListener&quot;);</span>
+<span class="nc" id="L611">        } catch (Exception e) {</span>
+            final String msg = &quot;Can't add listener to MBean server delegate: &quot;;
+<span class="nc" id="L613">            RuntimeException re = new IllegalArgumentException(msg + e);</span>
+<span class="nc" id="L614">            EnvHelp.initCause(re, e);</span>
+<span class="nc" id="L615">            logger.fine(&quot;createListeners&quot;, msg + e);</span>
+<span class="nc" id="L616">            logger.debug(&quot;createListeners&quot;, e);</span>
+<span class="nc" id="L617">            throw re;</span>
+<span class="nc" id="L618">        }</span>
+
+        /* Spec doesn't say whether Set returned by QueryNames can be modified
+           so we clone it. */
+<span class="nc" id="L622">        Set&lt;ObjectName&gt; names = queryNames(null, broadcasterQuery);</span>
+<span class="nc" id="L623">        names = new HashSet&lt;ObjectName&gt;(names);</span>
+
+<span class="nc" id="L625">        synchronized (this) {</span>
+<span class="nc" id="L626">            names.addAll(createdDuringQuery);</span>
+<span class="nc" id="L627">            createdDuringQuery = null;</span>
+<span class="nc" id="L628">        }</span>
+
+<span class="nc bnc" id="L630" title="All 2 branches missed.">        for (ObjectName name : names)</span>
+<span class="nc" id="L631">            addBufferListener(name);</span>
+<span class="nc" id="L632">        logger.debug(&quot;createListeners&quot;, &quot;ends&quot;);</span>
+<span class="nc" id="L633">    }</span>
+
+    private void addBufferListener(ObjectName name) {
+<span class="nc" id="L636">        checkNoLocks();</span>
+<span class="nc bnc" id="L637" title="All 2 branches missed.">        if (logger.debugOn())</span>
+<span class="nc" id="L638">            logger.debug(&quot;addBufferListener&quot;, name.toString());</span>
+        try {
+<span class="nc" id="L640">            addNotificationListener(name, bufferListener, null, name);</span>
+<span class="nc" id="L641">        } catch (Exception e) {</span>
+<span class="nc" id="L642">            logger.trace(&quot;addBufferListener&quot;, e);</span>
+            /* This can happen if the MBean was unregistered just
+               after the query.  Or user NotificationBroadcaster might
+               throw unexpected exception.  */
+<span class="nc" id="L646">        }</span>
+<span class="nc" id="L647">    }</span>
+
+    private void removeBufferListener(ObjectName name) {
+<span class="nc" id="L650">        checkNoLocks();</span>
+<span class="nc bnc" id="L651" title="All 2 branches missed.">        if (logger.debugOn())</span>
+<span class="nc" id="L652">            logger.debug(&quot;removeBufferListener&quot;, name.toString());</span>
+        try {
+<span class="nc" id="L654">            removeNotificationListener(name, bufferListener);</span>
+<span class="nc" id="L655">        } catch (Exception e) {</span>
+<span class="nc" id="L656">            logger.trace(&quot;removeBufferListener&quot;, e);</span>
+<span class="nc" id="L657">        }</span>
+<span class="nc" id="L658">    }</span>
+
+    private void addNotificationListener(final ObjectName name,
+                                         final NotificationListener listener,
+                                         final NotificationFilter filter,
+                                         final Object handback)
+            throws Exception {
+        try {
+<span class="nc" id="L666">            AccessController.doPrivileged(new PrivilegedExceptionAction&lt;Void&gt;() {</span>
+                public Void run() throws InstanceNotFoundException {
+<span class="nc" id="L668">                    mBeanServer.addNotificationListener(name,</span>
+                                                        listener,
+                                                        filter,
+                                                        handback);
+<span class="nc" id="L672">                    return null;</span>
+                }
+            });
+<span class="nc" id="L675">        } catch (Exception e) {</span>
+<span class="nc" id="L676">            throw extractException(e);</span>
+<span class="nc" id="L677">        }</span>
+<span class="nc" id="L678">    }</span>
+
+    private void removeNotificationListener(final ObjectName name,
+                                            final NotificationListener listener)
+            throws Exception {
+        try {
+<span class="nc" id="L684">            AccessController.doPrivileged(new PrivilegedExceptionAction&lt;Void&gt;() {</span>
+                public Void run() throws Exception {
+<span class="nc" id="L686">                    mBeanServer.removeNotificationListener(name, listener);</span>
+<span class="nc" id="L687">                    return null;</span>
+                }
+            });
+<span class="nc" id="L690">        } catch (Exception e) {</span>
+<span class="nc" id="L691">            throw extractException(e);</span>
+<span class="nc" id="L692">        }</span>
+<span class="nc" id="L693">    }</span>
+
+    private Set&lt;ObjectName&gt; queryNames(final ObjectName name,
+                                       final QueryExp query) {
+<span class="nc" id="L697">        PrivilegedAction&lt;Set&lt;ObjectName&gt;&gt; act =</span>
+<span class="nc" id="L698">            new PrivilegedAction&lt;Set&lt;ObjectName&gt;&gt;() {</span>
+                public Set&lt;ObjectName&gt; run() {
+<span class="nc" id="L700">                    return mBeanServer.queryNames(name, query);</span>
+                }
+            };
+        try {
+<span class="nc" id="L704">            return AccessController.doPrivileged(act);</span>
+<span class="nc" id="L705">        } catch (RuntimeException e) {</span>
+<span class="nc" id="L706">            logger.fine(&quot;queryNames&quot;, &quot;Failed to query names: &quot; + e);</span>
+<span class="nc" id="L707">            logger.debug(&quot;queryNames&quot;, e);</span>
+<span class="nc" id="L708">            throw e;</span>
+        }
+    }
+
+    private static boolean isInstanceOf(final MBeanServer mbs,
+                                        final ObjectName name,
+                                        final String className) {
+<span class="nc" id="L715">        PrivilegedExceptionAction&lt;Boolean&gt; act =</span>
+<span class="nc" id="L716">            new PrivilegedExceptionAction&lt;Boolean&gt;() {</span>
+                public Boolean run() throws InstanceNotFoundException {
+<span class="nc" id="L718">                    return mbs.isInstanceOf(name, className);</span>
+                }
+            };
+        try {
+<span class="nc" id="L722">            return AccessController.doPrivileged(act);</span>
+<span class="nc" id="L723">        } catch (Exception e) {</span>
+<span class="nc" id="L724">            logger.fine(&quot;isInstanceOf&quot;, &quot;failed: &quot; + e);</span>
+<span class="nc" id="L725">            logger.debug(&quot;isInstanceOf&quot;, e);</span>
+<span class="nc" id="L726">            return false;</span>
+        }
+    }
+
+    /* This method must not be synchronized.  See the comment on the
+     * createListeners method.
+     *
+     * The notification could arrive after our buffer has been destroyed
+     * or even during its destruction.  So we always add our listener
+     * (without synchronization), then we check if the buffer has been
+     * destroyed and if so remove the listener we just added.
+     */
+    private void createdNotification(MBeanServerNotification n) {
+        final String shouldEqual =
+            MBeanServerNotification.REGISTRATION_NOTIFICATION;
+<span class="nc bnc" id="L741" title="All 2 branches missed.">        if (!n.getType().equals(shouldEqual)) {</span>
+<span class="nc" id="L742">            logger.warning(&quot;createNotification&quot;, &quot;bad type: &quot; + n.getType());</span>
+<span class="nc" id="L743">            return;</span>
+        }
+
+<span class="nc" id="L746">        ObjectName name = n.getMBeanName();</span>
+<span class="nc bnc" id="L747" title="All 2 branches missed.">        if (logger.debugOn())</span>
+<span class="nc" id="L748">            logger.debug(&quot;createdNotification&quot;, &quot;for: &quot; + name);</span>
+
+<span class="nc" id="L750">        synchronized (this) {</span>
+<span class="nc bnc" id="L751" title="All 2 branches missed.">            if (createdDuringQuery != null) {</span>
+<span class="nc" id="L752">                createdDuringQuery.add(name);</span>
+<span class="nc" id="L753">                return;</span>
+            }
+<span class="nc" id="L755">        }</span>
+
+<span class="nc bnc" id="L757" title="All 2 branches missed.">        if (isInstanceOf(mBeanServer, name, broadcasterClass)) {</span>
+<span class="nc" id="L758">            addBufferListener(name);</span>
+<span class="nc bnc" id="L759" title="All 2 branches missed.">            if (isDisposed())</span>
+<span class="nc" id="L760">                removeBufferListener(name);</span>
+        }
+<span class="nc" id="L762">    }</span>
+
+<span class="nc" id="L764">    private class BufferListener implements NotificationListener {</span>
+        public void handleNotification(Notification notif, Object handback) {
+<span class="nc bnc" id="L766" title="All 2 branches missed.">            if (logger.debugOn()) {</span>
+<span class="nc" id="L767">                logger.debug(&quot;BufferListener.handleNotification&quot;,</span>
+                      &quot;notif=&quot; + notif + &quot;; handback=&quot; + handback);
+            }
+<span class="nc" id="L770">            ObjectName name = (ObjectName) handback;</span>
+<span class="nc" id="L771">            addNotification(new NamedNotification(name, notif));</span>
+<span class="nc" id="L772">        }</span>
+    }
+
+<span class="nc" id="L775">    private final NotificationListener bufferListener = new BufferListener();</span>
+
+<span class="nc" id="L777">    private static class BroadcasterQuery</span>
+            extends QueryEval implements QueryExp {
+        private static final long serialVersionUID = 7378487660587592048L;
+
+        public boolean apply(final ObjectName name) {
+<span class="nc" id="L782">            final MBeanServer mbs = QueryEval.getMBeanServer();</span>
+<span class="nc" id="L783">            return isInstanceOf(mbs, name, broadcasterClass);</span>
+        }
+    }
+<span class="nc" id="L786">    private static final QueryExp broadcasterQuery = new BroadcasterQuery();</span>
+
+    private static final NotificationFilter creationFilter;
+    static {
+<span class="nc" id="L790">        NotificationFilterSupport nfs = new NotificationFilterSupport();</span>
+<span class="nc" id="L791">        nfs.enableType(MBeanServerNotification.REGISTRATION_NOTIFICATION);</span>
+<span class="nc" id="L792">        creationFilter = nfs;</span>
+    }
+
+<span class="nc" id="L795">    private final NotificationListener creationListener =</span>
+<span class="nc" id="L796">        new NotificationListener() {</span>
+            public void handleNotification(Notification notif,
+                                           Object handback) {
+<span class="nc" id="L799">                logger.debug(&quot;creationListener&quot;, &quot;handleNotification called&quot;);</span>
+<span class="nc" id="L800">                createdNotification((MBeanServerNotification) notif);</span>
+<span class="nc" id="L801">            }</span>
+        };
+
+    private void destroyListeners() {
+<span class="nc" id="L805">        checkNoLocks();</span>
+<span class="nc" id="L806">        logger.debug(&quot;destroyListeners&quot;, &quot;starts&quot;);</span>
+        try {
+<span class="nc" id="L808">            removeNotificationListener(MBeanServerDelegate.DELEGATE_NAME,</span>
+                                       creationListener);
+<span class="nc" id="L810">        } catch (Exception e) {</span>
+<span class="nc" id="L811">            logger.warning(&quot;remove listener from MBeanServer delegate&quot;, e);</span>
+<span class="nc" id="L812">        }</span>
+<span class="nc" id="L813">        Set&lt;ObjectName&gt; names = queryNames(null, broadcasterQuery);</span>
+<span class="nc bnc" id="L814" title="All 2 branches missed.">        for (final ObjectName name : names) {</span>
+<span class="nc bnc" id="L815" title="All 2 branches missed.">            if (logger.debugOn())</span>
+<span class="nc" id="L816">                logger.debug(&quot;destroyListeners&quot;,</span>
+                             &quot;remove listener from &quot; + name);
+<span class="nc" id="L818">            removeBufferListener(name);</span>
+<span class="nc" id="L819">        }</span>
+<span class="nc" id="L820">        logger.debug(&quot;destroyListeners&quot;, &quot;ends&quot;);</span>
+<span class="nc" id="L821">    }</span>
+
+    private void checkNoLocks() {
+<span class="nc bnc" id="L824" title="All 4 branches missed.">        if (Thread.holdsLock(this) || Thread.holdsLock(globalLock))</span>
+<span class="nc" id="L825">            logger.warning(&quot;checkNoLocks&quot;, &quot;lock protocol violation&quot;);</span>
+<span class="nc" id="L826">    }</span>
+
+    /**
+     * Iterate until we extract the real exception
+     * from a stack of PrivilegedActionExceptions.
+     */
+    private static Exception extractException(Exception e) {
+<span class="nc bnc" id="L833" title="All 2 branches missed.">        while (e instanceof PrivilegedActionException) {</span>
+<span class="nc" id="L834">            e = ((PrivilegedActionException)e).getException();</span>
+        }
+<span class="nc" id="L836">        return e;</span>
+    }
+
+<span class="nc" id="L839">    private static final ClassLogger logger =</span>
+        new ClassLogger(&quot;javax.management.remote.misc&quot;,
+                        &quot;ArrayNotificationBuffer&quot;);
+
+    private final MBeanServer mBeanServer;
+    private final ArrayQueue&lt;NamedNotification&gt; queue;
+    private int queueSize;
+    private long earliestSequenceNumber;
+    private long nextSequenceNumber;
+    private Set&lt;ObjectName&gt; createdDuringQuery;
+
+<span class="nc" id="L850">    static final String broadcasterClass =</span>
+<span class="nc" id="L851">        NotificationBroadcaster.class.getName();</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

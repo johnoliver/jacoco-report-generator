@@ -1,0 +1,683 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>Type1Font.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.font</a> &gt; <span class="el_source">Type1Font.java</span></div><h1>Type1Font.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2003, 2010, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.font;
+
+import java.lang.ref.WeakReference;
+import java.awt.FontFormatException;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.io.UnsupportedEncodingException;
+import java.lang.ref.WeakReference;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.MappedByteBuffer;
+import java.nio.BufferUnderflowException;
+import java.nio.channels.ClosedChannelException;
+import java.nio.channels.FileChannel;
+import sun.java2d.Disposer;
+import sun.java2d.DisposerRecord;
+import java.util.HashSet;
+import java.util.HashMap;
+import java.awt.Font;
+
+/*
+ * Adobe Technical Note 5040 details the format of PFB files.
+ * the file is divided into ascii and binary sections. Each section
+ * starts with a header
+ * 0x8001 - start of binary data, is followed by 4 bytes length, then data
+ * 0x8002 - start of ascii data, is followed by 4 bytes length, then data
+ * 0x8003 - end of data segment
+ * The length is organised as LSB-&gt;MSB.
+ *
+ * Note: I experimented with using a MappedByteBuffer and
+ * there were two problems/questions.
+ * 1. If a global buffer is used rather than one allocated in the calling
+ * context, then we need to synchronize on all uses of that data, which
+ * means more code would beed to be synchronized with probable repercussions
+ * elsewhere.
+ * 2. It is not clear whether to free the buffer when the file is closed.
+ * If we have the contents in memory then why keep open files around?
+ * The mmapped buffer doesn't need it.
+ * Also regular GC is what frees the buffer. So closing the file and nulling
+ * out the reference still needs to wait for the buffer to be GC'd to
+ * reclaim the storage.
+ * If the contents of the buffer are persistent there's no need
+ * to worry about synchronization.
+ * Perhaps could use a WeakReference, and when its referent is gone, and
+ * need it can just reopen the file.
+ * Type1 fonts thus don't use up file descriptor references, but can
+ * use memory footprint in a way that's managed by the host O/S.
+ * The main &quot;pain&quot; may be the different model means code needs to be written
+ * without assumptions as to how this is handled by the different subclasses
+ * of FileFont.
+ */
+public class Type1Font extends FileFont {
+
+     private static class T1DisposerRecord  implements DisposerRecord {
+<span class="nc" id="L81">        String fileName = null;</span>
+
+<span class="nc" id="L83">        T1DisposerRecord(String name) {</span>
+<span class="nc" id="L84">            fileName = name;</span>
+<span class="nc" id="L85">        }</span>
+
+        public synchronized void dispose() {
+<span class="nc" id="L88">            java.security.AccessController.doPrivileged(</span>
+<span class="nc" id="L89">                new java.security.PrivilegedAction() {</span>
+                    public Object run() {
+
+<span class="nc bnc" id="L92" title="All 2 branches missed.">                        if (fileName != null) {</span>
+<span class="nc" id="L93">                            (new java.io.File(fileName)).delete();</span>
+                        }
+<span class="nc" id="L95">                        return null;</span>
+                    }
+             });
+<span class="nc" id="L98">        }</span>
+    }
+
+<span class="nc" id="L101">    WeakReference bufferRef = new WeakReference(null);</span>
+
+<span class="nc" id="L103">    private String psName = null;</span>
+
+    static private HashMap styleAbbreviationsMapping;
+    static private HashSet styleNameTokes;
+
+    static {
+<span class="nc" id="L109">        styleAbbreviationsMapping = new HashMap();</span>
+<span class="nc" id="L110">        styleNameTokes = new HashSet();</span>
+
+        /* These abbreviation rules are taken from Appendix 1 of Adobe Technical Note #5088 */
+        /* NB: this list is not complete - we did not include abbreviations which contain
+               several capital letters because current expansion algorithm do not support this.
+               (namely we have omited MM aka &quot;Multiple Master&quot;, OsF aka &quot;Oldstyle figures&quot;,
+                           OS aka &quot;Oldstyle&quot;, SC aka &quot;Small caps&quot; and  DS aka &quot;Display&quot; */
+<span class="nc" id="L117">        String nm[] = {&quot;Black&quot;, &quot;Bold&quot;, &quot;Book&quot;, &quot;Demi&quot;, &quot;Heavy&quot;, &quot;Light&quot;,</span>
+                       &quot;Meduium&quot;, &quot;Nord&quot;, &quot;Poster&quot;, &quot;Regular&quot;, &quot;Super&quot;, &quot;Thin&quot;,
+                       &quot;Compressed&quot;, &quot;Condensed&quot;, &quot;Compact&quot;, &quot;Extended&quot;, &quot;Narrow&quot;,
+                       &quot;Inclined&quot;, &quot;Italic&quot;, &quot;Kursiv&quot;, &quot;Oblique&quot;, &quot;Upright&quot;, &quot;Sloped&quot;,
+                       &quot;Semi&quot;, &quot;Ultra&quot;, &quot;Extra&quot;,
+                       &quot;Alternate&quot;, &quot;Alternate&quot;, &quot;Deutsche Fraktur&quot;, &quot;Expert&quot;, &quot;Inline&quot;, &quot;Ornaments&quot;,
+                       &quot;Outline&quot;, &quot;Roman&quot;, &quot;Rounded&quot;, &quot;Script&quot;, &quot;Shaded&quot;, &quot;Swash&quot;, &quot;Titling&quot;, &quot;Typewriter&quot;};
+<span class="nc" id="L124">        String abbrv[] = {&quot;Blk&quot;, &quot;Bd&quot;, &quot;Bk&quot;, &quot;Dm&quot;, &quot;Hv&quot;, &quot;Lt&quot;,</span>
+                          &quot;Md&quot;, &quot;Nd&quot;, &quot;Po&quot;, &quot;Rg&quot;, &quot;Su&quot;, &quot;Th&quot;,
+                          &quot;Cm&quot;, &quot;Cn&quot;, &quot;Ct&quot;, &quot;Ex&quot;, &quot;Nr&quot;,
+                          &quot;Ic&quot;, &quot;It&quot;, &quot;Ks&quot;, &quot;Obl&quot;, &quot;Up&quot;, &quot;Sl&quot;,
+                          &quot;Sm&quot;, &quot;Ult&quot;, &quot;X&quot;,
+                          &quot;A&quot;, &quot;Alt&quot;, &quot;Dfr&quot;, &quot;Exp&quot;, &quot;In&quot;, &quot;Or&quot;,
+                          &quot;Ou&quot;, &quot;Rm&quot;, &quot;Rd&quot;, &quot;Scr&quot;, &quot;Sh&quot;, &quot;Sw&quot;, &quot;Ti&quot;, &quot;Typ&quot;};
+       /* This is only subset of names from nm[] because we want to distinguish things
+           like &quot;Lucida Sans TypeWriter Bold&quot; and &quot;Lucida Sans Bold&quot;.
+           Names from &quot;Design and/or special purpose&quot; group are omitted. */
+<span class="nc" id="L134">       String styleTokens[] = {&quot;Black&quot;, &quot;Bold&quot;, &quot;Book&quot;, &quot;Demi&quot;, &quot;Heavy&quot;, &quot;Light&quot;,</span>
+                       &quot;Medium&quot;, &quot;Nord&quot;, &quot;Poster&quot;, &quot;Regular&quot;, &quot;Super&quot;, &quot;Thin&quot;,
+                       &quot;Compressed&quot;, &quot;Condensed&quot;, &quot;Compact&quot;, &quot;Extended&quot;, &quot;Narrow&quot;,
+                       &quot;Inclined&quot;, &quot;Italic&quot;, &quot;Kursiv&quot;, &quot;Oblique&quot;, &quot;Upright&quot;, &quot;Sloped&quot;, &quot;Slanted&quot;,
+                       &quot;Semi&quot;, &quot;Ultra&quot;, &quot;Extra&quot;};
+
+<span class="nc bnc" id="L140" title="All 2 branches missed.">        for(int i=0; i&lt;nm.length; i++) {</span>
+<span class="nc" id="L141">            styleAbbreviationsMapping.put(abbrv[i], nm[i]);</span>
+        }
+<span class="nc bnc" id="L143" title="All 2 branches missed.">        for(int i=0; i&lt;styleTokens.length; i++) {</span>
+<span class="nc" id="L144">            styleNameTokes.add(styleTokens[i]);</span>
+        }
+<span class="nc" id="L146">        }</span>
+
+
+    /**
+     * Constructs a Type1 Font.
+     * @param platname - Platform identifier of the font. Typically file name.
+     * @param nativeNames - Native names - typically XLFDs on Unix.
+     */
+    public Type1Font(String platname, Object nativeNames)
+        throws FontFormatException {
+
+<span class="nc" id="L157">        this(platname, nativeNames, false);</span>
+<span class="nc" id="L158">    }</span>
+
+    /**
+     * - does basic verification of the file
+     * - reads the names (full, family).
+     * - determines the style of the font.
+     * @throws FontFormatException - if the font can't be opened
+     * or fails verification,  or there's no usable cmap
+     */
+    public Type1Font(String platname, Object nativeNames, boolean createdCopy)
+        throws FontFormatException {
+<span class="nc" id="L169">        super(platname, nativeNames);</span>
+<span class="nc" id="L170">        fontRank = Font2D.TYPE1_RANK;</span>
+<span class="nc" id="L171">        checkedNatives = true;</span>
+        try {
+<span class="nc" id="L173">            verify();</span>
+<span class="nc" id="L174">        } catch (Throwable t) {</span>
+<span class="nc bnc" id="L175" title="All 2 branches missed.">            if (createdCopy) {</span>
+<span class="nc" id="L176">                T1DisposerRecord ref = new T1DisposerRecord(platname);</span>
+<span class="nc" id="L177">                Disposer.addObjectRecord(bufferRef, ref);</span>
+<span class="nc" id="L178">                bufferRef = null;</span>
+            }
+<span class="nc bnc" id="L180" title="All 2 branches missed.">            if (t instanceof FontFormatException) {</span>
+<span class="nc" id="L181">                throw (FontFormatException)t;</span>
+            } else {
+<span class="nc" id="L183">                throw new FontFormatException(&quot;Unexpected runtime exception.&quot;);</span>
+            }
+<span class="nc" id="L185">        }</span>
+<span class="nc" id="L186">    }</span>
+
+    private synchronized ByteBuffer getBuffer() throws FontFormatException {
+<span class="nc" id="L189">        MappedByteBuffer mapBuf = (MappedByteBuffer)bufferRef.get();</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">        if (mapBuf == null) {</span>
+          //System.out.println(&quot;open T1 &quot; + platName);
+            try {
+<span class="nc" id="L193">                RandomAccessFile raf = (RandomAccessFile)</span>
+<span class="nc" id="L194">                java.security.AccessController.doPrivileged(</span>
+<span class="nc" id="L195">                    new java.security.PrivilegedAction() {</span>
+                        public Object run() {
+                            try {
+<span class="nc" id="L198">                                return new RandomAccessFile(platName, &quot;r&quot;);</span>
+<span class="nc" id="L199">                            } catch (FileNotFoundException ffne) {</span>
+                            }
+<span class="nc" id="L201">                            return null;</span>
+                    }
+                });
+<span class="nc" id="L204">                FileChannel fc = raf.getChannel();</span>
+<span class="nc" id="L205">                fileSize = (int)fc.size();</span>
+<span class="nc" id="L206">                mapBuf = fc.map(FileChannel.MapMode.READ_ONLY, 0, fileSize);</span>
+<span class="nc" id="L207">                mapBuf.position(0);</span>
+<span class="nc" id="L208">                bufferRef = new WeakReference(mapBuf);</span>
+<span class="nc" id="L209">                fc.close();</span>
+<span class="nc" id="L210">            } catch (NullPointerException e) {</span>
+<span class="nc" id="L211">                throw new FontFormatException(e.toString());</span>
+<span class="nc" id="L212">            } catch (ClosedChannelException e) {</span>
+                /* NIO I/O is interruptible, recurse to retry operation.
+                 * Clear interrupts before recursing in case NIO didn't.
+                 */
+<span class="nc" id="L216">                Thread.interrupted();</span>
+<span class="nc" id="L217">                return getBuffer();</span>
+<span class="nc" id="L218">            } catch (IOException e) {</span>
+<span class="nc" id="L219">                throw new FontFormatException(e.toString());</span>
+<span class="nc" id="L220">            }</span>
+        }
+<span class="nc" id="L222">        return mapBuf;</span>
+    }
+
+    protected void close() {
+<span class="nc" id="L226">    }</span>
+
+    /* called from native code to read file into a direct byte buffer */
+    void readFile(ByteBuffer buffer) {
+<span class="nc" id="L230">        RandomAccessFile raf = null;</span>
+        FileChannel fc;
+        try {
+<span class="nc" id="L233">            raf = (RandomAccessFile)</span>
+<span class="nc" id="L234">                java.security.AccessController.doPrivileged(</span>
+<span class="nc" id="L235">                    new java.security.PrivilegedAction() {</span>
+                        public Object run() {
+                            try {
+<span class="nc" id="L238">                                return new RandomAccessFile(platName, &quot;r&quot;);</span>
+<span class="nc" id="L239">                            } catch (FileNotFoundException fnfe) {</span>
+                            }
+<span class="nc" id="L241">                            return null;</span>
+                    }
+            });
+<span class="nc" id="L244">            fc = raf.getChannel();</span>
+<span class="nc bnc" id="L245" title="All 4 branches missed.">            while (buffer.remaining() &gt; 0 &amp;&amp; fc.read(buffer) != -1) {}</span>
+<span class="nc" id="L246">        } catch (NullPointerException npe) {</span>
+<span class="nc" id="L247">        } catch (ClosedChannelException e) {</span>
+            try {
+<span class="nc bnc" id="L249" title="All 2 branches missed.">                if (raf != null) {</span>
+<span class="nc" id="L250">                    raf.close();</span>
+<span class="nc" id="L251">                    raf = null;</span>
+                }
+<span class="nc" id="L253">            } catch (IOException ioe) {</span>
+<span class="nc" id="L254">            }</span>
+            /* NIO I/O is interruptible, recurse to retry operation.
+             * Clear interrupts before recursing in case NIO didn't.
+             */
+<span class="nc" id="L258">            Thread.interrupted();</span>
+<span class="nc" id="L259">            readFile(buffer);</span>
+<span class="nc" id="L260">        } catch (IOException e) {</span>
+        } finally  {
+<span class="nc bnc" id="L262" title="All 10 branches missed.">            if (raf != null) {</span>
+                try {
+<span class="nc" id="L264">                    raf.close();</span>
+<span class="nc" id="L265">                } catch (IOException e) {</span>
+<span class="nc" id="L266">                }</span>
+            }
+        }
+<span class="nc" id="L269">    }</span>
+
+    public synchronized ByteBuffer readBlock(int offset, int length) {
+<span class="nc" id="L272">        ByteBuffer mappedBuf = null;</span>
+        try {
+<span class="nc" id="L274">            mappedBuf = getBuffer();</span>
+<span class="nc bnc" id="L275" title="All 2 branches missed.">            if (offset &gt; fileSize) {</span>
+<span class="nc" id="L276">                offset = fileSize;</span>
+            }
+<span class="nc" id="L278">            mappedBuf.position(offset);</span>
+<span class="nc" id="L279">            return mappedBuf.slice();</span>
+<span class="nc" id="L280">        } catch (FontFormatException e) {</span>
+<span class="nc" id="L281">            return null;</span>
+        }
+    }
+
+    private void verify() throws FontFormatException {
+        /* Normal usage should not call getBuffer(), as its state
+         * ie endianness, position etc, are shared. verify() can do
+         * this as its called only from within the constructor before
+         * there are other users of this object.
+         */
+<span class="nc" id="L291">        ByteBuffer bb = getBuffer();</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">        if (bb.capacity() &lt; 6) {</span>
+<span class="nc" id="L293">            throw new FontFormatException(&quot;short file&quot;);</span>
+        }
+<span class="nc" id="L295">        int val = bb.get(0) &amp; 0xff;</span>
+<span class="nc bnc" id="L296" title="All 2 branches missed.">        if ((bb.get(0) &amp; 0xff) == 0x80) {</span>
+<span class="nc" id="L297">            verifyPFB(bb);</span>
+<span class="nc" id="L298">            bb.position(6);</span>
+        } else {
+<span class="nc" id="L300">            verifyPFA(bb);</span>
+<span class="nc" id="L301">            bb.position(0);</span>
+        }
+<span class="nc" id="L303">        initNames(bb);</span>
+<span class="nc bnc" id="L304" title="All 4 branches missed.">        if (familyName == null || fullName == null) {</span>
+<span class="nc" id="L305">            throw new FontFormatException(&quot;Font name not found&quot;);</span>
+        }
+<span class="nc" id="L307">        setStyle();</span>
+<span class="nc" id="L308">    }</span>
+
+    public int getFileSize() {
+<span class="nc bnc" id="L311" title="All 2 branches missed.">        if (fileSize == 0) {</span>
+            try {
+<span class="nc" id="L313">                getBuffer();</span>
+<span class="nc" id="L314">            } catch (FontFormatException e) {</span>
+<span class="nc" id="L315">            }</span>
+        }
+<span class="nc" id="L317">        return fileSize;</span>
+    }
+
+    private void verifyPFA(ByteBuffer bb) throws FontFormatException {
+<span class="nc bnc" id="L321" title="All 2 branches missed.">        if (bb.getShort() != 0x2521) { // 0x2521 is %!</span>
+<span class="nc" id="L322">            throw new FontFormatException(&quot;bad pfa font&quot;);</span>
+        }
+        // remind - additional verification needed?
+<span class="nc" id="L325">    }</span>
+
+    private void verifyPFB(ByteBuffer bb) throws FontFormatException {
+
+<span class="nc" id="L329">        int pos = 0;</span>
+        while (true) {
+            try {
+<span class="nc" id="L332">                int segType = bb.getShort(pos) &amp; 0xffff;</span>
+<span class="nc bnc" id="L333" title="All 4 branches missed.">                if (segType == 0x8001 || segType == 0x8002) {</span>
+<span class="nc" id="L334">                    bb.order(ByteOrder.LITTLE_ENDIAN);</span>
+<span class="nc" id="L335">                    int segLen = bb.getInt(pos+2);</span>
+<span class="nc" id="L336">                    bb.order(ByteOrder.BIG_ENDIAN);</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">                    if (segLen &lt;= 0) {</span>
+<span class="nc" id="L338">                        throw new FontFormatException(&quot;bad segment length&quot;);</span>
+                    }
+<span class="nc" id="L340">                    pos += segLen+6;</span>
+<span class="nc bnc" id="L341" title="All 2 branches missed.">                } else if (segType == 0x8003) {</span>
+<span class="nc" id="L342">                    return;</span>
+                } else {
+<span class="nc" id="L344">                    throw new FontFormatException(&quot;bad pfb file&quot;);</span>
+                }
+<span class="nc" id="L346">            } catch (BufferUnderflowException bue) {</span>
+<span class="nc" id="L347">                throw new FontFormatException(bue.toString());</span>
+<span class="nc" id="L348">            } catch (Exception e) {</span>
+<span class="nc" id="L349">                throw new FontFormatException(e.toString());</span>
+<span class="nc" id="L350">            }</span>
+        }
+    }
+
+    private static final int PSEOFTOKEN = 0;
+    private static final int PSNAMETOKEN = 1;
+    private static final int PSSTRINGTOKEN = 2;
+
+    /* Need to parse the ascii contents of the Type1 font file,
+     * looking for FullName, FamilyName and FontName.
+     * If explicit names are not found then extract them from first text line.
+     * Operating on bytes so can't use Java String utilities, which
+     * is a large part of why this is a hack.
+     *
+     * Also check for mandatory FontType and verify if it is supported.
+     */
+    private void initNames(ByteBuffer bb) throws FontFormatException {
+<span class="nc" id="L367">        boolean eof = false;</span>
+<span class="nc" id="L368">        String fontType = null;</span>
+        try {
+            //Parse font looking for explicit FullName, FamilyName and FontName
+            //  (according to Type1 spec they are optional)
+<span class="nc bnc" id="L372" title="All 10 branches missed.">            while ((fullName == null || familyName == null || psName == null || fontType == null) &amp;&amp; !eof) {</span>
+<span class="nc" id="L373">                int tokenType = nextTokenType(bb);</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">                if (tokenType == PSNAMETOKEN) {</span>
+<span class="nc" id="L375">                    int pos = bb.position();</span>
+<span class="nc bnc" id="L376" title="All 2 branches missed.">                    if (bb.get(pos) == 'F') {</span>
+<span class="nc" id="L377">                        String s = getSimpleToken(bb);</span>
+<span class="nc bnc" id="L378" title="All 2 branches missed.">                        if (&quot;FullName&quot;.equals(s)) {</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">                            if (nextTokenType(bb)==PSSTRINGTOKEN) {</span>
+<span class="nc" id="L380">                                fullName = getString(bb);</span>
+                            }
+<span class="nc bnc" id="L382" title="All 2 branches missed.">                        } else if (&quot;FamilyName&quot;.equals(s)) {</span>
+<span class="nc bnc" id="L383" title="All 2 branches missed.">                            if (nextTokenType(bb)==PSSTRINGTOKEN) {</span>
+<span class="nc" id="L384">                                familyName = getString(bb);</span>
+                            }
+<span class="nc bnc" id="L386" title="All 2 branches missed.">                        } else if (&quot;FontName&quot;.equals(s)) {</span>
+<span class="nc bnc" id="L387" title="All 2 branches missed.">                            if (nextTokenType(bb)==PSNAMETOKEN) {</span>
+<span class="nc" id="L388">                                psName = getSimpleToken(bb);</span>
+                            }
+<span class="nc bnc" id="L390" title="All 2 branches missed.">                        } else if (&quot;FontType&quot;.equals(s)) {</span>
+                            /* look for
+                                 /FontType id def
+                            */
+<span class="nc" id="L394">                            String token = getSimpleToken(bb);</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">                            if (&quot;def&quot;.equals(getSimpleToken(bb))) {</span>
+<span class="nc" id="L396">                                fontType = token;</span>
+                        }
+                        }
+<span class="nc" id="L399">                    } else {</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">                        while (bb.get() &gt; ' '); // skip token</span>
+                    }
+<span class="nc bnc" id="L402" title="All 2 branches missed.">                } else if (tokenType == PSEOFTOKEN) {</span>
+<span class="nc" id="L403">                    eof = true;</span>
+                }
+<span class="nc" id="L405">            }</span>
+<span class="nc" id="L406">        } catch (Exception e) {</span>
+<span class="nc" id="L407">                throw new FontFormatException(e.toString());</span>
+<span class="nc" id="L408">        }</span>
+
+        /* Ignore all fonts besides Type1 (e.g. Type3 fonts) */
+<span class="nc bnc" id="L411" title="All 2 branches missed.">        if (!&quot;1&quot;.equals(fontType)) {</span>
+<span class="nc" id="L412">            throw new FontFormatException(&quot;Unsupported font type&quot;);</span>
+        }
+
+<span class="nc bnc" id="L415" title="All 2 branches missed.">    if (psName == null) { //no explicit FontName</span>
+                // Try to extract font name from the first text line.
+                // According to Type1 spec first line consist of
+                //  &quot;%!FontType1-SpecVersion: FontName FontVersion&quot;
+                // or
+                //  &quot;%!PS-AdobeFont-1.0: FontName version&quot;
+<span class="nc" id="L421">                bb.position(0);</span>
+<span class="nc bnc" id="L422" title="All 2 branches missed.">                if (bb.getShort() != 0x2521) { //if pfb (do not start with &quot;%!&quot;)</span>
+                    //skip segment header and &quot;%!&quot;
+<span class="nc" id="L424">                    bb.position(8);</span>
+                    //NB: assume that first segment is ASCII one
+                    //  (is it possible to have valid Type1 font with first binary segment?)
+                }
+<span class="nc" id="L428">                String formatType = getSimpleToken(bb);</span>
+<span class="nc bnc" id="L429" title="All 4 branches missed.">                if (!formatType.startsWith(&quot;FontType1-&quot;) &amp;&amp; !formatType.startsWith(&quot;PS-AdobeFont-&quot;)) {</span>
+<span class="nc" id="L430">                        throw new FontFormatException(&quot;Unsupported font format [&quot; + formatType + &quot;]&quot;);</span>
+                }
+<span class="nc" id="L432">                psName = getSimpleToken(bb);</span>
+        }
+
+    //if we got to the end of file then we did not find at least one of FullName or FamilyName
+    //Try to deduce missing names from present ones
+    //NB: At least psName must be already initialized by this moment
+<span class="nc bnc" id="L438" title="All 2 branches missed.">        if (eof) {</span>
+            //if we find fullName or familyName then use it as another name too
+<span class="nc bnc" id="L440" title="All 2 branches missed.">            if (fullName != null) {</span>
+<span class="nc" id="L441">                familyName = fullName2FamilyName(fullName);</span>
+<span class="nc bnc" id="L442" title="All 2 branches missed.">            } else if (familyName != null) {</span>
+<span class="nc" id="L443">                fullName = familyName;</span>
+            } else { //fallback - use postscript font name to deduce full and family names
+<span class="nc" id="L445">                fullName = psName2FullName(psName);</span>
+<span class="nc" id="L446">                familyName = psName2FamilyName(psName);</span>
+            }
+        }
+<span class="nc" id="L449">    }</span>
+
+    private String fullName2FamilyName(String name) {
+        String res, token;
+        int len, start, end; //length of family name part
+
+        //FamilyName is truncated version of FullName
+        //Truncated tail must contain only style modifiers
+
+<span class="nc" id="L458">        end = name.length();</span>
+
+<span class="nc bnc" id="L460" title="All 2 branches missed.">        while (end &gt; 0) {</span>
+<span class="nc" id="L461">            start = end - 1;</span>
+<span class="nc bnc" id="L462" title="All 4 branches missed.">            while (start &gt; 0 &amp;&amp; name.charAt(start) != ' ')</span>
+<span class="nc" id="L463">              start--;</span>
+            //as soon as we meet first non style token truncate
+            // current tail and return
+<span class="nc bnc" id="L466" title="All 2 branches missed.">                        if (!isStyleToken(name.substring(start+1, end))) {</span>
+<span class="nc" id="L467">                                return name.substring(0, end);</span>
+            }
+<span class="nc" id="L469">                        end = start;</span>
+        }
+
+<span class="nc" id="L472">                return name; //should not happen</span>
+        }
+
+    private String expandAbbreviation(String abbr) {
+<span class="nc bnc" id="L476" title="All 2 branches missed.">        if (styleAbbreviationsMapping.containsKey(abbr))</span>
+<span class="nc" id="L477">                        return (String) styleAbbreviationsMapping.get(abbr);</span>
+<span class="nc" id="L478">        return abbr;</span>
+    }
+
+    private boolean isStyleToken(String token) {
+<span class="nc" id="L482">        return styleNameTokes.contains(token);</span>
+    }
+
+    private String psName2FullName(String name) {
+        String res;
+        int pos;
+
+        //According to Adobe technical note #5088 psName (aka FontName) has form
+        //   &lt;Family Name&gt;&lt;VendorID&gt;-&lt;Weight&gt;&lt;Width&gt;&lt;Slant&gt;&lt;Character Set&gt;
+        //where spaces are not allowed.
+
+        //Conversion: Expand abbreviations in style portion (everything after '-'),
+        //            replace '-' with space and insert missing spaces
+<span class="nc" id="L495">        pos = name.indexOf(&quot;-&quot;);</span>
+<span class="nc bnc" id="L496" title="All 2 branches missed.">        if (pos &gt;= 0) {</span>
+<span class="nc" id="L497">            res =  expandName(name.substring(0, pos), false);</span>
+<span class="nc" id="L498">            res += &quot; &quot; + expandName(name.substring(pos+1), true);</span>
+        } else {
+<span class="nc" id="L500">            res = expandName(name, false);</span>
+        }
+
+<span class="nc" id="L503">        return res;</span>
+    }
+
+    private String psName2FamilyName(String name) {
+<span class="nc" id="L507">        String tmp = name;</span>
+
+        //According to Adobe technical note #5088 psName (aka FontName) has form
+        //   &lt;Family Name&gt;&lt;VendorID&gt;-&lt;Weight&gt;&lt;Width&gt;&lt;Slant&gt;&lt;Character Set&gt;
+        //where spaces are not allowed.
+
+        //Conversion: Truncate style portion (everything after '-')
+        //            and insert missing spaces
+
+<span class="nc bnc" id="L516" title="All 2 branches missed.">        if (tmp.indexOf(&quot;-&quot;) &gt; 0) {</span>
+<span class="nc" id="L517">            tmp = tmp.substring(0, tmp.indexOf(&quot;-&quot;));</span>
+        }
+
+<span class="nc" id="L520">        return expandName(tmp, false);</span>
+    }
+
+    private int nextCapitalLetter(String s, int off) {
+<span class="nc bnc" id="L524" title="All 4 branches missed.">        for (; (off &gt;=0) &amp;&amp; off &lt; s.length(); off++) {</span>
+<span class="nc bnc" id="L525" title="All 4 branches missed.">            if (s.charAt(off) &gt;= 'A' &amp;&amp; s.charAt(off) &lt;= 'Z')</span>
+<span class="nc" id="L526">                return off;</span>
+        }
+<span class="nc" id="L528">        return -1;</span>
+    }
+
+    private String expandName(String s, boolean tryExpandAbbreviations) {
+<span class="nc" id="L532">        StringBuffer res = new StringBuffer(s.length() + 10);</span>
+<span class="nc" id="L533">        int start=0, end;</span>
+
+<span class="nc bnc" id="L535" title="All 2 branches missed.">        while(start &lt; s.length()) {</span>
+<span class="nc" id="L536">            end = nextCapitalLetter(s, start + 1);</span>
+<span class="nc bnc" id="L537" title="All 2 branches missed.">            if (end &lt; 0) {</span>
+<span class="nc" id="L538">                end = s.length();</span>
+            }
+
+<span class="nc bnc" id="L541" title="All 2 branches missed.">            if (start != 0) {</span>
+<span class="nc" id="L542">                res.append(&quot; &quot;);</span>
+            }
+
+<span class="nc bnc" id="L545" title="All 2 branches missed.">            if (tryExpandAbbreviations) {</span>
+<span class="nc" id="L546">                res.append(expandAbbreviation(s.substring(start, end)));</span>
+            } else {
+<span class="nc" id="L548">                res.append(s.substring(start, end));</span>
+            }
+<span class="nc" id="L550">            start = end;</span>
+                }
+
+<span class="nc" id="L553">        return res.toString();</span>
+    }
+
+    /* skip lines beginning with &quot;%&quot; and leading white space on a line */
+    private byte skip(ByteBuffer bb) {
+<span class="nc" id="L558">        byte b = bb.get();</span>
+<span class="nc bnc" id="L559" title="All 2 branches missed.">        while (b == '%') {</span>
+            while (true) {
+<span class="nc" id="L561">                b = bb.get();</span>
+<span class="nc bnc" id="L562" title="All 4 branches missed.">                if (b == '\r' || b == '\n') {</span>
+<span class="nc" id="L563">                    break;</span>
+                }
+            }
+        }
+<span class="nc bnc" id="L567" title="All 2 branches missed.">        while (b &lt;= ' ') {</span>
+<span class="nc" id="L568">            b = bb.get();</span>
+        }
+<span class="nc" id="L570">        return b;</span>
+    }
+
+    /*
+     * Token types:
+     * PSNAMETOKEN - /
+     * PSSTRINGTOKEN - literal text string
+     */
+    private int nextTokenType(ByteBuffer bb) {
+
+        try {
+<span class="nc" id="L581">            byte b = skip(bb);</span>
+
+            while (true) {
+<span class="nc bnc" id="L584" title="All 2 branches missed.">                if (b == (byte)'/') { // PS defined name follows.</span>
+<span class="nc" id="L585">                    return PSNAMETOKEN;</span>
+<span class="nc bnc" id="L586" title="All 2 branches missed.">                } else if (b == (byte)'(') { // PS string follows</span>
+<span class="nc" id="L587">                    return PSSTRINGTOKEN;</span>
+<span class="nc bnc" id="L588" title="All 4 branches missed.">                } else if ((b == (byte)'\r') || (b == (byte)'\n')) {</span>
+<span class="nc" id="L589">                b = skip(bb);</span>
+                } else {
+<span class="nc" id="L591">                    b = bb.get();</span>
+                }
+            }
+<span class="nc" id="L594">        } catch (BufferUnderflowException e) {</span>
+<span class="nc" id="L595">            return PSEOFTOKEN;</span>
+        }
+    }
+
+    /* Read simple token (sequence of non-whitespace characters)
+         starting from the current position.
+         Skip leading whitespaces (if any). */
+    private String getSimpleToken(ByteBuffer bb) {
+<span class="nc bnc" id="L603" title="All 2 branches missed.">        while (bb.get() &lt;= ' ');</span>
+<span class="nc" id="L604">        int pos1 = bb.position()-1;</span>
+<span class="nc bnc" id="L605" title="All 2 branches missed.">        while (bb.get() &gt; ' ');</span>
+<span class="nc" id="L606">        int pos2 = bb.position();</span>
+<span class="nc" id="L607">        byte[] nameBytes = new byte[pos2-pos1-1];</span>
+<span class="nc" id="L608">        bb.position(pos1);</span>
+<span class="nc" id="L609">        bb.get(nameBytes);</span>
+        try {
+<span class="nc" id="L611">            return new String(nameBytes, &quot;US-ASCII&quot;);</span>
+<span class="nc" id="L612">        } catch (UnsupportedEncodingException e) {</span>
+<span class="nc" id="L613">            return new String(nameBytes);</span>
+        }
+    }
+
+    private String getString(ByteBuffer bb) {
+<span class="nc" id="L618">        int pos1 = bb.position();</span>
+<span class="nc bnc" id="L619" title="All 2 branches missed.">        while (bb.get() != ')');</span>
+<span class="nc" id="L620">        int pos2 = bb.position();</span>
+<span class="nc" id="L621">        byte[] nameBytes = new byte[pos2-pos1-1];</span>
+<span class="nc" id="L622">        bb.position(pos1);</span>
+<span class="nc" id="L623">        bb.get(nameBytes);</span>
+        try {
+<span class="nc" id="L625">            return new String(nameBytes, &quot;US-ASCII&quot;);</span>
+<span class="nc" id="L626">        } catch (UnsupportedEncodingException e) {</span>
+<span class="nc" id="L627">            return new String(nameBytes);</span>
+        }
+    }
+
+
+    public String getPostscriptName() {
+<span class="nc" id="L633">        return psName;</span>
+    }
+
+    protected synchronized FontScaler getScaler() {
+<span class="nc bnc" id="L637" title="All 2 branches missed.">        if (scaler == null) {</span>
+<span class="nc" id="L638">            scaler = FontScaler.getScaler(this, 0, false, fileSize);</span>
+        }
+
+<span class="nc" id="L641">        return scaler;</span>
+    }
+
+    CharToGlyphMapper getMapper() {
+<span class="nc bnc" id="L645" title="All 2 branches missed.">        if (mapper == null) {</span>
+<span class="nc" id="L646">            mapper = new Type1GlyphMapper(this);</span>
+        }
+<span class="nc" id="L648">        return mapper;</span>
+    }
+
+    public int getNumGlyphs() {
+        try {
+<span class="nc" id="L653">            return getScaler().getNumGlyphs();</span>
+<span class="nc" id="L654">        } catch (FontScalerException e) {</span>
+<span class="nc" id="L655">            scaler = FontScaler.getNullScaler();</span>
+<span class="nc" id="L656">            return getNumGlyphs();</span>
+        }
+    }
+
+    public int getMissingGlyphCode() {
+        try {
+<span class="nc" id="L662">            return getScaler().getMissingGlyphCode();</span>
+<span class="nc" id="L663">        } catch (FontScalerException e) {</span>
+<span class="nc" id="L664">            scaler = FontScaler.getNullScaler();</span>
+<span class="nc" id="L665">            return getMissingGlyphCode();</span>
+        }
+    }
+
+    public int getGlyphCode(char charCode) {
+        try {
+<span class="nc" id="L671">            return getScaler().getGlyphCode(charCode);</span>
+<span class="nc" id="L672">        } catch (FontScalerException e) {</span>
+<span class="nc" id="L673">            scaler = FontScaler.getNullScaler();</span>
+<span class="nc" id="L674">            return getGlyphCode(charCode);</span>
+        }
+    }
+
+    public String toString() {
+<span class="nc" id="L679">        return &quot;** Type1 Font: Family=&quot;+familyName+ &quot; Name=&quot;+fullName+</span>
+<span class="nc" id="L680">            &quot; style=&quot;+style+&quot; fileName=&quot;+getPublicFileName();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

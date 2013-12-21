@@ -1,0 +1,473 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>Target.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.rmi.transport</a> &gt; <span class="el_source">Target.java</span></div><h1>Target.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1996, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package sun.rmi.transport;
+
+import java.rmi.Remote;
+import java.rmi.NoSuchObjectException;
+import java.rmi.dgc.VMID;
+import java.rmi.server.ObjID;
+import java.rmi.server.Unreferenced;
+import java.security.AccessControlContext;
+import java.security.AccessController;
+import java.util.*;
+import sun.rmi.runtime.Log;
+import sun.rmi.runtime.NewThreadAction;
+import sun.rmi.server.Dispatcher;
+
+/**
+ * A target contains information pertaining to a remote object that
+ * resides in this address space.  Targets are located via the
+ * ObjectTable.
+ */
+public final class Target {
+    /** object id for target */
+    private final ObjID id;
+    /** flag indicating whether target is subject to collection */
+    private final boolean permanent;
+    /** weak reference to remote object implementation */
+    private final WeakRef weakImpl;
+    /** dispatcher for remote object */
+    private volatile Dispatcher disp;
+    /** stub for remote object */
+    private final Remote stub;
+    /** set of clients that hold references to this target */
+<span class="fc" id="L56">    private final Vector&lt;VMID&gt; refSet = new Vector&lt;&gt;();</span>
+    /** table that maps client endpoints to sequence numbers */
+<span class="fc" id="L58">    private final Hashtable&lt;VMID, SequenceEntry&gt; sequenceTable =</span>
+        new Hashtable&lt;&gt;(5);
+    /** access control context in which target was created */
+    private final AccessControlContext acc;
+    /** context class loader in which target was created */
+    private final ClassLoader ccl;
+    /** number of pending/executing calls */
+<span class="fc" id="L65">    private int callCount = 0;</span>
+    /** true if this target has been removed from the object table */
+<span class="fc" id="L67">    private boolean removed = false;</span>
+    /**
+     * the transport through which this target was exported and
+     * through which remote calls will be allowed
+     */
+<span class="fc" id="L72">    private volatile Transport exportedTransport = null;</span>
+
+    /** number to identify next callback thread created here */
+<span class="fc" id="L75">    private static int nextThreadNum = 0;</span>
+
+    /**
+     * Construct a Target for a remote object &quot;impl&quot; with
+     * a specific object id.
+     *
+     * If &quot;permanent&quot; is true, then the impl is pinned permanently
+     * (the impl will not be collected via distributed and/or local
+     * GC).  If &quot;on&quot; is false, than the impl is subject to
+     * collection. Permanent objects do not keep a server from
+     * exiting.
+     */
+    public Target(Remote impl, Dispatcher disp, Remote stub, ObjID id,
+                  boolean permanent)
+<span class="fc" id="L89">    {</span>
+<span class="fc" id="L90">        this.weakImpl = new WeakRef(impl, ObjectTable.reapQueue);</span>
+<span class="fc" id="L91">        this.disp = disp;</span>
+<span class="fc" id="L92">        this.stub = stub;</span>
+<span class="fc" id="L93">        this.id = id;</span>
+<span class="fc" id="L94">        this.acc = AccessController.getContext();</span>
+
+        /*
+         * Fix for 4149366: so that downloaded parameter types unmarshalled
+         * for this impl will be compatible with types known only to the
+         * impl class's class loader (when it's not identical to the
+         * exporting thread's context class loader), mark the impl's class
+         * loader as the loader to use as the context class loader in the
+         * server's dispatch thread while a call to this impl is being
+         * processed (unless this exporting thread's context class loader is
+         * a child of the impl's class loader, such as when a registry is
+         * exported by an application, in which case this thread's context
+         * class loader is preferred).
+         */
+        ClassLoader threadContextLoader =
+<span class="fc" id="L109">            Thread.currentThread().getContextClassLoader();</span>
+<span class="fc" id="L110">        ClassLoader serverLoader = impl.getClass().getClassLoader();</span>
+<span class="fc bfc" id="L111" title="All 2 branches covered.">        if (checkLoaderAncestry(threadContextLoader, serverLoader)) {</span>
+<span class="fc" id="L112">            this.ccl = threadContextLoader;</span>
+        } else {
+<span class="fc" id="L114">            this.ccl = serverLoader;</span>
+        }
+
+<span class="fc" id="L117">        this.permanent = permanent;</span>
+<span class="fc bfc" id="L118" title="All 2 branches covered.">        if (permanent) {</span>
+<span class="fc" id="L119">            pinImpl();</span>
+        }
+<span class="fc" id="L121">    }</span>
+
+    /**
+     * Return true if the first class loader is a child of (or identical
+     * to) the second class loader.  Either loader may be &quot;null&quot;, which is
+     * considered to be the parent of any non-null class loader.
+     *
+     * (utility method added for the 1.2beta4 fix for 4149366)
+     */
+    private static boolean checkLoaderAncestry(ClassLoader child,
+                                               ClassLoader ancestor)
+    {
+<span class="fc bfc" id="L133" title="All 2 branches covered.">        if (ancestor == null) {</span>
+<span class="fc" id="L134">            return true;</span>
+<span class="pc bpc" id="L135" title="1 of 2 branches missed.">        } else if (child == null) {</span>
+<span class="nc" id="L136">            return false;</span>
+        } else {
+<span class="fc" id="L138">            for (ClassLoader parent = child;</span>
+<span class="fc bfc" id="L139" title="All 2 branches covered.">                 parent != null;</span>
+<span class="fc" id="L140">                 parent = parent.getParent())</span>
+            {
+<span class="fc bfc" id="L142" title="All 2 branches covered.">                if (parent == ancestor) {</span>
+<span class="fc" id="L143">                    return true;</span>
+                }
+            }
+<span class="fc" id="L146">            return false;</span>
+        }
+    }
+
+    /** Get the stub (proxy) object for this target
+     */
+    public Remote getStub() {
+<span class="fc" id="L153">        return stub;</span>
+    }
+
+    /**
+     * Returns the object endpoint for the target.
+     */
+    ObjectEndpoint getObjectEndpoint() {
+<span class="fc" id="L160">        return new ObjectEndpoint(id, exportedTransport);</span>
+    }
+
+    /**
+     * Get the weak reference for the Impl of this target.
+     */
+    WeakRef getWeakImpl() {
+<span class="fc" id="L167">        return weakImpl;</span>
+    }
+
+    /**
+     * Returns the dispatcher for this remote object target.
+     */
+    Dispatcher getDispatcher() {
+<span class="fc" id="L174">        return disp;</span>
+    }
+
+    AccessControlContext getAccessControlContext() {
+<span class="fc" id="L178">        return acc;</span>
+    }
+
+    ClassLoader getContextClassLoader() {
+<span class="fc" id="L182">        return ccl;</span>
+    }
+
+    /**
+     * Get the impl for this target.
+     * Note: this may return null if the impl has been garbage collected.
+     * (currently, there is no need to make this method public)
+     */
+    Remote getImpl() {
+<span class="fc" id="L191">        return (Remote)weakImpl.get();</span>
+    }
+
+    /**
+     * Returns true if the target is permanent.
+     */
+    boolean isPermanent() {
+<span class="fc" id="L198">        return permanent;</span>
+    }
+
+    /**
+     * Pin impl in target. Pin the WeakRef object so it holds a strong
+     * reference to the object to it will not be garbage collected locally.
+     * This way there is a single object responsible for the weak ref
+     * mechanism.
+     */
+    synchronized void pinImpl() {
+<span class="fc" id="L208">        weakImpl.pin();</span>
+<span class="fc" id="L209">    }</span>
+
+    /**
+     * Unpin impl in target.  Weaken the reference to impl so that it
+     * can be garbage collected locally. But only if there the refSet
+     * is empty.  All of the weak/strong handling is in WeakRef
+     */
+    synchronized void unpinImpl() {
+        /* only unpin if:
+         * a) impl is not permanent, and
+         * b) impl is not already unpinned, and
+         * c) there are no external references (outside this
+         *    address space) for the impl
+         */
+<span class="fc bfc" id="L223" title="All 4 branches covered.">        if (!permanent &amp;&amp; refSet.isEmpty()) {</span>
+<span class="fc" id="L224">            weakImpl.unpin();</span>
+        }
+<span class="fc" id="L226">    }</span>
+
+    /**
+     * Enable the transport through which remote calls to this target
+     * are allowed to be set if it has not already been set.
+     */
+    void setExportedTransport(Transport exportedTransport) {
+<span class="pc bpc" id="L233" title="1 of 2 branches missed.">        if (this.exportedTransport == null) {</span>
+<span class="fc" id="L234">            this.exportedTransport = exportedTransport;</span>
+        }
+<span class="fc" id="L236">    }</span>
+
+    /**
+     * Add an endpoint to the remembered set.  Also adds a notifier
+     * to call back if the address space associated with the endpoint
+     * dies.
+     */
+    synchronized void referenced(long sequenceNum, VMID vmid) {
+        // check sequence number for vmid
+<span class="fc" id="L245">        SequenceEntry entry = sequenceTable.get(vmid);</span>
+<span class="fc bfc" id="L246" title="All 2 branches covered.">        if (entry == null) {</span>
+<span class="fc" id="L247">            sequenceTable.put(vmid, new SequenceEntry(sequenceNum));</span>
+<span class="pc bpc" id="L248" title="1 of 2 branches missed.">        } else if (entry.sequenceNum &lt; sequenceNum) {</span>
+<span class="fc" id="L249">            entry.update(sequenceNum);</span>
+        } else  {
+            // late dirty call; ignore.
+<span class="nc" id="L252">            return;</span>
+        }
+
+<span class="fc bfc" id="L255" title="All 2 branches covered.">        if (!refSet.contains(vmid)) {</span>
+            /*
+             * A Target must be pinned while its refSet is not empty.  It may
+             * have become unpinned if external LiveRefs only existed in
+             * serialized form for some period of time, or if a client failed
+             * to renew its lease due to a transient network failure.  So,
+             * make sure that it is pinned here; this fixes bugid 4069644.
+             */
+<span class="fc" id="L263">            pinImpl();</span>
+<span class="pc bpc" id="L264" title="1 of 2 branches missed.">            if (getImpl() == null)      // too late if impl was collected</span>
+<span class="nc" id="L265">                return;</span>
+
+<span class="fc bfc" id="L267" title="All 2 branches covered.">            if (DGCImpl.dgcLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="fc" id="L268">                DGCImpl.dgcLog.log(Log.VERBOSE, &quot;add to dirty set: &quot; + vmid);</span>
+            }
+
+<span class="fc" id="L271">            refSet.addElement(vmid);</span>
+
+<span class="fc" id="L273">            DGCImpl.getDGCImpl().registerTarget(vmid, this);</span>
+        }
+<span class="fc" id="L275">    }</span>
+
+    /**
+     * Remove endpoint from remembered set.  If set becomes empty,
+     * remove server from Transport's object table.
+     */
+    synchronized void unreferenced(long sequenceNum, VMID vmid, boolean strong)
+    {
+        // check sequence number for vmid
+<span class="fc" id="L284">        SequenceEntry entry = sequenceTable.get(vmid);</span>
+<span class="pc bpc" id="L285" title="2 of 4 branches missed.">        if (entry == null || entry.sequenceNum &gt; sequenceNum) {</span>
+            // late clean call; ignore
+<span class="nc" id="L287">            return;</span>
+<span class="pc bpc" id="L288" title="1 of 2 branches missed.">        } else if (strong) {</span>
+            // strong clean call; retain sequenceNum
+<span class="nc" id="L290">            entry.retain(sequenceNum);</span>
+<span class="pc bpc" id="L291" title="1 of 2 branches missed.">        } else if (entry.keep == false) {</span>
+            // get rid of sequence number
+<span class="fc" id="L293">            sequenceTable.remove(vmid);</span>
+        }
+
+<span class="pc bpc" id="L296" title="1 of 2 branches missed.">        if (DGCImpl.dgcLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="nc" id="L297">            DGCImpl.dgcLog.log(Log.VERBOSE, &quot;remove from dirty set: &quot; + vmid);</span>
+        }
+
+<span class="fc" id="L300">        refSetRemove(vmid);</span>
+<span class="fc" id="L301">    }</span>
+
+    /**
+     * Remove endpoint from the reference set.
+     */
+    synchronized private void refSetRemove(VMID vmid) {
+        // remove notification request
+<span class="fc" id="L308">        DGCImpl.getDGCImpl().unregisterTarget(vmid, this);</span>
+
+<span class="pc bpc" id="L310" title="1 of 4 branches missed.">        if (refSet.removeElement(vmid) &amp;&amp; refSet.isEmpty()) {</span>
+            // reference set is empty, so server can be garbage collected.
+            // remove object from table.
+<span class="pc bpc" id="L313" title="1 of 2 branches missed.">            if (DGCImpl.dgcLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="nc" id="L314">                DGCImpl.dgcLog.log(Log.VERBOSE,</span>
+                    &quot;reference set is empty: target = &quot; + this);
+            }
+
+            /*
+             * If the remote object implements the Unreferenced interface,
+             * invoke its unreferenced callback in a separate thread.
+             */
+<span class="fc" id="L322">            Remote obj = getImpl();</span>
+<span class="fc bfc" id="L323" title="All 2 branches covered.">            if (obj instanceof Unreferenced) {</span>
+<span class="fc" id="L324">                final Unreferenced unrefObj = (Unreferenced) obj;</span>
+<span class="fc" id="L325">                final Thread t =</span>
+<span class="fc" id="L326">                    java.security.AccessController.doPrivileged(</span>
+<span class="fc" id="L327">                        new NewThreadAction(new Runnable() {</span>
+                            public void run() {
+<span class="fc" id="L329">                                unrefObj.unreferenced();</span>
+<span class="fc" id="L330">                            }</span>
+                        }, &quot;Unreferenced-&quot; + nextThreadNum++, false, true));
+                // REMIND: access to nextThreadNum not synchronized; you care?
+                /*
+                 * We must manually set the context class loader appropriately
+                 * for threads that may invoke user code (see bugid 4171278).
+                 */
+<span class="fc" id="L337">                java.security.AccessController.doPrivileged(</span>
+<span class="fc" id="L338">                    new java.security.PrivilegedAction&lt;Void&gt;() {</span>
+                        public Void run() {
+<span class="fc" id="L340">                        t.setContextClassLoader(ccl);</span>
+<span class="fc" id="L341">                        return null;</span>
+                    }
+                });
+
+<span class="fc" id="L345">                t.start();</span>
+            }
+
+<span class="fc" id="L348">            unpinImpl();</span>
+        }
+<span class="fc" id="L350">    }</span>
+
+    /**
+     * Mark this target as not accepting new calls if any of the
+     * following conditions exist: a) the force parameter is true,
+     * b) the target's call count is zero, or c) the object is already
+     * not accepting calls. Returns true if target is marked as not
+     * accepting new calls; returns false otherwise.
+     */
+    synchronized boolean unexport(boolean force) {
+
+<span class="pc bpc" id="L361" title="1 of 6 branches missed.">        if ((force == true) || (callCount == 0) || (disp == null)) {</span>
+<span class="fc" id="L362">            disp = null;</span>
+            /*
+             * Fix for 4331349: unpin object so that it may be gc'd.
+             * Also, unregister all vmids referencing this target
+             * so target can be gc'd.
+             */
+<span class="fc" id="L368">            unpinImpl();</span>
+<span class="fc" id="L369">            DGCImpl dgc = DGCImpl.getDGCImpl();</span>
+<span class="fc" id="L370">            Enumeration&lt;VMID&gt; enum_ = refSet.elements();</span>
+<span class="fc bfc" id="L371" title="All 2 branches covered.">            while (enum_.hasMoreElements()) {</span>
+<span class="fc" id="L372">                VMID vmid = enum_.nextElement();</span>
+<span class="fc" id="L373">                dgc.unregisterTarget(vmid, this);</span>
+<span class="fc" id="L374">            }</span>
+<span class="fc" id="L375">            return true;</span>
+        } else {
+<span class="fc" id="L377">            return false;</span>
+        }
+    }
+
+    /**
+     * Mark this target as having been removed from the object table.
+     */
+    synchronized void markRemoved() {
+<span class="pc bpc" id="L385" title="1 of 2 branches missed.">        if (!(!removed)) { throw new AssertionError(); }</span>
+
+<span class="fc" id="L387">        removed = true;</span>
+<span class="fc bfc" id="L388" title="All 4 branches covered.">        if (!permanent &amp;&amp; callCount == 0) {</span>
+<span class="fc" id="L389">            ObjectTable.decrementKeepAliveCount();</span>
+        }
+
+<span class="pc bpc" id="L392" title="1 of 2 branches missed.">        if (exportedTransport != null) {</span>
+<span class="fc" id="L393">            exportedTransport.targetUnexported();</span>
+        }
+<span class="fc" id="L395">    }</span>
+
+    /**
+     * Increment call count.
+     */
+    synchronized void incrementCallCount() throws NoSuchObjectException {
+
+<span class="pc bpc" id="L402" title="1 of 2 branches missed.">        if (disp != null) {</span>
+<span class="fc" id="L403">            callCount ++;</span>
+        } else {
+<span class="nc" id="L405">            throw new NoSuchObjectException(&quot;object not accepting new calls&quot;);</span>
+        }
+<span class="fc" id="L407">    }</span>
+
+    /**
+     * Decrement call count.
+     */
+    synchronized void decrementCallCount() {
+
+<span class="pc bpc" id="L414" title="1 of 2 branches missed.">        if (--callCount &lt; 0) {</span>
+<span class="nc" id="L415">            throw new Error(&quot;internal error: call count less than zero&quot;);</span>
+        }
+
+        /*
+         * The &quot;keep-alive count&quot; is the number of non-permanent remote
+         * objects that are either in the object table or still have calls
+         * in progress.  Therefore, this state change may affect the
+         * keep-alive count: if this target is for a non-permanent remote
+         * object that has been removed from the object table and now has a
+         * call count of zero, it needs to be decremented.
+         */
+<span class="pc bpc" id="L426" title="1 of 6 branches missed.">        if (!permanent &amp;&amp; removed &amp;&amp; callCount == 0) {</span>
+<span class="fc" id="L427">            ObjectTable.decrementKeepAliveCount();</span>
+        }
+<span class="fc" id="L429">    }</span>
+
+    /**
+     * Returns true if remembered set is empty; otherwise returns
+     * false
+     */
+    boolean isEmpty() {
+<span class="fc" id="L436">        return refSet.isEmpty();</span>
+    }
+
+    /**
+     * This method is called if the address space associated with the
+     * vmid dies.  In that case, the vmid should be removed
+     * from the reference set.
+     */
+    synchronized public void vmidDead(VMID vmid) {
+<span class="pc bpc" id="L445" title="1 of 2 branches missed.">        if (DGCImpl.dgcLog.isLoggable(Log.BRIEF)) {</span>
+<span class="nc" id="L446">            DGCImpl.dgcLog.log(Log.BRIEF, &quot;removing endpoint &quot; +</span>
+                            vmid + &quot; from reference set&quot;);
+        }
+
+<span class="fc" id="L450">        sequenceTable.remove(vmid);</span>
+<span class="fc" id="L451">        refSetRemove(vmid);</span>
+<span class="fc" id="L452">    }</span>
+}
+
+class SequenceEntry {
+    long sequenceNum;
+    boolean keep;
+
+<span class="fc" id="L459">    SequenceEntry(long sequenceNum) {</span>
+<span class="fc" id="L460">        this.sequenceNum = sequenceNum;</span>
+<span class="fc" id="L461">        keep = false;</span>
+<span class="fc" id="L462">    }</span>
+
+    void retain(long sequenceNum) {
+<span class="nc" id="L465">        this.sequenceNum = sequenceNum;</span>
+<span class="nc" id="L466">        keep = true;</span>
+<span class="nc" id="L467">    }</span>
+
+    void update(long sequenceNum) {
+<span class="fc" id="L470">        this.sequenceNum = sequenceNum;</span>
+<span class="fc" id="L471">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

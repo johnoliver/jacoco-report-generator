@@ -1,0 +1,1146 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>DatagramChannelImpl.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.nio.ch</a> &gt; <span class="el_source">DatagramChannelImpl.java</span></div><h1>DatagramChannelImpl.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2001, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.nio.ch;
+
+import java.io.FileDescriptor;
+import java.io.IOException;
+import java.net.*;
+import java.nio.ByteBuffer;
+import java.nio.channels.*;
+import java.nio.channels.spi.*;
+import java.util.*;
+import sun.net.ResourceManager;
+
+/**
+ * An implementation of DatagramChannels.
+ */
+
+<span class="pc bpc" id="L41" title="1 of 2 branches missed.">class DatagramChannelImpl</span>
+    extends DatagramChannel
+    implements SelChImpl
+{
+
+    // Used to make native read and write calls
+<span class="fc" id="L47">    private static NativeDispatcher nd = new DatagramDispatcher();</span>
+
+    // Our file descriptor
+    private final FileDescriptor fd;
+
+    // fd value needed for dev/poll. This value will remain valid
+    // even after the value in the file descriptor object has been set to -1
+    private final int fdVal;
+
+    // The protocol family of the socket
+    private final ProtocolFamily family;
+
+    // IDs of native threads doing reads and writes, for signalling
+<span class="pc" id="L60">    private volatile long readerThread = 0;</span>
+<span class="pc" id="L61">    private volatile long writerThread = 0;</span>
+
+    // Cached InetAddress and port for unconnected DatagramChannels
+    // used by receive0
+    private InetAddress cachedSenderInetAddress;
+    private int cachedSenderPort;
+
+    // Lock held by current reading or connecting thread
+<span class="pc" id="L69">    private final Object readLock = new Object();</span>
+
+    // Lock held by current writing or connecting thread
+<span class="pc" id="L72">    private final Object writeLock = new Object();</span>
+
+    // Lock held by any thread that modifies the state fields declared below
+    // DO NOT invoke a blocking I/O operation while holding this lock!
+<span class="pc" id="L76">    private final Object stateLock = new Object();</span>
+
+    // -- The following fields are protected by stateLock
+
+    // State (does not necessarily increase monotonically)
+    private static final int ST_UNINITIALIZED = -1;
+    private static final int ST_UNCONNECTED = 0;
+    private static final int ST_CONNECTED = 1;
+    private static final int ST_KILLED = 2;
+<span class="pc" id="L85">    private int state = ST_UNINITIALIZED;</span>
+
+    // Binding
+    private InetSocketAddress localAddress;
+    private InetSocketAddress remoteAddress;
+
+    // Our socket adaptor, if any
+    private DatagramSocket socket;
+
+    // Multicast support
+    private MembershipRegistry registry;
+
+    // set true when socket is bound and SO_REUSEADDRESS is emulated
+    private boolean reuseAddressEmulated;
+
+    // set true/false when socket is already bound and SO_REUSEADDR is emulated
+    private boolean isReuseAddress;
+
+    // -- End of fields protected by stateLock
+
+
+    public DatagramChannelImpl(SelectorProvider sp)
+        throws IOException
+    {
+<span class="fc" id="L109">        super(sp);</span>
+<span class="fc" id="L110">        ResourceManager.beforeUdpCreate();</span>
+        try {
+<span class="fc bfc" id="L112" title="All 2 branches covered.">            this.family = Net.isIPv6Available() ?</span>
+                StandardProtocolFamily.INET6 : StandardProtocolFamily.INET;
+<span class="fc" id="L114">            this.fd = Net.socket(family, false);</span>
+<span class="fc" id="L115">            this.fdVal = IOUtil.fdVal(fd);</span>
+<span class="fc" id="L116">            this.state = ST_UNCONNECTED;</span>
+<span class="nc" id="L117">        } catch (IOException ioe) {</span>
+<span class="nc" id="L118">            ResourceManager.afterUdpClose();</span>
+<span class="nc" id="L119">            throw ioe;</span>
+<span class="fc" id="L120">        }</span>
+<span class="fc" id="L121">    }</span>
+
+    public DatagramChannelImpl(SelectorProvider sp, ProtocolFamily family)
+        throws IOException
+    {
+<span class="fc" id="L126">        super(sp);</span>
+<span class="pc bpc" id="L127" title="1 of 4 branches missed.">        if ((family != StandardProtocolFamily.INET) &amp;&amp;</span>
+            (family != StandardProtocolFamily.INET6))
+        {
+<span class="nc bnc" id="L130" title="All 2 branches missed.">            if (family == null)</span>
+<span class="nc" id="L131">                throw new NullPointerException(&quot;'family' is null&quot;);</span>
+            else
+<span class="nc" id="L133">                throw new UnsupportedOperationException(&quot;Protocol family not supported&quot;);</span>
+        }
+<span class="fc bfc" id="L135" title="All 2 branches covered.">        if (family == StandardProtocolFamily.INET6) {</span>
+<span class="pc bpc" id="L136" title="1 of 2 branches missed.">            if (!Net.isIPv6Available()) {</span>
+<span class="nc" id="L137">                throw new UnsupportedOperationException(&quot;IPv6 not available&quot;);</span>
+            }
+        }
+<span class="fc" id="L140">        this.family = family;</span>
+<span class="fc" id="L141">        this.fd = Net.socket(family, false);</span>
+<span class="fc" id="L142">        this.fdVal = IOUtil.fdVal(fd);</span>
+<span class="fc" id="L143">        this.state = ST_UNCONNECTED;</span>
+<span class="fc" id="L144">    }</span>
+
+    public DatagramChannelImpl(SelectorProvider sp, FileDescriptor fd)
+        throws IOException
+    {
+<span class="nc" id="L149">        super(sp);</span>
+<span class="nc bnc" id="L150" title="All 2 branches missed.">        this.family = Net.isIPv6Available() ?</span>
+            StandardProtocolFamily.INET6 : StandardProtocolFamily.INET;
+<span class="nc" id="L152">        this.fd = fd;</span>
+<span class="nc" id="L153">        this.fdVal = IOUtil.fdVal(fd);</span>
+<span class="nc" id="L154">        this.state = ST_UNCONNECTED;</span>
+<span class="nc" id="L155">        this.localAddress = Net.localAddress(fd);</span>
+<span class="nc" id="L156">    }</span>
+
+    public DatagramSocket socket() {
+<span class="fc" id="L159">        synchronized (stateLock) {</span>
+<span class="pc bpc" id="L160" title="1 of 2 branches missed.">            if (socket == null)</span>
+<span class="fc" id="L161">                socket = DatagramSocketAdaptor.create(this);</span>
+<span class="fc" id="L162">            return socket;</span>
+<span class="nc" id="L163">        }</span>
+    }
+
+    @Override
+    public SocketAddress getLocalAddress() throws IOException {
+<span class="fc" id="L168">        synchronized (stateLock) {</span>
+<span class="fc bfc" id="L169" title="All 2 branches covered.">            if (!isOpen())</span>
+<span class="fc" id="L170">                throw new ClosedChannelException();</span>
+            // Perform security check before returning address
+<span class="fc" id="L172">            return Net.getRevealedLocalAddress(localAddress);</span>
+<span class="fc" id="L173">        }</span>
+    }
+
+    @Override
+    public SocketAddress getRemoteAddress() throws IOException {
+<span class="nc" id="L178">        synchronized (stateLock) {</span>
+<span class="nc bnc" id="L179" title="All 2 branches missed.">            if (!isOpen())</span>
+<span class="nc" id="L180">                throw new ClosedChannelException();</span>
+<span class="nc" id="L181">            return remoteAddress;</span>
+<span class="nc" id="L182">        }</span>
+    }
+
+    @Override
+    public &lt;T&gt; DatagramChannel setOption(SocketOption&lt;T&gt; name, T value)
+        throws IOException
+    {
+<span class="pc bpc" id="L189" title="1 of 2 branches missed.">        if (name == null)</span>
+<span class="nc" id="L190">            throw new NullPointerException();</span>
+<span class="pc bpc" id="L191" title="1 of 2 branches missed.">        if (!supportedOptions().contains(name))</span>
+<span class="nc" id="L192">            throw new UnsupportedOperationException(&quot;'&quot; + name + &quot;' not supported&quot;);</span>
+
+<span class="fc" id="L194">        synchronized (stateLock) {</span>
+<span class="fc" id="L195">            ensureOpen();</span>
+
+<span class="pc bpc" id="L197" title="1 of 2 branches missed.">            if (name == StandardSocketOptions.IP_TOS) {</span>
+                // IPv4 only; no-op for IPv6
+<span class="nc bnc" id="L199" title="All 2 branches missed.">                if (family == StandardProtocolFamily.INET) {</span>
+<span class="nc" id="L200">                    Net.setSocketOption(fd, family, name, value);</span>
+                }
+<span class="nc" id="L202">                return this;</span>
+            }
+
+<span class="pc bpc" id="L205" title="2 of 4 branches missed.">            if (name == StandardSocketOptions.IP_MULTICAST_TTL ||</span>
+                name == StandardSocketOptions.IP_MULTICAST_LOOP)
+            {
+                // options are protocol dependent
+<span class="nc" id="L209">                Net.setSocketOption(fd, family, name, value);</span>
+<span class="nc" id="L210">                return this;</span>
+            }
+
+<span class="fc bfc" id="L213" title="All 2 branches covered.">            if (name == StandardSocketOptions.IP_MULTICAST_IF) {</span>
+<span class="pc bpc" id="L214" title="1 of 2 branches missed.">                if (value == null)</span>
+<span class="nc" id="L215">                    throw new IllegalArgumentException(&quot;Cannot set IP_MULTICAST_IF to 'null'&quot;);</span>
+<span class="fc" id="L216">                NetworkInterface interf = (NetworkInterface)value;</span>
+<span class="pc bpc" id="L217" title="1 of 2 branches missed.">                if (family == StandardProtocolFamily.INET6) {</span>
+<span class="nc" id="L218">                    int index = interf.getIndex();</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">                    if (index == -1)</span>
+<span class="nc" id="L220">                        throw new IOException(&quot;Network interface cannot be identified&quot;);</span>
+<span class="nc" id="L221">                    Net.setInterface6(fd, index);</span>
+<span class="nc" id="L222">                } else {</span>
+                    // need IPv4 address to identify interface
+<span class="fc" id="L224">                    Inet4Address target = Net.anyInet4Address(interf);</span>
+<span class="pc bpc" id="L225" title="1 of 2 branches missed.">                    if (target == null)</span>
+<span class="nc" id="L226">                        throw new IOException(&quot;Network interface not configured for IPv4&quot;);</span>
+<span class="fc" id="L227">                    int targetAddress = Net.inet4AsInt(target);</span>
+<span class="fc" id="L228">                    Net.setInterface4(fd, targetAddress);</span>
+                }
+<span class="fc" id="L230">                return this;</span>
+            }
+<span class="pc bpc" id="L232" title="1 of 2 branches missed.">            if (name == StandardSocketOptions.SO_REUSEADDR &amp;&amp;</span>
+<span class="pc bpc" id="L233" title="3 of 4 branches missed.">                    Net.useExclusiveBind() &amp;&amp; localAddress != null)</span>
+            {
+<span class="nc" id="L235">                reuseAddressEmulated = true;</span>
+<span class="nc" id="L236">                this.isReuseAddress = (Boolean)value;</span>
+            }
+
+            // remaining options don't need any special handling
+<span class="fc" id="L240">            Net.setSocketOption(fd, Net.UNSPEC, name, value);</span>
+<span class="fc" id="L241">            return this;</span>
+<span class="nc" id="L242">        }</span>
+    }
+
+    @Override
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public &lt;T&gt; T getOption(SocketOption&lt;T&gt; name)
+        throws IOException
+    {
+<span class="nc bnc" id="L250" title="All 2 branches missed.">        if (name == null)</span>
+<span class="nc" id="L251">            throw new NullPointerException();</span>
+<span class="nc bnc" id="L252" title="All 2 branches missed.">        if (!supportedOptions().contains(name))</span>
+<span class="nc" id="L253">            throw new UnsupportedOperationException(&quot;'&quot; + name + &quot;' not supported&quot;);</span>
+
+<span class="nc" id="L255">        synchronized (stateLock) {</span>
+<span class="nc" id="L256">            ensureOpen();</span>
+
+<span class="nc bnc" id="L258" title="All 2 branches missed.">            if (name == StandardSocketOptions.IP_TOS) {</span>
+                // IPv4 only; always return 0 on IPv6
+<span class="nc bnc" id="L260" title="All 2 branches missed.">                if (family == StandardProtocolFamily.INET) {</span>
+<span class="nc" id="L261">                    return (T) Net.getSocketOption(fd, family, name);</span>
+                } else {
+<span class="nc" id="L263">                    return (T) Integer.valueOf(0);</span>
+                }
+            }
+
+<span class="nc bnc" id="L267" title="All 4 branches missed.">            if (name == StandardSocketOptions.IP_MULTICAST_TTL ||</span>
+                name == StandardSocketOptions.IP_MULTICAST_LOOP)
+            {
+<span class="nc" id="L270">                return (T) Net.getSocketOption(fd, family, name);</span>
+            }
+
+<span class="nc bnc" id="L273" title="All 2 branches missed.">            if (name == StandardSocketOptions.IP_MULTICAST_IF) {</span>
+<span class="nc bnc" id="L274" title="All 2 branches missed.">                if (family == StandardProtocolFamily.INET) {</span>
+<span class="nc" id="L275">                    int address = Net.getInterface4(fd);</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">                    if (address == 0)</span>
+<span class="nc" id="L277">                        return null;    // default interface</span>
+
+<span class="nc" id="L279">                    InetAddress ia = Net.inet4FromInt(address);</span>
+<span class="nc" id="L280">                    NetworkInterface ni = NetworkInterface.getByInetAddress(ia);</span>
+<span class="nc bnc" id="L281" title="All 2 branches missed.">                    if (ni == null)</span>
+<span class="nc" id="L282">                        throw new IOException(&quot;Unable to map address to interface&quot;);</span>
+<span class="nc" id="L283">                    return (T) ni;</span>
+                } else {
+<span class="nc" id="L285">                    int index = Net.getInterface6(fd);</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">                    if (index == 0)</span>
+<span class="nc" id="L287">                        return null;    // default interface</span>
+
+<span class="nc" id="L289">                    NetworkInterface ni = NetworkInterface.getByIndex(index);</span>
+<span class="nc bnc" id="L290" title="All 2 branches missed.">                    if (ni == null)</span>
+<span class="nc" id="L291">                        throw new IOException(&quot;Unable to map index to interface&quot;);</span>
+<span class="nc" id="L292">                    return (T) ni;</span>
+                }
+            }
+
+<span class="nc bnc" id="L296" title="All 4 branches missed.">            if (name == StandardSocketOptions.SO_REUSEADDR &amp;&amp;</span>
+                    reuseAddressEmulated)
+            {
+<span class="nc" id="L299">                return (T)Boolean.valueOf(isReuseAddress);</span>
+            }
+
+            // no special handling
+<span class="nc" id="L303">            return (T) Net.getSocketOption(fd, Net.UNSPEC, name);</span>
+<span class="nc" id="L304">        }</span>
+    }
+
+<span class="nc" id="L307">    private static class DefaultOptionsHolder {</span>
+<span class="fc" id="L308">        static final Set&lt;SocketOption&lt;?&gt;&gt; defaultOptions = defaultOptions();</span>
+
+        private static Set&lt;SocketOption&lt;?&gt;&gt; defaultOptions() {
+<span class="fc" id="L311">            HashSet&lt;SocketOption&lt;?&gt;&gt; set = new HashSet&lt;SocketOption&lt;?&gt;&gt;(8);</span>
+<span class="fc" id="L312">            set.add(StandardSocketOptions.SO_SNDBUF);</span>
+<span class="fc" id="L313">            set.add(StandardSocketOptions.SO_RCVBUF);</span>
+<span class="fc" id="L314">            set.add(StandardSocketOptions.SO_REUSEADDR);</span>
+<span class="fc" id="L315">            set.add(StandardSocketOptions.SO_BROADCAST);</span>
+<span class="fc" id="L316">            set.add(StandardSocketOptions.IP_TOS);</span>
+<span class="fc" id="L317">            set.add(StandardSocketOptions.IP_MULTICAST_IF);</span>
+<span class="fc" id="L318">            set.add(StandardSocketOptions.IP_MULTICAST_TTL);</span>
+<span class="fc" id="L319">            set.add(StandardSocketOptions.IP_MULTICAST_LOOP);</span>
+<span class="fc" id="L320">            return Collections.unmodifiableSet(set);</span>
+        }
+    }
+
+    @Override
+    public final Set&lt;SocketOption&lt;?&gt;&gt; supportedOptions() {
+<span class="fc" id="L326">        return DefaultOptionsHolder.defaultOptions;</span>
+    }
+
+    private void ensureOpen() throws ClosedChannelException {
+<span class="fc bfc" id="L330" title="All 2 branches covered.">        if (!isOpen())</span>
+<span class="fc" id="L331">            throw new ClosedChannelException();</span>
+<span class="fc" id="L332">    }</span>
+
+    private SocketAddress sender;       // Set by receive0 (## ugh)
+
+    public SocketAddress receive(ByteBuffer dst) throws IOException {
+<span class="pc bpc" id="L337" title="1 of 2 branches missed.">        if (dst.isReadOnly())</span>
+<span class="nc" id="L338">            throw new IllegalArgumentException(&quot;Read-only buffer&quot;);</span>
+<span class="pc bpc" id="L339" title="1 of 2 branches missed.">        if (dst == null)</span>
+<span class="nc" id="L340">            throw new NullPointerException();</span>
+<span class="fc" id="L341">        synchronized (readLock) {</span>
+<span class="fc" id="L342">            ensureOpen();</span>
+            // Socket was not bound before attempting receive
+<span class="fc bfc" id="L344" title="All 2 branches covered.">            if (localAddress() == null)</span>
+<span class="fc" id="L345">                bind(null);</span>
+<span class="fc" id="L346">            int n = 0;</span>
+<span class="fc" id="L347">            ByteBuffer bb = null;</span>
+            try {
+<span class="fc" id="L349">                begin();</span>
+<span class="fc bfc" id="L350" title="All 2 branches covered.">                if (!isOpen())</span>
+<span class="fc" id="L351">                    return null;</span>
+<span class="fc" id="L352">                SecurityManager security = System.getSecurityManager();</span>
+<span class="fc" id="L353">                readerThread = NativeThread.current();</span>
+<span class="fc bfc" id="L354" title="All 4 branches covered.">                if (isConnected() || (security == null)) {</span>
+                    do {
+<span class="fc" id="L356">                        n = receive(fd, dst);</span>
+<span class="pc bpc" id="L357" title="1 of 4 branches missed.">                    } while ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="pc bpc" id="L358" title="1 of 2 branches missed.">                    if (n == IOStatus.UNAVAILABLE)</span>
+<span class="nc" id="L359">                        return null;</span>
+                } else {
+<span class="fc" id="L361">                    bb = Util.getTemporaryDirectBuffer(dst.remaining());</span>
+                    for (;;) {
+                        do {
+<span class="fc" id="L364">                            n = receive(fd, bb);</span>
+<span class="pc bpc" id="L365" title="3 of 4 branches missed.">                        } while ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="fc bfc" id="L366" title="All 2 branches covered.">                        if (n == IOStatus.UNAVAILABLE)</span>
+<span class="fc" id="L367">                            return null;</span>
+<span class="fc" id="L368">                        InetSocketAddress isa = (InetSocketAddress)sender;</span>
+                        try {
+<span class="fc" id="L370">                            security.checkAccept(</span>
+<span class="fc" id="L371">                                isa.getAddress().getHostAddress(),</span>
+<span class="fc" id="L372">                                isa.getPort());</span>
+<span class="nc" id="L373">                        } catch (SecurityException se) {</span>
+                            // Ignore packet
+<span class="nc" id="L375">                            bb.clear();</span>
+<span class="nc" id="L376">                            n = 0;</span>
+<span class="nc" id="L377">                            continue;</span>
+<span class="fc" id="L378">                        }</span>
+<span class="fc" id="L379">                        bb.flip();</span>
+<span class="fc" id="L380">                        dst.put(bb);</span>
+<span class="fc" id="L381">                        break;</span>
+                    }
+                }
+<span class="fc" id="L384">                return sender;</span>
+            } finally {
+<span class="pc bpc" id="L386" title="6 of 10 branches missed.">                if (bb != null)</span>
+<span class="pc" id="L387">                    Util.releaseTemporaryDirectBuffer(bb);</span>
+<span class="pc" id="L388">                readerThread = 0;</span>
+<span class="pc bpc" id="L389" title="13 of 20 branches missed.">                end((n &gt; 0) || (n == IOStatus.UNAVAILABLE));</span>
+<span class="pc bpc" id="L390" title="16 of 20 branches missed.">                assert IOStatus.check(n);</span>
+            }
+<span class="fc" id="L392">        }</span>
+    }
+
+    private int receive(FileDescriptor fd, ByteBuffer dst)
+        throws IOException
+    {
+<span class="fc" id="L398">        int pos = dst.position();</span>
+<span class="fc" id="L399">        int lim = dst.limit();</span>
+<span class="pc bpc" id="L400" title="2 of 4 branches missed.">        assert (pos &lt;= lim);</span>
+<span class="pc bpc" id="L401" title="1 of 2 branches missed.">        int rem = (pos &lt;= lim ? lim - pos : 0);</span>
+<span class="pc bpc" id="L402" title="1 of 4 branches missed.">        if (dst instanceof DirectBuffer &amp;&amp; rem &gt; 0)</span>
+<span class="fc" id="L403">            return receiveIntoNativeBuffer(fd, dst, rem, pos);</span>
+
+        // Substitute a native buffer. If the supplied buffer is empty
+        // we must instead use a nonempty buffer, otherwise the call
+        // will not block waiting for a datagram on some platforms.
+<span class="fc" id="L408">        int newSize = Math.max(rem, 1);</span>
+<span class="fc" id="L409">        ByteBuffer bb = Util.getTemporaryDirectBuffer(newSize);</span>
+        try {
+<span class="fc" id="L411">            int n = receiveIntoNativeBuffer(fd, bb, newSize, 0);</span>
+<span class="fc" id="L412">            bb.flip();</span>
+<span class="pc bpc" id="L413" title="2 of 4 branches missed.">            if (n &gt; 0 &amp;&amp; rem &gt; 0)</span>
+<span class="fc" id="L414">                dst.put(bb);</span>
+<span class="fc" id="L415">            return n;</span>
+        } finally {
+<span class="pc" id="L417">            Util.releaseTemporaryDirectBuffer(bb);</span>
+        }
+    }
+
+    private int receiveIntoNativeBuffer(FileDescriptor fd, ByteBuffer bb,
+                                        int rem, int pos)
+        throws IOException
+    {
+<span class="fc" id="L425">        int n = receive0(fd, ((DirectBuffer)bb).address() + pos, rem,</span>
+<span class="fc" id="L426">                         isConnected());</span>
+<span class="fc bfc" id="L427" title="All 2 branches covered.">        if (n &gt; 0)</span>
+<span class="fc" id="L428">            bb.position(pos + n);</span>
+<span class="fc" id="L429">        return n;</span>
+    }
+
+    public int send(ByteBuffer src, SocketAddress target)
+        throws IOException
+    {
+<span class="pc bpc" id="L435" title="1 of 2 branches missed.">        if (src == null)</span>
+<span class="nc" id="L436">            throw new NullPointerException();</span>
+
+<span class="fc" id="L438">        synchronized (writeLock) {</span>
+<span class="fc" id="L439">            ensureOpen();</span>
+<span class="fc" id="L440">            InetSocketAddress isa = Net.checkAddress(target);</span>
+<span class="fc" id="L441">            InetAddress ia = isa.getAddress();</span>
+<span class="pc bpc" id="L442" title="1 of 2 branches missed.">            if (ia == null)</span>
+<span class="nc" id="L443">                throw new IOException(&quot;Target address not resolved&quot;);</span>
+<span class="fc" id="L444">            synchronized (stateLock) {</span>
+<span class="pc bpc" id="L445" title="1 of 2 branches missed.">                if (!isConnected()) {</span>
+<span class="pc bpc" id="L446" title="1 of 2 branches missed.">                    if (target == null)</span>
+<span class="nc" id="L447">                        throw new NullPointerException();</span>
+<span class="fc" id="L448">                    SecurityManager sm = System.getSecurityManager();</span>
+<span class="pc bpc" id="L449" title="1 of 2 branches missed.">                    if (sm != null) {</span>
+<span class="fc bfc" id="L450" title="All 2 branches covered.">                        if (ia.isMulticastAddress()) {</span>
+<span class="fc" id="L451">                            sm.checkMulticast(ia);</span>
+                        } else {
+<span class="fc" id="L453">                            sm.checkConnect(ia.getHostAddress(),</span>
+<span class="fc" id="L454">                                            isa.getPort());</span>
+                        }
+                    }
+<span class="fc" id="L457">                } else { // Connected case; Check address then write</span>
+<span class="nc bnc" id="L458" title="All 2 branches missed.">                    if (!target.equals(remoteAddress)) {</span>
+<span class="nc" id="L459">                        throw new IllegalArgumentException(</span>
+                            &quot;Connected address not equal to target address&quot;);
+                    }
+<span class="nc" id="L462">                    return write(src);</span>
+                }
+<span class="pc" id="L464">            }</span>
+
+<span class="fc" id="L466">            int n = 0;</span>
+            try {
+<span class="fc" id="L468">                begin();</span>
+<span class="pc bpc" id="L469" title="1 of 2 branches missed.">                if (!isOpen())</span>
+<span class="nc" id="L470">                    return 0;</span>
+<span class="fc" id="L471">                writerThread = NativeThread.current();</span>
+                do {
+<span class="fc" id="L473">                    n = send(fd, src, isa);</span>
+<span class="pc bpc" id="L474" title="3 of 4 branches missed.">                } while ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+
+<span class="fc" id="L476">                synchronized (stateLock) {</span>
+<span class="pc bpc" id="L477" title="2 of 4 branches missed.">                    if (isOpen() &amp;&amp; (localAddress == null)) {</span>
+<span class="fc" id="L478">                        localAddress = Net.localAddress(fd);</span>
+                    }
+<span class="pc" id="L480">                }</span>
+<span class="fc" id="L481">                return IOStatus.normalize(n);</span>
+            } finally {
+<span class="pc" id="L483">                writerThread = 0;</span>
+<span class="pc bpc" id="L484" title="11 of 12 branches missed.">                end((n &gt; 0) || (n == IOStatus.UNAVAILABLE));</span>
+<span class="pc bpc" id="L485" title="10 of 12 branches missed.">                assert IOStatus.check(n);</span>
+            }
+<span class="nc" id="L487">        }</span>
+    }
+
+    private int send(FileDescriptor fd, ByteBuffer src, InetSocketAddress target)
+        throws IOException
+    {
+<span class="pc bpc" id="L493" title="1 of 2 branches missed.">        if (src instanceof DirectBuffer)</span>
+<span class="nc" id="L494">            return sendFromNativeBuffer(fd, src, target);</span>
+
+        // Substitute a native buffer
+<span class="fc" id="L497">        int pos = src.position();</span>
+<span class="fc" id="L498">        int lim = src.limit();</span>
+<span class="pc bpc" id="L499" title="2 of 4 branches missed.">        assert (pos &lt;= lim);</span>
+<span class="pc bpc" id="L500" title="1 of 2 branches missed.">        int rem = (pos &lt;= lim ? lim - pos : 0);</span>
+
+<span class="fc" id="L502">        ByteBuffer bb = Util.getTemporaryDirectBuffer(rem);</span>
+        try {
+<span class="fc" id="L504">            bb.put(src);</span>
+<span class="fc" id="L505">            bb.flip();</span>
+            // Do not update src until we see how many bytes were written
+<span class="fc" id="L507">            src.position(pos);</span>
+
+<span class="fc" id="L509">            int n = sendFromNativeBuffer(fd, bb, target);</span>
+<span class="pc bpc" id="L510" title="1 of 2 branches missed.">            if (n &gt; 0) {</span>
+                // now update src
+<span class="fc" id="L512">                src.position(pos + n);</span>
+            }
+<span class="fc" id="L514">            return n;</span>
+        } finally {
+<span class="pc" id="L516">            Util.releaseTemporaryDirectBuffer(bb);</span>
+        }
+    }
+
+    private int sendFromNativeBuffer(FileDescriptor fd, ByteBuffer bb,
+                                     InetSocketAddress target)
+        throws IOException
+    {
+<span class="fc" id="L524">        int pos = bb.position();</span>
+<span class="fc" id="L525">        int lim = bb.limit();</span>
+<span class="pc bpc" id="L526" title="2 of 4 branches missed.">        assert (pos &lt;= lim);</span>
+<span class="pc bpc" id="L527" title="1 of 2 branches missed.">        int rem = (pos &lt;= lim ? lim - pos : 0);</span>
+
+<span class="fc bfc" id="L529" title="All 2 branches covered.">        boolean preferIPv6 = (family != StandardProtocolFamily.INET);</span>
+        int written;
+        try {
+<span class="fc" id="L532">            written = send0(preferIPv6, fd, ((DirectBuffer)bb).address() + pos,</span>
+<span class="fc" id="L533">                            rem, target.getAddress(), target.getPort());</span>
+<span class="nc" id="L534">        } catch (PortUnreachableException pue) {</span>
+<span class="nc bnc" id="L535" title="All 2 branches missed.">            if (isConnected())</span>
+<span class="nc" id="L536">                throw pue;</span>
+<span class="nc" id="L537">            written = rem;</span>
+<span class="fc" id="L538">        }</span>
+<span class="pc bpc" id="L539" title="1 of 2 branches missed.">        if (written &gt; 0)</span>
+<span class="fc" id="L540">            bb.position(pos + written);</span>
+<span class="fc" id="L541">        return written;</span>
+    }
+
+    public int read(ByteBuffer buf) throws IOException {
+<span class="pc bpc" id="L545" title="1 of 2 branches missed.">        if (buf == null)</span>
+<span class="nc" id="L546">            throw new NullPointerException();</span>
+<span class="fc" id="L547">        synchronized (readLock) {</span>
+<span class="fc" id="L548">            synchronized (stateLock) {</span>
+<span class="fc" id="L549">                ensureOpen();</span>
+<span class="pc bpc" id="L550" title="1 of 2 branches missed.">                if (!isConnected())</span>
+<span class="nc" id="L551">                    throw new NotYetConnectedException();</span>
+<span class="pc" id="L552">            }</span>
+<span class="fc" id="L553">            int n = 0;</span>
+            try {
+<span class="fc" id="L555">                begin();</span>
+<span class="fc bfc" id="L556" title="All 2 branches covered.">                if (!isOpen())</span>
+<span class="fc" id="L557">                    return 0;</span>
+<span class="fc" id="L558">                readerThread = NativeThread.current();</span>
+                do {
+<span class="fc" id="L560">                    n = IOUtil.read(fd, buf, -1, nd);</span>
+<span class="pc bpc" id="L561" title="2 of 4 branches missed.">                } while ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="fc" id="L562">                return IOStatus.normalize(n);</span>
+            } finally {
+<span class="pc" id="L564">                readerThread = 0;</span>
+<span class="pc bpc" id="L565" title="8 of 12 branches missed.">                end((n &gt; 0) || (n == IOStatus.UNAVAILABLE));</span>
+<span class="nc bnc" id="L566" title="All 12 branches missed.">                assert IOStatus.check(n);</span>
+            }
+<span class="fc" id="L568">        }</span>
+    }
+
+    public long read(ByteBuffer[] dsts, int offset, int length)
+        throws IOException
+    {
+<span class="pc bpc" id="L574" title="3 of 6 branches missed.">        if ((offset &lt; 0) || (length &lt; 0) || (offset &gt; dsts.length - length))</span>
+<span class="nc" id="L575">            throw new IndexOutOfBoundsException();</span>
+<span class="fc" id="L576">        synchronized (readLock) {</span>
+<span class="fc" id="L577">            synchronized (stateLock) {</span>
+<span class="fc" id="L578">                ensureOpen();</span>
+<span class="pc bpc" id="L579" title="1 of 2 branches missed.">                if (!isConnected())</span>
+<span class="nc" id="L580">                    throw new NotYetConnectedException();</span>
+<span class="pc" id="L581">            }</span>
+<span class="fc" id="L582">            long n = 0;</span>
+            try {
+<span class="fc" id="L584">                begin();</span>
+<span class="fc bfc" id="L585" title="All 2 branches covered.">                if (!isOpen())</span>
+<span class="fc" id="L586">                    return 0;</span>
+<span class="fc" id="L587">                readerThread = NativeThread.current();</span>
+                do {
+<span class="fc" id="L589">                    n = IOUtil.read(fd, dsts, offset, length, nd);</span>
+<span class="pc bpc" id="L590" title="2 of 4 branches missed.">                } while ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="fc" id="L591">                return IOStatus.normalize(n);</span>
+            } finally {
+<span class="pc" id="L593">                readerThread = 0;</span>
+<span class="pc bpc" id="L594" title="8 of 12 branches missed.">                end((n &gt; 0) || (n == IOStatus.UNAVAILABLE));</span>
+<span class="nc bnc" id="L595" title="All 12 branches missed.">                assert IOStatus.check(n);</span>
+            }
+<span class="fc" id="L597">        }</span>
+    }
+
+    public int write(ByteBuffer buf) throws IOException {
+<span class="pc bpc" id="L601" title="1 of 2 branches missed.">        if (buf == null)</span>
+<span class="nc" id="L602">            throw new NullPointerException();</span>
+<span class="fc" id="L603">        synchronized (writeLock) {</span>
+<span class="fc" id="L604">            synchronized (stateLock) {</span>
+<span class="fc" id="L605">                ensureOpen();</span>
+<span class="fc bfc" id="L606" title="All 2 branches covered.">                if (!isConnected())</span>
+<span class="fc" id="L607">                    throw new NotYetConnectedException();</span>
+<span class="fc" id="L608">            }</span>
+<span class="fc" id="L609">            int n = 0;</span>
+            try {
+<span class="fc" id="L611">                begin();</span>
+<span class="pc bpc" id="L612" title="1 of 2 branches missed.">                if (!isOpen())</span>
+<span class="nc" id="L613">                    return 0;</span>
+<span class="fc" id="L614">                writerThread = NativeThread.current();</span>
+                do {
+<span class="fc" id="L616">                    n = IOUtil.write(fd, buf, -1, nd);</span>
+<span class="pc bpc" id="L617" title="3 of 4 branches missed.">                } while ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="fc" id="L618">                return IOStatus.normalize(n);</span>
+            } finally {
+<span class="pc" id="L620">                writerThread = 0;</span>
+<span class="pc bpc" id="L621" title="11 of 12 branches missed.">                end((n &gt; 0) || (n == IOStatus.UNAVAILABLE));</span>
+<span class="pc bpc" id="L622" title="10 of 12 branches missed.">                assert IOStatus.check(n);</span>
+            }
+<span class="fc" id="L624">        }</span>
+    }
+
+    public long write(ByteBuffer[] srcs, int offset, int length)
+        throws IOException
+    {
+<span class="nc bnc" id="L630" title="All 6 branches missed.">        if ((offset &lt; 0) || (length &lt; 0) || (offset &gt; srcs.length - length))</span>
+<span class="nc" id="L631">            throw new IndexOutOfBoundsException();</span>
+<span class="nc" id="L632">        synchronized (writeLock) {</span>
+<span class="nc" id="L633">            synchronized (stateLock) {</span>
+<span class="nc" id="L634">                ensureOpen();</span>
+<span class="nc bnc" id="L635" title="All 2 branches missed.">                if (!isConnected())</span>
+<span class="nc" id="L636">                    throw new NotYetConnectedException();</span>
+<span class="nc" id="L637">            }</span>
+<span class="nc" id="L638">            long n = 0;</span>
+            try {
+<span class="nc" id="L640">                begin();</span>
+<span class="nc bnc" id="L641" title="All 2 branches missed.">                if (!isOpen())</span>
+<span class="nc" id="L642">                    return 0;</span>
+<span class="nc" id="L643">                writerThread = NativeThread.current();</span>
+                do {
+<span class="nc" id="L645">                    n = IOUtil.write(fd, srcs, offset, length, nd);</span>
+<span class="nc bnc" id="L646" title="All 4 branches missed.">                } while ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="nc" id="L647">                return IOStatus.normalize(n);</span>
+            } finally {
+<span class="nc" id="L649">                writerThread = 0;</span>
+<span class="nc bnc" id="L650" title="All 12 branches missed.">                end((n &gt; 0) || (n == IOStatus.UNAVAILABLE));</span>
+<span class="nc bnc" id="L651" title="All 12 branches missed.">                assert IOStatus.check(n);</span>
+            }
+<span class="nc" id="L653">        }</span>
+    }
+
+    protected void implConfigureBlocking(boolean block) throws IOException {
+<span class="fc" id="L657">        IOUtil.configureBlocking(fd, block);</span>
+<span class="fc" id="L658">    }</span>
+
+    public SocketAddress localAddress() {
+<span class="fc" id="L661">        synchronized (stateLock) {</span>
+<span class="fc" id="L662">            return localAddress;</span>
+<span class="nc" id="L663">        }</span>
+    }
+
+    public SocketAddress remoteAddress() {
+<span class="nc" id="L667">        synchronized (stateLock) {</span>
+<span class="nc" id="L668">            return remoteAddress;</span>
+<span class="nc" id="L669">        }</span>
+    }
+
+    @Override
+    public DatagramChannel bind(SocketAddress local) throws IOException {
+<span class="fc" id="L674">        synchronized (readLock) {</span>
+<span class="fc" id="L675">            synchronized (writeLock) {</span>
+<span class="fc" id="L676">                synchronized (stateLock) {</span>
+<span class="fc" id="L677">                    ensureOpen();</span>
+<span class="fc bfc" id="L678" title="All 2 branches covered.">                    if (localAddress != null)</span>
+<span class="fc" id="L679">                        throw new AlreadyBoundException();</span>
+                    InetSocketAddress isa;
+<span class="fc bfc" id="L681" title="All 2 branches covered.">                    if (local == null) {</span>
+                        // only Inet4Address allowed with IPv4 socket
+<span class="fc bfc" id="L683" title="All 2 branches covered.">                        if (family == StandardProtocolFamily.INET) {</span>
+<span class="fc" id="L684">                            isa = new InetSocketAddress(InetAddress.getByName(&quot;0.0.0.0&quot;), 0);</span>
+                        } else {
+<span class="fc" id="L686">                            isa = new InetSocketAddress(0);</span>
+                        }
+                    } else {
+<span class="fc" id="L689">                        isa = Net.checkAddress(local);</span>
+
+                        // only Inet4Address allowed with IPv4 socket
+<span class="fc bfc" id="L692" title="All 2 branches covered.">                        if (family == StandardProtocolFamily.INET) {</span>
+<span class="fc" id="L693">                            InetAddress addr = isa.getAddress();</span>
+<span class="pc bpc" id="L694" title="1 of 2 branches missed.">                            if (!(addr instanceof Inet4Address))</span>
+<span class="nc" id="L695">                                throw new UnsupportedAddressTypeException();</span>
+                        }
+                    }
+<span class="fc" id="L698">                    SecurityManager sm = System.getSecurityManager();</span>
+<span class="fc bfc" id="L699" title="All 2 branches covered.">                    if (sm != null) {</span>
+<span class="fc" id="L700">                        sm.checkListen(isa.getPort());</span>
+                    }
+<span class="fc" id="L702">                    Net.bind(family, fd, isa.getAddress(), isa.getPort());</span>
+<span class="fc" id="L703">                    localAddress = Net.localAddress(fd);</span>
+<span class="fc" id="L704">                }</span>
+<span class="fc" id="L705">            }</span>
+<span class="fc" id="L706">        }</span>
+<span class="fc" id="L707">        return this;</span>
+    }
+
+    public boolean isConnected() {
+<span class="fc" id="L711">        synchronized (stateLock) {</span>
+<span class="fc bfc" id="L712" title="All 2 branches covered.">            return (state == ST_CONNECTED);</span>
+<span class="nc" id="L713">        }</span>
+    }
+
+    void ensureOpenAndUnconnected() throws IOException { // package-private
+<span class="fc" id="L717">        synchronized (stateLock) {</span>
+<span class="pc bpc" id="L718" title="1 of 2 branches missed.">            if (!isOpen())</span>
+<span class="nc" id="L719">                throw new ClosedChannelException();</span>
+<span class="pc bpc" id="L720" title="1 of 2 branches missed.">            if (state != ST_UNCONNECTED)</span>
+<span class="nc" id="L721">                throw new IllegalStateException(&quot;Connect already invoked&quot;);</span>
+<span class="pc" id="L722">        }</span>
+<span class="fc" id="L723">    }</span>
+
+    @Override
+    public DatagramChannel connect(SocketAddress sa) throws IOException {
+<span class="fc" id="L727">        int localPort = 0;</span>
+
+<span class="fc" id="L729">        synchronized(readLock) {</span>
+<span class="fc" id="L730">            synchronized(writeLock) {</span>
+<span class="fc" id="L731">                synchronized (stateLock) {</span>
+<span class="fc" id="L732">                    ensureOpenAndUnconnected();</span>
+<span class="fc" id="L733">                    InetSocketAddress isa = Net.checkAddress(sa);</span>
+<span class="fc" id="L734">                    SecurityManager sm = System.getSecurityManager();</span>
+<span class="fc bfc" id="L735" title="All 2 branches covered.">                    if (sm != null)</span>
+<span class="fc" id="L736">                        sm.checkConnect(isa.getAddress().getHostAddress(),</span>
+<span class="fc" id="L737">                                        isa.getPort());</span>
+<span class="fc" id="L738">                    int n = Net.connect(family,</span>
+                                        fd,
+<span class="fc" id="L740">                                        isa.getAddress(),</span>
+<span class="fc" id="L741">                                        isa.getPort());</span>
+<span class="pc bpc" id="L742" title="1 of 2 branches missed.">                    if (n &lt;= 0)</span>
+<span class="nc" id="L743">                        throw new Error();      // Can't happen</span>
+
+                    // Connection succeeded; disallow further invocation
+<span class="fc" id="L746">                    state = ST_CONNECTED;</span>
+<span class="fc" id="L747">                    remoteAddress = isa;</span>
+<span class="fc" id="L748">                    sender = isa;</span>
+<span class="fc" id="L749">                    cachedSenderInetAddress = isa.getAddress();</span>
+<span class="fc" id="L750">                    cachedSenderPort = isa.getPort();</span>
+
+                    // set or refresh local address
+<span class="fc" id="L753">                    localAddress = Net.localAddress(fd);</span>
+<span class="pc" id="L754">                }</span>
+<span class="pc" id="L755">            }</span>
+<span class="pc" id="L756">        }</span>
+<span class="fc" id="L757">        return this;</span>
+    }
+
+    public DatagramChannel disconnect() throws IOException {
+<span class="fc" id="L761">        synchronized(readLock) {</span>
+<span class="fc" id="L762">            synchronized(writeLock) {</span>
+<span class="fc" id="L763">                synchronized (stateLock) {</span>
+<span class="pc bpc" id="L764" title="2 of 4 branches missed.">                    if (!isConnected() || !isOpen())</span>
+<span class="nc" id="L765">                        return this;</span>
+<span class="fc" id="L766">                    InetSocketAddress isa = remoteAddress;</span>
+<span class="fc" id="L767">                    SecurityManager sm = System.getSecurityManager();</span>
+<span class="pc bpc" id="L768" title="1 of 2 branches missed.">                    if (sm != null)</span>
+<span class="nc" id="L769">                        sm.checkConnect(isa.getAddress().getHostAddress(),</span>
+<span class="nc" id="L770">                                        isa.getPort());</span>
+<span class="pc bpc" id="L771" title="1 of 2 branches missed.">                    boolean isIPv6 = (family == StandardProtocolFamily.INET6);</span>
+<span class="fc" id="L772">                    disconnect0(fd, isIPv6);</span>
+<span class="fc" id="L773">                    remoteAddress = null;</span>
+<span class="fc" id="L774">                    state = ST_UNCONNECTED;</span>
+
+                    // refresh local address
+<span class="fc" id="L777">                    localAddress = Net.localAddress(fd);</span>
+<span class="pc" id="L778">                }</span>
+<span class="pc" id="L779">            }</span>
+<span class="pc" id="L780">        }</span>
+<span class="fc" id="L781">        return this;</span>
+    }
+
+    /**
+     * Joins channel's socket to the given group/interface and
+     * optional source address.
+     */
+    private MembershipKey innerJoin(InetAddress group,
+                                    NetworkInterface interf,
+                                    InetAddress source)
+        throws IOException
+    {
+<span class="pc bpc" id="L793" title="1 of 2 branches missed.">        if (!group.isMulticastAddress())</span>
+<span class="nc" id="L794">            throw new IllegalArgumentException(&quot;Group not a multicast address&quot;);</span>
+
+        // check multicast address is compatible with this socket
+<span class="pc bpc" id="L797" title="1 of 2 branches missed.">        if (group instanceof Inet4Address) {</span>
+<span class="pc bpc" id="L798" title="1 of 4 branches missed.">            if (family == StandardProtocolFamily.INET6 &amp;&amp; !Net.canIPv6SocketJoinIPv4Group())</span>
+<span class="nc" id="L799">                throw new IllegalArgumentException(&quot;IPv6 socket cannot join IPv4 multicast group&quot;);</span>
+<span class="nc bnc" id="L800" title="All 2 branches missed.">        } else if (group instanceof Inet6Address) {</span>
+<span class="nc bnc" id="L801" title="All 2 branches missed.">            if (family != StandardProtocolFamily.INET6)</span>
+<span class="nc" id="L802">                throw new IllegalArgumentException(&quot;Only IPv6 sockets can join IPv6 multicast group&quot;);</span>
+        } else {
+<span class="nc" id="L804">            throw new IllegalArgumentException(&quot;Address type not supported&quot;);</span>
+        }
+
+        // check source address
+<span class="pc bpc" id="L808" title="1 of 2 branches missed.">        if (source != null) {</span>
+<span class="nc bnc" id="L809" title="All 2 branches missed.">            if (source.isAnyLocalAddress())</span>
+<span class="nc" id="L810">                throw new IllegalArgumentException(&quot;Source address is a wildcard address&quot;);</span>
+<span class="nc bnc" id="L811" title="All 2 branches missed.">            if (source.isMulticastAddress())</span>
+<span class="nc" id="L812">                throw new IllegalArgumentException(&quot;Source address is multicast address&quot;);</span>
+<span class="nc bnc" id="L813" title="All 2 branches missed.">            if (source.getClass() != group.getClass())</span>
+<span class="nc" id="L814">                throw new IllegalArgumentException(&quot;Source address is different type to group&quot;);</span>
+        }
+
+<span class="fc" id="L817">        SecurityManager sm = System.getSecurityManager();</span>
+<span class="pc bpc" id="L818" title="1 of 2 branches missed.">        if (sm != null)</span>
+<span class="fc" id="L819">            sm.checkMulticast(group);</span>
+
+<span class="fc" id="L821">        synchronized (stateLock) {</span>
+<span class="pc bpc" id="L822" title="1 of 2 branches missed.">            if (!isOpen())</span>
+<span class="nc" id="L823">                throw new ClosedChannelException();</span>
+
+            // check the registry to see if we are already a member of the group
+<span class="pc bpc" id="L826" title="1 of 2 branches missed.">            if (registry == null) {</span>
+<span class="fc" id="L827">                registry = new MembershipRegistry();</span>
+            } else {
+                // return existing membership key
+<span class="nc" id="L830">                MembershipKey key = registry.checkMembership(group, interf, source);</span>
+<span class="nc bnc" id="L831" title="All 2 branches missed.">                if (key != null)</span>
+<span class="nc" id="L832">                    return key;</span>
+            }
+
+            MembershipKeyImpl key;
+<span class="pc bpc" id="L836" title="1 of 4 branches missed.">            if ((family == StandardProtocolFamily.INET6) &amp;&amp;</span>
+<span class="pc bpc" id="L837" title="1 of 2 branches missed.">                ((group instanceof Inet6Address) || Net.canJoin6WithIPv4Group()))</span>
+            {
+<span class="nc" id="L839">                int index = interf.getIndex();</span>
+<span class="nc bnc" id="L840" title="All 2 branches missed.">                if (index == -1)</span>
+<span class="nc" id="L841">                    throw new IOException(&quot;Network interface cannot be identified&quot;);</span>
+
+                // need multicast and source address as byte arrays
+<span class="nc" id="L844">                byte[] groupAddress = Net.inet6AsByteArray(group);</span>
+<span class="nc bnc" id="L845" title="All 2 branches missed.">                byte[] sourceAddress = (source == null) ? null :</span>
+<span class="nc" id="L846">                    Net.inet6AsByteArray(source);</span>
+
+                // join the group
+<span class="nc" id="L849">                int n = Net.join6(fd, groupAddress, index, sourceAddress);</span>
+<span class="nc bnc" id="L850" title="All 2 branches missed.">                if (n == IOStatus.UNAVAILABLE)</span>
+<span class="nc" id="L851">                    throw new UnsupportedOperationException();</span>
+
+<span class="nc" id="L853">                key = new MembershipKeyImpl.Type6(this, group, interf, source,</span>
+                                                  groupAddress, index, sourceAddress);
+
+<span class="nc" id="L856">            } else {</span>
+                // need IPv4 address to identify interface
+<span class="fc" id="L858">                Inet4Address target = Net.anyInet4Address(interf);</span>
+<span class="pc bpc" id="L859" title="1 of 2 branches missed.">                if (target == null)</span>
+<span class="nc" id="L860">                    throw new IOException(&quot;Network interface not configured for IPv4&quot;);</span>
+
+<span class="fc" id="L862">                int groupAddress = Net.inet4AsInt(group);</span>
+<span class="fc" id="L863">                int targetAddress = Net.inet4AsInt(target);</span>
+<span class="pc bpc" id="L864" title="1 of 2 branches missed.">                int sourceAddress = (source == null) ? 0 : Net.inet4AsInt(source);</span>
+
+                // join the group
+<span class="fc" id="L867">                int n = Net.join4(fd, groupAddress, targetAddress, sourceAddress);</span>
+<span class="pc bpc" id="L868" title="1 of 2 branches missed.">                if (n == IOStatus.UNAVAILABLE)</span>
+<span class="nc" id="L869">                    throw new UnsupportedOperationException();</span>
+
+<span class="fc" id="L871">                key = new MembershipKeyImpl.Type4(this, group, interf, source,</span>
+                                                  groupAddress, targetAddress, sourceAddress);
+            }
+
+<span class="fc" id="L875">            registry.add(key);</span>
+<span class="fc" id="L876">            return key;</span>
+<span class="nc" id="L877">        }</span>
+    }
+
+    @Override
+    public MembershipKey join(InetAddress group,
+                              NetworkInterface interf)
+        throws IOException
+    {
+<span class="fc" id="L885">        return innerJoin(group, interf, null);</span>
+    }
+
+    @Override
+    public MembershipKey join(InetAddress group,
+                              NetworkInterface interf,
+                              InetAddress source)
+        throws IOException
+    {
+<span class="nc bnc" id="L894" title="All 2 branches missed.">        if (source == null)</span>
+<span class="nc" id="L895">            throw new NullPointerException(&quot;source address is null&quot;);</span>
+<span class="nc" id="L896">        return innerJoin(group, interf, source);</span>
+    }
+
+    // package-private
+    void drop(MembershipKeyImpl key) {
+<span class="nc bnc" id="L901" title="All 4 branches missed.">        assert key.channel() == this;</span>
+
+<span class="nc" id="L903">        synchronized (stateLock) {</span>
+<span class="nc bnc" id="L904" title="All 2 branches missed.">            if (!key.isValid())</span>
+<span class="nc" id="L905">                return;</span>
+
+            try {
+<span class="nc bnc" id="L908" title="All 2 branches missed.">                if (key instanceof MembershipKeyImpl.Type6) {</span>
+<span class="nc" id="L909">                    MembershipKeyImpl.Type6 key6 =</span>
+                        (MembershipKeyImpl.Type6)key;
+<span class="nc" id="L911">                    Net.drop6(fd, key6.groupAddress(), key6.index(), key6.source());</span>
+<span class="nc" id="L912">                } else {</span>
+<span class="nc" id="L913">                    MembershipKeyImpl.Type4 key4 = (MembershipKeyImpl.Type4)key;</span>
+<span class="nc" id="L914">                    Net.drop4(fd, key4.groupAddress(), key4.interfaceAddress(),</span>
+<span class="nc" id="L915">                        key4.source());</span>
+                }
+<span class="nc" id="L917">            } catch (IOException ioe) {</span>
+                // should not happen
+<span class="nc" id="L919">                throw new AssertionError(ioe);</span>
+<span class="nc" id="L920">            }</span>
+
+<span class="nc" id="L922">            key.invalidate();</span>
+<span class="nc" id="L923">            registry.remove(key);</span>
+<span class="nc" id="L924">        }</span>
+<span class="nc" id="L925">    }</span>
+
+    /**
+     * Block datagrams from given source if a memory to receive all
+     * datagrams.
+     */
+    void block(MembershipKeyImpl key, InetAddress source)
+        throws IOException
+    {
+<span class="nc bnc" id="L934" title="All 4 branches missed.">        assert key.channel() == this;</span>
+<span class="nc bnc" id="L935" title="All 4 branches missed.">        assert key.sourceAddress() == null;</span>
+
+<span class="nc" id="L937">        synchronized (stateLock) {</span>
+<span class="nc bnc" id="L938" title="All 2 branches missed.">            if (!key.isValid())</span>
+<span class="nc" id="L939">                throw new IllegalStateException(&quot;key is no longer valid&quot;);</span>
+<span class="nc bnc" id="L940" title="All 2 branches missed.">            if (source.isAnyLocalAddress())</span>
+<span class="nc" id="L941">                throw new IllegalArgumentException(&quot;Source address is a wildcard address&quot;);</span>
+<span class="nc bnc" id="L942" title="All 2 branches missed.">            if (source.isMulticastAddress())</span>
+<span class="nc" id="L943">                throw new IllegalArgumentException(&quot;Source address is multicast address&quot;);</span>
+<span class="nc bnc" id="L944" title="All 2 branches missed.">            if (source.getClass() != key.group().getClass())</span>
+<span class="nc" id="L945">                throw new IllegalArgumentException(&quot;Source address is different type to group&quot;);</span>
+
+            int n;
+<span class="nc bnc" id="L948" title="All 2 branches missed.">            if (key instanceof MembershipKeyImpl.Type6) {</span>
+<span class="nc" id="L949">                 MembershipKeyImpl.Type6 key6 =</span>
+                    (MembershipKeyImpl.Type6)key;
+<span class="nc" id="L951">                n = Net.block6(fd, key6.groupAddress(), key6.index(),</span>
+<span class="nc" id="L952">                               Net.inet6AsByteArray(source));</span>
+<span class="nc" id="L953">            } else {</span>
+<span class="nc" id="L954">                MembershipKeyImpl.Type4 key4 =</span>
+                    (MembershipKeyImpl.Type4)key;
+<span class="nc" id="L956">                n = Net.block4(fd, key4.groupAddress(), key4.interfaceAddress(),</span>
+<span class="nc" id="L957">                               Net.inet4AsInt(source));</span>
+            }
+<span class="nc bnc" id="L959" title="All 2 branches missed.">            if (n == IOStatus.UNAVAILABLE) {</span>
+                // ancient kernel
+<span class="nc" id="L961">                throw new UnsupportedOperationException();</span>
+            }
+<span class="nc" id="L963">        }</span>
+<span class="nc" id="L964">    }</span>
+
+    /**
+     * Unblock given source.
+     */
+    void unblock(MembershipKeyImpl key, InetAddress source) {
+<span class="nc bnc" id="L970" title="All 4 branches missed.">        assert key.channel() == this;</span>
+<span class="nc bnc" id="L971" title="All 4 branches missed.">        assert key.sourceAddress() == null;</span>
+
+<span class="nc" id="L973">        synchronized (stateLock) {</span>
+<span class="nc bnc" id="L974" title="All 2 branches missed.">            if (!key.isValid())</span>
+<span class="nc" id="L975">                throw new IllegalStateException(&quot;key is no longer valid&quot;);</span>
+
+            try {
+<span class="nc bnc" id="L978" title="All 2 branches missed.">                if (key instanceof MembershipKeyImpl.Type6) {</span>
+<span class="nc" id="L979">                    MembershipKeyImpl.Type6 key6 =</span>
+                        (MembershipKeyImpl.Type6)key;
+<span class="nc" id="L981">                    Net.unblock6(fd, key6.groupAddress(), key6.index(),</span>
+<span class="nc" id="L982">                                 Net.inet6AsByteArray(source));</span>
+<span class="nc" id="L983">                } else {</span>
+<span class="nc" id="L984">                    MembershipKeyImpl.Type4 key4 =</span>
+                        (MembershipKeyImpl.Type4)key;
+<span class="nc" id="L986">                    Net.unblock4(fd, key4.groupAddress(), key4.interfaceAddress(),</span>
+<span class="nc" id="L987">                                 Net.inet4AsInt(source));</span>
+                }
+<span class="nc" id="L989">            } catch (IOException ioe) {</span>
+                // should not happen
+<span class="nc" id="L991">                throw new AssertionError(ioe);</span>
+<span class="nc" id="L992">            }</span>
+<span class="nc" id="L993">        }</span>
+<span class="nc" id="L994">    }</span>
+
+    protected void implCloseSelectableChannel() throws IOException {
+<span class="fc" id="L997">        synchronized (stateLock) {</span>
+<span class="pc bpc" id="L998" title="1 of 2 branches missed.">            if (state != ST_KILLED)</span>
+<span class="fc" id="L999">                nd.preClose(fd);</span>
+<span class="fc" id="L1000">            ResourceManager.afterUdpClose();</span>
+
+            // if member of mulitcast group then invalidate all keys
+<span class="fc bfc" id="L1003" title="All 2 branches covered.">            if (registry != null)</span>
+<span class="fc" id="L1004">                registry.invalidateAll();</span>
+
+            long th;
+<span class="fc bfc" id="L1007" title="All 2 branches covered.">            if ((th = readerThread) != 0)</span>
+<span class="fc" id="L1008">                NativeThread.signal(th);</span>
+<span class="pc bpc" id="L1009" title="1 of 2 branches missed.">            if ((th = writerThread) != 0)</span>
+<span class="nc" id="L1010">                NativeThread.signal(th);</span>
+<span class="pc bpc" id="L1011" title="1 of 2 branches missed.">            if (!isRegistered())</span>
+<span class="fc" id="L1012">                kill();</span>
+<span class="pc" id="L1013">        }</span>
+<span class="fc" id="L1014">    }</span>
+
+    public void kill() throws IOException {
+<span class="fc" id="L1017">        synchronized (stateLock) {</span>
+<span class="pc bpc" id="L1018" title="1 of 2 branches missed.">            if (state == ST_KILLED)</span>
+<span class="nc" id="L1019">                return;</span>
+<span class="pc bpc" id="L1020" title="1 of 2 branches missed.">            if (state == ST_UNINITIALIZED) {</span>
+<span class="nc" id="L1021">                state = ST_KILLED;</span>
+<span class="nc" id="L1022">                return;</span>
+            }
+<span class="pc bpc" id="L1024" title="3 of 6 branches missed.">            assert !isOpen() &amp;&amp; !isRegistered();</span>
+<span class="fc" id="L1025">            nd.close(fd);</span>
+<span class="fc" id="L1026">            state = ST_KILLED;</span>
+<span class="pc" id="L1027">        }</span>
+<span class="fc" id="L1028">    }</span>
+
+    protected void finalize() throws IOException {
+        // fd is null if constructor threw exception
+<span class="pc bpc" id="L1032" title="1 of 2 branches missed.">        if (fd != null)</span>
+<span class="fc" id="L1033">            close();</span>
+<span class="fc" id="L1034">    }</span>
+
+    /**
+     * Translates native poll revent set into a ready operation set
+     */
+    public boolean translateReadyOps(int ops, int initialOps,
+                                     SelectionKeyImpl sk) {
+<span class="fc" id="L1041">        int intOps = sk.nioInterestOps(); // Do this just once, it synchronizes</span>
+<span class="fc" id="L1042">        int oldOps = sk.nioReadyOps();</span>
+<span class="fc" id="L1043">        int newOps = initialOps;</span>
+
+<span class="pc bpc" id="L1045" title="1 of 2 branches missed.">        if ((ops &amp; PollArrayWrapper.POLLNVAL) != 0) {</span>
+            // This should only happen if this channel is pre-closed while a
+            // selection operation is in progress
+            // ## Throw an error if this channel has not been pre-closed
+<span class="nc" id="L1049">            return false;</span>
+        }
+
+<span class="pc bpc" id="L1052" title="1 of 2 branches missed.">        if ((ops &amp; (PollArrayWrapper.POLLERR</span>
+                    | PollArrayWrapper.POLLHUP)) != 0) {
+<span class="nc" id="L1054">            newOps = intOps;</span>
+<span class="nc" id="L1055">            sk.nioReadyOps(newOps);</span>
+<span class="nc bnc" id="L1056" title="All 2 branches missed.">            return (newOps &amp; ~oldOps) != 0;</span>
+        }
+
+<span class="pc bpc" id="L1059" title="1 of 4 branches missed.">        if (((ops &amp; PollArrayWrapper.POLLIN) != 0) &amp;&amp;</span>
+            ((intOps &amp; SelectionKey.OP_READ) != 0))
+<span class="fc" id="L1061">            newOps |= SelectionKey.OP_READ;</span>
+
+<span class="pc bpc" id="L1063" title="1 of 4 branches missed.">        if (((ops &amp; PollArrayWrapper.POLLOUT) != 0) &amp;&amp;</span>
+            ((intOps &amp; SelectionKey.OP_WRITE) != 0))
+<span class="fc" id="L1065">            newOps |= SelectionKey.OP_WRITE;</span>
+
+<span class="fc" id="L1067">        sk.nioReadyOps(newOps);</span>
+<span class="fc bfc" id="L1068" title="All 2 branches covered.">        return (newOps &amp; ~oldOps) != 0;</span>
+    }
+
+    public boolean translateAndUpdateReadyOps(int ops, SelectionKeyImpl sk) {
+<span class="nc" id="L1072">        return translateReadyOps(ops, sk.nioReadyOps(), sk);</span>
+    }
+
+    public boolean translateAndSetReadyOps(int ops, SelectionKeyImpl sk) {
+<span class="fc" id="L1076">        return translateReadyOps(ops, 0, sk);</span>
+    }
+
+    // package-private
+    int poll(int events, long timeout) throws IOException {
+<span class="nc bnc" id="L1081" title="All 6 branches missed.">        assert Thread.holdsLock(blockingLock()) &amp;&amp; !isBlocking();</span>
+
+<span class="nc" id="L1083">        synchronized (readLock) {</span>
+<span class="nc" id="L1084">            int n = 0;</span>
+            try {
+<span class="nc" id="L1086">                begin();</span>
+<span class="nc" id="L1087">                synchronized (stateLock) {</span>
+<span class="nc bnc" id="L1088" title="All 2 branches missed.">                    if (!isOpen())</span>
+<span class="nc" id="L1089">                        return 0;</span>
+<span class="nc" id="L1090">                    readerThread = NativeThread.current();</span>
+<span class="nc" id="L1091">                }</span>
+<span class="nc" id="L1092">                n = Net.poll(fd, events, timeout);</span>
+            } finally {
+<span class="nc" id="L1094">                readerThread = 0;</span>
+<span class="nc bnc" id="L1095" title="All 6 branches missed.">                end(n &gt; 0);</span>
+<span class="nc" id="L1096">            }</span>
+<span class="nc" id="L1097">            return n;</span>
+<span class="nc" id="L1098">        }</span>
+    }
+
+    /**
+     * Translates an interest operation set into a native poll event set
+     */
+    public void translateAndSetInterestOps(int ops, SelectionKeyImpl sk) {
+<span class="fc" id="L1105">        int newOps = 0;</span>
+
+<span class="fc bfc" id="L1107" title="All 2 branches covered.">        if ((ops &amp; SelectionKey.OP_READ) != 0)</span>
+<span class="fc" id="L1108">            newOps |= PollArrayWrapper.POLLIN;</span>
+<span class="fc bfc" id="L1109" title="All 2 branches covered.">        if ((ops &amp; SelectionKey.OP_WRITE) != 0)</span>
+<span class="fc" id="L1110">            newOps |= PollArrayWrapper.POLLOUT;</span>
+<span class="pc bpc" id="L1111" title="1 of 2 branches missed.">        if ((ops &amp; SelectionKey.OP_CONNECT) != 0)</span>
+<span class="nc" id="L1112">            newOps |= PollArrayWrapper.POLLIN;</span>
+<span class="fc" id="L1113">        sk.selector.putEventOps(sk, newOps);</span>
+<span class="fc" id="L1114">    }</span>
+
+    public FileDescriptor getFD() {
+<span class="nc" id="L1117">        return fd;</span>
+    }
+
+    public int getFDVal() {
+<span class="fc" id="L1121">        return fdVal;</span>
+    }
+
+
+    // -- Native methods --
+
+    private static native void initIDs();
+
+    private static native void disconnect0(FileDescriptor fd, boolean isIPv6)
+        throws IOException;
+
+    private native int receive0(FileDescriptor fd, long address, int len,
+                                boolean connected)
+        throws IOException;
+
+    private native int send0(boolean preferIPv6, FileDescriptor fd, long address,
+                             int len, InetAddress addr, int port)
+        throws IOException;
+
+    static {
+<span class="fc" id="L1141">        IOUtil.load();</span>
+<span class="fc" id="L1142">        initIDs();</span>
+<span class="fc" id="L1143">    }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

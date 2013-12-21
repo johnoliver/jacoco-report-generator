@@ -1,0 +1,3590 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>LdapCtx.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">com.sun.jndi.ldap</a> &gt; <span class="el_source">LdapCtx.java</span></div><h1>LdapCtx.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1999, 2011, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package com.sun.jndi.ldap;
+
+import javax.naming.*;
+import javax.naming.directory.*;
+import javax.naming.spi.*;
+import javax.naming.event.*;
+import javax.naming.ldap.*;
+import javax.naming.ldap.LdapName;
+import javax.naming.ldap.Rdn;
+
+import java.util.Locale;
+import java.util.Vector;
+import java.util.Hashtable;
+import java.util.List;
+import java.util.StringTokenizer;
+import java.util.Enumeration;
+
+import java.io.IOException;
+import java.io.OutputStream;
+
+import com.sun.jndi.toolkit.ctx.*;
+import com.sun.jndi.toolkit.dir.HierMemDirCtx;
+import com.sun.jndi.toolkit.dir.SearchFilter;
+import com.sun.jndi.ldap.ext.StartTlsResponseImpl;
+
+/**
+ * The LDAP context implementation.
+ *
+ * Implementation is not thread-safe. Caller must sync as per JNDI spec.
+ * Members that are used directly or indirectly by internal worker threads
+ * (Connection, EventQueue, NamingEventNotifier) must be thread-safe.
+ * Connection - calls LdapClient.processUnsolicited(), which in turn calls
+ *   LdapCtx.convertControls() and LdapCtx.fireUnsolicited().
+ *   convertControls() - no sync; reads envprops and 'this'
+ *   fireUnsolicited() - sync on eventSupport for all references to 'unsolicited'
+ *      (even those in other methods);  don't sync on LdapCtx in case caller
+ *      is already sync'ing on it - this would prevent Unsol events from firing
+ *      and the Connection thread to block (thus preventing any other data
+ *      from being read from the connection)
+ *      References to 'eventSupport' need not be sync'ed because these
+ *      methods can only be called after eventSupport has been set first
+ *      (via addNamingListener()).
+ * EventQueue - no direct or indirect calls to LdapCtx
+ * NamingEventNotifier - calls newInstance() to get instance for run() to use;
+ *      no sync needed for methods invoked on new instance;
+ *
+ * LdapAttribute links to LdapCtx in order to process getAttributeDefinition()
+ * and getAttributeSyntaxDefinition() calls. It invokes LdapCtx.getSchema(),
+ * which uses schemaTrees (a Hashtable - already sync). Potential conflict
+ * of duplicating construction of tree for same subschemasubentry
+ * but no inconsistency problems.
+ *
+ * NamingEnumerations link to LdapCtx for the following:
+ * 1. increment/decrement enum count so that ctx doesn't close the
+ *    underlying connection
+ * 2. LdapClient handle to get next batch of results
+ * 3. Sets LdapCtx's response controls
+ * 4. Process return code
+ * 5. For narrowing response controls (using ctx's factories)
+ * Since processing of NamingEnumeration by client is treated the same as method
+ * invocation on LdapCtx, caller is responsible for locking.
+ *
+ * @author Vincent Ryan
+ * @author Rosanna Lee
+ */
+
+final public class LdapCtx extends ComponentDirContext
+    implements EventDirContext, LdapContext {
+
+    /*
+     * Used to store arguments to the search method.
+     */
+    final static class SearchArgs {
+        Name name;
+        String filter;
+        SearchControls cons;
+        String[] reqAttrs; // those attributes originally requested
+
+<span class="fc" id="L104">        SearchArgs(Name name, String filter, SearchControls cons, String[] ra) {</span>
+<span class="fc" id="L105">            this.name = name;</span>
+<span class="fc" id="L106">            this.filter = filter;</span>
+<span class="fc" id="L107">            this.cons = cons;</span>
+<span class="fc" id="L108">            this.reqAttrs = ra;</span>
+<span class="fc" id="L109">        }</span>
+    }
+
+    private static final boolean debug = false;
+
+    private static final boolean HARD_CLOSE = true;
+    private static final boolean SOFT_CLOSE = false;
+
+    // -----------------  Constants  -----------------
+
+    public static final int DEFAULT_PORT = 389;
+    public static final int DEFAULT_SSL_PORT = 636;
+    public static final String DEFAULT_HOST = &quot;localhost&quot;;
+
+    private static final boolean DEFAULT_DELETE_RDN = true;
+    private static final boolean DEFAULT_TYPES_ONLY = false;
+    private static final int DEFAULT_DEREF_ALIASES = 3; // always deref
+    private static final int DEFAULT_LDAP_VERSION = LdapClient.LDAP_VERSION3_VERSION2;
+    private static final int DEFAULT_BATCH_SIZE = 1;
+    private static final int DEFAULT_REFERRAL_MODE = LdapClient.LDAP_REF_IGNORE;
+    private static final char DEFAULT_REF_SEPARATOR = '#';
+
+        // Used by LdapPoolManager
+    static final String DEFAULT_SSL_FACTORY =
+        &quot;javax.net.ssl.SSLSocketFactory&quot;;       // use Sun's SSL
+    private static final int DEFAULT_REFERRAL_LIMIT = 10;
+    private static final String STARTTLS_REQ_OID = &quot;1.3.6.1.4.1.1466.20037&quot;;
+
+    // schema operational and user attributes
+<span class="fc" id="L138">    private static final String[] SCHEMA_ATTRIBUTES =</span>
+        { &quot;objectClasses&quot;, &quot;attributeTypes&quot;, &quot;matchingRules&quot;, &quot;ldapSyntaxes&quot; };
+
+    // --------------- Environment property names ----------
+
+    // LDAP protocol version: &quot;2&quot;, &quot;3&quot;
+    private static final String VERSION = &quot;java.naming.ldap.version&quot;;
+
+    // Binary-valued attributes. Space separated string of attribute names.
+    private static final String BINARY_ATTRIBUTES =
+                                        &quot;java.naming.ldap.attributes.binary&quot;;
+
+    // Delete old RDN during modifyDN: &quot;true&quot;, &quot;false&quot;
+    private static final String DELETE_RDN = &quot;java.naming.ldap.deleteRDN&quot;;
+
+    // De-reference aliases: &quot;never&quot;, &quot;searching&quot;, &quot;finding&quot;, &quot;always&quot;
+    private static final String DEREF_ALIASES = &quot;java.naming.ldap.derefAliases&quot;;
+
+    // Return only attribute types (no values)
+    private static final String TYPES_ONLY = &quot;java.naming.ldap.typesOnly&quot;;
+
+    // Separator character for encoding Reference's RefAddrs; default is '#'
+    private static final String REF_SEPARATOR = &quot;java.naming.ldap.ref.separator&quot;;
+
+    // Socket factory
+    private static final String SOCKET_FACTORY = &quot;java.naming.ldap.factory.socket&quot;;
+
+    // Bind Controls (used by LdapReferralException)
+    static final String BIND_CONTROLS = &quot;java.naming.ldap.control.connect&quot;;
+
+    private static final String REFERRAL_LIMIT =
+        &quot;java.naming.ldap.referral.limit&quot;;
+
+    // trace BER (java.io.OutputStream)
+    private static final String TRACE_BER = &quot;com.sun.jndi.ldap.trace.ber&quot;;
+
+    // Get around Netscape Schema Bugs
+    private static final String NETSCAPE_SCHEMA_BUG =
+        &quot;com.sun.jndi.ldap.netscape.schemaBugs&quot;;
+    // deprecated
+    private static final String OLD_NETSCAPE_SCHEMA_BUG =
+        &quot;com.sun.naming.netscape.schemaBugs&quot;;   // for backward compatibility
+
+    // Timeout for socket connect
+    private static final String CONNECT_TIMEOUT =
+        &quot;com.sun.jndi.ldap.connect.timeout&quot;;
+
+     // Timeout for reading responses
+    private static final String READ_TIMEOUT =
+        &quot;com.sun.jndi.ldap.read.timeout&quot;;
+
+    // Environment property for connection pooling
+    private static final String ENABLE_POOL = &quot;com.sun.jndi.ldap.connect.pool&quot;;
+
+    // Environment property for the domain name (derived from this context's DN)
+    private static final String DOMAIN_NAME = &quot;com.sun.jndi.ldap.domainname&quot;;
+
+    // Block until the first search reply is received
+    private static final String WAIT_FOR_REPLY =
+        &quot;com.sun.jndi.ldap.search.waitForReply&quot;;
+
+    // Size of the queue of unprocessed search replies
+    private static final String REPLY_QUEUE_SIZE =
+        &quot;com.sun.jndi.ldap.search.replyQueueSize&quot;;
+
+    // ----------------- Fields that don't change -----------------------
+<span class="fc" id="L204">    private static final NameParser parser = new LdapNameParser();</span>
+
+    // controls that Provider needs
+<span class="fc" id="L207">    private static final ControlFactory myResponseControlFactory =</span>
+        new DefaultResponseControlFactory();
+<span class="fc" id="L209">    private static final Control manageReferralControl =</span>
+        new ManageReferralControl(false);
+
+<span class="fc" id="L212">    private static final HierMemDirCtx EMPTY_SCHEMA = new HierMemDirCtx();</span>
+    static {
+<span class="fc" id="L214">        EMPTY_SCHEMA.setReadOnly(</span>
+            new SchemaViolationException(&quot;Cannot update schema object&quot;));
+<span class="fc" id="L216">    }</span>
+
+    // ------------ Package private instance variables ----------------
+    // Cannot be private; used by enums
+
+        // ------- Inherited by derived context instances
+
+    int port_number;                    // port number of server
+<span class="pc" id="L224">    String hostname = null;             // host name of server (no brackets</span>
+                                        //   for IPv6 literals)
+<span class="pc" id="L226">    LdapClient clnt = null;             // connection handle</span>
+<span class="pc" id="L227">    Hashtable&lt;String, java.lang.Object&gt; envprops = null; // environment properties of context</span>
+<span class="pc" id="L228">    int handleReferrals = DEFAULT_REFERRAL_MODE; // how referral is handled</span>
+<span class="pc" id="L229">    boolean hasLdapsScheme = false;     // true if the context was created</span>
+                                        //  using an LDAPS URL.
+
+        // ------- Not inherited by derived context instances
+
+    String currentDN;                   // DN of this context
+    Name currentParsedDN;               // DN of this context
+<span class="pc" id="L236">    Vector&lt;Control&gt; respCtls = null;    // Response controls read</span>
+<span class="pc" id="L237">    Control[] reqCtls = null;           // Controls to be sent with each request</span>
+
+
+    // ------------- Private instance variables ------------------------
+
+        // ------- Inherited by derived context instances
+
+<span class="pc" id="L244">    private OutputStream trace = null;  // output stream for BER debug output</span>
+<span class="pc" id="L245">    private boolean netscapeSchemaBug = false;       // workaround</span>
+<span class="pc" id="L246">    private Control[] bindCtls = null;  // Controls to be sent with LDAP &quot;bind&quot;</span>
+<span class="pc" id="L247">    private int referralHopLimit = DEFAULT_REFERRAL_LIMIT;  // max referral</span>
+<span class="pc" id="L248">    private Hashtable&lt;String, DirContext&gt; schemaTrees = null; // schema root of this context</span>
+<span class="pc" id="L249">    private int batchSize = DEFAULT_BATCH_SIZE;      // batch size for search results</span>
+<span class="pc" id="L250">    private boolean deleteRDN = DEFAULT_DELETE_RDN;  // delete the old RDN when modifying DN</span>
+<span class="pc" id="L251">    private boolean typesOnly = DEFAULT_TYPES_ONLY;  // return attribute types (no values)</span>
+<span class="pc" id="L252">    private int derefAliases = DEFAULT_DEREF_ALIASES;// de-reference alias entries during searching</span>
+<span class="pc" id="L253">    private char addrEncodingSeparator = DEFAULT_REF_SEPARATOR;  // encoding RefAddr</span>
+
+<span class="pc" id="L255">    private Hashtable&lt;String, Boolean&gt; binaryAttrs = null; // attr values returned as byte[]</span>
+<span class="pc" id="L256">    private int connectTimeout = -1;         // no timeout value</span>
+<span class="pc" id="L257">    private int readTimeout = -1;            // no timeout value</span>
+<span class="pc" id="L258">    private boolean waitForReply = true;     // wait for search response</span>
+<span class="pc" id="L259">    private int replyQueueSize  = -1;        // unlimited queue size</span>
+<span class="pc" id="L260">    private boolean useSsl = false;          // true if SSL protocol is active</span>
+<span class="pc" id="L261">    private boolean useDefaultPortNumber = false; // no port number was supplied</span>
+
+        // ------- Not inherited by derived context instances
+
+    // True if this context was created by another LdapCtx.
+<span class="pc" id="L266">    private boolean parentIsLdapCtx = false; // see composeName()</span>
+
+<span class="pc" id="L268">    private int hopCount = 1;                // current referral hop count</span>
+<span class="pc" id="L269">    private String url = null;               // URL of context; see getURL()</span>
+    private EventSupport eventSupport;       // Event support helper for this ctx
+<span class="pc" id="L271">    private boolean unsolicited = false;     // if there unsolicited listeners</span>
+<span class="pc" id="L272">    private boolean sharable = true;         // can share connection with other ctx</span>
+
+    // -------------- Constructors  -----------------------------------
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public LdapCtx(String dn, String host, int port_number,
+            Hashtable&lt;?,?&gt; props,
+<span class="fc" id="L279">            boolean useSsl) throws NamingException {</span>
+
+<span class="fc" id="L281">        this.useSsl = this.hasLdapsScheme = useSsl;</span>
+
+<span class="pc bpc" id="L283" title="1 of 2 branches missed.">        if (props != null) {</span>
+<span class="fc" id="L284">            envprops = (Hashtable&lt;String, java.lang.Object&gt;) props.clone();</span>
+
+            // SSL env prop overrides the useSsl argument
+<span class="fc bfc" id="L287" title="All 2 branches covered.">            if (&quot;ssl&quot;.equals(envprops.get(Context.SECURITY_PROTOCOL))) {</span>
+<span class="fc" id="L288">                this.useSsl = true;</span>
+            }
+
+            // %%% These are only examined when the context is created
+            // %%% because they are only for debugging or workaround purposes.
+<span class="fc" id="L293">            trace = (OutputStream)envprops.get(TRACE_BER);</span>
+
+<span class="pc bpc" id="L295" title="1 of 2 branches missed.">            if (props.get(NETSCAPE_SCHEMA_BUG) != null ||</span>
+<span class="pc bpc" id="L296" title="1 of 2 branches missed.">                props.get(OLD_NETSCAPE_SCHEMA_BUG) != null) {</span>
+<span class="nc" id="L297">                netscapeSchemaBug = true;</span>
+            }
+        }
+
+<span class="fc bfc" id="L301" title="All 2 branches covered.">        currentDN = (dn != null) ? dn : &quot;&quot;;</span>
+<span class="fc" id="L302">        currentParsedDN = parser.parse(currentDN);</span>
+
+<span class="pc bpc" id="L304" title="2 of 4 branches missed.">        hostname = (host != null &amp;&amp; host.length() &gt; 0) ? host : DEFAULT_HOST;</span>
+<span class="pc bpc" id="L305" title="1 of 2 branches missed.">        if (hostname.charAt(0) == '[') {</span>
+<span class="nc" id="L306">            hostname = hostname.substring(1, hostname.length() - 1);</span>
+        }
+
+<span class="pc bpc" id="L309" title="1 of 2 branches missed.">        if (port_number &gt; 0) {</span>
+<span class="fc" id="L310">            this.port_number = port_number;</span>
+        } else {
+<span class="nc bnc" id="L312" title="All 2 branches missed.">            this.port_number = this.useSsl ? DEFAULT_SSL_PORT : DEFAULT_PORT;</span>
+<span class="nc" id="L313">            this.useDefaultPortNumber = true;</span>
+        }
+
+<span class="fc" id="L316">        schemaTrees = new Hashtable&lt;&gt;(11, 0.75f);</span>
+<span class="fc" id="L317">        initEnv();</span>
+        try {
+<span class="fc" id="L319">            connect(false);</span>
+<span class="fc" id="L320">        } catch (NamingException e) {</span>
+            try {
+<span class="fc" id="L322">                close();</span>
+<span class="nc" id="L323">            } catch (Exception e2) {</span>
+                // Nothing
+<span class="fc" id="L325">            }</span>
+<span class="fc" id="L326">            throw e;</span>
+<span class="fc" id="L327">        }</span>
+<span class="fc" id="L328">    }</span>
+
+<span class="nc" id="L330">    LdapCtx(LdapCtx existing, String newDN) throws NamingException {</span>
+<span class="nc" id="L331">        useSsl = existing.useSsl;</span>
+<span class="nc" id="L332">        hasLdapsScheme = existing.hasLdapsScheme;</span>
+<span class="nc" id="L333">        useDefaultPortNumber = existing.useDefaultPortNumber;</span>
+
+<span class="nc" id="L335">        hostname = existing.hostname;</span>
+<span class="nc" id="L336">        port_number = existing.port_number;</span>
+<span class="nc" id="L337">        currentDN = newDN;</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">        if (existing.currentDN == currentDN) {</span>
+<span class="nc" id="L339">            currentParsedDN = existing.currentParsedDN;</span>
+        } else {
+<span class="nc" id="L341">            currentParsedDN = parser.parse(currentDN);</span>
+        }
+
+<span class="nc" id="L344">        envprops = existing.envprops;</span>
+<span class="nc" id="L345">        schemaTrees = existing.schemaTrees;</span>
+
+<span class="nc" id="L347">        clnt = existing.clnt;</span>
+<span class="nc" id="L348">        clnt.incRefCount();</span>
+
+<span class="nc bnc" id="L350" title="All 4 branches missed.">        parentIsLdapCtx = ((newDN == null || newDN.equals(existing.currentDN))</span>
+                           ? existing.parentIsLdapCtx
+                           : true);
+
+        // inherit these debugging/workaround flags
+<span class="nc" id="L355">        trace = existing.trace;</span>
+<span class="nc" id="L356">        netscapeSchemaBug = existing.netscapeSchemaBug;</span>
+
+<span class="nc" id="L358">        initEnv();</span>
+<span class="nc" id="L359">    }</span>
+
+    public LdapContext newInstance(Control[] reqCtls) throws NamingException {
+
+<span class="nc" id="L363">        LdapContext clone = new LdapCtx(this, currentDN);</span>
+
+        // Connection controls are inherited from environment
+
+        // Set clone's request controls
+        // setRequestControls() will clone reqCtls
+<span class="nc" id="L369">        clone.setRequestControls(reqCtls);</span>
+<span class="nc" id="L370">        return clone;</span>
+    }
+
+    // --------------- Namespace Updates ---------------------
+    // -- bind/rebind/unbind
+    // -- rename
+    // -- createSubcontext/destroySubcontext
+
+    protected void c_bind(Name name, Object obj, Continuation cont)
+            throws NamingException {
+<span class="nc" id="L380">        c_bind(name, obj, null, cont);</span>
+<span class="nc" id="L381">    }</span>
+
+    /*
+     * attrs == null
+     *      if obj is DirContext, attrs = obj.getAttributes()
+     * if attrs == null &amp;&amp; obj == null
+     *      disallow (cannot determine objectclass to use)
+     * if obj == null
+     *      just create entry using attrs
+     * else
+     *      objAttrs = create attributes for representing obj
+     *      attrs += objAttrs
+     *      create entry using attrs
+     */
+    protected void c_bind(Name name, Object obj, Attributes attrs,
+                          Continuation cont)
+            throws NamingException {
+
+<span class="nc" id="L399">        cont.setError(this, name);</span>
+
+<span class="nc" id="L401">        Attributes inputAttrs = attrs; // Attributes supplied by caller</span>
+        try {
+<span class="nc" id="L403">            ensureOpen();</span>
+
+<span class="nc bnc" id="L405" title="All 2 branches missed.">            if (obj == null) {</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">                if (attrs == null) {</span>
+<span class="nc" id="L407">                    throw new IllegalArgumentException(</span>
+                        &quot;cannot bind null object with no attributes&quot;);
+                }
+            } else {
+<span class="nc" id="L411">                attrs = Obj.determineBindAttrs(addrEncodingSeparator, obj, attrs,</span>
+                    false, name, this, envprops); // not cloned
+            }
+
+<span class="nc" id="L415">            String newDN = fullyQualifiedName(name);</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">            attrs = addRdnAttributes(newDN, attrs, inputAttrs != attrs);</span>
+<span class="nc" id="L417">            LdapEntry entry = new LdapEntry(newDN, attrs);</span>
+
+<span class="nc" id="L419">            LdapResult answer = clnt.add(entry, reqCtls);</span>
+<span class="nc" id="L420">            respCtls = answer.resControls; // retrieve response controls</span>
+
+<span class="nc bnc" id="L422" title="All 2 branches missed.">            if (answer.status != LdapClient.LDAP_SUCCESS) {</span>
+<span class="nc" id="L423">                processReturnCode(answer, name);</span>
+            }
+
+<span class="nc" id="L426">        } catch (LdapReferralException e) {</span>
+<span class="nc bnc" id="L427" title="All 2 branches missed.">            if (handleReferrals == LdapClient.LDAP_REF_THROW)</span>
+<span class="nc" id="L428">                throw cont.fillInException(e);</span>
+
+            // process the referrals sequentially
+            while (true) {
+
+<span class="nc" id="L433">                LdapReferralContext refCtx =</span>
+<span class="nc" id="L434">                    (LdapReferralContext)e.getReferralContext(envprops, bindCtls);</span>
+
+                // repeat the original operation at the new context
+                try {
+
+<span class="nc" id="L439">                    refCtx.bind(name, obj, inputAttrs);</span>
+<span class="nc" id="L440">                    return;</span>
+
+<span class="nc" id="L442">                } catch (LdapReferralException re) {</span>
+<span class="nc" id="L443">                    e = re;</span>
+                    continue;
+
+                } finally {
+                    // Make sure we close referral context
+<span class="nc" id="L448">                    refCtx.close();</span>
+                }
+            }
+
+<span class="nc" id="L452">        } catch (IOException e) {</span>
+<span class="nc" id="L453">            NamingException e2 = new CommunicationException(e.getMessage());</span>
+<span class="nc" id="L454">            e2.setRootCause(e);</span>
+<span class="nc" id="L455">            throw cont.fillInException(e2);</span>
+
+<span class="nc" id="L457">        } catch (NamingException e) {</span>
+<span class="nc" id="L458">            throw cont.fillInException(e);</span>
+<span class="nc" id="L459">        }</span>
+<span class="nc" id="L460">    }</span>
+
+    protected void c_rebind(Name name, Object obj, Continuation cont)
+            throws NamingException {
+<span class="nc" id="L464">        c_rebind(name, obj, null, cont);</span>
+<span class="nc" id="L465">    }</span>
+
+
+    /*
+     * attrs == null
+     *    if obj is DirContext, attrs = obj.getAttributes().
+     * if attrs == null
+     *    leave any existing attributes alone
+     *    (set attrs = {objectclass=top} if object doesn't exist)
+     * else
+     *    replace all existing attributes with attrs
+     * if obj == null
+     *      just create entry using attrs
+     * else
+     *      objAttrs = create attributes for representing obj
+     *      attrs += objAttrs
+     *      create entry using attrs
+     */
+    protected void c_rebind(Name name, Object obj, Attributes attrs,
+        Continuation cont) throws NamingException {
+
+<span class="nc" id="L486">        cont.setError(this, name);</span>
+
+<span class="nc" id="L488">        Attributes inputAttrs = attrs;</span>
+
+        try {
+<span class="nc" id="L491">            Attributes origAttrs = null;</span>
+
+            // Check if name is bound
+            try {
+<span class="nc" id="L495">                origAttrs = c_getAttributes(name, null, cont);</span>
+<span class="nc" id="L496">            } catch (NameNotFoundException e) {}</span>
+
+            // Name not bound, just add it
+<span class="nc bnc" id="L499" title="All 2 branches missed.">            if (origAttrs == null) {</span>
+<span class="nc" id="L500">                c_bind(name, obj, attrs, cont);</span>
+<span class="nc" id="L501">                return;</span>
+            }
+
+            // there's an object there already, need to figure out
+            // what to do about its attributes
+
+<span class="nc bnc" id="L507" title="All 4 branches missed.">            if (attrs == null &amp;&amp; obj instanceof DirContext) {</span>
+<span class="nc" id="L508">                attrs = ((DirContext)obj).getAttributes(&quot;&quot;);</span>
+            }
+<span class="nc" id="L510">            Attributes keepAttrs = (Attributes)origAttrs.clone();</span>
+
+<span class="nc bnc" id="L512" title="All 2 branches missed.">            if (attrs == null) {</span>
+                // we're not changing any attrs, leave old attributes alone
+
+                // Remove Java-related object classes from objectclass attribute
+<span class="nc" id="L516">                Attribute origObjectClass =</span>
+<span class="nc" id="L517">                    origAttrs.get(Obj.JAVA_ATTRIBUTES[Obj.OBJECT_CLASS]);</span>
+
+<span class="nc bnc" id="L519" title="All 2 branches missed.">                if (origObjectClass != null) {</span>
+                    // clone so that keepAttrs is not affected
+<span class="nc" id="L521">                    origObjectClass = (Attribute)origObjectClass.clone();</span>
+<span class="nc bnc" id="L522" title="All 2 branches missed.">                    for (int i = 0; i &lt; Obj.JAVA_OBJECT_CLASSES.length; i++) {</span>
+<span class="nc" id="L523">                        origObjectClass.remove(Obj.JAVA_OBJECT_CLASSES_LOWER[i]);</span>
+<span class="nc" id="L524">                        origObjectClass.remove(Obj.JAVA_OBJECT_CLASSES[i]);</span>
+                    }
+                    // update;
+<span class="nc" id="L527">                    origAttrs.put(origObjectClass);</span>
+                }
+
+                // remove all Java-related attributes except objectclass
+<span class="nc bnc" id="L531" title="All 2 branches missed.">                for (int i = 1; i &lt; Obj.JAVA_ATTRIBUTES.length; i++) {</span>
+<span class="nc" id="L532">                    origAttrs.remove(Obj.JAVA_ATTRIBUTES[i]);</span>
+                }
+
+<span class="nc" id="L535">                attrs = origAttrs;</span>
+            }
+<span class="nc bnc" id="L537" title="All 2 branches missed.">            if (obj != null) {</span>
+<span class="nc bnc" id="L538" title="All 2 branches missed.">                attrs =</span>
+<span class="nc" id="L539">                    Obj.determineBindAttrs(addrEncodingSeparator, obj, attrs,</span>
+                        inputAttrs != attrs, name, this, envprops);
+            }
+
+<span class="nc" id="L543">            String newDN = fullyQualifiedName(name);</span>
+            // remove entry
+<span class="nc" id="L545">            LdapResult answer = clnt.delete(newDN, reqCtls);</span>
+<span class="nc" id="L546">            respCtls = answer.resControls; // retrieve response controls</span>
+
+<span class="nc bnc" id="L548" title="All 2 branches missed.">            if (answer.status != LdapClient.LDAP_SUCCESS) {</span>
+<span class="nc" id="L549">                processReturnCode(answer, name);</span>
+<span class="nc" id="L550">                return;</span>
+            }
+
+<span class="nc" id="L553">            Exception addEx = null;</span>
+            try {
+<span class="nc bnc" id="L555" title="All 2 branches missed.">                attrs = addRdnAttributes(newDN, attrs, inputAttrs != attrs);</span>
+
+                // add it back using updated attrs
+<span class="nc" id="L558">                LdapEntry entry = new LdapEntry(newDN, attrs);</span>
+<span class="nc" id="L559">                answer = clnt.add(entry, reqCtls);</span>
+<span class="nc bnc" id="L560" title="All 2 branches missed.">                if (answer.resControls != null) {</span>
+<span class="nc" id="L561">                    respCtls = appendVector(respCtls, answer.resControls);</span>
+                }
+<span class="nc" id="L563">            } catch (NamingException | IOException ae) {</span>
+<span class="nc" id="L564">                addEx = ae;</span>
+<span class="nc" id="L565">            }</span>
+
+<span class="nc bnc" id="L567" title="All 6 branches missed.">            if ((addEx != null &amp;&amp; !(addEx instanceof LdapReferralException)) ||</span>
+                answer.status != LdapClient.LDAP_SUCCESS) {
+                // Attempt to restore old entry
+<span class="nc" id="L570">                LdapResult answer2 =</span>
+<span class="nc" id="L571">                    clnt.add(new LdapEntry(newDN, keepAttrs), reqCtls);</span>
+<span class="nc bnc" id="L572" title="All 2 branches missed.">                if (answer2.resControls != null) {</span>
+<span class="nc" id="L573">                    respCtls = appendVector(respCtls, answer2.resControls);</span>
+                }
+
+<span class="nc bnc" id="L576" title="All 2 branches missed.">                if (addEx == null) {</span>
+<span class="nc" id="L577">                    processReturnCode(answer, name);</span>
+                }
+            }
+
+            // Rethrow exception
+<span class="nc bnc" id="L582" title="All 2 branches missed.">            if (addEx instanceof NamingException) {</span>
+<span class="nc" id="L583">                throw (NamingException)addEx;</span>
+<span class="nc bnc" id="L584" title="All 2 branches missed.">            } else if (addEx instanceof IOException) {</span>
+<span class="nc" id="L585">                throw (IOException)addEx;</span>
+            }
+
+<span class="nc" id="L588">        } catch (LdapReferralException e) {</span>
+<span class="nc bnc" id="L589" title="All 2 branches missed.">            if (handleReferrals == LdapClient.LDAP_REF_THROW)</span>
+<span class="nc" id="L590">                throw cont.fillInException(e);</span>
+
+            // process the referrals sequentially
+            while (true) {
+
+<span class="nc" id="L595">                LdapReferralContext refCtx =</span>
+<span class="nc" id="L596">                    (LdapReferralContext)e.getReferralContext(envprops, bindCtls);</span>
+
+                // repeat the original operation at the new context
+                try {
+
+<span class="nc" id="L601">                    refCtx.rebind(name, obj, inputAttrs);</span>
+<span class="nc" id="L602">                    return;</span>
+
+<span class="nc" id="L604">                } catch (LdapReferralException re) {</span>
+<span class="nc" id="L605">                    e = re;</span>
+                    continue;
+
+                } finally {
+                    // Make sure we close referral context
+<span class="nc" id="L610">                    refCtx.close();</span>
+                }
+            }
+
+<span class="nc" id="L614">        } catch (IOException e) {</span>
+<span class="nc" id="L615">            NamingException e2 = new CommunicationException(e.getMessage());</span>
+<span class="nc" id="L616">            e2.setRootCause(e);</span>
+<span class="nc" id="L617">            throw cont.fillInException(e2);</span>
+
+<span class="nc" id="L619">        } catch (NamingException e) {</span>
+<span class="nc" id="L620">            throw cont.fillInException(e);</span>
+<span class="nc" id="L621">        }</span>
+<span class="nc" id="L622">    }</span>
+
+    protected void c_unbind(Name name, Continuation cont)
+            throws NamingException {
+<span class="nc" id="L626">        cont.setError(this, name);</span>
+
+        try {
+<span class="nc" id="L629">            ensureOpen();</span>
+
+<span class="nc" id="L631">            String fname = fullyQualifiedName(name);</span>
+<span class="nc" id="L632">            LdapResult answer = clnt.delete(fname, reqCtls);</span>
+<span class="nc" id="L633">            respCtls = answer.resControls; // retrieve response controls</span>
+
+<span class="nc" id="L635">            adjustDeleteStatus(fname, answer);</span>
+
+<span class="nc bnc" id="L637" title="All 2 branches missed.">            if (answer.status != LdapClient.LDAP_SUCCESS) {</span>
+<span class="nc" id="L638">                processReturnCode(answer, name);</span>
+            }
+
+<span class="nc" id="L641">        } catch (LdapReferralException e) {</span>
+<span class="nc bnc" id="L642" title="All 2 branches missed.">            if (handleReferrals == LdapClient.LDAP_REF_THROW)</span>
+<span class="nc" id="L643">                throw cont.fillInException(e);</span>
+
+            // process the referrals sequentially
+            while (true) {
+
+<span class="nc" id="L648">                LdapReferralContext refCtx =</span>
+<span class="nc" id="L649">                    (LdapReferralContext)e.getReferralContext(envprops, bindCtls);</span>
+
+                // repeat the original operation at the new context
+                try {
+
+<span class="nc" id="L654">                    refCtx.unbind(name);</span>
+<span class="nc" id="L655">                    return;</span>
+
+<span class="nc" id="L657">                } catch (LdapReferralException re) {</span>
+<span class="nc" id="L658">                    e = re;</span>
+                    continue;
+
+                } finally {
+                    // Make sure we close referral context
+<span class="nc" id="L663">                    refCtx.close();</span>
+                }
+            }
+
+<span class="nc" id="L667">        } catch (IOException e) {</span>
+<span class="nc" id="L668">            NamingException e2 = new CommunicationException(e.getMessage());</span>
+<span class="nc" id="L669">            e2.setRootCause(e);</span>
+<span class="nc" id="L670">            throw cont.fillInException(e2);</span>
+
+<span class="nc" id="L672">        } catch (NamingException e) {</span>
+<span class="nc" id="L673">            throw cont.fillInException(e);</span>
+<span class="nc" id="L674">        }</span>
+<span class="nc" id="L675">    }</span>
+
+    protected void c_rename(Name oldName, Name newName, Continuation cont)
+            throws NamingException
+    {
+        Name oldParsed, newParsed;
+        Name oldParent, newParent;
+<span class="nc" id="L682">        String newRDN = null;</span>
+<span class="nc" id="L683">        String newSuperior = null;</span>
+
+        // assert (oldName instanceOf CompositeName);
+
+<span class="nc" id="L687">        cont.setError(this, oldName);</span>
+
+        try {
+<span class="nc" id="L690">            ensureOpen();</span>
+
+            // permit oldName to be empty (for processing referral contexts)
+<span class="nc bnc" id="L693" title="All 2 branches missed.">            if (oldName.isEmpty()) {</span>
+<span class="nc" id="L694">                oldParent = parser.parse(&quot;&quot;);</span>
+            } else {
+<span class="nc" id="L696">                oldParsed = parser.parse(oldName.get(0)); // extract DN &amp; parse</span>
+<span class="nc" id="L697">                oldParent = oldParsed.getPrefix(oldParsed.size() - 1);</span>
+            }
+
+<span class="nc bnc" id="L700" title="All 2 branches missed.">            if (newName instanceof CompositeName) {</span>
+<span class="nc" id="L701">                newParsed = parser.parse(newName.get(0)); // extract DN &amp; parse</span>
+            } else {
+<span class="nc" id="L703">                newParsed = newName; // CompoundName/LdapName is already parsed</span>
+            }
+<span class="nc" id="L705">            newParent = newParsed.getPrefix(newParsed.size() - 1);</span>
+
+<span class="nc bnc" id="L707" title="All 2 branches missed.">            if(!oldParent.equals(newParent)) {</span>
+<span class="nc bnc" id="L708" title="All 2 branches missed.">                if (!clnt.isLdapv3) {</span>
+<span class="nc" id="L709">                    throw new InvalidNameException(</span>
+                                  &quot;LDAPv2 doesn't support changing &quot; +
+                                  &quot;the parent as a result of a rename&quot;);
+                } else {
+<span class="nc" id="L713">                    newSuperior = fullyQualifiedName(newParent.toString());</span>
+                }
+            }
+
+<span class="nc" id="L717">            newRDN = newParsed.get(newParsed.size() - 1);</span>
+
+<span class="nc" id="L719">            LdapResult answer = clnt.moddn(fullyQualifiedName(oldName),</span>
+                                    newRDN,
+                                    deleteRDN,
+                                    newSuperior,
+                                    reqCtls);
+<span class="nc" id="L724">            respCtls = answer.resControls; // retrieve response controls</span>
+
+<span class="nc bnc" id="L726" title="All 2 branches missed.">            if (answer.status != LdapClient.LDAP_SUCCESS) {</span>
+<span class="nc" id="L727">                processReturnCode(answer, oldName);</span>
+            }
+
+<span class="nc" id="L730">        } catch (LdapReferralException e) {</span>
+
+            // Record the new RDN (for use after the referral is followed).
+<span class="nc" id="L733">            e.setNewRdn(newRDN);</span>
+
+            // Cannot continue when a referral has been received and a
+            // newSuperior name was supplied (because the newSuperior is
+            // relative to a naming context BEFORE the referral is followed).
+<span class="nc bnc" id="L738" title="All 2 branches missed.">            if (newSuperior != null) {</span>
+<span class="nc" id="L739">                PartialResultException pre = new PartialResultException(</span>
+                    &quot;Cannot continue referral processing when newSuperior is &quot; +
+                    &quot;nonempty: &quot; + newSuperior);
+<span class="nc" id="L742">                pre.setRootCause(cont.fillInException(e));</span>
+<span class="nc" id="L743">                throw cont.fillInException(pre);</span>
+            }
+
+<span class="nc bnc" id="L746" title="All 2 branches missed.">            if (handleReferrals == LdapClient.LDAP_REF_THROW)</span>
+<span class="nc" id="L747">                throw cont.fillInException(e);</span>
+
+            // process the referrals sequentially
+            while (true) {
+
+<span class="nc" id="L752">                LdapReferralContext refCtx =</span>
+<span class="nc" id="L753">                    (LdapReferralContext)e.getReferralContext(envprops, bindCtls);</span>
+
+                // repeat the original operation at the new context
+                try {
+
+<span class="nc" id="L758">                    refCtx.rename(oldName, newName);</span>
+<span class="nc" id="L759">                    return;</span>
+
+<span class="nc" id="L761">                } catch (LdapReferralException re) {</span>
+<span class="nc" id="L762">                    e = re;</span>
+                    continue;
+
+                } finally {
+                    // Make sure we close referral context
+<span class="nc" id="L767">                    refCtx.close();</span>
+                }
+            }
+
+<span class="nc" id="L771">        } catch (IOException e) {</span>
+<span class="nc" id="L772">            NamingException e2 = new CommunicationException(e.getMessage());</span>
+<span class="nc" id="L773">            e2.setRootCause(e);</span>
+<span class="nc" id="L774">            throw cont.fillInException(e2);</span>
+
+<span class="nc" id="L776">        } catch (NamingException e) {</span>
+<span class="nc" id="L777">            throw cont.fillInException(e);</span>
+<span class="nc" id="L778">        }</span>
+<span class="nc" id="L779">    }</span>
+
+    protected Context c_createSubcontext(Name name, Continuation cont)
+            throws NamingException {
+<span class="nc" id="L783">        return c_createSubcontext(name, null, cont);</span>
+    }
+
+    protected DirContext c_createSubcontext(Name name, Attributes attrs,
+                                            Continuation cont)
+            throws NamingException {
+<span class="nc" id="L789">        cont.setError(this, name);</span>
+
+<span class="nc" id="L791">        Attributes inputAttrs = attrs;</span>
+        try {
+<span class="nc" id="L793">            ensureOpen();</span>
+<span class="nc bnc" id="L794" title="All 2 branches missed.">            if (attrs == null) {</span>
+                  // add structural objectclass; name needs to have &quot;cn&quot;
+<span class="nc" id="L796">                  Attribute oc = new BasicAttribute(</span>
+                      Obj.JAVA_ATTRIBUTES[Obj.OBJECT_CLASS],
+                      Obj.JAVA_OBJECT_CLASSES[Obj.STRUCTURAL]);
+<span class="nc" id="L799">                  oc.add(&quot;top&quot;);</span>
+<span class="nc" id="L800">                  attrs = new BasicAttributes(true); // case ignore</span>
+<span class="nc" id="L801">                  attrs.put(oc);</span>
+            }
+<span class="nc" id="L803">            String newDN = fullyQualifiedName(name);</span>
+<span class="nc bnc" id="L804" title="All 2 branches missed.">            attrs = addRdnAttributes(newDN, attrs, inputAttrs != attrs);</span>
+
+<span class="nc" id="L806">            LdapEntry entry = new LdapEntry(newDN, attrs);</span>
+
+<span class="nc" id="L808">            LdapResult answer = clnt.add(entry, reqCtls);</span>
+<span class="nc" id="L809">            respCtls = answer.resControls; // retrieve response controls</span>
+
+<span class="nc bnc" id="L811" title="All 2 branches missed.">            if (answer.status != LdapClient.LDAP_SUCCESS) {</span>
+<span class="nc" id="L812">                processReturnCode(answer, name);</span>
+<span class="nc" id="L813">                return null;</span>
+            }
+
+            // creation successful, get back live object
+<span class="nc" id="L817">            return new LdapCtx(this, newDN);</span>
+
+<span class="nc" id="L819">        } catch (LdapReferralException e) {</span>
+<span class="nc bnc" id="L820" title="All 2 branches missed.">            if (handleReferrals == LdapClient.LDAP_REF_THROW)</span>
+<span class="nc" id="L821">                throw cont.fillInException(e);</span>
+
+            // process the referrals sequentially
+            while (true) {
+
+<span class="nc" id="L826">                LdapReferralContext refCtx =</span>
+<span class="nc" id="L827">                    (LdapReferralContext)e.getReferralContext(envprops, bindCtls);</span>
+
+                // repeat the original operation at the new context
+                try {
+
+<span class="nc" id="L832">                    return refCtx.createSubcontext(name, inputAttrs);</span>
+
+<span class="nc" id="L834">                } catch (LdapReferralException re) {</span>
+<span class="nc" id="L835">                    e = re;</span>
+                    continue;
+
+                } finally {
+                    // Make sure we close referral context
+<span class="nc" id="L840">                    refCtx.close();</span>
+                }
+            }
+
+<span class="nc" id="L844">        } catch (IOException e) {</span>
+<span class="nc" id="L845">            NamingException e2 = new CommunicationException(e.getMessage());</span>
+<span class="nc" id="L846">            e2.setRootCause(e);</span>
+<span class="nc" id="L847">            throw cont.fillInException(e2);</span>
+
+<span class="nc" id="L849">        } catch (NamingException e) {</span>
+<span class="nc" id="L850">            throw cont.fillInException(e);</span>
+        }
+    }
+
+    protected void c_destroySubcontext(Name name, Continuation cont)
+        throws NamingException {
+<span class="nc" id="L856">        cont.setError(this, name);</span>
+
+        try {
+<span class="nc" id="L859">            ensureOpen();</span>
+
+<span class="nc" id="L861">            String fname = fullyQualifiedName(name);</span>
+<span class="nc" id="L862">            LdapResult answer = clnt.delete(fname, reqCtls);</span>
+<span class="nc" id="L863">            respCtls = answer.resControls; // retrieve response controls</span>
+
+<span class="nc" id="L865">            adjustDeleteStatus(fname, answer);</span>
+
+<span class="nc bnc" id="L867" title="All 2 branches missed.">            if (answer.status != LdapClient.LDAP_SUCCESS) {</span>
+<span class="nc" id="L868">                processReturnCode(answer, name);</span>
+            }
+
+<span class="nc" id="L871">        } catch (LdapReferralException e) {</span>
+<span class="nc bnc" id="L872" title="All 2 branches missed.">            if (handleReferrals == LdapClient.LDAP_REF_THROW)</span>
+<span class="nc" id="L873">                throw cont.fillInException(e);</span>
+
+            // process the referrals sequentially
+            while (true) {
+
+<span class="nc" id="L878">                LdapReferralContext refCtx =</span>
+<span class="nc" id="L879">                    (LdapReferralContext)e.getReferralContext(envprops, bindCtls);</span>
+
+                // repeat the original operation at the new context
+                try {
+
+<span class="nc" id="L884">                    refCtx.destroySubcontext(name);</span>
+<span class="nc" id="L885">                    return;</span>
+<span class="nc" id="L886">                } catch (LdapReferralException re) {</span>
+<span class="nc" id="L887">                    e = re;</span>
+                    continue;
+                } finally {
+                    // Make sure we close referral context
+<span class="nc" id="L891">                    refCtx.close();</span>
+                }
+            }
+<span class="nc" id="L894">        } catch (IOException e) {</span>
+<span class="nc" id="L895">            NamingException e2 = new CommunicationException(e.getMessage());</span>
+<span class="nc" id="L896">            e2.setRootCause(e);</span>
+<span class="nc" id="L897">            throw cont.fillInException(e2);</span>
+<span class="nc" id="L898">        } catch (NamingException e) {</span>
+<span class="nc" id="L899">            throw cont.fillInException(e);</span>
+<span class="nc" id="L900">        }</span>
+<span class="nc" id="L901">    }</span>
+
+    /**
+     * Adds attributes from RDN to attrs if not already present.
+     * Note that if attrs already contains an attribute by the same name,
+     * or if the distinguished name is empty, then leave attrs unchanged.
+     *
+     * @param dn The non-null DN of the entry to add
+     * @param attrs The non-null attributes of entry to add
+     * @param directUpdate Whether attrs can be updated directly
+     * @returns Non-null attributes with attributes from the RDN added
+     */
+    private static Attributes addRdnAttributes(String dn, Attributes attrs,
+        boolean directUpdate) throws NamingException {
+
+            // Handle the empty name
+<span class="nc bnc" id="L917" title="All 2 branches missed.">            if (dn.equals(&quot;&quot;)) {</span>
+<span class="nc" id="L918">                return attrs;</span>
+            }
+
+            // Parse string name into list of RDNs
+<span class="nc" id="L922">            List&lt;Rdn&gt; rdnList = (new LdapName(dn)).getRdns();</span>
+
+            // Get leaf RDN
+<span class="nc" id="L925">            Rdn rdn = rdnList.get(rdnList.size() - 1);</span>
+<span class="nc" id="L926">            Attributes nameAttrs = rdn.toAttributes();</span>
+
+            // Add attributes of RDN to attrs if not already there
+<span class="nc" id="L929">            NamingEnumeration&lt;? extends Attribute&gt; enum_ = nameAttrs.getAll();</span>
+            Attribute nameAttr;
+<span class="nc bnc" id="L931" title="All 2 branches missed.">            while (enum_.hasMore()) {</span>
+<span class="nc" id="L932">                nameAttr = enum_.next();</span>
+
+                // If attrs already has the attribute, don't change or add to it
+<span class="nc bnc" id="L935" title="All 2 branches missed.">                if (attrs.get(nameAttr.getID()) ==  null) {</span>
+
+                    /**
+                     * When attrs.isCaseIgnored() is false, attrs.get() will
+                     * return null when the case mis-matches for otherwise
+                     * equal attrIDs.
+                     * As the attrIDs' case is irrelevant for LDAP, ignore
+                     * the case of attrIDs even when attrs.isCaseIgnored() is
+                     * false. This is done by explicitly comparing the elements in
+                     * the enumeration of IDs with their case ignored.
+                     */
+<span class="nc bnc" id="L946" title="All 2 branches missed.">                    if (!attrs.isCaseIgnored() &amp;&amp;</span>
+<span class="nc bnc" id="L947" title="All 2 branches missed.">                            containsIgnoreCase(attrs.getIDs(), nameAttr.getID())) {</span>
+<span class="nc" id="L948">                        continue;</span>
+                    }
+
+<span class="nc bnc" id="L951" title="All 2 branches missed.">                    if (!directUpdate) {</span>
+<span class="nc" id="L952">                        attrs = (Attributes)attrs.clone();</span>
+<span class="nc" id="L953">                        directUpdate = true;</span>
+                    }
+<span class="nc" id="L955">                    attrs.put(nameAttr);</span>
+                }
+            }
+
+<span class="nc" id="L959">            return attrs;</span>
+    }
+
+
+    private static boolean containsIgnoreCase(NamingEnumeration&lt;String&gt; enumStr,
+                                String str) throws NamingException {
+        String strEntry;
+
+<span class="nc bnc" id="L967" title="All 2 branches missed.">        while (enumStr.hasMore()) {</span>
+<span class="nc" id="L968">             strEntry = enumStr.next();</span>
+<span class="nc bnc" id="L969" title="All 2 branches missed.">             if (strEntry.equalsIgnoreCase(str)) {</span>
+<span class="nc" id="L970">                return true;</span>
+             }
+        }
+<span class="nc" id="L973">        return false;</span>
+    }
+
+
+    private void adjustDeleteStatus(String fname, LdapResult answer) {
+<span class="nc bnc" id="L978" title="All 4 branches missed.">        if (answer.status == LdapClient.LDAP_NO_SUCH_OBJECT &amp;&amp;</span>
+            answer.matchedDN != null) {
+            try {
+                // %%% RL: are there any implications for referrals?
+
+<span class="nc" id="L983">                Name orig = parser.parse(fname);</span>
+<span class="nc" id="L984">                Name matched = parser.parse(answer.matchedDN);</span>
+<span class="nc bnc" id="L985" title="All 2 branches missed.">                if ((orig.size() - matched.size()) == 1)</span>
+<span class="nc" id="L986">                    answer.status = LdapClient.LDAP_SUCCESS;</span>
+<span class="nc" id="L987">            } catch (NamingException e) {}</span>
+        }
+<span class="nc" id="L989">    }</span>
+
+    /*
+     * Append the the second Vector onto the first Vector
+     * (v2 must be non-null)
+     */
+    private static &lt;T&gt; Vector&lt;T&gt; appendVector(Vector&lt;T&gt; v1, Vector&lt;T&gt; v2) {
+<span class="nc bnc" id="L996" title="All 2 branches missed.">        if (v1 == null) {</span>
+<span class="nc" id="L997">            v1 = v2;</span>
+        } else {
+<span class="nc bnc" id="L999" title="All 2 branches missed.">            for (int i = 0; i &lt; v2.size(); i++) {</span>
+<span class="nc" id="L1000">                v1.addElement(v2.elementAt(i));</span>
+            }
+        }
+<span class="nc" id="L1003">        return v1;</span>
+    }
+
+    // ------------- Lookups and Browsing -------------------------
+    // lookup/lookupLink
+    // list/listBindings
+
+    protected Object c_lookupLink(Name name, Continuation cont)
+            throws NamingException {
+<span class="nc" id="L1012">        return c_lookup(name, cont);</span>
+    }
+
+    protected Object c_lookup(Name name, Continuation cont)
+            throws NamingException {
+<span class="nc" id="L1017">        cont.setError(this, name);</span>
+<span class="nc" id="L1018">        Object obj = null;</span>
+        Attributes attrs;
+
+        try {
+<span class="nc" id="L1022">            SearchControls cons = new SearchControls();</span>
+<span class="nc" id="L1023">            cons.setSearchScope(SearchControls.OBJECT_SCOPE);</span>
+<span class="nc" id="L1024">            cons.setReturningAttributes(null); // ask for all attributes</span>
+<span class="nc" id="L1025">            cons.setReturningObjFlag(true); // need values to construct obj</span>
+
+<span class="nc" id="L1027">            LdapResult answer = doSearchOnce(name, &quot;(objectClass=*)&quot;, cons, true);</span>
+<span class="nc" id="L1028">            respCtls = answer.resControls; // retrieve response controls</span>
+
+            // should get back 1 SearchResponse and 1 SearchResult
+
+<span class="nc bnc" id="L1032" title="All 2 branches missed.">            if (answer.status != LdapClient.LDAP_SUCCESS) {</span>
+<span class="nc" id="L1033">                processReturnCode(answer, name);</span>
+            }
+
+<span class="nc bnc" id="L1036" title="All 4 branches missed.">            if (answer.entries == null || answer.entries.size() != 1) {</span>
+                // found it but got no attributes
+<span class="nc" id="L1038">                attrs = new BasicAttributes(LdapClient.caseIgnore);</span>
+            } else {
+<span class="nc" id="L1040">                LdapEntry entry = answer.entries.elementAt(0);</span>
+<span class="nc" id="L1041">                attrs = entry.attributes;</span>
+
+<span class="nc" id="L1043">                Vector&lt;Control&gt; entryCtls = entry.respCtls; // retrieve entry controls</span>
+<span class="nc bnc" id="L1044" title="All 2 branches missed.">                if (entryCtls != null) {</span>
+<span class="nc" id="L1045">                    appendVector(respCtls, entryCtls); // concatenate controls</span>
+                }
+            }
+
+<span class="nc bnc" id="L1049" title="All 2 branches missed.">            if (attrs.get(Obj.JAVA_ATTRIBUTES[Obj.CLASSNAME]) != null) {</span>
+                // serialized object or object reference
+<span class="nc" id="L1051">                obj = Obj.decodeObject(attrs);</span>
+            }
+<span class="nc bnc" id="L1053" title="All 2 branches missed.">            if (obj == null) {</span>
+<span class="nc" id="L1054">                obj = new LdapCtx(this, fullyQualifiedName(name));</span>
+            }
+<span class="nc" id="L1056">        } catch (LdapReferralException e) {</span>
+<span class="nc bnc" id="L1057" title="All 2 branches missed.">            if (handleReferrals == LdapClient.LDAP_REF_THROW)</span>
+<span class="nc" id="L1058">                throw cont.fillInException(e);</span>
+
+            // process the referrals sequentially
+            while (true) {
+
+<span class="nc" id="L1063">                LdapReferralContext refCtx =</span>
+<span class="nc" id="L1064">                    (LdapReferralContext)e.getReferralContext(envprops, bindCtls);</span>
+                // repeat the original operation at the new context
+                try {
+
+<span class="nc" id="L1068">                    return refCtx.lookup(name);</span>
+
+<span class="nc" id="L1070">                } catch (LdapReferralException re) {</span>
+<span class="nc" id="L1071">                    e = re;</span>
+                    continue;
+
+                } finally {
+                    // Make sure we close referral context
+<span class="nc" id="L1076">                    refCtx.close();</span>
+                }
+            }
+
+<span class="nc" id="L1080">        } catch (NamingException e) {</span>
+<span class="nc" id="L1081">            throw cont.fillInException(e);</span>
+<span class="nc" id="L1082">        }</span>
+
+        try {
+<span class="nc" id="L1085">            return DirectoryManager.getObjectInstance(obj, name,</span>
+                this, envprops, attrs);
+
+<span class="nc" id="L1088">        } catch (NamingException e) {</span>
+<span class="nc" id="L1089">            throw cont.fillInException(e);</span>
+
+<span class="nc" id="L1091">        } catch (Exception e) {</span>
+<span class="nc" id="L1092">            NamingException e2 = new NamingException(</span>
+                    &quot;problem generating object using object factory&quot;);
+<span class="nc" id="L1094">            e2.setRootCause(e);</span>
+<span class="nc" id="L1095">            throw cont.fillInException(e2);</span>
+        }
+    }
+
+    protected NamingEnumeration&lt;NameClassPair&gt; c_list(Name name, Continuation cont)
+            throws NamingException {
+<span class="nc" id="L1101">        SearchControls cons = new SearchControls();</span>
+<span class="nc" id="L1102">        String[] classAttrs = new String[2];</span>
+
+<span class="nc" id="L1104">        classAttrs[0] = Obj.JAVA_ATTRIBUTES[Obj.OBJECT_CLASS];</span>
+<span class="nc" id="L1105">        classAttrs[1] = Obj.JAVA_ATTRIBUTES[Obj.CLASSNAME];</span>
+<span class="nc" id="L1106">        cons.setReturningAttributes(classAttrs);</span>
+
+        // set this flag to override the typesOnly flag
+<span class="nc" id="L1109">        cons.setReturningObjFlag(true);</span>
+
+<span class="nc" id="L1111">        cont.setError(this, name);</span>
+
+<span class="nc" id="L1113">        LdapResult answer = null;</span>
+
+        try {
+<span class="nc" id="L1116">            answer = doSearch(name, &quot;(objectClass=*)&quot;, cons, true, true);</span>
+
+            // list result may contain continuation references
+<span class="nc bnc" id="L1119" title="All 4 branches missed.">            if ((answer.status != LdapClient.LDAP_SUCCESS) ||</span>
+                (answer.referrals != null)) {
+<span class="nc" id="L1121">                processReturnCode(answer, name);</span>
+            }
+
+<span class="nc" id="L1124">            return new LdapNamingEnumeration(this, answer, name, cont);</span>
+
+<span class="nc" id="L1126">        } catch (LdapReferralException e) {</span>
+<span class="nc bnc" id="L1127" title="All 2 branches missed.">            if (handleReferrals == LdapClient.LDAP_REF_THROW)</span>
+<span class="nc" id="L1128">                throw cont.fillInException(e);</span>
+
+            // process the referrals sequentially
+            while (true) {
+
+<span class="nc" id="L1133">                LdapReferralContext refCtx =</span>
+<span class="nc" id="L1134">                    (LdapReferralContext)e.getReferralContext(envprops, bindCtls);</span>
+
+                // repeat the original operation at the new context
+                try {
+
+<span class="nc" id="L1139">                    return refCtx.list(name);</span>
+
+<span class="nc" id="L1141">                } catch (LdapReferralException re) {</span>
+<span class="nc" id="L1142">                    e = re;</span>
+                    continue;
+
+                } finally {
+                    // Make sure we close referral context
+<span class="nc" id="L1147">                    refCtx.close();</span>
+                }
+            }
+
+<span class="nc" id="L1151">        } catch (LimitExceededException e) {</span>
+<span class="nc" id="L1152">            LdapNamingEnumeration res =</span>
+                new LdapNamingEnumeration(this, answer, name, cont);
+
+<span class="nc" id="L1155">            res.setNamingException(</span>
+<span class="nc" id="L1156">                    (LimitExceededException)cont.fillInException(e));</span>
+<span class="nc" id="L1157">            return res;</span>
+
+<span class="nc" id="L1159">        } catch (PartialResultException e) {</span>
+<span class="nc" id="L1160">            LdapNamingEnumeration res =</span>
+                new LdapNamingEnumeration(this, answer, name, cont);
+
+<span class="nc" id="L1163">            res.setNamingException(</span>
+<span class="nc" id="L1164">                    (PartialResultException)cont.fillInException(e));</span>
+<span class="nc" id="L1165">            return res;</span>
+
+<span class="nc" id="L1167">        } catch (NamingException e) {</span>
+<span class="nc" id="L1168">            throw cont.fillInException(e);</span>
+        }
+    }
+
+    protected NamingEnumeration&lt;Binding&gt; c_listBindings(Name name, Continuation cont)
+            throws NamingException {
+
+<span class="nc" id="L1175">        SearchControls cons = new SearchControls();</span>
+<span class="nc" id="L1176">        cons.setReturningAttributes(null); // ask for all attributes</span>
+<span class="nc" id="L1177">        cons.setReturningObjFlag(true); // need values to construct obj</span>
+
+<span class="nc" id="L1179">        cont.setError(this, name);</span>
+
+<span class="nc" id="L1181">        LdapResult answer = null;</span>
+
+        try {
+<span class="nc" id="L1184">            answer = doSearch(name, &quot;(objectClass=*)&quot;, cons, true, true);</span>
+
+            // listBindings result may contain continuation references
+<span class="nc bnc" id="L1187" title="All 4 branches missed.">            if ((answer.status != LdapClient.LDAP_SUCCESS) ||</span>
+                (answer.referrals != null)) {
+<span class="nc" id="L1189">                processReturnCode(answer, name);</span>
+            }
+
+<span class="nc" id="L1192">            return new LdapBindingEnumeration(this, answer, name, cont);</span>
+
+<span class="nc" id="L1194">        } catch (LdapReferralException e) {</span>
+<span class="nc bnc" id="L1195" title="All 2 branches missed.">            if (handleReferrals == LdapClient.LDAP_REF_THROW)</span>
+<span class="nc" id="L1196">                throw cont.fillInException(e);</span>
+
+            // process the referrals sequentially
+            while (true) {
+                @SuppressWarnings(&quot;unchecked&quot;)
+<span class="nc" id="L1201">                LdapReferralContext refCtx =</span>
+<span class="nc" id="L1202">                    (LdapReferralContext)e.getReferralContext(envprops, bindCtls);</span>
+
+                // repeat the original operation at the new context
+                try {
+
+<span class="nc" id="L1207">                    return refCtx.listBindings(name);</span>
+
+<span class="nc" id="L1209">                } catch (LdapReferralException re) {</span>
+<span class="nc" id="L1210">                    e = re;</span>
+                    continue;
+
+                } finally {
+                    // Make sure we close referral context
+<span class="nc" id="L1215">                    refCtx.close();</span>
+                }
+            }
+<span class="nc" id="L1218">        } catch (LimitExceededException e) {</span>
+<span class="nc" id="L1219">            LdapBindingEnumeration res =</span>
+                new LdapBindingEnumeration(this, answer, name, cont);
+
+<span class="nc" id="L1222">            res.setNamingException(cont.fillInException(e));</span>
+<span class="nc" id="L1223">            return res;</span>
+
+<span class="nc" id="L1225">        } catch (PartialResultException e) {</span>
+<span class="nc" id="L1226">            LdapBindingEnumeration res =</span>
+                new LdapBindingEnumeration(this, answer, name, cont);
+
+<span class="nc" id="L1229">            res.setNamingException(cont.fillInException(e));</span>
+<span class="nc" id="L1230">            return res;</span>
+
+<span class="nc" id="L1232">        } catch (NamingException e) {</span>
+<span class="nc" id="L1233">            throw cont.fillInException(e);</span>
+        }
+    }
+
+    // --------------- Name-related Methods -----------------------
+    // -- getNameParser/getNameInNamespace/composeName
+
+    protected NameParser c_getNameParser(Name name, Continuation cont)
+            throws NamingException
+    {
+        // ignore name, always return same parser
+<span class="nc" id="L1244">        cont.setSuccess();</span>
+<span class="nc" id="L1245">        return parser;</span>
+    }
+
+    public String getNameInNamespace() {
+<span class="nc" id="L1249">        return currentDN;</span>
+    }
+
+    public Name composeName(Name name, Name prefix)
+        throws NamingException
+    {
+        Name result;
+
+        // Handle compound names.  A pair of LdapNames is an easy case.
+<span class="nc bnc" id="L1258" title="All 4 branches missed.">        if ((name instanceof LdapName) &amp;&amp; (prefix instanceof LdapName)) {</span>
+<span class="nc" id="L1259">            result = (Name)(prefix.clone());</span>
+<span class="nc" id="L1260">            result.addAll(name);</span>
+<span class="nc" id="L1261">            return new CompositeName().add(result.toString());</span>
+        }
+<span class="nc bnc" id="L1263" title="All 2 branches missed.">        if (!(name instanceof CompositeName)) {</span>
+<span class="nc" id="L1264">            name = new CompositeName().add(name.toString());</span>
+        }
+<span class="nc bnc" id="L1266" title="All 2 branches missed.">        if (!(prefix instanceof CompositeName)) {</span>
+<span class="nc" id="L1267">            prefix = new CompositeName().add(prefix.toString());</span>
+        }
+
+<span class="nc" id="L1270">        int prefixLast = prefix.size() - 1;</span>
+
+<span class="nc bnc" id="L1272" title="All 4 branches missed.">        if (name.isEmpty() || prefix.isEmpty() ||</span>
+<span class="nc bnc" id="L1273" title="All 4 branches missed.">                name.get(0).equals(&quot;&quot;) || prefix.get(prefixLast).equals(&quot;&quot;)) {</span>
+<span class="nc" id="L1274">            return super.composeName(name, prefix);</span>
+        }
+
+<span class="nc" id="L1277">        result = (Name)(prefix.clone());</span>
+<span class="nc" id="L1278">        result.addAll(name);</span>
+
+<span class="nc bnc" id="L1280" title="All 2 branches missed.">        if (parentIsLdapCtx) {</span>
+<span class="nc" id="L1281">            String ldapComp = concatNames(result.get(prefixLast + 1),</span>
+<span class="nc" id="L1282">                                          result.get(prefixLast));</span>
+<span class="nc" id="L1283">            result.remove(prefixLast + 1);</span>
+<span class="nc" id="L1284">            result.remove(prefixLast);</span>
+<span class="nc" id="L1285">            result.add(prefixLast, ldapComp);</span>
+        }
+<span class="nc" id="L1287">        return result;</span>
+    }
+
+    private String fullyQualifiedName(Name rel) {
+<span class="pc bpc" id="L1291" title="1 of 2 branches missed.">        return rel.isEmpty()</span>
+                ? currentDN
+<span class="fc" id="L1293">                : fullyQualifiedName(rel.get(0));</span>
+    }
+
+    private String fullyQualifiedName(String rel) {
+<span class="fc" id="L1297">        return (concatNames(rel, currentDN));</span>
+    }
+
+    // used by LdapSearchEnumeration
+    private static String concatNames(String lesser, String greater) {
+<span class="pc bpc" id="L1302" title="2 of 4 branches missed.">        if (lesser == null || lesser.equals(&quot;&quot;)) {</span>
+<span class="nc" id="L1303">            return greater;</span>
+<span class="pc bpc" id="L1304" title="2 of 4 branches missed.">        } else if (greater == null || greater.equals(&quot;&quot;)) {</span>
+<span class="fc" id="L1305">            return lesser;</span>
+        } else {
+<span class="nc" id="L1307">            return (lesser + &quot;,&quot; + greater);</span>
+        }
+    }
+
+   // --------------- Reading and Updating Attributes
+   // getAttributes/modifyAttributes
+
+    protected Attributes c_getAttributes(Name name, String[] attrIds,
+                                      Continuation cont)
+            throws NamingException {
+<span class="nc" id="L1317">        cont.setError(this, name);</span>
+
+<span class="nc" id="L1319">        SearchControls cons = new SearchControls();</span>
+<span class="nc" id="L1320">        cons.setSearchScope(SearchControls.OBJECT_SCOPE);</span>
+<span class="nc" id="L1321">        cons.setReturningAttributes(attrIds);</span>
+
+        try {
+<span class="nc" id="L1324">            LdapResult answer =</span>
+<span class="nc" id="L1325">                doSearchOnce(name, &quot;(objectClass=*)&quot;, cons, true);</span>
+<span class="nc" id="L1326">            respCtls = answer.resControls; // retrieve response controls</span>
+
+<span class="nc bnc" id="L1328" title="All 2 branches missed.">            if (answer.status != LdapClient.LDAP_SUCCESS) {</span>
+<span class="nc" id="L1329">                processReturnCode(answer, name);</span>
+            }
+
+<span class="nc bnc" id="L1332" title="All 4 branches missed.">            if (answer.entries == null || answer.entries.size() != 1) {</span>
+<span class="nc" id="L1333">                return new BasicAttributes(LdapClient.caseIgnore);</span>
+            }
+
+            // get attributes from result
+<span class="nc" id="L1337">            LdapEntry entry = answer.entries.elementAt(0);</span>
+
+<span class="nc" id="L1339">            Vector&lt;Control&gt; entryCtls = entry.respCtls; // retrieve entry controls</span>
+<span class="nc bnc" id="L1340" title="All 2 branches missed.">            if (entryCtls != null) {</span>
+<span class="nc" id="L1341">                appendVector(respCtls, entryCtls); // concatenate controls</span>
+            }
+
+            // do this so attributes can find their schema
+<span class="nc" id="L1345">            setParents(entry.attributes, (Name) name.clone());</span>
+
+<span class="nc" id="L1347">            return (entry.attributes);</span>
+
+<span class="nc" id="L1349">        } catch (LdapReferralException e) {</span>
+<span class="nc bnc" id="L1350" title="All 2 branches missed.">            if (handleReferrals == LdapClient.LDAP_REF_THROW)</span>
+<span class="nc" id="L1351">                throw cont.fillInException(e);</span>
+
+            // process the referrals sequentially
+            while (true) {
+
+<span class="nc" id="L1356">                LdapReferralContext refCtx =</span>
+<span class="nc" id="L1357">                    (LdapReferralContext)e.getReferralContext(envprops, bindCtls);</span>
+
+                // repeat the original operation at the new context
+                try {
+
+<span class="nc" id="L1362">                    return refCtx.getAttributes(name, attrIds);</span>
+
+<span class="nc" id="L1364">                } catch (LdapReferralException re) {</span>
+<span class="nc" id="L1365">                    e = re;</span>
+                    continue;
+
+                } finally {
+                    // Make sure we close referral context
+<span class="nc" id="L1370">                    refCtx.close();</span>
+                }
+            }
+
+<span class="nc" id="L1374">        } catch (NamingException e) {</span>
+<span class="nc" id="L1375">            throw cont.fillInException(e);</span>
+        }
+    }
+
+    protected void c_modifyAttributes(Name name, int mod_op, Attributes attrs,
+                                      Continuation cont)
+            throws NamingException {
+
+<span class="nc" id="L1383">        cont.setError(this, name);</span>
+
+        try {
+<span class="nc" id="L1386">            ensureOpen();</span>
+
+<span class="nc bnc" id="L1388" title="All 4 branches missed.">            if (attrs == null || attrs.size() == 0) {</span>
+<span class="nc" id="L1389">                return; // nothing to do</span>
+            }
+<span class="nc" id="L1391">            String newDN = fullyQualifiedName(name);</span>
+<span class="nc" id="L1392">            int jmod_op = convertToLdapModCode(mod_op);</span>
+
+            // construct mod list
+<span class="nc" id="L1395">            int[] jmods = new int[attrs.size()];</span>
+<span class="nc" id="L1396">            Attribute[] jattrs = new Attribute[attrs.size()];</span>
+
+<span class="nc" id="L1398">            NamingEnumeration&lt;? extends Attribute&gt; ae = attrs.getAll();</span>
+<span class="nc bnc" id="L1399" title="All 4 branches missed.">            for(int i = 0; i &lt; jmods.length &amp;&amp; ae.hasMore(); i++) {</span>
+<span class="nc" id="L1400">                jmods[i] = jmod_op;</span>
+<span class="nc" id="L1401">                jattrs[i] = ae.next();</span>
+            }
+
+<span class="nc" id="L1404">            LdapResult answer = clnt.modify(newDN, jmods, jattrs, reqCtls);</span>
+<span class="nc" id="L1405">            respCtls = answer.resControls; // retrieve response controls</span>
+
+<span class="nc bnc" id="L1407" title="All 2 branches missed.">            if (answer.status != LdapClient.LDAP_SUCCESS) {</span>
+<span class="nc" id="L1408">                processReturnCode(answer, name);</span>
+<span class="nc" id="L1409">                return;</span>
+            }
+
+<span class="nc" id="L1412">        } catch (LdapReferralException e) {</span>
+<span class="nc bnc" id="L1413" title="All 2 branches missed.">            if (handleReferrals == LdapClient.LDAP_REF_THROW)</span>
+<span class="nc" id="L1414">                throw cont.fillInException(e);</span>
+
+            // process the referrals sequentially
+            while (true) {
+
+<span class="nc" id="L1419">                LdapReferralContext refCtx =</span>
+<span class="nc" id="L1420">                    (LdapReferralContext)e.getReferralContext(envprops, bindCtls);</span>
+
+                // repeat the original operation at the new context
+                try {
+
+<span class="nc" id="L1425">                    refCtx.modifyAttributes(name, mod_op, attrs);</span>
+<span class="nc" id="L1426">                    return;</span>
+
+<span class="nc" id="L1428">                } catch (LdapReferralException re) {</span>
+<span class="nc" id="L1429">                    e = re;</span>
+                    continue;
+
+                } finally {
+                    // Make sure we close referral context
+<span class="nc" id="L1434">                    refCtx.close();</span>
+                }
+            }
+
+<span class="nc" id="L1438">        } catch (IOException e) {</span>
+<span class="nc" id="L1439">            NamingException e2 = new CommunicationException(e.getMessage());</span>
+<span class="nc" id="L1440">            e2.setRootCause(e);</span>
+<span class="nc" id="L1441">            throw cont.fillInException(e2);</span>
+
+<span class="nc" id="L1443">        } catch (NamingException e) {</span>
+<span class="nc" id="L1444">            throw cont.fillInException(e);</span>
+<span class="nc" id="L1445">        }</span>
+<span class="nc" id="L1446">    }</span>
+
+    protected void c_modifyAttributes(Name name, ModificationItem[] mods,
+                                      Continuation cont)
+            throws NamingException {
+<span class="nc" id="L1451">        cont.setError(this, name);</span>
+
+        try {
+<span class="nc" id="L1454">            ensureOpen();</span>
+
+<span class="nc bnc" id="L1456" title="All 4 branches missed.">            if (mods == null || mods.length == 0) {</span>
+<span class="nc" id="L1457">                return; // nothing to do</span>
+            }
+<span class="nc" id="L1459">            String newDN = fullyQualifiedName(name);</span>
+
+            // construct mod list
+<span class="nc" id="L1462">            int[] jmods = new int[mods.length];</span>
+<span class="nc" id="L1463">            Attribute[] jattrs = new Attribute[mods.length];</span>
+            ModificationItem mod;
+<span class="nc bnc" id="L1465" title="All 2 branches missed.">            for (int i = 0; i &lt; jmods.length; i++) {</span>
+<span class="nc" id="L1466">                mod = mods[i];</span>
+<span class="nc" id="L1467">                jmods[i] = convertToLdapModCode(mod.getModificationOp());</span>
+<span class="nc" id="L1468">                jattrs[i] = mod.getAttribute();</span>
+            }
+
+<span class="nc" id="L1471">            LdapResult answer = clnt.modify(newDN, jmods, jattrs, reqCtls);</span>
+<span class="nc" id="L1472">            respCtls = answer.resControls; // retrieve response controls</span>
+
+<span class="nc bnc" id="L1474" title="All 2 branches missed.">            if (answer.status != LdapClient.LDAP_SUCCESS) {</span>
+<span class="nc" id="L1475">                processReturnCode(answer, name);</span>
+            }
+
+<span class="nc" id="L1478">        } catch (LdapReferralException e) {</span>
+<span class="nc bnc" id="L1479" title="All 2 branches missed.">            if (handleReferrals == LdapClient.LDAP_REF_THROW)</span>
+<span class="nc" id="L1480">                throw cont.fillInException(e);</span>
+
+            // process the referrals sequentially
+            while (true) {
+
+<span class="nc" id="L1485">                LdapReferralContext refCtx =</span>
+<span class="nc" id="L1486">                    (LdapReferralContext)e.getReferralContext(envprops, bindCtls);</span>
+
+                // repeat the original operation at the new context
+                try {
+
+<span class="nc" id="L1491">                    refCtx.modifyAttributes(name, mods);</span>
+<span class="nc" id="L1492">                    return;</span>
+
+<span class="nc" id="L1494">                } catch (LdapReferralException re) {</span>
+<span class="nc" id="L1495">                    e = re;</span>
+                    continue;
+
+                } finally {
+                    // Make sure we close referral context
+<span class="nc" id="L1500">                    refCtx.close();</span>
+                }
+            }
+
+<span class="nc" id="L1504">        } catch (IOException e) {</span>
+<span class="nc" id="L1505">            NamingException e2 = new CommunicationException(e.getMessage());</span>
+<span class="nc" id="L1506">            e2.setRootCause(e);</span>
+<span class="nc" id="L1507">            throw cont.fillInException(e2);</span>
+
+<span class="nc" id="L1509">        } catch (NamingException e) {</span>
+<span class="nc" id="L1510">            throw cont.fillInException(e);</span>
+<span class="nc" id="L1511">        }</span>
+<span class="nc" id="L1512">    }</span>
+
+    private static int convertToLdapModCode(int mod_op) {
+<span class="nc bnc" id="L1515" title="All 4 branches missed.">        switch (mod_op) {</span>
+        case DirContext.ADD_ATTRIBUTE:
+<span class="nc" id="L1517">            return(LdapClient.ADD);</span>
+
+        case DirContext.REPLACE_ATTRIBUTE:
+<span class="nc" id="L1520">            return (LdapClient.REPLACE);</span>
+
+        case DirContext.REMOVE_ATTRIBUTE:
+<span class="nc" id="L1523">            return (LdapClient.DELETE);</span>
+
+        default:
+<span class="nc" id="L1526">            throw new IllegalArgumentException(&quot;Invalid modification code&quot;);</span>
+        }
+    }
+
+   // ------------------- Schema -----------------------
+
+    protected DirContext c_getSchema(Name name, Continuation cont)
+            throws NamingException {
+<span class="nc" id="L1534">        cont.setError(this, name);</span>
+        try {
+<span class="nc" id="L1536">            return getSchemaTree(name);</span>
+
+<span class="nc" id="L1538">        } catch (NamingException e) {</span>
+<span class="nc" id="L1539">            throw cont.fillInException(e);</span>
+        }
+    }
+
+    protected DirContext c_getSchemaClassDefinition(Name name,
+                                                    Continuation cont)
+            throws NamingException {
+<span class="nc" id="L1546">        cont.setError(this, name);</span>
+
+        try {
+            // retrieve the objectClass attribute from LDAP
+<span class="nc" id="L1550">            Attribute objectClassAttr = c_getAttributes(name,</span>
+<span class="nc" id="L1551">                new String[]{&quot;objectclass&quot;}, cont).get(&quot;objectclass&quot;);</span>
+<span class="nc bnc" id="L1552" title="All 4 branches missed.">            if (objectClassAttr == null || objectClassAttr.size() == 0) {</span>
+<span class="nc" id="L1553">                return EMPTY_SCHEMA;</span>
+            }
+
+            // retrieve the root of the ObjectClass schema tree
+<span class="nc" id="L1557">            Context ocSchema = (Context) c_getSchema(name, cont).lookup(</span>
+                LdapSchemaParser.OBJECTCLASS_DEFINITION_NAME);
+
+            // create a context to hold the schema objects representing the object
+            // classes
+<span class="nc" id="L1562">            HierMemDirCtx objectClassCtx = new HierMemDirCtx();</span>
+            DirContext objectClassDef;
+            String objectClassName;
+<span class="nc" id="L1565">            for (Enumeration&lt;?&gt; objectClasses = objectClassAttr.getAll();</span>
+<span class="nc bnc" id="L1566" title="All 2 branches missed.">                objectClasses.hasMoreElements(); ) {</span>
+<span class="nc" id="L1567">                objectClassName = (String)objectClasses.nextElement();</span>
+                // %%% Should we fail if not found, or just continue?
+<span class="nc" id="L1569">                objectClassDef = (DirContext)ocSchema.lookup(objectClassName);</span>
+<span class="nc" id="L1570">                objectClassCtx.bind(objectClassName, objectClassDef);</span>
+            }
+
+            // Make context read-only
+<span class="nc" id="L1574">            objectClassCtx.setReadOnly(</span>
+                new SchemaViolationException(&quot;Cannot update schema object&quot;));
+<span class="nc" id="L1576">            return (DirContext)objectClassCtx;</span>
+
+<span class="nc" id="L1578">        } catch (NamingException e) {</span>
+<span class="nc" id="L1579">            throw cont.fillInException(e);</span>
+        }
+    }
+
+    /*
+     * getSchemaTree first looks to see if we have already built a
+     * schema tree for the given entry. If not, it builds a new one and
+     * stores it in our private hash table
+     */
+    private DirContext getSchemaTree(Name name) throws NamingException {
+<span class="nc" id="L1589">        String subschemasubentry = getSchemaEntry(name, true);</span>
+
+<span class="nc" id="L1591">        DirContext schemaTree = schemaTrees.get(subschemasubentry);</span>
+
+<span class="nc bnc" id="L1593" title="All 2 branches missed.">        if(schemaTree==null) {</span>
+            if(debug){System.err.println(&quot;LdapCtx: building new schema tree &quot; + this);}
+<span class="nc" id="L1595">            schemaTree = buildSchemaTree(subschemasubentry);</span>
+<span class="nc" id="L1596">            schemaTrees.put(subschemasubentry, schemaTree);</span>
+        }
+
+<span class="nc" id="L1599">        return schemaTree;</span>
+    }
+
+    /*
+     * buildSchemaTree builds the schema tree corresponding to the
+     * given subschemasubentree
+     */
+    private DirContext buildSchemaTree(String subschemasubentry)
+        throws NamingException {
+
+        // get the schema entry itself
+        // DO ask for return object here because we need it to
+        // create context. Since asking for all attrs, we won't
+        // be transmitting any specific attrIDs (like Java-specific ones).
+<span class="nc" id="L1613">        SearchControls constraints = new</span>
+            SearchControls(SearchControls.OBJECT_SCOPE,
+                0, 0, /* count and time limits */
+                SCHEMA_ATTRIBUTES /* return schema attrs */,
+                true /* return obj */,
+                false /*deref link */ );
+
+<span class="nc" id="L1620">        Name sse = (new CompositeName()).add(subschemasubentry);</span>
+<span class="nc" id="L1621">        NamingEnumeration&lt;SearchResult&gt; results =</span>
+<span class="nc" id="L1622">            searchAux(sse, &quot;(objectClass=subschema)&quot;, constraints,</span>
+            false, true, new Continuation());
+
+<span class="nc bnc" id="L1625" title="All 2 branches missed.">        if(!results.hasMore()) {</span>
+<span class="nc" id="L1626">            throw new OperationNotSupportedException(</span>
+                &quot;Cannot get read subschemasubentry: &quot; + subschemasubentry);
+        }
+<span class="nc" id="L1629">        SearchResult result = results.next();</span>
+<span class="nc" id="L1630">        results.close();</span>
+
+<span class="nc" id="L1632">        Object obj = result.getObject();</span>
+<span class="nc bnc" id="L1633" title="All 2 branches missed.">        if(!(obj instanceof LdapCtx)) {</span>
+<span class="nc" id="L1634">            throw new NamingException(</span>
+                &quot;Cannot get schema object as DirContext: &quot; + subschemasubentry);
+        }
+
+<span class="nc" id="L1638">        return LdapSchemaCtx.createSchemaTree(envprops, subschemasubentry,</span>
+            (LdapCtx)obj /* schema entry */,
+<span class="nc" id="L1640">            result.getAttributes() /* schema attributes */,</span>
+            netscapeSchemaBug);
+   }
+
+    /*
+     * getSchemaEntree returns the DN of the subschemasubentree for the
+     * given entree. It first looks to see if the given entry has
+     * a subschema different from that of the root DIT (by looking for
+     * a &quot;subschemasubentry&quot; attribute). If it doesn't find one, it returns
+     * the one for the root of the DIT (by looking for the root's
+     * &quot;subschemasubentry&quot; attribute).
+     *
+     * This function is called regardless of the server's version, since
+     * an administrator may have setup the server to support client schema
+     * queries. If this function trys a serarch on a v2 server that
+     * doesn't support schema, one of these two things will happen:
+     * 1) It will get an exception when querying the root DSE
+     * 2) It will not find a subschemasubentry on the root DSE
+     * If either of these things occur and the server is not v3, we
+     * throw OperationNotSupported.
+     *
+     * the relative flag tells whether the given name is relative to this
+     * context.
+     */
+    private String getSchemaEntry(Name name, boolean relative)
+        throws NamingException {
+
+        // Asks for operational attribute &quot;subschemasubentry&quot;
+<span class="nc" id="L1668">        SearchControls constraints = new SearchControls(SearchControls.OBJECT_SCOPE,</span>
+            0, 0, /* count and time limits */
+            new String[]{&quot;subschemasubentry&quot;} /* attr to return */,
+            false /* returning obj */,
+            false /* deref link */);
+
+        NamingEnumeration&lt;SearchResult&gt; results;
+        try {
+<span class="nc" id="L1676">            results = searchAux(name, &quot;objectclass=*&quot;, constraints, relative,</span>
+                true, new Continuation());
+
+<span class="nc" id="L1679">        } catch (NamingException ne) {</span>
+<span class="nc bnc" id="L1680" title="All 6 branches missed.">            if (!clnt.isLdapv3 &amp;&amp; currentDN.length() == 0 &amp;&amp; name.isEmpty()) {</span>
+                // we got an error looking for a root entry on an ldapv2
+                // server. The server must not support schema.
+<span class="nc" id="L1683">                throw new OperationNotSupportedException(</span>
+                    &quot;Cannot get schema information from server&quot;);
+            } else {
+<span class="nc" id="L1686">                throw ne;</span>
+            }
+<span class="nc" id="L1688">        }</span>
+
+<span class="nc bnc" id="L1690" title="All 2 branches missed.">        if (!results.hasMoreElements()) {</span>
+<span class="nc" id="L1691">            throw new ConfigurationException(</span>
+                &quot;Requesting schema of nonexistent entry: &quot; + name);
+        }
+
+<span class="nc" id="L1695">        SearchResult result = results.next();</span>
+<span class="nc" id="L1696">        results.close();</span>
+
+<span class="nc" id="L1698">        Attribute schemaEntryAttr =</span>
+<span class="nc" id="L1699">            result.getAttributes().get(&quot;subschemasubentry&quot;);</span>
+        //System.err.println(&quot;schema entry attrs: &quot; + schemaEntryAttr);
+
+<span class="nc bnc" id="L1702" title="All 4 branches missed.">        if (schemaEntryAttr == null || schemaEntryAttr.size() &lt; 0) {</span>
+<span class="nc bnc" id="L1703" title="All 4 branches missed.">            if (currentDN.length() == 0 &amp;&amp; name.isEmpty()) {</span>
+                // the server doesn't have a subschemasubentry in its root DSE.
+                // therefore, it doesn't support schema.
+<span class="nc" id="L1706">                throw new OperationNotSupportedException(</span>
+                    &quot;Cannot read subschemasubentry of root DSE&quot;);
+            } else {
+<span class="nc" id="L1709">                return getSchemaEntry(new CompositeName(), false);</span>
+            }
+        }
+
+<span class="nc" id="L1713">        return (String)(schemaEntryAttr.get()); // return schema entry name</span>
+    }
+
+    // package-private; used by search enum.
+    // Set attributes to point to this context in case some one
+    // asked for their schema
+    void setParents(Attributes attrs, Name name) throws NamingException {
+<span class="nc" id="L1720">        NamingEnumeration&lt;? extends Attribute&gt; ae = attrs.getAll();</span>
+<span class="nc bnc" id="L1721" title="All 2 branches missed.">        while(ae.hasMore()) {</span>
+<span class="nc" id="L1722">            ((LdapAttribute) ae.next()).setParent(this, name);</span>
+        }
+<span class="nc" id="L1724">    }</span>
+
+    /*
+     * Returns the URL associated with this context; used by LdapAttribute
+     * after deserialization to get pointer to this context.
+     */
+    String getURL() {
+<span class="nc bnc" id="L1731" title="All 2 branches missed.">        if (url == null) {</span>
+<span class="nc" id="L1732">            url = LdapURL.toUrlString(hostname, port_number, currentDN,</span>
+                hasLdapsScheme);
+        }
+
+<span class="nc" id="L1736">        return url;</span>
+    }
+
+   // --------------------- Searches -----------------------------
+    protected NamingEnumeration&lt;SearchResult&gt; c_search(Name name,
+                                         Attributes matchingAttributes,
+                                         Continuation cont)
+            throws NamingException {
+<span class="nc" id="L1744">        return c_search(name, matchingAttributes, null, cont);</span>
+    }
+
+    protected NamingEnumeration&lt;SearchResult&gt; c_search(Name name,
+                                         Attributes matchingAttributes,
+                                         String[] attributesToReturn,
+                                         Continuation cont)
+            throws NamingException {
+<span class="nc" id="L1752">        SearchControls cons = new SearchControls();</span>
+<span class="nc" id="L1753">        cons.setReturningAttributes(attributesToReturn);</span>
+        String filter;
+        try {
+<span class="nc" id="L1756">            filter = SearchFilter.format(matchingAttributes);</span>
+<span class="nc" id="L1757">        } catch (NamingException e) {</span>
+<span class="nc" id="L1758">            cont.setError(this, name);</span>
+<span class="nc" id="L1759">            throw cont.fillInException(e);</span>
+<span class="nc" id="L1760">        }</span>
+<span class="nc" id="L1761">        return c_search(name, filter, cons, cont);</span>
+    }
+
+    protected NamingEnumeration&lt;SearchResult&gt; c_search(Name name,
+                                         String filter,
+                                         SearchControls cons,
+                                         Continuation cont)
+            throws NamingException {
+<span class="fc" id="L1769">        return searchAux(name, filter, cloneSearchControls(cons), true,</span>
+                 waitForReply, cont);
+    }
+
+    protected NamingEnumeration&lt;SearchResult&gt; c_search(Name name,
+                                         String filterExpr,
+                                         Object[] filterArgs,
+                                         SearchControls cons,
+                                         Continuation cont)
+            throws NamingException {
+        String strfilter;
+        try {
+<span class="nc" id="L1781">            strfilter = SearchFilter.format(filterExpr, filterArgs);</span>
+<span class="nc" id="L1782">        } catch (NamingException e) {</span>
+<span class="nc" id="L1783">            cont.setError(this, name);</span>
+<span class="nc" id="L1784">            throw cont.fillInException(e);</span>
+<span class="nc" id="L1785">        }</span>
+<span class="nc" id="L1786">        return c_search(name, strfilter, cons, cont);</span>
+    }
+
+        // Used by NamingNotifier
+    NamingEnumeration&lt;SearchResult&gt; searchAux(Name name,
+        String filter,
+        SearchControls cons,
+        boolean relative,
+        boolean waitForReply, Continuation cont) throws NamingException {
+
+<span class="fc" id="L1796">        LdapResult answer = null;</span>
+<span class="fc" id="L1797">        String[] tokens = new String[2];    // stores ldap compare op. values</span>
+        String[] reqAttrs;                  // remember what was asked
+
+<span class="pc bpc" id="L1800" title="1 of 2 branches missed.">        if (cons == null) {</span>
+<span class="nc" id="L1801">            cons = new SearchControls();</span>
+        }
+<span class="fc" id="L1803">        reqAttrs = cons.getReturningAttributes();</span>
+
+        // if objects are requested then request the Java attributes too
+        // so that the objects can be constructed
+<span class="pc bpc" id="L1807" title="1 of 2 branches missed.">        if (cons.getReturningObjFlag()) {</span>
+<span class="nc bnc" id="L1808" title="All 2 branches missed.">            if (reqAttrs != null) {</span>
+
+                // check for presence of &quot;*&quot; (user attributes wildcard)
+<span class="nc" id="L1811">                boolean hasWildcard = false;</span>
+<span class="nc bnc" id="L1812" title="All 2 branches missed.">                for (int i = reqAttrs.length - 1; i &gt;= 0; i--) {</span>
+<span class="nc bnc" id="L1813" title="All 2 branches missed.">                    if (reqAttrs[i].equals(&quot;*&quot;)) {</span>
+<span class="nc" id="L1814">                        hasWildcard = true;</span>
+<span class="nc" id="L1815">                        break;</span>
+                    }
+                }
+<span class="nc bnc" id="L1818" title="All 2 branches missed.">                if (! hasWildcard) {</span>
+<span class="nc" id="L1819">                    String[] totalAttrs =</span>
+                        new String[reqAttrs.length +Obj.JAVA_ATTRIBUTES.length];
+<span class="nc" id="L1821">                    System.arraycopy(reqAttrs, 0, totalAttrs, 0,</span>
+                        reqAttrs.length);
+<span class="nc" id="L1823">                    System.arraycopy(Obj.JAVA_ATTRIBUTES, 0, totalAttrs,</span>
+                        reqAttrs.length, Obj.JAVA_ATTRIBUTES.length);
+
+<span class="nc" id="L1826">                    cons.setReturningAttributes(totalAttrs);</span>
+                }
+            }
+        }
+
+<span class="fc" id="L1831">        LdapCtx.SearchArgs args =</span>
+            new LdapCtx.SearchArgs(name, filter, cons, reqAttrs);
+
+<span class="fc" id="L1834">        cont.setError(this, name);</span>
+        try {
+            // see if this can be done as a compare, otherwise do a search
+<span class="pc bpc" id="L1837" title="1 of 2 branches missed.">            if (searchToCompare(filter, cons, tokens)){</span>
+                //System.err.println(&quot;compare triggered&quot;);
+<span class="nc" id="L1839">                answer = compare(name, tokens[0], tokens[1]);</span>
+<span class="nc bnc" id="L1840" title="All 2 branches missed.">                if (! (answer.compareToSearchResult(fullyQualifiedName(name)))){</span>
+<span class="nc" id="L1841">                    processReturnCode(answer, name);</span>
+                }
+            } else {
+<span class="fc" id="L1844">                answer = doSearch(name, filter, cons, relative, waitForReply);</span>
+                // search result may contain referrals
+<span class="fc" id="L1846">                processReturnCode(answer, name);</span>
+            }
+<span class="fc" id="L1848">            return new LdapSearchEnumeration(this, answer,</span>
+<span class="fc" id="L1849">                                             fullyQualifiedName(name),</span>
+                                             args, cont);
+
+<span class="nc" id="L1852">        } catch (LdapReferralException e) {</span>
+<span class="nc bnc" id="L1853" title="All 2 branches missed.">            if (handleReferrals == LdapClient.LDAP_REF_THROW)</span>
+<span class="nc" id="L1854">                throw cont.fillInException(e);</span>
+
+            // process the referrals sequentially
+            while (true) {
+
+                @SuppressWarnings(&quot;unchecked&quot;)
+<span class="nc" id="L1860">                LdapReferralContext refCtx = (LdapReferralContext)</span>
+<span class="nc" id="L1861">                        e.getReferralContext(envprops, bindCtls);</span>
+
+                // repeat the original operation at the new context
+                try {
+
+<span class="nc" id="L1866">                    return refCtx.search(name, filter, cons);</span>
+
+<span class="nc" id="L1868">                } catch (LdapReferralException re) {</span>
+<span class="nc" id="L1869">                    e = re;</span>
+                    continue;
+
+                } finally {
+                    // Make sure we close referral context
+<span class="nc" id="L1874">                    refCtx.close();</span>
+                }
+            }
+
+<span class="nc" id="L1878">        } catch (LimitExceededException e) {</span>
+<span class="nc" id="L1879">            LdapSearchEnumeration res =</span>
+<span class="nc" id="L1880">                new LdapSearchEnumeration(this, answer, fullyQualifiedName(name),</span>
+                                          args, cont);
+<span class="nc" id="L1882">            res.setNamingException(e);</span>
+<span class="nc" id="L1883">            return res;</span>
+
+<span class="nc" id="L1885">        } catch (PartialResultException e) {</span>
+<span class="nc" id="L1886">            LdapSearchEnumeration res =</span>
+<span class="nc" id="L1887">                new LdapSearchEnumeration(this, answer, fullyQualifiedName(name),</span>
+                                          args, cont);
+
+<span class="nc" id="L1890">            res.setNamingException(e);</span>
+<span class="nc" id="L1891">            return res;</span>
+
+<span class="nc" id="L1893">        } catch (IOException e) {</span>
+<span class="nc" id="L1894">            NamingException e2 = new CommunicationException(e.getMessage());</span>
+<span class="nc" id="L1895">            e2.setRootCause(e);</span>
+<span class="nc" id="L1896">            throw cont.fillInException(e2);</span>
+
+<span class="fc" id="L1898">        } catch (NamingException e) {</span>
+<span class="fc" id="L1899">            throw cont.fillInException(e);</span>
+        }
+    }
+
+
+    LdapResult getSearchReply(LdapClient eClnt, LdapResult res)
+            throws NamingException {
+        // ensureOpen() won't work here because
+        // session was associated with previous connection
+
+        // %%% RL: we can actually allow the enumeration to continue
+        // using the old handle but other weird things might happen
+        // when we hit a referral
+<span class="nc bnc" id="L1912" title="All 2 branches missed.">        if (clnt != eClnt) {</span>
+<span class="nc" id="L1913">            throw new CommunicationException(</span>
+                &quot;Context's connection changed; unable to continue enumeration&quot;);
+        }
+
+        try {
+<span class="nc" id="L1918">            return eClnt.getSearchReply(batchSize, res, binaryAttrs);</span>
+<span class="nc" id="L1919">        } catch (IOException e) {</span>
+<span class="nc" id="L1920">            NamingException e2 = new CommunicationException(e.getMessage());</span>
+<span class="nc" id="L1921">            e2.setRootCause(e);</span>
+<span class="nc" id="L1922">            throw e2;</span>
+        }
+    }
+
+    // Perform a search. Expect 1 SearchResultEntry and the SearchResultDone.
+    private LdapResult doSearchOnce(Name name, String filter,
+        SearchControls cons, boolean relative) throws NamingException {
+
+<span class="nc" id="L1930">        int savedBatchSize = batchSize;</span>
+<span class="nc" id="L1931">        batchSize = 2; // 2 protocol elements</span>
+
+<span class="nc" id="L1933">        LdapResult answer = doSearch(name, filter, cons, relative, true);</span>
+
+<span class="nc" id="L1935">        batchSize = savedBatchSize;</span>
+<span class="nc" id="L1936">        return answer;</span>
+    }
+
+    private LdapResult doSearch(Name name, String filter, SearchControls cons,
+        boolean relative, boolean waitForReply) throws NamingException {
+<span class="fc" id="L1941">            ensureOpen();</span>
+            try {
+                int scope;
+
+<span class="pc bpc" id="L1945" title="2 of 3 branches missed.">                switch (cons.getSearchScope()) {</span>
+                case SearchControls.OBJECT_SCOPE:
+<span class="nc" id="L1947">                    scope = LdapClient.SCOPE_BASE_OBJECT;</span>
+<span class="nc" id="L1948">                    break;</span>
+                default:
+                case SearchControls.ONELEVEL_SCOPE:
+<span class="nc" id="L1951">                    scope = LdapClient.SCOPE_ONE_LEVEL;</span>
+<span class="nc" id="L1952">                    break;</span>
+                case SearchControls.SUBTREE_SCOPE:
+<span class="fc" id="L1954">                    scope = LdapClient.SCOPE_SUBTREE;</span>
+                    break;
+                }
+
+                // If cons.getReturningObjFlag() then caller should already
+                // have make sure to request the appropriate attrs
+
+<span class="fc" id="L1961">                String[] retattrs = cons.getReturningAttributes();</span>
+<span class="pc bpc" id="L1962" title="3 of 4 branches missed.">                if (retattrs != null &amp;&amp; retattrs.length == 0) {</span>
+                    // Ldap treats null and empty array the same
+                    // need to replace with single element array
+<span class="nc" id="L1965">                    retattrs = new String[1];</span>
+<span class="nc" id="L1966">                    retattrs[0] = &quot;1.1&quot;;</span>
+                }
+
+<span class="pc bpc" id="L1969" title="1 of 2 branches missed.">                String nm = (relative</span>
+<span class="pc" id="L1970">                             ? fullyQualifiedName(name)</span>
+<span class="nc bnc" id="L1971" title="All 2 branches missed.">                             : (name.isEmpty()</span>
+                                ? &quot;&quot;
+<span class="pc" id="L1973">                                : name.get(0)));</span>
+
+                // JNDI unit is milliseconds, LDAP unit is seconds.
+                // Zero means no limit.
+<span class="fc" id="L1977">                int msecLimit = cons.getTimeLimit();</span>
+<span class="fc" id="L1978">                int secLimit = 0;</span>
+
+<span class="pc bpc" id="L1980" title="1 of 2 branches missed.">                if (msecLimit &gt; 0) {</span>
+<span class="nc" id="L1981">                    secLimit = (msecLimit / 1000) + 1;</span>
+                }
+
+<span class="fc" id="L1984">                LdapResult answer =</span>
+<span class="fc" id="L1985">                    clnt.search(nm,</span>
+                        scope,
+                        derefAliases,
+<span class="fc" id="L1988">                        (int)cons.getCountLimit(),</span>
+                        secLimit,
+<span class="pc bpc" id="L1990" title="1 of 2 branches missed.">                        cons.getReturningObjFlag() ? false : typesOnly,</span>
+                        retattrs,
+                        filter,
+                        batchSize,
+                        reqCtls,
+                        binaryAttrs,
+                        waitForReply,
+                        replyQueueSize);
+<span class="fc" id="L1998">                respCtls = answer.resControls; // retrieve response controls</span>
+<span class="fc" id="L1999">                return answer;</span>
+
+<span class="nc" id="L2001">            } catch (IOException e) {</span>
+<span class="nc" id="L2002">                NamingException e2 = new CommunicationException(e.getMessage());</span>
+<span class="nc" id="L2003">                e2.setRootCause(e);</span>
+<span class="nc" id="L2004">                throw e2;</span>
+            }
+    }
+
+
+    /*
+     * Certain simple JNDI searches are automatically converted to
+     * LDAP compare operations by the LDAP service provider. A search
+     * is converted to a compare iff:
+     *
+     *    - the scope is set to OBJECT_SCOPE
+     *    - the filter string contains a simple assertion: &quot;&lt;type&gt;=&lt;value&gt;&quot;
+     *    - the returning attributes list is present but empty
+     */
+
+    // returns true if a search can be caried out as a compare, and sets
+    // tokens[0] and tokens[1] to the type and value respectively.
+    // e.g. filter &quot;cn=Jon Ruiz&quot; becomes, type &quot;cn&quot; and value &quot;Jon Ruiz&quot;
+    // This function uses the documents JNDI Compare example as a model
+    // for when to turn a search into a compare.
+
+    private static boolean searchToCompare(
+                                    String filter,
+                                    SearchControls cons,
+                                    String tokens[]) {
+
+        // if scope is not object-scope, it's really a search
+<span class="pc bpc" id="L2031" title="1 of 2 branches missed.">        if (cons.getSearchScope() != SearchControls.OBJECT_SCOPE) {</span>
+<span class="fc" id="L2032">            return false;</span>
+        }
+
+        // if attributes are to be returned, it's really a search
+<span class="nc" id="L2036">        String[] attrs = cons.getReturningAttributes();</span>
+<span class="nc bnc" id="L2037" title="All 4 branches missed.">        if (attrs == null || attrs.length != 0) {</span>
+<span class="nc" id="L2038">            return false;</span>
+        }
+
+        // if the filter not a simple assertion, it's really a search
+<span class="nc bnc" id="L2042" title="All 2 branches missed.">        if (! filterToAssertion(filter, tokens)) {</span>
+<span class="nc" id="L2043">            return false;</span>
+        }
+
+        // it can be converted to a compare
+<span class="nc" id="L2047">        return true;</span>
+    }
+
+    // If the supplied filter is a simple assertion i.e. &quot;&lt;type&gt;=&lt;value&gt;&quot;
+    // (enclosing parentheses are permitted) then
+    // filterToAssertion will return true and pass the type and value as
+    // the first and second elements of tokens respectively.
+    // precondition: tokens[] must be initialized and be at least of size 2.
+
+    private static boolean filterToAssertion(String filter, String tokens[]) {
+
+        // find the left and right half of the assertion
+<span class="nc" id="L2059">        StringTokenizer assertionTokenizer = new StringTokenizer(filter, &quot;=&quot;);</span>
+
+<span class="nc bnc" id="L2061" title="All 2 branches missed.">        if (assertionTokenizer.countTokens() != 2) {</span>
+<span class="nc" id="L2062">            return false;</span>
+        }
+
+<span class="nc" id="L2065">        tokens[0] = assertionTokenizer.nextToken();</span>
+<span class="nc" id="L2066">        tokens[1] = assertionTokenizer.nextToken();</span>
+
+        // make sure the value does not contain a wildcard
+<span class="nc bnc" id="L2069" title="All 2 branches missed.">        if (tokens[1].indexOf('*') != -1) {</span>
+<span class="nc" id="L2070">            return false;</span>
+        }
+
+        // test for enclosing parenthesis
+<span class="nc" id="L2074">        boolean hasParens = false;</span>
+<span class="nc" id="L2075">        int len = tokens[1].length();</span>
+
+<span class="nc bnc" id="L2077" title="All 2 branches missed.">        if ((tokens[0].charAt(0) == '(') &amp;&amp;</span>
+<span class="nc bnc" id="L2078" title="All 2 branches missed.">            (tokens[1].charAt(len - 1) == ')')) {</span>
+<span class="nc" id="L2079">            hasParens = true;</span>
+
+<span class="nc bnc" id="L2081" title="All 2 branches missed.">        } else if ((tokens[0].charAt(0) == '(') ||</span>
+<span class="nc bnc" id="L2082" title="All 2 branches missed.">            (tokens[1].charAt(len - 1) == ')')) {</span>
+<span class="nc" id="L2083">            return false; // unbalanced</span>
+        }
+
+        // make sure the left and right half are not expresions themselves
+<span class="nc" id="L2087">        StringTokenizer illegalCharsTokenizer =</span>
+            new StringTokenizer(tokens[0], &quot;()&amp;|!=~&gt;&lt;*&quot;, true);
+
+<span class="nc bnc" id="L2090" title="All 4 branches missed.">        if (illegalCharsTokenizer.countTokens() != (hasParens ? 2 : 1)) {</span>
+<span class="nc" id="L2091">            return false;</span>
+        }
+
+<span class="nc" id="L2094">        illegalCharsTokenizer =</span>
+            new StringTokenizer(tokens[1], &quot;()&amp;|!=~&gt;&lt;*&quot;, true);
+
+<span class="nc bnc" id="L2097" title="All 4 branches missed.">        if (illegalCharsTokenizer.countTokens() != (hasParens ? 2 : 1)) {</span>
+<span class="nc" id="L2098">            return false;</span>
+        }
+
+        // strip off enclosing parenthesis, if present
+<span class="nc bnc" id="L2102" title="All 2 branches missed.">        if (hasParens) {</span>
+<span class="nc" id="L2103">            tokens[0] = tokens[0].substring(1);</span>
+<span class="nc" id="L2104">            tokens[1] = tokens[1].substring(0, len - 1);</span>
+        }
+
+<span class="nc" id="L2107">        return true;</span>
+    }
+
+    private LdapResult compare(Name name, String type, String value)
+        throws IOException, NamingException {
+
+<span class="nc" id="L2113">        ensureOpen();</span>
+<span class="nc" id="L2114">        String nm = fullyQualifiedName(name);</span>
+
+<span class="nc" id="L2116">        LdapResult answer = clnt.compare(nm, type, value, reqCtls);</span>
+<span class="nc" id="L2117">        respCtls = answer.resControls; // retrieve response controls</span>
+
+<span class="nc" id="L2119">        return answer;</span>
+    }
+
+    private static SearchControls cloneSearchControls(SearchControls cons) {
+<span class="pc bpc" id="L2123" title="1 of 2 branches missed.">        if (cons == null) {</span>
+<span class="nc" id="L2124">            return null;</span>
+        }
+<span class="fc" id="L2126">        String[] retAttrs = cons.getReturningAttributes();</span>
+<span class="pc bpc" id="L2127" title="1 of 2 branches missed.">        if (retAttrs != null) {</span>
+<span class="nc" id="L2128">            String[] attrs = new String[retAttrs.length];</span>
+<span class="nc" id="L2129">            System.arraycopy(retAttrs, 0, attrs, 0, retAttrs.length);</span>
+<span class="nc" id="L2130">            retAttrs = attrs;</span>
+        }
+<span class="fc" id="L2132">        return new SearchControls(cons.getSearchScope(),</span>
+<span class="fc" id="L2133">                                  cons.getCountLimit(),</span>
+<span class="fc" id="L2134">                                  cons.getTimeLimit(),</span>
+                                  retAttrs,
+<span class="fc" id="L2136">                                  cons.getReturningObjFlag(),</span>
+<span class="fc" id="L2137">                                  cons.getDerefLinkFlag());</span>
+    }
+
+   // -------------- Environment Properties ------------------
+
+    /**
+     * Override with noncloning version.
+     */
+    protected Hashtable&lt;String, Object&gt; p_getEnvironment() {
+<span class="fc" id="L2146">        return envprops;</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;) // clone()
+    public Hashtable&lt;String, Object&gt; getEnvironment() throws NamingException {
+<span class="nc bnc" id="L2151" title="All 2 branches missed.">        return (envprops == null</span>
+                ? new Hashtable&lt;String, Object&gt;(5, 0.75f)
+<span class="nc" id="L2153">                : (Hashtable&lt;String, Object&gt;)envprops.clone());</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;) // clone()
+    public Object removeFromEnvironment(String propName)
+        throws NamingException {
+
+        // not there; just return
+<span class="nc bnc" id="L2161" title="All 4 branches missed.">        if (envprops == null || envprops.get(propName) == null) {</span>
+<span class="nc" id="L2162">            return null;</span>
+        }
+<span class="nc bnc" id="L2164" title="All 71 branches missed.">        switch (propName) {</span>
+            case REF_SEPARATOR:
+<span class="nc" id="L2166">                addrEncodingSeparator = DEFAULT_REF_SEPARATOR;</span>
+<span class="nc" id="L2167">                break;</span>
+            case TYPES_ONLY:
+<span class="nc" id="L2169">                typesOnly = DEFAULT_TYPES_ONLY;</span>
+<span class="nc" id="L2170">                break;</span>
+            case DELETE_RDN:
+<span class="nc" id="L2172">                deleteRDN = DEFAULT_DELETE_RDN;</span>
+<span class="nc" id="L2173">                break;</span>
+            case DEREF_ALIASES:
+<span class="nc" id="L2175">                derefAliases = DEFAULT_DEREF_ALIASES;</span>
+<span class="nc" id="L2176">                break;</span>
+            case Context.BATCHSIZE:
+<span class="nc" id="L2178">                batchSize = DEFAULT_BATCH_SIZE;</span>
+<span class="nc" id="L2179">                break;</span>
+            case REFERRAL_LIMIT:
+<span class="nc" id="L2181">                referralHopLimit = DEFAULT_REFERRAL_LIMIT;</span>
+<span class="nc" id="L2182">                break;</span>
+            case Context.REFERRAL:
+<span class="nc" id="L2184">                setReferralMode(null, true);</span>
+<span class="nc" id="L2185">                break;</span>
+            case BINARY_ATTRIBUTES:
+<span class="nc" id="L2187">                setBinaryAttributes(null);</span>
+<span class="nc" id="L2188">                break;</span>
+            case CONNECT_TIMEOUT:
+<span class="nc" id="L2190">                connectTimeout = -1;</span>
+<span class="nc" id="L2191">                break;</span>
+            case READ_TIMEOUT:
+<span class="nc" id="L2193">                readTimeout = -1;</span>
+<span class="nc" id="L2194">                break;</span>
+            case WAIT_FOR_REPLY:
+<span class="nc" id="L2196">                waitForReply = true;</span>
+<span class="nc" id="L2197">                break;</span>
+            case REPLY_QUEUE_SIZE:
+<span class="nc" id="L2199">                replyQueueSize = -1;</span>
+<span class="nc" id="L2200">                break;</span>
+
+            // The following properties affect the connection
+
+            case Context.SECURITY_PROTOCOL:
+<span class="nc" id="L2205">                closeConnection(SOFT_CLOSE);</span>
+                // De-activate SSL and reset the context's url and port number
+<span class="nc bnc" id="L2207" title="All 4 branches missed.">                if (useSsl &amp;&amp; !hasLdapsScheme) {</span>
+<span class="nc" id="L2208">                    useSsl = false;</span>
+<span class="nc" id="L2209">                    url = null;</span>
+<span class="nc bnc" id="L2210" title="All 2 branches missed.">                    if (useDefaultPortNumber) {</span>
+<span class="nc" id="L2211">                        port_number = DEFAULT_PORT;</span>
+                    }
+                }
+                break;
+            case VERSION:
+            case SOCKET_FACTORY:
+<span class="nc" id="L2217">                closeConnection(SOFT_CLOSE);</span>
+<span class="nc" id="L2218">                break;</span>
+            case Context.SECURITY_AUTHENTICATION:
+            case Context.SECURITY_PRINCIPAL:
+            case Context.SECURITY_CREDENTIALS:
+<span class="nc" id="L2222">                sharable = false;</span>
+                break;
+        }
+
+        // Update environment; reconnection will use new props
+<span class="nc" id="L2227">        envprops = (Hashtable&lt;String, Object&gt;)envprops.clone();</span>
+<span class="nc" id="L2228">        return envprops.remove(propName);</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;) // clone()
+    public Object addToEnvironment(String propName, Object propVal)
+        throws NamingException {
+
+            // If adding null, call remove
+<span class="nc bnc" id="L2236" title="All 2 branches missed.">            if (propVal == null) {</span>
+<span class="nc" id="L2237">                return removeFromEnvironment(propName);</span>
+            }
+<span class="nc bnc" id="L2239" title="All 71 branches missed.">            switch (propName) {</span>
+                case REF_SEPARATOR:
+<span class="nc" id="L2241">                    setRefSeparator((String)propVal);</span>
+<span class="nc" id="L2242">                    break;</span>
+                case TYPES_ONLY:
+<span class="nc" id="L2244">                    setTypesOnly((String)propVal);</span>
+<span class="nc" id="L2245">                    break;</span>
+                case DELETE_RDN:
+<span class="nc" id="L2247">                    setDeleteRDN((String)propVal);</span>
+<span class="nc" id="L2248">                    break;</span>
+                case DEREF_ALIASES:
+<span class="nc" id="L2250">                    setDerefAliases((String)propVal);</span>
+<span class="nc" id="L2251">                    break;</span>
+                case Context.BATCHSIZE:
+<span class="nc" id="L2253">                    setBatchSize((String)propVal);</span>
+<span class="nc" id="L2254">                    break;</span>
+                case REFERRAL_LIMIT:
+<span class="nc" id="L2256">                    setReferralLimit((String)propVal);</span>
+<span class="nc" id="L2257">                    break;</span>
+                case Context.REFERRAL:
+<span class="nc" id="L2259">                    setReferralMode((String)propVal, true);</span>
+<span class="nc" id="L2260">                    break;</span>
+                case BINARY_ATTRIBUTES:
+<span class="nc" id="L2262">                    setBinaryAttributes((String)propVal);</span>
+<span class="nc" id="L2263">                    break;</span>
+                case CONNECT_TIMEOUT:
+<span class="nc" id="L2265">                    setConnectTimeout((String)propVal);</span>
+<span class="nc" id="L2266">                    break;</span>
+                case READ_TIMEOUT:
+<span class="nc" id="L2268">                    setReadTimeout((String)propVal);</span>
+<span class="nc" id="L2269">                    break;</span>
+                case WAIT_FOR_REPLY:
+<span class="nc" id="L2271">                    setWaitForReply((String)propVal);</span>
+<span class="nc" id="L2272">                    break;</span>
+                case REPLY_QUEUE_SIZE:
+<span class="nc" id="L2274">                    setReplyQueueSize((String)propVal);</span>
+<span class="nc" id="L2275">                    break;</span>
+
+            // The following properties affect the connection
+
+                case Context.SECURITY_PROTOCOL:
+<span class="nc" id="L2280">                    closeConnection(SOFT_CLOSE);</span>
+                    // Activate SSL and reset the context's url and port number
+<span class="nc bnc" id="L2282" title="All 2 branches missed.">                    if (&quot;ssl&quot;.equals(propVal)) {</span>
+<span class="nc" id="L2283">                        useSsl = true;</span>
+<span class="nc" id="L2284">                        url = null;</span>
+<span class="nc bnc" id="L2285" title="All 2 branches missed.">                        if (useDefaultPortNumber) {</span>
+<span class="nc" id="L2286">                            port_number = DEFAULT_SSL_PORT;</span>
+                        }
+                    }
+                    break;
+                case VERSION:
+                case SOCKET_FACTORY:
+<span class="nc" id="L2292">                    closeConnection(SOFT_CLOSE);</span>
+<span class="nc" id="L2293">                    break;</span>
+                case Context.SECURITY_AUTHENTICATION:
+                case Context.SECURITY_PRINCIPAL:
+                case Context.SECURITY_CREDENTIALS:
+<span class="nc" id="L2297">                    sharable = false;</span>
+                    break;
+            }
+
+            // Update environment; reconnection will use new props
+<span class="nc bnc" id="L2302" title="All 2 branches missed.">            envprops = (envprops == null</span>
+                ? new Hashtable&lt;String, Object&gt;(5, 0.75f)
+<span class="nc" id="L2304">                : (Hashtable&lt;String, Object&gt;)envprops.clone());</span>
+<span class="nc" id="L2305">            return envprops.put(propName, propVal);</span>
+    }
+
+    /**
+     * Sets the URL that created the context in the java.naming.provider.url
+     * property.
+     */
+    void setProviderUrl(String providerUrl) { // called by LdapCtxFactory
+<span class="pc bpc" id="L2313" title="1 of 2 branches missed.">        if (envprops != null) {</span>
+<span class="fc" id="L2314">            envprops.put(Context.PROVIDER_URL, providerUrl);</span>
+        }
+<span class="fc" id="L2316">    }</span>
+
+    /**
+     * Sets the domain name for the context in the com.sun.jndi.ldap.domainname
+     * property.
+     * Used for hostname verification by Start TLS
+     */
+    void setDomainName(String domainName) { // called by LdapCtxFactory
+<span class="nc bnc" id="L2324" title="All 2 branches missed.">        if (envprops != null) {</span>
+<span class="nc" id="L2325">            envprops.put(DOMAIN_NAME, domainName);</span>
+        }
+<span class="nc" id="L2327">    }</span>
+
+    private void initEnv() throws NamingException {
+<span class="pc bpc" id="L2330" title="1 of 2 branches missed.">        if (envprops == null) {</span>
+            // Make sure that referrals are to their default
+<span class="nc" id="L2332">            setReferralMode(null, false);</span>
+<span class="nc" id="L2333">            return;</span>
+        }
+
+        // Set batch size
+<span class="fc" id="L2337">        setBatchSize((String)envprops.get(Context.BATCHSIZE));</span>
+
+        // Set separator used for encoding RefAddr
+<span class="fc" id="L2340">        setRefSeparator((String)envprops.get(REF_SEPARATOR));</span>
+
+        // Set whether RDN is removed when renaming object
+<span class="fc" id="L2343">        setDeleteRDN((String)envprops.get(DELETE_RDN));</span>
+
+        // Set whether types are returned only
+<span class="fc" id="L2346">        setTypesOnly((String)envprops.get(TYPES_ONLY));</span>
+
+        // Set how aliases are dereferenced
+<span class="fc" id="L2349">        setDerefAliases((String)envprops.get(DEREF_ALIASES));</span>
+
+        // Set the limit on referral chains
+<span class="fc" id="L2352">        setReferralLimit((String)envprops.get(REFERRAL_LIMIT));</span>
+
+<span class="fc" id="L2354">        setBinaryAttributes((String)envprops.get(BINARY_ATTRIBUTES));</span>
+
+<span class="fc" id="L2356">        bindCtls = cloneControls((Control[]) envprops.get(BIND_CONTROLS));</span>
+
+        // set referral handling
+<span class="fc" id="L2359">        setReferralMode((String)envprops.get(Context.REFERRAL), false);</span>
+
+        // Set the connect timeout
+<span class="fc" id="L2362">        setConnectTimeout((String)envprops.get(CONNECT_TIMEOUT));</span>
+
+        // Set the read timeout
+<span class="fc" id="L2365">        setReadTimeout((String)envprops.get(READ_TIMEOUT));</span>
+
+        // Set the flag that controls whether to block until the first reply
+        // is received
+<span class="fc" id="L2369">        setWaitForReply((String)envprops.get(WAIT_FOR_REPLY));</span>
+
+        // Set the size of the queue of unprocessed search replies
+<span class="fc" id="L2372">        setReplyQueueSize((String)envprops.get(REPLY_QUEUE_SIZE));</span>
+
+        // When connection is created, it will use these and other
+        // properties from the environment
+<span class="fc" id="L2376">    }</span>
+
+    private void setDeleteRDN(String deleteRDNProp) {
+<span class="pc bpc" id="L2379" title="1 of 2 branches missed.">        if ((deleteRDNProp != null) &amp;&amp;</span>
+<span class="nc bnc" id="L2380" title="All 2 branches missed.">            (deleteRDNProp.equalsIgnoreCase(&quot;false&quot;))) {</span>
+<span class="nc" id="L2381">            deleteRDN = false;</span>
+        } else {
+<span class="fc" id="L2383">            deleteRDN = DEFAULT_DELETE_RDN;</span>
+        }
+<span class="fc" id="L2385">    }</span>
+
+    private void setTypesOnly(String typesOnlyProp) {
+<span class="pc bpc" id="L2388" title="1 of 2 branches missed.">        if ((typesOnlyProp != null) &amp;&amp;</span>
+<span class="nc bnc" id="L2389" title="All 2 branches missed.">            (typesOnlyProp.equalsIgnoreCase(&quot;true&quot;))) {</span>
+<span class="nc" id="L2390">            typesOnly = true;</span>
+        } else {
+<span class="fc" id="L2392">            typesOnly = DEFAULT_TYPES_ONLY;</span>
+        }
+<span class="fc" id="L2394">    }</span>
+
+    /**
+     * Sets the batch size of this context;
+     */
+    private void setBatchSize(String batchSizeProp) {
+        // set batchsize
+<span class="pc bpc" id="L2401" title="1 of 2 branches missed.">        if (batchSizeProp != null) {</span>
+<span class="nc" id="L2402">            batchSize = Integer.parseInt(batchSizeProp);</span>
+        } else {
+<span class="fc" id="L2404">            batchSize = DEFAULT_BATCH_SIZE;</span>
+        }
+<span class="fc" id="L2406">    }</span>
+
+    /**
+     * Sets the referral mode of this context to 'follow', 'throw' or 'ignore'.
+     * If referral mode is 'ignore' then activate the manageReferral control.
+     */
+    private void setReferralMode(String ref, boolean update) {
+        // First determine the referral mode
+<span class="pc bpc" id="L2414" title="1 of 2 branches missed.">        if (ref != null) {</span>
+<span class="nc bnc" id="L2415" title="All 14 branches missed.">            switch (ref) {</span>
+                case &quot;follow&quot;:
+<span class="nc" id="L2417">                    handleReferrals = LdapClient.LDAP_REF_FOLLOW;</span>
+<span class="nc" id="L2418">                    break;</span>
+                case &quot;throw&quot;:
+<span class="nc" id="L2420">                    handleReferrals = LdapClient.LDAP_REF_THROW;</span>
+<span class="nc" id="L2421">                    break;</span>
+                case &quot;ignore&quot;:
+<span class="nc" id="L2423">                    handleReferrals = LdapClient.LDAP_REF_IGNORE;</span>
+<span class="nc" id="L2424">                    break;</span>
+                default:
+<span class="nc" id="L2426">                    throw new IllegalArgumentException(</span>
+                        &quot;Illegal value for &quot; + Context.REFERRAL + &quot; property.&quot;);
+            }
+        } else {
+<span class="fc" id="L2430">            handleReferrals = DEFAULT_REFERRAL_MODE;</span>
+        }
+
+<span class="pc bpc" id="L2433" title="1 of 2 branches missed.">        if (handleReferrals == LdapClient.LDAP_REF_IGNORE) {</span>
+            // If ignoring referrals, add manageReferralControl
+<span class="fc" id="L2435">            reqCtls = addControl(reqCtls, manageReferralControl);</span>
+
+<span class="nc bnc" id="L2437" title="All 2 branches missed.">        } else if (update) {</span>
+
+            // If we're update an existing context, remove the control
+<span class="nc" id="L2440">            reqCtls = removeControl(reqCtls, manageReferralControl);</span>
+
+        } // else, leave alone; need not update
+<span class="fc" id="L2443">    }</span>
+
+    /**
+     * Set whether aliases are derefereced during resolution and searches.
+     */
+    private void setDerefAliases(String deref) {
+<span class="pc bpc" id="L2449" title="1 of 2 branches missed.">        if (deref != null) {</span>
+<span class="nc bnc" id="L2450" title="All 18 branches missed.">            switch (deref) {</span>
+                case &quot;never&quot;:
+<span class="nc" id="L2452">                    derefAliases = 0; // never de-reference aliases</span>
+<span class="nc" id="L2453">                    break;</span>
+                case &quot;searching&quot;:
+<span class="nc" id="L2455">                    derefAliases = 1; // de-reference aliases during searching</span>
+<span class="nc" id="L2456">                    break;</span>
+                case &quot;finding&quot;:
+<span class="nc" id="L2458">                    derefAliases = 2; // de-reference during name resolution</span>
+<span class="nc" id="L2459">                    break;</span>
+                case &quot;always&quot;:
+<span class="nc" id="L2461">                    derefAliases = 3; // always de-reference aliases</span>
+<span class="nc" id="L2462">                    break;</span>
+                default:
+<span class="nc" id="L2464">                    throw new IllegalArgumentException(&quot;Illegal value for &quot; +</span>
+                        DEREF_ALIASES + &quot; property.&quot;);
+            }
+        } else {
+<span class="fc" id="L2468">            derefAliases = DEFAULT_DEREF_ALIASES;</span>
+        }
+<span class="fc" id="L2470">    }</span>
+
+    private void setRefSeparator(String sepStr) throws NamingException {
+<span class="pc bpc" id="L2473" title="3 of 4 branches missed.">        if (sepStr != null &amp;&amp; sepStr.length() &gt; 0) {</span>
+<span class="nc" id="L2474">            addrEncodingSeparator = sepStr.charAt(0);</span>
+        } else {
+<span class="fc" id="L2476">            addrEncodingSeparator = DEFAULT_REF_SEPARATOR;</span>
+        }
+<span class="fc" id="L2478">    }</span>
+
+    /**
+     * Sets the limit on referral chains
+     */
+    private void setReferralLimit(String referralLimitProp) {
+        // set referral limit
+<span class="pc bpc" id="L2485" title="1 of 2 branches missed.">        if (referralLimitProp != null) {</span>
+<span class="nc" id="L2486">            referralHopLimit = Integer.parseInt(referralLimitProp);</span>
+
+            // a zero setting indicates no limit
+<span class="nc bnc" id="L2489" title="All 2 branches missed.">            if (referralHopLimit == 0)</span>
+<span class="nc" id="L2490">                referralHopLimit = Integer.MAX_VALUE;</span>
+        } else {
+<span class="fc" id="L2492">            referralHopLimit = DEFAULT_REFERRAL_LIMIT;</span>
+        }
+<span class="fc" id="L2494">    }</span>
+
+    // For counting referral hops
+    void setHopCount(int hopCount) {
+<span class="nc" id="L2498">        this.hopCount = hopCount;</span>
+<span class="nc" id="L2499">    }</span>
+
+    /**
+     * Sets the connect timeout value
+     */
+    private void setConnectTimeout(String connectTimeoutProp) {
+<span class="fc bfc" id="L2505" title="All 2 branches covered.">        if (connectTimeoutProp != null) {</span>
+<span class="fc" id="L2506">            connectTimeout = Integer.parseInt(connectTimeoutProp);</span>
+        } else {
+<span class="fc" id="L2508">            connectTimeout = -1;</span>
+        }
+<span class="fc" id="L2510">    }</span>
+
+    /**
+     * Sets the size of the queue of unprocessed search replies
+     */
+    private void setReplyQueueSize(String replyQueueSizeProp) {
+<span class="pc bpc" id="L2516" title="1 of 2 branches missed.">        if (replyQueueSizeProp != null) {</span>
+<span class="nc" id="L2517">           replyQueueSize = Integer.parseInt(replyQueueSizeProp);</span>
+            // disallow an empty queue
+<span class="nc bnc" id="L2519" title="All 2 branches missed.">            if (replyQueueSize &lt;= 0) {</span>
+<span class="nc" id="L2520">                replyQueueSize = -1;    // unlimited</span>
+            }
+        } else {
+<span class="fc" id="L2523">            replyQueueSize = -1;        // unlimited</span>
+        }
+<span class="fc" id="L2525">    }</span>
+
+    /**
+     * Sets the flag that controls whether to block until the first search
+     * reply is received
+     */
+    private void setWaitForReply(String waitForReplyProp) {
+<span class="fc bfc" id="L2532" title="All 2 branches covered.">        if (waitForReplyProp != null &amp;&amp;</span>
+<span class="pc bpc" id="L2533" title="1 of 2 branches missed.">            (waitForReplyProp.equalsIgnoreCase(&quot;false&quot;))) {</span>
+<span class="fc" id="L2534">            waitForReply = false;</span>
+        } else {
+<span class="fc" id="L2536">            waitForReply = true;</span>
+        }
+<span class="fc" id="L2538">    }</span>
+
+    /**
+     * Sets the read timeout value
+     */
+    private void setReadTimeout(String readTimeoutProp) {
+<span class="fc bfc" id="L2544" title="All 2 branches covered.">        if (readTimeoutProp != null) {</span>
+<span class="fc" id="L2545">           readTimeout = Integer.parseInt(readTimeoutProp);</span>
+        } else {
+<span class="fc" id="L2547">            readTimeout = -1;</span>
+        }
+<span class="fc" id="L2549">    }</span>
+
+    /*
+     * Extract URLs from a string. The format of the string is:
+     *
+     *     &lt;urlstring &gt; ::= &quot;Referral:&quot; &lt;ldapurls&gt;
+     *     &lt;ldapurls&gt;   ::= &lt;separator&gt; &lt;ldapurl&gt; | &lt;ldapurls&gt;
+     *     &lt;separator&gt;  ::= ASCII linefeed character (0x0a)
+     *     &lt;ldapurl&gt;    ::= LDAP URL format (RFC 1959)
+     *
+     * Returns a Vector of single-String Vectors.
+     */
+    private static Vector&lt;Vector&lt;String&gt;&gt; extractURLs(String refString) {
+
+<span class="nc" id="L2563">        int separator = 0;</span>
+<span class="nc" id="L2564">        int urlCount = 0;</span>
+
+        // count the number of URLs
+<span class="nc bnc" id="L2567" title="All 2 branches missed.">        while ((separator = refString.indexOf('\n', separator)) &gt;= 0) {</span>
+<span class="nc" id="L2568">            separator++;</span>
+<span class="nc" id="L2569">            urlCount++;</span>
+        }
+
+<span class="nc" id="L2572">        Vector&lt;Vector&lt;String&gt;&gt; referrals = new Vector&lt;&gt;(urlCount);</span>
+        int iURL;
+<span class="nc" id="L2574">        int i = 0;</span>
+
+<span class="nc" id="L2576">        separator = refString.indexOf('\n');</span>
+<span class="nc" id="L2577">        iURL = separator + 1;</span>
+<span class="nc bnc" id="L2578" title="All 2 branches missed.">        while ((separator = refString.indexOf('\n', iURL)) &gt;= 0) {</span>
+<span class="nc" id="L2579">            Vector&lt;String&gt; referral = new Vector&lt;&gt;(1);</span>
+<span class="nc" id="L2580">            referral.addElement(refString.substring(iURL, separator));</span>
+<span class="nc" id="L2581">            referrals.addElement(referral);</span>
+<span class="nc" id="L2582">            iURL = separator + 1;</span>
+<span class="nc" id="L2583">        }</span>
+<span class="nc" id="L2584">        Vector&lt;String&gt; referral = new Vector&lt;&gt;(1);</span>
+<span class="nc" id="L2585">        referral.addElement(refString.substring(iURL));</span>
+<span class="nc" id="L2586">        referrals.addElement(referral);</span>
+
+<span class="nc" id="L2588">        return referrals;</span>
+    }
+
+    /*
+     * Argument is a space-separated list of attribute IDs
+     * Converts attribute IDs to lowercase before adding to built-in list.
+     */
+    private void setBinaryAttributes(String attrIds) {
+<span class="pc bpc" id="L2596" title="1 of 2 branches missed.">        if (attrIds == null) {</span>
+<span class="fc" id="L2597">            binaryAttrs = null;</span>
+        } else {
+<span class="nc" id="L2599">            binaryAttrs = new Hashtable&lt;&gt;(11, 0.75f);</span>
+<span class="nc" id="L2600">            StringTokenizer tokens =</span>
+<span class="nc" id="L2601">                new StringTokenizer(attrIds.toLowerCase(Locale.ENGLISH), &quot; &quot;);</span>
+
+<span class="nc bnc" id="L2603" title="All 2 branches missed.">            while (tokens.hasMoreTokens()) {</span>
+<span class="nc" id="L2604">                binaryAttrs.put(tokens.nextToken(), Boolean.TRUE);</span>
+            }
+        }
+<span class="fc" id="L2607">    }</span>
+
+   // ----------------- Connection  ---------------------
+
+    protected void finalize() {
+        try {
+<span class="fc" id="L2613">            close();</span>
+<span class="nc" id="L2614">        } catch (NamingException e) {</span>
+            // ignore failures
+<span class="fc" id="L2616">        }</span>
+<span class="fc" id="L2617">    }</span>
+
+    synchronized public void close() throws NamingException {
+        if (debug) {
+            System.err.println(&quot;LdapCtx: close() called &quot; + this);
+            (new Throwable()).printStackTrace();
+        }
+
+        // Event (normal and unsolicited)
+<span class="pc bpc" id="L2626" title="1 of 2 branches missed.">        if (eventSupport != null) {</span>
+<span class="nc" id="L2627">            eventSupport.cleanup(); // idempotent</span>
+<span class="nc" id="L2628">            removeUnsolicited();</span>
+        }
+
+        // Enumerations that are keeping the connection alive
+<span class="fc bfc" id="L2632" title="All 2 branches covered.">        if (enumCount &gt; 0) {</span>
+            if (debug)
+                System.err.println(&quot;LdapCtx: close deferred&quot;);
+<span class="fc" id="L2635">            closeRequested = true;</span>
+<span class="fc" id="L2636">            return;</span>
+        }
+<span class="fc" id="L2638">        closeConnection(SOFT_CLOSE);</span>
+
+// %%%: RL: There is no need to set these to null, as they're just
+// variables whose contents and references will automatically
+// be cleaned up when they're no longer referenced.
+// Also, setting these to null creates problems for the attribute
+// schema-related methods, which need these to work.
+/*
+        schemaTrees = null;
+        envprops = null;
+*/
+<span class="fc" id="L2649">    }</span>
+
+    @SuppressWarnings(&quot;unchecked&quot;) // clone()
+    public void reconnect(Control[] connCtls) throws NamingException {
+        // Update environment
+<span class="nc bnc" id="L2654" title="All 2 branches missed.">        envprops = (envprops == null</span>
+                ? new Hashtable&lt;String, Object&gt;(5, 0.75f)
+<span class="nc" id="L2656">                : (Hashtable&lt;String, Object&gt;)envprops.clone());</span>
+
+<span class="nc bnc" id="L2658" title="All 2 branches missed.">        if (connCtls == null) {</span>
+<span class="nc" id="L2659">            envprops.remove(BIND_CONTROLS);</span>
+<span class="nc" id="L2660">            bindCtls = null;</span>
+        } else {
+<span class="nc" id="L2662">            envprops.put(BIND_CONTROLS, bindCtls = cloneControls(connCtls));</span>
+        }
+
+<span class="nc" id="L2665">        sharable = false;  // can't share with existing contexts</span>
+<span class="nc" id="L2666">        ensureOpen();      // open or reauthenticated</span>
+<span class="nc" id="L2667">    }</span>
+
+    private void ensureOpen() throws NamingException {
+<span class="fc" id="L2670">        ensureOpen(false);</span>
+<span class="fc" id="L2671">    }</span>
+
+    private void ensureOpen(boolean startTLS) throws NamingException {
+
+        try {
+<span class="pc bpc" id="L2676" title="1 of 2 branches missed.">            if (clnt == null) {</span>
+                if (debug) {
+                    System.err.println(&quot;LdapCtx: Reconnecting &quot; + this);
+                }
+
+                // reset the cache before a new connection is established
+<span class="nc" id="L2682">                schemaTrees = new Hashtable&lt;&gt;(11, 0.75f);</span>
+<span class="nc" id="L2683">                connect(startTLS);</span>
+
+<span class="pc bpc" id="L2685" title="2 of 4 branches missed.">            } else if (!sharable || startTLS) {</span>
+
+<span class="nc" id="L2687">                synchronized (clnt) {</span>
+<span class="nc bnc" id="L2688" title="All 4 branches missed.">                    if (!clnt.isLdapv3</span>
+                        || clnt.referenceCount &gt; 1
+<span class="nc bnc" id="L2690" title="All 2 branches missed.">                        || clnt.usingSaslStreams()) {</span>
+<span class="nc" id="L2691">                        closeConnection(SOFT_CLOSE);</span>
+                    }
+<span class="nc" id="L2693">                }</span>
+                // reset the cache before a new connection is established
+<span class="nc" id="L2695">                schemaTrees = new Hashtable&lt;&gt;(11, 0.75f);</span>
+<span class="nc" id="L2696">                connect(startTLS);</span>
+            }
+
+        } finally {
+<span class="pc" id="L2700">            sharable = true;   // connection is now either new or single-use</span>
+                               // OK for others to start sharing again
+<span class="fc" id="L2702">        }</span>
+<span class="fc" id="L2703">    }</span>
+
+    private void connect(boolean startTLS) throws NamingException {
+        if (debug) { System.err.println(&quot;LdapCtx: Connecting &quot; + this); }
+
+<span class="fc" id="L2708">        String user = null;             // authenticating user</span>
+<span class="fc" id="L2709">        Object passwd = null;           // password for authenticating user</span>
+<span class="fc" id="L2710">        String secProtocol = null;      // security protocol (e.g. &quot;ssl&quot;)</span>
+<span class="fc" id="L2711">        String socketFactory = null;    // socket factory</span>
+<span class="fc" id="L2712">        String authMechanism = null;    // authentication mechanism</span>
+<span class="fc" id="L2713">        String ver = null;</span>
+        int ldapVersion;                // LDAP protocol version
+<span class="fc" id="L2715">        boolean usePool = false;        // enable connection pooling</span>
+
+<span class="pc bpc" id="L2717" title="1 of 2 branches missed.">        if (envprops != null) {</span>
+<span class="fc" id="L2718">            user = (String)envprops.get(Context.SECURITY_PRINCIPAL);</span>
+<span class="fc" id="L2719">            passwd = envprops.get(Context.SECURITY_CREDENTIALS);</span>
+<span class="fc" id="L2720">            ver = (String)envprops.get(VERSION);</span>
+<span class="fc bfc" id="L2721" title="All 2 branches covered.">            secProtocol =</span>
+<span class="fc" id="L2722">               useSsl ? &quot;ssl&quot; : (String)envprops.get(Context.SECURITY_PROTOCOL);</span>
+<span class="fc" id="L2723">            socketFactory = (String)envprops.get(SOCKET_FACTORY);</span>
+<span class="fc" id="L2724">            authMechanism =</span>
+<span class="fc" id="L2725">                (String)envprops.get(Context.SECURITY_AUTHENTICATION);</span>
+
+<span class="fc" id="L2727">            usePool = &quot;true&quot;.equalsIgnoreCase((String)envprops.get(ENABLE_POOL));</span>
+        }
+
+<span class="pc bpc" id="L2730" title="1 of 2 branches missed.">        if (socketFactory == null) {</span>
+<span class="fc" id="L2731">            socketFactory =</span>
+<span class="fc bfc" id="L2732" title="All 2 branches covered.">                &quot;ssl&quot;.equals(secProtocol) ? DEFAULT_SSL_FACTORY : null;</span>
+        }
+
+<span class="fc bfc" id="L2735" title="All 2 branches covered.">        if (authMechanism == null) {</span>
+<span class="fc bfc" id="L2736" title="All 2 branches covered.">            authMechanism = (user == null) ? &quot;none&quot; : &quot;simple&quot;;</span>
+        }
+
+        try {
+<span class="pc bpc" id="L2740" title="1 of 2 branches missed.">            boolean initial = (clnt == null);</span>
+
+<span class="pc bpc" id="L2742" title="1 of 2 branches missed.">            if (initial) {</span>
+<span class="fc bfc" id="L2743" title="All 2 branches covered.">                ldapVersion = (ver != null) ? Integer.parseInt(ver) :</span>
+                    DEFAULT_LDAP_VERSION;
+
+<span class="fc" id="L2746">                clnt = LdapClient.getInstance(</span>
+                    usePool, // Whether to use connection pooling
+
+                    // Required for LdapClient constructor
+                    hostname,
+                    port_number,
+                    socketFactory,
+                    connectTimeout,
+                    readTimeout,
+                    trace,
+
+                    // Required for basic client identity
+                    ldapVersion,
+                    authMechanism,
+                    bindCtls,
+                    secProtocol,
+
+                    // Required for simple client identity
+                    user,
+                    passwd,
+
+                    // Required for SASL client identity
+                    envprops);
+
+
+                /**
+                 * Pooled connections are preauthenticated;
+                 * newly created ones are not.
+                 */
+<span class="pc bpc" id="L2775" title="1 of 2 branches missed.">                if (clnt.authenticateCalled()) {</span>
+<span class="nc" id="L2776">                    return;</span>
+                }
+
+<span class="nc bnc" id="L2779" title="All 4 branches missed.">            } else if (sharable &amp;&amp; startTLS) {</span>
+<span class="nc" id="L2780">                return; // no authentication required</span>
+
+            } else {
+                // reauthenticating over existing connection;
+                // only v3 supports this
+<span class="nc" id="L2785">                ldapVersion = LdapClient.LDAP_VERSION3;</span>
+            }
+
+<span class="fc" id="L2788">            LdapResult answer = clnt.authenticate(initial,</span>
+                user, passwd, ldapVersion, authMechanism, bindCtls, envprops);
+
+<span class="fc" id="L2791">            respCtls = answer.resControls; // retrieve (bind) response controls</span>
+
+<span class="pc bpc" id="L2793" title="1 of 2 branches missed.">            if (answer.status != LdapClient.LDAP_SUCCESS) {</span>
+<span class="nc bnc" id="L2794" title="All 2 branches missed.">                if (initial) {</span>
+<span class="nc" id="L2795">                    closeConnection(HARD_CLOSE);  // hard close</span>
+                }
+<span class="nc" id="L2797">                processReturnCode(answer);</span>
+            }
+
+<span class="nc" id="L2800">        } catch (LdapReferralException e) {</span>
+<span class="nc bnc" id="L2801" title="All 2 branches missed.">            if (handleReferrals == LdapClient.LDAP_REF_THROW)</span>
+<span class="nc" id="L2802">                throw e;</span>
+
+            String referral;
+            LdapURL url;
+<span class="nc" id="L2806">            NamingException saved_ex = null;</span>
+
+            // Process the referrals sequentially (top level) and
+            // recursively (per referral)
+            while (true) {
+
+<span class="nc bnc" id="L2812" title="All 2 branches missed.">                if ((referral = e.getNextReferral()) == null) {</span>
+                    // No more referrals to follow
+
+<span class="nc bnc" id="L2815" title="All 2 branches missed.">                    if (saved_ex != null) {</span>
+<span class="nc" id="L2816">                        throw (NamingException)(saved_ex.fillInStackTrace());</span>
+                    } else {
+                        // No saved exception, something must have gone wrong
+<span class="nc" id="L2819">                        throw new NamingException(</span>
+                        &quot;Internal error processing referral during connection&quot;);
+                    }
+                }
+
+                // Use host/port number from referral
+<span class="nc" id="L2825">                url = new LdapURL(referral);</span>
+<span class="nc" id="L2826">                hostname = url.getHost();</span>
+<span class="nc bnc" id="L2827" title="All 4 branches missed.">                if ((hostname != null) &amp;&amp; (hostname.charAt(0) == '[')) {</span>
+<span class="nc" id="L2828">                    hostname = hostname.substring(1, hostname.length() - 1);</span>
+                }
+<span class="nc" id="L2830">                port_number = url.getPort();</span>
+
+                // Try to connect again using new host/port number
+                try {
+<span class="nc" id="L2834">                    connect(startTLS);</span>
+<span class="nc" id="L2835">                    break;</span>
+
+<span class="nc" id="L2837">                } catch (NamingException ne) {</span>
+<span class="nc" id="L2838">                    saved_ex = ne;</span>
+<span class="nc" id="L2839">                    continue; // follow another referral</span>
+                }
+            }
+<span class="fc" id="L2842">        }</span>
+<span class="fc" id="L2843">    }</span>
+
+    private void closeConnection(boolean hardclose) {
+<span class="fc" id="L2846">        removeUnsolicited();            // idempotent</span>
+
+<span class="fc bfc" id="L2848" title="All 2 branches covered.">        if (clnt != null) {</span>
+            if (debug) {
+                System.err.println(&quot;LdapCtx: calling clnt.close() &quot; + this);
+            }
+<span class="fc" id="L2852">            clnt.close(reqCtls, hardclose);</span>
+<span class="fc" id="L2853">            clnt = null;</span>
+        }
+<span class="fc" id="L2855">    }</span>
+
+    // Used by Enum classes to track whether it still needs context
+<span class="pc" id="L2858">    private int enumCount = 0;</span>
+<span class="pc" id="L2859">    private boolean closeRequested = false;</span>
+
+    synchronized void incEnumCount() {
+<span class="fc" id="L2862">        ++enumCount;</span>
+        if (debug) System.err.println(&quot;LdapCtx: &quot; + this + &quot; enum inc: &quot; + enumCount);
+<span class="fc" id="L2864">    }</span>
+
+    synchronized void decEnumCount() {
+<span class="fc" id="L2867">        --enumCount;</span>
+        if (debug) System.err.println(&quot;LdapCtx: &quot; + this + &quot; enum dec: &quot; + enumCount);
+
+<span class="pc bpc" id="L2870" title="2 of 4 branches missed.">        if (enumCount == 0 &amp;&amp; closeRequested) {</span>
+            try {
+<span class="fc" id="L2872">                close();</span>
+<span class="nc" id="L2873">            } catch (NamingException e) {</span>
+                // ignore failures
+<span class="fc" id="L2875">            }</span>
+        }
+<span class="fc" id="L2877">    }</span>
+
+
+   // ------------ Return code and Error messages  -----------------------
+
+    protected void processReturnCode(LdapResult answer) throws NamingException {
+<span class="nc" id="L2883">        processReturnCode(answer, null, this, null, envprops, null);</span>
+<span class="nc" id="L2884">    }</span>
+
+    void processReturnCode(LdapResult answer, Name remainName)
+    throws NamingException {
+<span class="fc" id="L2888">        processReturnCode(answer,</span>
+<span class="fc" id="L2889">                          (new CompositeName()).add(currentDN),</span>
+                          this,
+                          remainName,
+                          envprops,
+<span class="fc" id="L2893">                          fullyQualifiedName(remainName));</span>
+<span class="fc" id="L2894">    }</span>
+
+    protected void processReturnCode(LdapResult res, Name resolvedName,
+        Object resolvedObj, Name remainName, Hashtable&lt;?,?&gt; envprops, String fullDN)
+    throws NamingException {
+
+<span class="fc" id="L2900">        String msg = LdapClient.getErrorMessage(res.status, res.errorMessage);</span>
+        NamingException e;
+<span class="fc" id="L2902">        LdapReferralException r = null;</span>
+
+<span class="pc bpc" id="L2904" title="4 of 5 branches missed.">        switch (res.status) {</span>
+
+        case LdapClient.LDAP_SUCCESS:
+
+            // handle Search continuation references
+<span class="pc bpc" id="L2909" title="1 of 2 branches missed.">            if (res.referrals != null) {</span>
+
+<span class="nc" id="L2911">                msg = &quot;Unprocessed Continuation Reference(s)&quot;;</span>
+
+<span class="nc bnc" id="L2913" title="All 2 branches missed.">                if (handleReferrals == LdapClient.LDAP_REF_IGNORE) {</span>
+<span class="nc" id="L2914">                    e = new PartialResultException(msg);</span>
+<span class="nc" id="L2915">                    break;</span>
+                }
+
+                // handle multiple sets of URLs
+<span class="nc" id="L2919">                int contRefCount = res.referrals.size();</span>
+<span class="nc" id="L2920">                LdapReferralException head = null;</span>
+<span class="nc" id="L2921">                LdapReferralException ptr = null;</span>
+
+<span class="nc" id="L2923">                msg = &quot;Continuation Reference&quot;;</span>
+
+                // make a chain of LdapReferralExceptions
+<span class="nc bnc" id="L2926" title="All 2 branches missed.">                for (int i = 0; i &lt; contRefCount; i++) {</span>
+
+<span class="nc" id="L2928">                    r = new LdapReferralException(resolvedName, resolvedObj,</span>
+                        remainName, msg, envprops, fullDN, handleReferrals,
+                        reqCtls);
+<span class="nc" id="L2931">                    r.setReferralInfo(res.referrals.elementAt(i), true);</span>
+
+<span class="nc bnc" id="L2933" title="All 2 branches missed.">                    if (hopCount &gt; 1) {</span>
+<span class="nc" id="L2934">                        r.setHopCount(hopCount);</span>
+                    }
+
+<span class="nc bnc" id="L2937" title="All 2 branches missed.">                    if (head == null) {</span>
+<span class="nc" id="L2938">                        head = ptr = r;</span>
+                    } else {
+<span class="nc" id="L2940">                        ptr.nextReferralEx = r; // append ex. to end of chain</span>
+<span class="nc" id="L2941">                        ptr = r;</span>
+                    }
+                }
+<span class="nc" id="L2944">                res.referrals = null;  // reset</span>
+
+<span class="nc bnc" id="L2946" title="All 2 branches missed.">                if (res.refEx == null) {</span>
+<span class="nc" id="L2947">                    res.refEx = head;</span>
+
+                } else {
+<span class="nc" id="L2950">                    ptr = res.refEx;</span>
+
+<span class="nc bnc" id="L2952" title="All 2 branches missed.">                    while (ptr.nextReferralEx != null) {</span>
+<span class="nc" id="L2953">                        ptr = ptr.nextReferralEx;</span>
+                    }
+<span class="nc" id="L2955">                    ptr.nextReferralEx = head;</span>
+                }
+
+                // check the hop limit
+<span class="nc bnc" id="L2959" title="All 2 branches missed.">                if (hopCount &gt; referralHopLimit) {</span>
+<span class="nc" id="L2960">                    NamingException lee =</span>
+                        new LimitExceededException(&quot;Referral limit exceeded&quot;);
+<span class="nc" id="L2962">                    lee.setRootCause(r);</span>
+<span class="nc" id="L2963">                    throw lee;</span>
+                }
+            }
+<span class="fc" id="L2966">            return;</span>
+
+        case LdapClient.LDAP_REFERRAL:
+
+<span class="nc bnc" id="L2970" title="All 2 branches missed.">            if (handleReferrals == LdapClient.LDAP_REF_IGNORE) {</span>
+<span class="nc" id="L2971">                e = new PartialResultException(msg);</span>
+<span class="nc" id="L2972">                break;</span>
+            }
+
+<span class="nc" id="L2975">            r = new LdapReferralException(resolvedName, resolvedObj, remainName,</span>
+                msg, envprops, fullDN, handleReferrals, reqCtls);
+            // only one set of URLs is present
+<span class="nc" id="L2978">            r.setReferralInfo(res.referrals.elementAt(0), false);</span>
+
+<span class="nc bnc" id="L2980" title="All 2 branches missed.">            if (hopCount &gt; 1) {</span>
+<span class="nc" id="L2981">                r.setHopCount(hopCount);</span>
+            }
+
+            // check the hop limit
+<span class="nc bnc" id="L2985" title="All 2 branches missed.">            if (hopCount &gt; referralHopLimit) {</span>
+<span class="nc" id="L2986">                NamingException lee =</span>
+                    new LimitExceededException(&quot;Referral limit exceeded&quot;);
+<span class="nc" id="L2988">                lee.setRootCause(r);</span>
+<span class="nc" id="L2989">                e = lee;</span>
+
+<span class="nc" id="L2991">            } else {</span>
+<span class="nc" id="L2992">                e = r;</span>
+            }
+<span class="nc" id="L2994">            break;</span>
+
+        /*
+         * Handle SLAPD-style referrals.
+         *
+         * Referrals received during name resolution should be followed
+         * until one succeeds - the target entry is located. An exception
+         * is thrown now to handle these.
+         *
+         * Referrals received during a search operation point to unexplored
+         * parts of the directory and each should be followed. An exception
+         * is thrown later (during results enumeration) to handle these.
+         */
+
+        case LdapClient.LDAP_PARTIAL_RESULTS:
+
+<span class="nc bnc" id="L3010" title="All 2 branches missed.">            if (handleReferrals == LdapClient.LDAP_REF_IGNORE) {</span>
+<span class="nc" id="L3011">                e = new PartialResultException(msg);</span>
+<span class="nc" id="L3012">                break;</span>
+            }
+
+            // extract SLAPD-style referrals from errorMessage
+<span class="nc bnc" id="L3016" title="All 4 branches missed.">            if ((res.errorMessage != null) &amp;&amp; (!res.errorMessage.equals(&quot;&quot;))) {</span>
+<span class="nc" id="L3017">                res.referrals = extractURLs(res.errorMessage);</span>
+            } else {
+<span class="nc" id="L3019">                e = new PartialResultException(msg);</span>
+<span class="nc" id="L3020">                break;</span>
+            }
+
+            // build exception
+<span class="nc" id="L3024">            r = new LdapReferralException(resolvedName,</span>
+                resolvedObj,
+                remainName,
+                msg,
+                envprops,
+                fullDN,
+                handleReferrals,
+                reqCtls);
+
+<span class="nc bnc" id="L3033" title="All 2 branches missed.">            if (hopCount &gt; 1) {</span>
+<span class="nc" id="L3034">                r.setHopCount(hopCount);</span>
+            }
+            /*
+             * %%%
+             * SLAPD-style referrals received during name resolution
+             * cannot be distinguished from those received during a
+             * search operation. Since both must be handled differently
+             * the following rule is applied:
+             *
+             *     If 1 referral and 0 entries is received then
+             *     assume name resolution has not yet completed.
+             */
+<span class="nc bnc" id="L3046" title="All 4 branches missed.">            if (((res.entries == null) || (res.entries.isEmpty())) &amp;&amp;</span>
+<span class="nc bnc" id="L3047" title="All 2 branches missed.">                (res.referrals.size() == 1)) {</span>
+
+<span class="nc" id="L3049">                r.setReferralInfo(res.referrals, false);</span>
+
+                // check the hop limit
+<span class="nc bnc" id="L3052" title="All 2 branches missed.">                if (hopCount &gt; referralHopLimit) {</span>
+<span class="nc" id="L3053">                    NamingException lee =</span>
+                        new LimitExceededException(&quot;Referral limit exceeded&quot;);
+<span class="nc" id="L3055">                    lee.setRootCause(r);</span>
+<span class="nc" id="L3056">                    e = lee;</span>
+
+<span class="nc" id="L3058">                } else {</span>
+<span class="nc" id="L3059">                    e = r;</span>
+                }
+
+            } else {
+<span class="nc" id="L3063">                r.setReferralInfo(res.referrals, true);</span>
+<span class="nc" id="L3064">                res.refEx = r;</span>
+<span class="nc" id="L3065">                return;</span>
+            }
+            break;
+
+        case LdapClient.LDAP_INVALID_DN_SYNTAX:
+        case LdapClient.LDAP_NAMING_VIOLATION:
+
+<span class="nc bnc" id="L3072" title="All 2 branches missed.">            if (remainName != null) {</span>
+<span class="nc" id="L3073">                e = new</span>
+<span class="nc" id="L3074">                    InvalidNameException(remainName.toString() + &quot;: &quot; + msg);</span>
+            } else {
+<span class="nc" id="L3076">                e = new InvalidNameException(msg);</span>
+            }
+<span class="nc" id="L3078">            break;</span>
+
+        default:
+<span class="nc" id="L3081">            e = mapErrorCode(res.status, res.errorMessage);</span>
+            break;
+        }
+<span class="nc" id="L3084">        e.setResolvedName(resolvedName);</span>
+<span class="nc" id="L3085">        e.setResolvedObj(resolvedObj);</span>
+<span class="nc" id="L3086">        e.setRemainingName(remainName);</span>
+<span class="nc" id="L3087">        throw e;</span>
+    }
+
+    /**
+     * Maps an LDAP error code to an appropriate NamingException.
+     * %%% public; used by controls
+     *
+     * @param errorCode numeric LDAP error code
+     * @param errorMessage textual description of the LDAP error. May be null.
+     *
+     * @return A NamingException or null if the error code indicates success.
+     */
+    public static NamingException mapErrorCode(int errorCode,
+        String errorMessage) {
+
+<span class="nc bnc" id="L3102" title="All 2 branches missed.">        if (errorCode == LdapClient.LDAP_SUCCESS)</span>
+<span class="nc" id="L3103">            return null;</span>
+
+<span class="nc" id="L3105">        NamingException e = null;</span>
+<span class="nc" id="L3106">        String message = LdapClient.getErrorMessage(errorCode, errorMessage);</span>
+
+<span class="nc bnc" id="L3108" title="All 29 branches missed.">        switch (errorCode) {</span>
+
+        case LdapClient.LDAP_ALIAS_DEREFERENCING_PROBLEM:
+<span class="nc" id="L3111">            e = new NamingException(message);</span>
+<span class="nc" id="L3112">            break;</span>
+
+        case LdapClient.LDAP_ALIAS_PROBLEM:
+<span class="nc" id="L3115">            e = new NamingException(message);</span>
+<span class="nc" id="L3116">            break;</span>
+
+        case LdapClient.LDAP_ATTRIBUTE_OR_VALUE_EXISTS:
+<span class="nc" id="L3119">            e = new AttributeInUseException(message);</span>
+<span class="nc" id="L3120">            break;</span>
+
+        case LdapClient.LDAP_AUTH_METHOD_NOT_SUPPORTED:
+        case LdapClient.LDAP_CONFIDENTIALITY_REQUIRED:
+        case LdapClient.LDAP_STRONG_AUTH_REQUIRED:
+        case LdapClient.LDAP_INAPPROPRIATE_AUTHENTICATION:
+<span class="nc" id="L3126">            e = new AuthenticationNotSupportedException(message);</span>
+<span class="nc" id="L3127">            break;</span>
+
+        case LdapClient.LDAP_ENTRY_ALREADY_EXISTS:
+<span class="nc" id="L3130">            e = new NameAlreadyBoundException(message);</span>
+<span class="nc" id="L3131">            break;</span>
+
+        case LdapClient.LDAP_INVALID_CREDENTIALS:
+        case LdapClient.LDAP_SASL_BIND_IN_PROGRESS:
+<span class="nc" id="L3135">            e = new AuthenticationException(message);</span>
+<span class="nc" id="L3136">            break;</span>
+
+        case LdapClient.LDAP_INAPPROPRIATE_MATCHING:
+<span class="nc" id="L3139">            e = new InvalidSearchFilterException(message);</span>
+<span class="nc" id="L3140">            break;</span>
+
+        case LdapClient.LDAP_INSUFFICIENT_ACCESS_RIGHTS:
+<span class="nc" id="L3143">            e = new NoPermissionException(message);</span>
+<span class="nc" id="L3144">            break;</span>
+
+        case LdapClient.LDAP_INVALID_ATTRIBUTE_SYNTAX:
+        case LdapClient.LDAP_CONSTRAINT_VIOLATION:
+<span class="nc" id="L3148">            e =  new InvalidAttributeValueException(message);</span>
+<span class="nc" id="L3149">            break;</span>
+
+        case LdapClient.LDAP_LOOP_DETECT:
+<span class="nc" id="L3152">            e = new NamingException(message);</span>
+<span class="nc" id="L3153">            break;</span>
+
+        case LdapClient.LDAP_NO_SUCH_ATTRIBUTE:
+<span class="nc" id="L3156">            e = new NoSuchAttributeException(message);</span>
+<span class="nc" id="L3157">            break;</span>
+
+        case LdapClient.LDAP_NO_SUCH_OBJECT:
+<span class="nc" id="L3160">            e = new NameNotFoundException(message);</span>
+<span class="nc" id="L3161">            break;</span>
+
+        case LdapClient.LDAP_OBJECT_CLASS_MODS_PROHIBITED:
+        case LdapClient.LDAP_OBJECT_CLASS_VIOLATION:
+        case LdapClient.LDAP_NOT_ALLOWED_ON_RDN:
+<span class="nc" id="L3166">            e = new SchemaViolationException(message);</span>
+<span class="nc" id="L3167">            break;</span>
+
+        case LdapClient.LDAP_NOT_ALLOWED_ON_NON_LEAF:
+<span class="nc" id="L3170">            e = new ContextNotEmptyException(message);</span>
+<span class="nc" id="L3171">            break;</span>
+
+        case LdapClient.LDAP_OPERATIONS_ERROR:
+            // %%% need new exception ?
+<span class="nc" id="L3175">            e = new NamingException(message);</span>
+<span class="nc" id="L3176">            break;</span>
+
+        case LdapClient.LDAP_OTHER:
+<span class="nc" id="L3179">            e = new NamingException(message);</span>
+<span class="nc" id="L3180">            break;</span>
+
+        case LdapClient.LDAP_PROTOCOL_ERROR:
+<span class="nc" id="L3183">            e = new CommunicationException(message);</span>
+<span class="nc" id="L3184">            break;</span>
+
+        case LdapClient.LDAP_SIZE_LIMIT_EXCEEDED:
+<span class="nc" id="L3187">            e = new SizeLimitExceededException(message);</span>
+<span class="nc" id="L3188">            break;</span>
+
+        case LdapClient.LDAP_TIME_LIMIT_EXCEEDED:
+<span class="nc" id="L3191">            e = new TimeLimitExceededException(message);</span>
+<span class="nc" id="L3192">            break;</span>
+
+        case LdapClient.LDAP_UNAVAILABLE_CRITICAL_EXTENSION:
+<span class="nc" id="L3195">            e = new OperationNotSupportedException(message);</span>
+<span class="nc" id="L3196">            break;</span>
+
+        case LdapClient.LDAP_UNAVAILABLE:
+        case LdapClient.LDAP_BUSY:
+<span class="nc" id="L3200">            e = new ServiceUnavailableException(message);</span>
+<span class="nc" id="L3201">            break;</span>
+
+        case LdapClient.LDAP_UNDEFINED_ATTRIBUTE_TYPE:
+<span class="nc" id="L3204">            e = new InvalidAttributeIdentifierException(message);</span>
+<span class="nc" id="L3205">            break;</span>
+
+        case LdapClient.LDAP_UNWILLING_TO_PERFORM:
+<span class="nc" id="L3208">            e = new OperationNotSupportedException(message);</span>
+<span class="nc" id="L3209">            break;</span>
+
+        case LdapClient.LDAP_COMPARE_FALSE:
+        case LdapClient.LDAP_COMPARE_TRUE:
+        case LdapClient.LDAP_IS_LEAF:
+            // these are really not exceptions and this code probably
+            // never gets executed
+<span class="nc" id="L3216">            e = new NamingException(message);</span>
+<span class="nc" id="L3217">            break;</span>
+
+        case LdapClient.LDAP_ADMIN_LIMIT_EXCEEDED:
+<span class="nc" id="L3220">            e = new LimitExceededException(message);</span>
+<span class="nc" id="L3221">            break;</span>
+
+        case LdapClient.LDAP_REFERRAL:
+<span class="nc" id="L3224">            e = new NamingException(message);</span>
+<span class="nc" id="L3225">            break;</span>
+
+        case LdapClient.LDAP_PARTIAL_RESULTS:
+<span class="nc" id="L3228">            e = new NamingException(message);</span>
+<span class="nc" id="L3229">            break;</span>
+
+        case LdapClient.LDAP_INVALID_DN_SYNTAX:
+        case LdapClient.LDAP_NAMING_VIOLATION:
+<span class="nc" id="L3233">            e = new InvalidNameException(message);</span>
+<span class="nc" id="L3234">            break;</span>
+
+        default:
+<span class="nc" id="L3237">            e = new NamingException(message);</span>
+            break;
+        }
+
+<span class="nc" id="L3241">        return e;</span>
+    }
+
+    // ----------------- Extensions and Controls -------------------
+
+    public ExtendedResponse extendedOperation(ExtendedRequest request)
+        throws NamingException {
+
+<span class="nc" id="L3249">        boolean startTLS = (request.getID().equals(STARTTLS_REQ_OID));</span>
+<span class="nc" id="L3250">        ensureOpen(startTLS);</span>
+
+        try {
+
+<span class="nc" id="L3254">            LdapResult answer =</span>
+<span class="nc" id="L3255">                clnt.extendedOp(request.getID(), request.getEncodedValue(),</span>
+                                reqCtls, startTLS);
+<span class="nc" id="L3257">            respCtls = answer.resControls; // retrieve response controls</span>
+
+<span class="nc bnc" id="L3259" title="All 2 branches missed.">            if (answer.status != LdapClient.LDAP_SUCCESS) {</span>
+<span class="nc" id="L3260">                processReturnCode(answer, new CompositeName());</span>
+            }
+            // %%% verify request.getID() == answer.extensionId
+
+<span class="nc bnc" id="L3264" title="All 2 branches missed.">            int len = (answer.extensionValue == null) ?</span>
+                        0 :
+                        answer.extensionValue.length;
+
+<span class="nc" id="L3268">            ExtendedResponse er =</span>
+<span class="nc" id="L3269">                request.createExtendedResponse(answer.extensionId,</span>
+                    answer.extensionValue, 0, len);
+
+<span class="nc bnc" id="L3272" title="All 2 branches missed.">            if (er instanceof StartTlsResponseImpl) {</span>
+                // Pass the connection handle to StartTlsResponseImpl
+<span class="nc bnc" id="L3274" title="All 2 branches missed.">                String domainName = (String)</span>
+<span class="nc" id="L3275">                    (envprops != null ? envprops.get(DOMAIN_NAME) : null);</span>
+<span class="nc" id="L3276">                ((StartTlsResponseImpl)er).setConnection(clnt.conn, domainName);</span>
+            }
+<span class="nc" id="L3278">            return er;</span>
+
+<span class="nc" id="L3280">        } catch (LdapReferralException e) {</span>
+
+<span class="nc bnc" id="L3282" title="All 2 branches missed.">            if (handleReferrals == LdapClient.LDAP_REF_THROW)</span>
+<span class="nc" id="L3283">                throw e;</span>
+
+            // process the referrals sequentially
+            while (true) {
+
+<span class="nc" id="L3288">                LdapReferralContext refCtx =</span>
+<span class="nc" id="L3289">                    (LdapReferralContext)e.getReferralContext(envprops, bindCtls);</span>
+
+                // repeat the original operation at the new context
+                try {
+
+<span class="nc" id="L3294">                    return refCtx.extendedOperation(request);</span>
+
+<span class="nc" id="L3296">                } catch (LdapReferralException re) {</span>
+<span class="nc" id="L3297">                    e = re;</span>
+                    continue;
+
+                } finally {
+                    // Make sure we close referral context
+<span class="nc" id="L3302">                    refCtx.close();</span>
+                }
+            }
+
+<span class="nc" id="L3306">        } catch (IOException e) {</span>
+<span class="nc" id="L3307">            NamingException e2 = new CommunicationException(e.getMessage());</span>
+<span class="nc" id="L3308">            e2.setRootCause(e);</span>
+<span class="nc" id="L3309">            throw e2;</span>
+        }
+    }
+
+    public void setRequestControls(Control[] reqCtls) throws NamingException {
+<span class="nc bnc" id="L3314" title="All 2 branches missed.">        if (handleReferrals == LdapClient.LDAP_REF_IGNORE) {</span>
+<span class="nc" id="L3315">            this.reqCtls = addControl(reqCtls, manageReferralControl);</span>
+        } else {
+<span class="nc" id="L3317">            this.reqCtls = cloneControls(reqCtls);</span>
+        }
+<span class="nc" id="L3319">    }</span>
+
+    public Control[] getRequestControls() throws NamingException {
+<span class="nc" id="L3322">        return cloneControls(reqCtls);</span>
+    }
+
+    public Control[] getConnectControls() throws NamingException {
+<span class="nc" id="L3326">        return cloneControls(bindCtls);</span>
+    }
+
+    public Control[] getResponseControls() throws NamingException {
+<span class="nc bnc" id="L3330" title="All 2 branches missed.">        return (respCtls != null)? convertControls(respCtls) : null;</span>
+    }
+
+    /**
+     * Narrow controls using own default factory and ControlFactory.
+     * @param ctls A non-null Vector&lt;Control&gt;
+     */
+    Control[] convertControls(Vector&lt;Control&gt; ctls) throws NamingException {
+<span class="nc" id="L3338">        int count = ctls.size();</span>
+
+<span class="nc bnc" id="L3340" title="All 2 branches missed.">        if (count == 0) {</span>
+<span class="nc" id="L3341">            return null;</span>
+        }
+
+<span class="nc" id="L3344">        Control[] controls = new Control[count];</span>
+
+<span class="nc bnc" id="L3346" title="All 2 branches missed.">        for (int i = 0; i &lt; count; i++) {</span>
+            // Try own factory first
+<span class="nc" id="L3348">            controls[i] = myResponseControlFactory.getControlInstance(</span>
+<span class="nc" id="L3349">                ctls.elementAt(i));</span>
+
+            // Try assigned factories if own produced null
+<span class="nc bnc" id="L3352" title="All 2 branches missed.">            if (controls[i] == null) {</span>
+<span class="nc" id="L3353">                controls[i] = ControlFactory.getControlInstance(</span>
+<span class="nc" id="L3354">                ctls.elementAt(i), this, envprops);</span>
+            }
+        }
+<span class="nc" id="L3357">        return controls;</span>
+    }
+
+    private static Control[] addControl(Control[] prevCtls, Control addition) {
+<span class="pc bpc" id="L3361" title="1 of 2 branches missed.">        if (prevCtls == null) {</span>
+<span class="fc" id="L3362">            return new Control[]{addition};</span>
+        }
+
+        // Find it
+<span class="nc" id="L3366">        int found = findControl(prevCtls, addition);</span>
+<span class="nc bnc" id="L3367" title="All 2 branches missed.">        if (found != -1) {</span>
+<span class="nc" id="L3368">            return prevCtls;  // no need to do it again</span>
+        }
+
+<span class="nc" id="L3371">        Control[] newCtls = new Control[prevCtls.length+1];</span>
+<span class="nc" id="L3372">        System.arraycopy(prevCtls, 0, newCtls, 0, prevCtls.length);</span>
+<span class="nc" id="L3373">        newCtls[prevCtls.length] = addition;</span>
+<span class="nc" id="L3374">        return newCtls;</span>
+    }
+
+    private static int findControl(Control[] ctls, Control target) {
+<span class="nc bnc" id="L3378" title="All 2 branches missed.">        for (int i = 0; i &lt; ctls.length; i++) {</span>
+<span class="nc bnc" id="L3379" title="All 2 branches missed.">            if (ctls[i] == target) {</span>
+<span class="nc" id="L3380">                return i;</span>
+            }
+        }
+<span class="nc" id="L3383">        return -1;</span>
+    }
+
+    private static Control[] removeControl(Control[] prevCtls, Control target) {
+<span class="nc bnc" id="L3387" title="All 2 branches missed.">        if (prevCtls == null) {</span>
+<span class="nc" id="L3388">            return null;</span>
+        }
+
+        // Find it
+<span class="nc" id="L3392">        int found = findControl(prevCtls, target);</span>
+<span class="nc bnc" id="L3393" title="All 2 branches missed.">        if (found == -1) {</span>
+<span class="nc" id="L3394">            return prevCtls;  // not there</span>
+        }
+
+        // Remove it
+<span class="nc" id="L3398">        Control[] newCtls = new Control[prevCtls.length-1];</span>
+<span class="nc" id="L3399">        System.arraycopy(prevCtls, 0, newCtls, 0, found);</span>
+<span class="nc" id="L3400">        System.arraycopy(prevCtls, found+1, newCtls, found,</span>
+            prevCtls.length-found-1);
+<span class="nc" id="L3402">        return newCtls;</span>
+    }
+
+    private static Control[] cloneControls(Control[] ctls) {
+<span class="pc bpc" id="L3406" title="1 of 2 branches missed.">        if (ctls == null) {</span>
+<span class="fc" id="L3407">            return null;</span>
+        }
+<span class="nc" id="L3409">        Control[] copiedCtls = new Control[ctls.length];</span>
+<span class="nc" id="L3410">        System.arraycopy(ctls, 0, copiedCtls, 0, ctls.length);</span>
+<span class="nc" id="L3411">        return copiedCtls;</span>
+    }
+
+    // -------------------- Events ------------------------
+    /*
+     * Access to eventSupport need not be synchronized even though the
+     * Connection thread can access it asynchronously. It is
+     * impossible for a race condition to occur because
+     * eventSupport.addNamingListener() must have been called before
+     * the Connection thread can call back to this ctx.
+     */
+    public void addNamingListener(Name nm, int scope, NamingListener l)
+        throws NamingException {
+<span class="nc" id="L3424">            addNamingListener(getTargetName(nm), scope, l);</span>
+<span class="nc" id="L3425">    }</span>
+
+    public void addNamingListener(String nm, int scope, NamingListener l)
+        throws NamingException {
+<span class="nc bnc" id="L3429" title="All 2 branches missed.">            if (eventSupport == null)</span>
+<span class="nc" id="L3430">                eventSupport = new EventSupport(this);</span>
+<span class="nc" id="L3431">            eventSupport.addNamingListener(getTargetName(new CompositeName(nm)),</span>
+                scope, l);
+
+            // If first time asking for unsol
+<span class="nc bnc" id="L3435" title="All 4 branches missed.">            if (l instanceof UnsolicitedNotificationListener &amp;&amp; !unsolicited) {</span>
+<span class="nc" id="L3436">                addUnsolicited();</span>
+            }
+<span class="nc" id="L3438">    }</span>
+
+    public void removeNamingListener(NamingListener l) throws NamingException {
+<span class="nc bnc" id="L3441" title="All 2 branches missed.">        if (eventSupport == null)</span>
+<span class="nc" id="L3442">            return; // no activity before, so just return</span>
+
+<span class="nc" id="L3444">        eventSupport.removeNamingListener(l);</span>
+
+        // If removing an Unsol listener and it is the last one, let clnt know
+<span class="nc bnc" id="L3447" title="All 2 branches missed.">        if (l instanceof UnsolicitedNotificationListener &amp;&amp;</span>
+<span class="nc bnc" id="L3448" title="All 2 branches missed.">            !eventSupport.hasUnsolicited()) {</span>
+<span class="nc" id="L3449">            removeUnsolicited();</span>
+        }
+<span class="nc" id="L3451">    }</span>
+
+    public void addNamingListener(String nm, String filter, SearchControls ctls,
+        NamingListener l) throws NamingException {
+<span class="nc bnc" id="L3455" title="All 2 branches missed.">            if (eventSupport == null)</span>
+<span class="nc" id="L3456">                eventSupport = new EventSupport(this);</span>
+<span class="nc" id="L3457">            eventSupport.addNamingListener(getTargetName(new CompositeName(nm)),</span>
+<span class="nc" id="L3458">                filter, cloneSearchControls(ctls), l);</span>
+
+            // If first time asking for unsol
+<span class="nc bnc" id="L3461" title="All 4 branches missed.">            if (l instanceof UnsolicitedNotificationListener &amp;&amp; !unsolicited) {</span>
+<span class="nc" id="L3462">                addUnsolicited();</span>
+            }
+<span class="nc" id="L3464">    }</span>
+
+    public void addNamingListener(Name nm, String filter, SearchControls ctls,
+        NamingListener l) throws NamingException {
+<span class="nc" id="L3468">            addNamingListener(getTargetName(nm), filter, ctls, l);</span>
+<span class="nc" id="L3469">    }</span>
+
+    public void addNamingListener(Name nm, String filter, Object[] filterArgs,
+        SearchControls ctls, NamingListener l) throws NamingException {
+<span class="nc" id="L3473">            addNamingListener(getTargetName(nm), filter, filterArgs, ctls, l);</span>
+<span class="nc" id="L3474">    }</span>
+
+    public void addNamingListener(String nm, String filterExpr, Object[] filterArgs,
+        SearchControls ctls, NamingListener l) throws NamingException {
+<span class="nc" id="L3478">        String strfilter = SearchFilter.format(filterExpr, filterArgs);</span>
+<span class="nc" id="L3479">        addNamingListener(getTargetName(new CompositeName(nm)), strfilter, ctls, l);</span>
+<span class="nc" id="L3480">    }</span>
+
+    public boolean targetMustExist() {
+<span class="nc" id="L3483">        return true;</span>
+    }
+
+    /**
+     * Retrieves the target name for which the listener is registering.
+     * If nm is a CompositeName, use its first and only component. It
+     * cannot have more than one components because a target be outside of
+     * this namespace. If nm is not a CompositeName, then treat it as a
+     * compound name.
+     * @param nm The non-null target name.
+     */
+    private static String getTargetName(Name nm) throws NamingException {
+<span class="nc bnc" id="L3495" title="All 2 branches missed.">        if (nm instanceof CompositeName) {</span>
+<span class="nc bnc" id="L3496" title="All 2 branches missed.">            if (nm.size() &gt; 1) {</span>
+<span class="nc" id="L3497">                throw new InvalidNameException(</span>
+                    &quot;Target cannot span multiple namespaces: &quot; + nm);
+<span class="nc bnc" id="L3499" title="All 2 branches missed.">            } else if (nm.isEmpty()) {</span>
+<span class="nc" id="L3500">                return &quot;&quot;;</span>
+            } else {
+<span class="nc" id="L3502">                return nm.get(0);</span>
+            }
+        } else {
+            // treat as compound name
+<span class="nc" id="L3506">            return nm.toString();</span>
+        }
+    }
+
+    // ------------------ Unsolicited Notification ---------------
+    // package private methods for handling unsolicited notification
+
+    /**
+     * Registers this context with the underlying LdapClient.
+     * When the underlying LdapClient receives an unsolicited notification,
+     * it will invoke LdapCtx.fireUnsolicited() so that this context
+     * can (using EventSupport) notified any registered listeners.
+     * This method is called by EventSupport when an unsolicited listener
+     * first registers with this context (should be called just once).
+     * @see #removeUnsolicited
+     * @see #fireUnsolicited
+     */
+    private void addUnsolicited() throws NamingException {
+        if (debug) {
+            System.out.println(&quot;LdapCtx.addUnsolicited: &quot; + this);
+        }
+
+        // addNamingListener must have created EventSupport already
+<span class="nc" id="L3529">        ensureOpen();</span>
+<span class="nc" id="L3530">        synchronized (eventSupport) {</span>
+<span class="nc" id="L3531">            clnt.addUnsolicited(this);</span>
+<span class="nc" id="L3532">            unsolicited = true;</span>
+<span class="nc" id="L3533">        }</span>
+<span class="nc" id="L3534">    }</span>
+
+    /**
+     * Removes this context from registering interest in unsolicited
+     * notifications from the underlying LdapClient. This method is called
+     * under any one of the following conditions:
+     * &lt;ul&gt;
+     * &lt;li&gt;All unsolicited listeners have been removed. (see removingNamingListener)
+     * &lt;li&gt;This context is closed.
+     * &lt;li&gt;This context's underlying LdapClient changes.
+     *&lt;/ul&gt;
+     * After this method has been called, this context will not pass
+     * on any events related to unsolicited notifications to EventSupport and
+     * and its listeners.
+     */
+
+    private void removeUnsolicited() {
+        if (debug) {
+            System.out.println(&quot;LdapCtx.removeUnsolicited: &quot; + unsolicited);
+        }
+<span class="pc bpc" id="L3554" title="1 of 2 branches missed.">        if (eventSupport == null) {</span>
+<span class="fc" id="L3555">            return;</span>
+        }
+
+        // addNamingListener must have created EventSupport already
+<span class="nc" id="L3559">        synchronized(eventSupport) {</span>
+<span class="nc bnc" id="L3560" title="All 4 branches missed.">            if (unsolicited &amp;&amp; clnt != null) {</span>
+<span class="nc" id="L3561">                clnt.removeUnsolicited(this);</span>
+            }
+<span class="nc" id="L3563">            unsolicited = false;</span>
+<span class="nc" id="L3564">        }</span>
+<span class="nc" id="L3565">    }</span>
+
+    /**
+     * Uses EventSupport to fire an event related to an unsolicited notification.
+     * Called by LdapClient when LdapClient receives an unsolicited notification.
+     */
+    void fireUnsolicited(Object obj) {
+        if (debug) {
+            System.out.println(&quot;LdapCtx.fireUnsolicited: &quot; + obj);
+        }
+        // addNamingListener must have created EventSupport already
+<span class="nc" id="L3576">        synchronized(eventSupport) {</span>
+<span class="nc bnc" id="L3577" title="All 2 branches missed.">            if (unsolicited) {</span>
+<span class="nc" id="L3578">                eventSupport.fireUnsolicited(obj);</span>
+
+<span class="nc bnc" id="L3580" title="All 2 branches missed.">                if (obj instanceof NamingException) {</span>
+<span class="nc" id="L3581">                    unsolicited = false;</span>
+                    // No need to notify clnt because clnt is the
+                    // only one that can fire a NamingException to
+                    // unsol listeners and it will handle its own cleanup
+                }
+            }
+<span class="nc" id="L3587">        }</span>
+<span class="nc" id="L3588">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

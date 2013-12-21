@@ -1,0 +1,1457 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>Handshaker.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.ssl</a> &gt; <span class="el_source">Handshaker.java</span></div><h1>Handshaker.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1996, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+
+package sun.security.ssl;
+
+import java.io.*;
+import java.util.*;
+import java.security.*;
+import java.security.NoSuchAlgorithmException;
+import java.security.AccessController;
+import java.security.AlgorithmConstraints;
+import java.security.AccessControlContext;
+import java.security.PrivilegedExceptionAction;
+import java.security.PrivilegedActionException;
+
+import javax.crypto.*;
+import javax.crypto.spec.*;
+
+import javax.net.ssl.*;
+import sun.misc.HexDumpEncoder;
+
+import sun.security.internal.spec.*;
+import sun.security.internal.interfaces.TlsMasterSecret;
+
+import sun.security.ssl.HandshakeMessage.*;
+import sun.security.ssl.CipherSuite.*;
+
+import static sun.security.ssl.CipherSuite.PRF.*;
+import static sun.security.ssl.CipherSuite.CipherType.*;
+
+/**
+ * Handshaker ... processes handshake records from an SSL V3.0
+ * data stream, handling all the details of the handshake protocol.
+ *
+ * Note that the real protocol work is done in two subclasses, the  base
+ * class just provides the control flow and key generation framework.
+ *
+ * @author David Brownell
+ */
+abstract class Handshaker {
+
+    // protocol version being established using this Handshaker
+    ProtocolVersion protocolVersion;
+
+    // the currently active protocol version during a renegotiation
+    ProtocolVersion     activeProtocolVersion;
+
+    // security parameters for secure renegotiation.
+    boolean             secureRenegotiation;
+    byte[]              clientVerifyData;
+    byte[]              serverVerifyData;
+
+    // Is it an initial negotiation  or a renegotiation?
+    boolean                     isInitialHandshake;
+
+    // List of enabled protocols
+    private ProtocolList        enabledProtocols;
+
+    // List of enabled CipherSuites
+    private CipherSuiteList     enabledCipherSuites;
+
+    // The endpoint identification protocol
+    String              identificationProtocol;
+
+    // The cryptographic algorithm constraints
+<span class="nc" id="L89">    private AlgorithmConstraints    algorithmConstraints = null;</span>
+
+    // Local supported signature and algorithms
+    Collection&lt;SignatureAndHashAlgorithm&gt; localSupportedSignAlgs;
+
+    // Peer supported signature and algorithms
+    Collection&lt;SignatureAndHashAlgorithm&gt; peerSupportedSignAlgs;
+
+    /*
+
+    /*
+     * List of active protocols
+     *
+     * Active protocols is a subset of enabled protocols, and will
+     * contain only those protocols that have vaild cipher suites
+     * enabled.
+     */
+    private ProtocolList       activeProtocols;
+
+    /*
+     * List of active cipher suites
+     *
+     * Active cipher suites is a subset of enabled cipher suites, and will
+     * contain only those cipher suites available for the active protocols.
+     */
+    private CipherSuiteList    activeCipherSuites;
+
+    // The server name indication and matchers
+<span class="nc" id="L117">    List&lt;SNIServerName&gt;         serverNames =</span>
+<span class="nc" id="L118">                                    Collections.&lt;SNIServerName&gt;emptyList();</span>
+<span class="nc" id="L119">    Collection&lt;SNIMatcher&gt;      sniMatchers =</span>
+<span class="nc" id="L120">                                    Collections.&lt;SNIMatcher&gt;emptyList();</span>
+
+    private boolean             isClient;
+    private boolean             needCertVerify;
+
+<span class="nc" id="L125">    SSLSocketImpl               conn = null;</span>
+<span class="nc" id="L126">    SSLEngineImpl               engine = null;</span>
+
+    HandshakeHash               handshakeHash;
+    HandshakeInStream           input;
+    HandshakeOutStream          output;
+    int                         state;
+    SSLContextImpl              sslContext;
+    RandomCookie                clnt_random, svr_random;
+    SSLSessionImpl              session;
+
+    // current CipherSuite. Never null, initially SSL_NULL_WITH_NULL_NULL
+    CipherSuite         cipherSuite;
+
+    // current key exchange. Never null, initially K_NULL
+    KeyExchange         keyExchange;
+
+    /* True if this session is being resumed (fast handshake) */
+    boolean             resumingSession;
+
+    /* True if it's OK to start a new SSL session */
+    boolean             enableNewSession;
+
+    // Whether local cipher suites preference should be honored during
+    // handshaking?
+    //
+    // Note that in this provider, this option only applies to server side.
+    // Local cipher suites preference is always honored in client side in
+    // this provider.
+<span class="nc" id="L154">    boolean preferLocalCipherSuites = false;</span>
+
+    // Temporary storage for the individual keys. Set by
+    // calculateConnectionKeys() and cleared once the ciphers are
+    // activated.
+    private SecretKey clntWriteKey, svrWriteKey;
+    private IvParameterSpec clntWriteIV, svrWriteIV;
+    private SecretKey clntMacSecret, svrMacSecret;
+
+    /*
+     * Delegated task subsystem data structures.
+     *
+     * If thrown is set, we need to propagate this back immediately
+     * on entry into processMessage().
+     *
+     * Data is protected by the SSLEngine.this lock.
+     */
+<span class="nc" id="L171">    private volatile boolean taskDelegated = false;</span>
+<span class="nc" id="L172">    private volatile DelegatedTask&lt;?&gt; delegatedTask = null;</span>
+<span class="nc" id="L173">    private volatile Exception thrown = null;</span>
+
+    // Could probably use a java.util.concurrent.atomic.AtomicReference
+    // here instead of using this lock.  Consider changing.
+<span class="nc" id="L177">    private Object thrownLock = new Object();</span>
+
+    /* Class and subclass dynamic debugging support */
+<span class="nc" id="L180">    static final Debug debug = Debug.getInstance(&quot;ssl&quot;);</span>
+
+    // By default, disable the unsafe legacy session renegotiation
+<span class="nc" id="L183">    static final boolean allowUnsafeRenegotiation = Debug.getBooleanProperty(</span>
+                    &quot;sun.security.ssl.allowUnsafeRenegotiation&quot;, false);
+
+    // For maximum interoperability and backward compatibility, RFC 5746
+    // allows server (or client) to accept ClientHello (or ServerHello)
+    // message without the secure renegotiation_info extension or SCSV.
+    //
+    // For maximum security, RFC 5746 also allows server (or client) to
+    // reject such message with a fatal &quot;handshake_failure&quot; alert.
+    //
+    // By default, allow such legacy hello messages.
+<span class="nc" id="L194">    static final boolean allowLegacyHelloMessages = Debug.getBooleanProperty(</span>
+                    &quot;sun.security.ssl.allowLegacyHelloMessages&quot;, true);
+
+    // To prevent the TLS renegotiation issues, by setting system property
+    // &quot;jdk.tls.rejectClientInitiatedRenegotiation&quot; to true, applications in
+    // server side can disable all client initiated SSL renegotiations
+    // regardless of the support of TLS protocols.
+    //
+    // By default, allow client initiated renegotiations.
+<span class="nc" id="L203">    static final boolean rejectClientInitiatedRenego =</span>
+<span class="nc" id="L204">            Debug.getBooleanProperty(</span>
+                &quot;jdk.tls.rejectClientInitiatedRenegotiation&quot;, false);
+
+    // need to dispose the object when it is invalidated
+    boolean invalidated;
+
+    Handshaker(SSLSocketImpl c, SSLContextImpl context,
+            ProtocolList enabledProtocols, boolean needCertVerify,
+            boolean isClient, ProtocolVersion activeProtocolVersion,
+            boolean isInitialHandshake, boolean secureRenegotiation,
+<span class="nc" id="L214">            byte[] clientVerifyData, byte[] serverVerifyData) {</span>
+<span class="nc" id="L215">        this.conn = c;</span>
+<span class="nc" id="L216">        init(context, enabledProtocols, needCertVerify, isClient,</span>
+            activeProtocolVersion, isInitialHandshake, secureRenegotiation,
+            clientVerifyData, serverVerifyData);
+<span class="nc" id="L219">    }</span>
+
+    Handshaker(SSLEngineImpl engine, SSLContextImpl context,
+            ProtocolList enabledProtocols, boolean needCertVerify,
+            boolean isClient, ProtocolVersion activeProtocolVersion,
+            boolean isInitialHandshake, boolean secureRenegotiation,
+<span class="nc" id="L225">            byte[] clientVerifyData, byte[] serverVerifyData) {</span>
+<span class="nc" id="L226">        this.engine = engine;</span>
+<span class="nc" id="L227">        init(context, enabledProtocols, needCertVerify, isClient,</span>
+            activeProtocolVersion, isInitialHandshake, secureRenegotiation,
+            clientVerifyData, serverVerifyData);
+<span class="nc" id="L230">    }</span>
+
+    private void init(SSLContextImpl context, ProtocolList enabledProtocols,
+            boolean needCertVerify, boolean isClient,
+            ProtocolVersion activeProtocolVersion,
+            boolean isInitialHandshake, boolean secureRenegotiation,
+            byte[] clientVerifyData, byte[] serverVerifyData) {
+
+<span class="nc bnc" id="L238" title="All 4 branches missed.">        if (debug != null &amp;&amp; Debug.isOn(&quot;handshake&quot;)) {</span>
+<span class="nc" id="L239">            System.out.println(</span>
+                &quot;Allow unsafe renegotiation: &quot; + allowUnsafeRenegotiation +
+                &quot;\nAllow legacy hello messages: &quot; + allowLegacyHelloMessages +
+                &quot;\nIs initial handshake: &quot; + isInitialHandshake +
+                &quot;\nIs secure renegotiation: &quot; + secureRenegotiation);
+        }
+
+<span class="nc" id="L246">        this.sslContext = context;</span>
+<span class="nc" id="L247">        this.isClient = isClient;</span>
+<span class="nc" id="L248">        this.needCertVerify = needCertVerify;</span>
+<span class="nc" id="L249">        this.activeProtocolVersion = activeProtocolVersion;</span>
+<span class="nc" id="L250">        this.isInitialHandshake = isInitialHandshake;</span>
+<span class="nc" id="L251">        this.secureRenegotiation = secureRenegotiation;</span>
+<span class="nc" id="L252">        this.clientVerifyData = clientVerifyData;</span>
+<span class="nc" id="L253">        this.serverVerifyData = serverVerifyData;</span>
+<span class="nc" id="L254">        enableNewSession = true;</span>
+<span class="nc" id="L255">        invalidated = false;</span>
+
+<span class="nc" id="L257">        setCipherSuite(CipherSuite.C_NULL);</span>
+<span class="nc" id="L258">        setEnabledProtocols(enabledProtocols);</span>
+
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        if (conn != null) {</span>
+<span class="nc" id="L261">            algorithmConstraints = new SSLAlgorithmConstraints(conn, true);</span>
+        } else {        // engine != null
+<span class="nc" id="L263">            algorithmConstraints = new SSLAlgorithmConstraints(engine, true);</span>
+        }
+
+
+        //
+        // In addition to the connection state machine, controlling
+        // how the connection deals with the different sorts of records
+        // that get sent (notably handshake transitions!), there's
+        // also a handshaking state machine that controls message
+        // sequencing.
+        //
+        // It's a convenient artifact of the protocol that this can,
+        // with only a couple of minor exceptions, be driven by the
+        // type constant for the last message seen:  except for the
+        // client's cert verify, those constants are in a convenient
+        // order to drastically simplify state machine checking.
+        //
+<span class="nc" id="L280">        state = -2;  // initialized but not activated</span>
+<span class="nc" id="L281">    }</span>
+
+    /*
+     * Reroutes calls to the SSLSocket or SSLEngine (*SE).
+     *
+     * We could have also done it by extra classes
+     * and letting them override, but this seemed much
+     * less involved.
+     */
+    void fatalSE(byte b, String diagnostic) throws IOException {
+<span class="nc" id="L291">        fatalSE(b, diagnostic, null);</span>
+<span class="nc" id="L292">    }</span>
+
+    void fatalSE(byte b, Throwable cause) throws IOException {
+<span class="nc" id="L295">        fatalSE(b, null, cause);</span>
+<span class="nc" id="L296">    }</span>
+
+    void fatalSE(byte b, String diagnostic, Throwable cause)
+            throws IOException {
+<span class="nc bnc" id="L300" title="All 2 branches missed.">        if (conn != null) {</span>
+<span class="nc" id="L301">            conn.fatal(b, diagnostic, cause);</span>
+        } else {
+<span class="nc" id="L303">            engine.fatal(b, diagnostic, cause);</span>
+        }
+<span class="nc" id="L305">    }</span>
+
+    void warningSE(byte b) {
+<span class="nc bnc" id="L308" title="All 2 branches missed.">        if (conn != null) {</span>
+<span class="nc" id="L309">            conn.warning(b);</span>
+        } else {
+<span class="nc" id="L311">            engine.warning(b);</span>
+        }
+<span class="nc" id="L313">    }</span>
+
+    // ONLY used by ClientHandshaker to setup the peer host in SSLSession.
+    String getHostSE() {
+<span class="nc bnc" id="L317" title="All 2 branches missed.">        if (conn != null) {</span>
+<span class="nc" id="L318">            return conn.getHost();</span>
+        } else {
+<span class="nc" id="L320">            return engine.getPeerHost();</span>
+        }
+    }
+
+    // ONLY used by ServerHandshaker to setup the peer host in SSLSession.
+    String getHostAddressSE() {
+<span class="nc bnc" id="L326" title="All 2 branches missed.">        if (conn != null) {</span>
+<span class="nc" id="L327">            return conn.getInetAddress().getHostAddress();</span>
+        } else {
+            /*
+             * This is for caching only, doesn't matter that's is really
+             * a hostname.  The main thing is that it doesn't do
+             * a reverse DNS lookup, potentially slowing things down.
+             */
+<span class="nc" id="L334">            return engine.getPeerHost();</span>
+        }
+    }
+
+    int getPortSE() {
+<span class="nc bnc" id="L339" title="All 2 branches missed.">        if (conn != null) {</span>
+<span class="nc" id="L340">            return conn.getPort();</span>
+        } else {
+<span class="nc" id="L342">            return engine.getPeerPort();</span>
+        }
+    }
+
+    int getLocalPortSE() {
+<span class="nc bnc" id="L347" title="All 2 branches missed.">        if (conn != null) {</span>
+<span class="nc" id="L348">            return conn.getLocalPort();</span>
+        } else {
+<span class="nc" id="L350">            return -1;</span>
+        }
+    }
+
+    AccessControlContext getAccSE() {
+<span class="nc bnc" id="L355" title="All 2 branches missed.">        if (conn != null) {</span>
+<span class="nc" id="L356">            return conn.getAcc();</span>
+        } else {
+<span class="nc" id="L358">            return engine.getAcc();</span>
+        }
+    }
+
+    private void setVersionSE(ProtocolVersion protocolVersion) {
+<span class="nc bnc" id="L363" title="All 2 branches missed.">        if (conn != null) {</span>
+<span class="nc" id="L364">            conn.setVersion(protocolVersion);</span>
+        } else {
+<span class="nc" id="L366">            engine.setVersion(protocolVersion);</span>
+        }
+<span class="nc" id="L368">    }</span>
+
+    /**
+     * Set the active protocol version and propagate it to the SSLSocket
+     * and our handshake streams. Called from ClientHandshaker
+     * and ServerHandshaker with the negotiated protocol version.
+     */
+    void setVersion(ProtocolVersion protocolVersion) {
+<span class="nc" id="L376">        this.protocolVersion = protocolVersion;</span>
+<span class="nc" id="L377">        setVersionSE(protocolVersion);</span>
+
+<span class="nc" id="L379">        output.r.setVersion(protocolVersion);</span>
+<span class="nc" id="L380">    }</span>
+
+    /**
+     * Set the enabled protocols. Called from the constructor or
+     * SSLSocketImpl/SSLEngineImpl.setEnabledProtocols() (if the
+     * handshake is not yet in progress).
+     */
+    void setEnabledProtocols(ProtocolList enabledProtocols) {
+<span class="nc" id="L388">        activeCipherSuites = null;</span>
+<span class="nc" id="L389">        activeProtocols = null;</span>
+
+<span class="nc" id="L391">        this.enabledProtocols = enabledProtocols;</span>
+<span class="nc" id="L392">    }</span>
+
+    /**
+     * Set the enabled cipher suites. Called from
+     * SSLSocketImpl/SSLEngineImpl.setEnabledCipherSuites() (if the
+     * handshake is not yet in progress).
+     */
+    void setEnabledCipherSuites(CipherSuiteList enabledCipherSuites) {
+<span class="nc" id="L400">        activeCipherSuites = null;</span>
+<span class="nc" id="L401">        activeProtocols = null;</span>
+<span class="nc" id="L402">        this.enabledCipherSuites = enabledCipherSuites;</span>
+<span class="nc" id="L403">    }</span>
+
+    /**
+     * Set the algorithm constraints. Called from the constructor or
+     * SSLSocketImpl/SSLEngineImpl.setAlgorithmConstraints() (if the
+     * handshake is not yet in progress).
+     */
+    void setAlgorithmConstraints(AlgorithmConstraints algorithmConstraints) {
+<span class="nc" id="L411">        activeCipherSuites = null;</span>
+<span class="nc" id="L412">        activeProtocols = null;</span>
+
+<span class="nc" id="L414">        this.algorithmConstraints =</span>
+            new SSLAlgorithmConstraints(algorithmConstraints);
+<span class="nc" id="L416">        this.localSupportedSignAlgs = null;</span>
+<span class="nc" id="L417">    }</span>
+
+    Collection&lt;SignatureAndHashAlgorithm&gt; getLocalSupportedSignAlgs() {
+<span class="nc bnc" id="L420" title="All 2 branches missed.">        if (localSupportedSignAlgs == null) {</span>
+<span class="nc" id="L421">            localSupportedSignAlgs =</span>
+<span class="nc" id="L422">                SignatureAndHashAlgorithm.getSupportedAlgorithms(</span>
+                                                    algorithmConstraints);
+        }
+
+<span class="nc" id="L426">        return localSupportedSignAlgs;</span>
+    }
+
+    void setPeerSupportedSignAlgs(
+            Collection&lt;SignatureAndHashAlgorithm&gt; algorithms) {
+<span class="nc" id="L431">        peerSupportedSignAlgs =</span>
+            new ArrayList&lt;SignatureAndHashAlgorithm&gt;(algorithms);
+<span class="nc" id="L433">    }</span>
+
+    Collection&lt;SignatureAndHashAlgorithm&gt; getPeerSupportedSignAlgs() {
+<span class="nc" id="L436">        return peerSupportedSignAlgs;</span>
+    }
+
+
+    /**
+     * Set the identification protocol. Called from the constructor or
+     * SSLSocketImpl/SSLEngineImpl.setIdentificationProtocol() (if the
+     * handshake is not yet in progress).
+     */
+    void setIdentificationProtocol(String protocol) {
+<span class="nc" id="L446">        this.identificationProtocol = protocol;</span>
+<span class="nc" id="L447">    }</span>
+
+    /**
+     * Sets the server name indication of the handshake.
+     */
+    void setSNIServerNames(List&lt;SNIServerName&gt; serverNames) {
+        // The serverNames parameter is unmodifiable.
+<span class="nc" id="L454">        this.serverNames = serverNames;</span>
+<span class="nc" id="L455">    }</span>
+
+    /**
+     * Sets the server name matchers of the handshaking.
+     */
+    void setSNIMatchers(Collection&lt;SNIMatcher&gt; sniMatchers) {
+        // The sniMatchers parameter is unmodifiable.
+<span class="nc" id="L462">        this.sniMatchers = sniMatchers;</span>
+<span class="nc" id="L463">    }</span>
+
+    /**
+     * Sets the cipher suites preference.
+     */
+    void setUseCipherSuitesOrder(boolean on) {
+<span class="nc" id="L469">        this.preferLocalCipherSuites = on;</span>
+<span class="nc" id="L470">    }</span>
+
+    /**
+     * Prior to handshaking, activate the handshake and initialize the version,
+     * input stream and output stream.
+     */
+    void activate(ProtocolVersion helloVersion) throws IOException {
+<span class="nc bnc" id="L477" title="All 2 branches missed.">        if (activeProtocols == null) {</span>
+<span class="nc" id="L478">            activeProtocols = getActiveProtocols();</span>
+        }
+
+<span class="nc bnc" id="L481" title="All 4 branches missed.">        if (activeProtocols.collection().isEmpty() ||</span>
+                activeProtocols.max.v == ProtocolVersion.NONE.v) {
+<span class="nc" id="L483">            throw new SSLHandshakeException(&quot;No appropriate protocol&quot;);</span>
+        }
+
+<span class="nc bnc" id="L486" title="All 2 branches missed.">        if (activeCipherSuites == null) {</span>
+<span class="nc" id="L487">            activeCipherSuites = getActiveCipherSuites();</span>
+        }
+
+<span class="nc bnc" id="L490" title="All 2 branches missed.">        if (activeCipherSuites.collection().isEmpty()) {</span>
+<span class="nc" id="L491">            throw new SSLHandshakeException(&quot;No appropriate cipher suite&quot;);</span>
+        }
+
+        // temporary protocol version until the actual protocol version
+        // is negotiated in the Hello exchange. This affects the record
+        // version we sent with the ClientHello.
+<span class="nc bnc" id="L497" title="All 2 branches missed.">        if (!isInitialHandshake) {</span>
+<span class="nc" id="L498">            protocolVersion = activeProtocolVersion;</span>
+        } else {
+<span class="nc" id="L500">            protocolVersion = activeProtocols.max;</span>
+        }
+
+<span class="nc bnc" id="L503" title="All 4 branches missed.">        if (helloVersion == null || helloVersion.v == ProtocolVersion.NONE.v) {</span>
+<span class="nc" id="L504">            helloVersion = activeProtocols.helloVersion;</span>
+        }
+
+        // We accumulate digests of the handshake messages so that
+        // we can read/write CertificateVerify and Finished messages,
+        // getting assurance against some particular active attacks.
+<span class="nc" id="L510">        handshakeHash = new HandshakeHash(needCertVerify);</span>
+
+        // Generate handshake input/output stream.
+<span class="nc" id="L513">        input = new HandshakeInStream(handshakeHash);</span>
+<span class="nc bnc" id="L514" title="All 2 branches missed.">        if (conn != null) {</span>
+<span class="nc" id="L515">            output = new HandshakeOutStream(protocolVersion, helloVersion,</span>
+                                        handshakeHash, conn);
+<span class="nc" id="L517">            conn.getAppInputStream().r.setHandshakeHash(handshakeHash);</span>
+<span class="nc" id="L518">            conn.getAppInputStream().r.setHelloVersion(helloVersion);</span>
+<span class="nc" id="L519">            conn.getAppOutputStream().r.setHelloVersion(helloVersion);</span>
+        } else {
+<span class="nc" id="L521">            output = new HandshakeOutStream(protocolVersion, helloVersion,</span>
+                                        handshakeHash, engine);
+<span class="nc" id="L523">            engine.inputRecord.setHandshakeHash(handshakeHash);</span>
+<span class="nc" id="L524">            engine.inputRecord.setHelloVersion(helloVersion);</span>
+<span class="nc" id="L525">            engine.outputRecord.setHelloVersion(helloVersion);</span>
+        }
+
+        // move state to activated
+<span class="nc" id="L529">        state = -1;</span>
+<span class="nc" id="L530">    }</span>
+
+    /**
+     * Set cipherSuite and keyExchange to the given CipherSuite.
+     * Does not perform any verification that this is a valid selection,
+     * this must be done before calling this method.
+     */
+    void setCipherSuite(CipherSuite s) {
+<span class="nc" id="L538">        this.cipherSuite = s;</span>
+<span class="nc" id="L539">        this.keyExchange = s.keyExchange;</span>
+<span class="nc" id="L540">    }</span>
+
+    /**
+     * Check if the given ciphersuite is enabled and available within the
+     * current active cipher suites.
+     *
+     * Does not check if the required server certificates are available.
+     */
+    boolean isNegotiable(CipherSuite s) {
+<span class="nc bnc" id="L549" title="All 2 branches missed.">        if (activeCipherSuites == null) {</span>
+<span class="nc" id="L550">            activeCipherSuites = getActiveCipherSuites();</span>
+        }
+
+<span class="nc" id="L553">        return isNegotiable(activeCipherSuites, s);</span>
+    }
+
+    /**
+     * Check if the given ciphersuite is enabled and available within the
+     * proposed cipher suite list.
+     *
+     * Does not check if the required server certificates are available.
+     */
+    final static boolean isNegotiable(CipherSuiteList proposed, CipherSuite s) {
+<span class="nc bnc" id="L563" title="All 4 branches missed.">        return proposed.contains(s) &amp;&amp; s.isNegotiable();</span>
+    }
+
+    /**
+     * Check if the given protocol version is enabled and available.
+     */
+    boolean isNegotiable(ProtocolVersion protocolVersion) {
+<span class="nc bnc" id="L570" title="All 2 branches missed.">        if (activeProtocols == null) {</span>
+<span class="nc" id="L571">            activeProtocols = getActiveProtocols();</span>
+        }
+
+<span class="nc" id="L574">        return activeProtocols.contains(protocolVersion);</span>
+    }
+
+    /**
+     * Select a protocol version from the list. Called from
+     * ServerHandshaker to negotiate protocol version.
+     *
+     * Return the lower of the protocol version suggested in the
+     * clien hello and the highest supported by the server.
+     */
+    ProtocolVersion selectProtocolVersion(ProtocolVersion protocolVersion) {
+<span class="nc bnc" id="L585" title="All 2 branches missed.">        if (activeProtocols == null) {</span>
+<span class="nc" id="L586">            activeProtocols = getActiveProtocols();</span>
+        }
+
+<span class="nc" id="L589">        return activeProtocols.selectProtocolVersion(protocolVersion);</span>
+    }
+
+    /**
+     * Get the active cipher suites.
+     *
+     * In TLS 1.1, many weak or vulnerable cipher suites were obsoleted,
+     * such as TLS_RSA_EXPORT_WITH_RC4_40_MD5. The implementation MUST NOT
+     * negotiate these cipher suites in TLS 1.1 or later mode.
+     *
+     * Therefore, when the active protocols only include TLS 1.1 or later,
+     * the client cannot request to negotiate those obsoleted cipher
+     * suites.  That is, the obsoleted suites should not be included in the
+     * client hello. So we need to create a subset of the enabled cipher
+     * suites, the active cipher suites, which does not contain obsoleted
+     * cipher suites of the minimum active protocol.
+     *
+     * Return empty list instead of null if no active cipher suites.
+     */
+    CipherSuiteList getActiveCipherSuites() {
+<span class="nc bnc" id="L609" title="All 2 branches missed.">        if (activeCipherSuites == null) {</span>
+<span class="nc bnc" id="L610" title="All 2 branches missed.">            if (activeProtocols == null) {</span>
+<span class="nc" id="L611">                activeProtocols = getActiveProtocols();</span>
+            }
+
+<span class="nc" id="L614">            ArrayList&lt;CipherSuite&gt; suites = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L615" title="All 4 branches missed.">            if (!(activeProtocols.collection().isEmpty()) &amp;&amp;</span>
+                    activeProtocols.min.v != ProtocolVersion.NONE.v) {
+<span class="nc bnc" id="L617" title="All 2 branches missed.">                for (CipherSuite suite : enabledCipherSuites.collection()) {</span>
+<span class="nc bnc" id="L618" title="All 4 branches missed.">                    if (suite.obsoleted &gt; activeProtocols.min.v &amp;&amp;</span>
+                            suite.supported &lt;= activeProtocols.max.v) {
+<span class="nc bnc" id="L620" title="All 2 branches missed.">                        if (algorithmConstraints.permits(</span>
+<span class="nc" id="L621">                                EnumSet.of(CryptoPrimitive.KEY_AGREEMENT),</span>
+                                suite.name, null)) {
+<span class="nc" id="L623">                            suites.add(suite);</span>
+                        }
+<span class="nc bnc" id="L625" title="All 4 branches missed.">                    } else if (debug != null &amp;&amp; Debug.isOn(&quot;verbose&quot;)) {</span>
+<span class="nc bnc" id="L626" title="All 2 branches missed.">                        if (suite.obsoleted &lt;= activeProtocols.min.v) {</span>
+<span class="nc" id="L627">                            System.out.println(</span>
+                                &quot;Ignoring obsoleted cipher suite: &quot; + suite);
+                        } else {
+<span class="nc" id="L630">                            System.out.println(</span>
+                                &quot;Ignoring unsupported cipher suite: &quot; + suite);
+                        }
+                    }
+<span class="nc" id="L634">                }</span>
+            }
+<span class="nc" id="L636">            activeCipherSuites = new CipherSuiteList(suites);</span>
+        }
+
+<span class="nc" id="L639">        return activeCipherSuites;</span>
+    }
+
+    /*
+     * Get the active protocol versions.
+     *
+     * In TLS 1.1, many weak or vulnerable cipher suites were obsoleted,
+     * such as TLS_RSA_EXPORT_WITH_RC4_40_MD5. The implementation MUST NOT
+     * negotiate these cipher suites in TLS 1.1 or later mode.
+     *
+     * For example, if &quot;TLS_RSA_EXPORT_WITH_RC4_40_MD5&quot; is the
+     * only enabled cipher suite, the client cannot request TLS 1.1 or
+     * later, even though TLS 1.1 or later is enabled.  We need to create a
+     * subset of the enabled protocols, called the active protocols, which
+     * contains protocols appropriate to the list of enabled Ciphersuites.
+     *
+     * Return empty list instead of null if no active protocol versions.
+     */
+    ProtocolList getActiveProtocols() {
+<span class="nc bnc" id="L658" title="All 2 branches missed.">        if (activeProtocols == null) {</span>
+<span class="nc" id="L659">            ArrayList&lt;ProtocolVersion&gt; protocols = new ArrayList&lt;&gt;(4);</span>
+<span class="nc bnc" id="L660" title="All 2 branches missed.">            for (ProtocolVersion protocol : enabledProtocols.collection()) {</span>
+<span class="nc" id="L661">                boolean found = false;</span>
+<span class="nc bnc" id="L662" title="All 2 branches missed.">                for (CipherSuite suite : enabledCipherSuites.collection()) {</span>
+<span class="nc bnc" id="L663" title="All 6 branches missed.">                    if (suite.isAvailable() &amp;&amp; suite.obsoleted &gt; protocol.v &amp;&amp;</span>
+                                               suite.supported &lt;= protocol.v) {
+<span class="nc bnc" id="L665" title="All 2 branches missed.">                        if (algorithmConstraints.permits(</span>
+<span class="nc" id="L666">                                EnumSet.of(CryptoPrimitive.KEY_AGREEMENT),</span>
+                                suite.name, null)) {
+<span class="nc" id="L668">                            protocols.add(protocol);</span>
+<span class="nc" id="L669">                            found = true;</span>
+<span class="nc" id="L670">                            break;</span>
+<span class="nc bnc" id="L671" title="All 4 branches missed.">                        } else if (debug != null &amp;&amp; Debug.isOn(&quot;verbose&quot;)) {</span>
+<span class="nc" id="L672">                            System.out.println(</span>
+                                &quot;Ignoring disabled cipher suite: &quot; + suite +
+                                 &quot; for &quot; + protocol);
+                        }
+<span class="nc bnc" id="L676" title="All 4 branches missed.">                    } else if (debug != null &amp;&amp; Debug.isOn(&quot;verbose&quot;)) {</span>
+<span class="nc" id="L677">                        System.out.println(</span>
+                            &quot;Ignoring unsupported cipher suite: &quot; + suite +
+                                 &quot; for &quot; + protocol);
+                    }
+<span class="nc" id="L681">                }</span>
+<span class="nc bnc" id="L682" title="All 6 branches missed.">                if (!found &amp;&amp; (debug != null) &amp;&amp; Debug.isOn(&quot;handshake&quot;)) {</span>
+<span class="nc" id="L683">                    System.out.println(</span>
+                        &quot;No available cipher suite for &quot; + protocol);
+                }
+<span class="nc" id="L686">            }</span>
+<span class="nc" id="L687">            activeProtocols = new ProtocolList(protocols);</span>
+        }
+
+<span class="nc" id="L690">        return activeProtocols;</span>
+    }
+
+    /**
+     * As long as handshaking has not activated, we can
+     * change whether session creations are allowed.
+     *
+     * Callers should do their own checking if handshaking
+     * has activated.
+     */
+    void setEnableSessionCreation(boolean newSessions) {
+<span class="nc" id="L701">        enableNewSession = newSessions;</span>
+<span class="nc" id="L702">    }</span>
+
+    /**
+     * Create a new read cipher and return it to caller.
+     */
+    CipherBox newReadCipher() throws NoSuchAlgorithmException {
+<span class="nc" id="L708">        BulkCipher cipher = cipherSuite.cipher;</span>
+        CipherBox box;
+<span class="nc bnc" id="L710" title="All 2 branches missed.">        if (isClient) {</span>
+<span class="nc" id="L711">            box = cipher.newCipher(protocolVersion, svrWriteKey, svrWriteIV,</span>
+<span class="nc" id="L712">                                   sslContext.getSecureRandom(), false);</span>
+<span class="nc" id="L713">            svrWriteKey = null;</span>
+<span class="nc" id="L714">            svrWriteIV = null;</span>
+        } else {
+<span class="nc" id="L716">            box = cipher.newCipher(protocolVersion, clntWriteKey, clntWriteIV,</span>
+<span class="nc" id="L717">                                   sslContext.getSecureRandom(), false);</span>
+<span class="nc" id="L718">            clntWriteKey = null;</span>
+<span class="nc" id="L719">            clntWriteIV = null;</span>
+        }
+<span class="nc" id="L721">        return box;</span>
+    }
+
+    /**
+     * Create a new write cipher and return it to caller.
+     */
+    CipherBox newWriteCipher() throws NoSuchAlgorithmException {
+<span class="nc" id="L728">        BulkCipher cipher = cipherSuite.cipher;</span>
+        CipherBox box;
+<span class="nc bnc" id="L730" title="All 2 branches missed.">        if (isClient) {</span>
+<span class="nc" id="L731">            box = cipher.newCipher(protocolVersion, clntWriteKey, clntWriteIV,</span>
+<span class="nc" id="L732">                                   sslContext.getSecureRandom(), true);</span>
+<span class="nc" id="L733">            clntWriteKey = null;</span>
+<span class="nc" id="L734">            clntWriteIV = null;</span>
+        } else {
+<span class="nc" id="L736">            box = cipher.newCipher(protocolVersion, svrWriteKey, svrWriteIV,</span>
+<span class="nc" id="L737">                                   sslContext.getSecureRandom(), true);</span>
+<span class="nc" id="L738">            svrWriteKey = null;</span>
+<span class="nc" id="L739">            svrWriteIV = null;</span>
+        }
+<span class="nc" id="L741">        return box;</span>
+    }
+
+    /**
+     * Create a new read MAC and return it to caller.
+     */
+    Authenticator newReadAuthenticator()
+            throws NoSuchAlgorithmException, InvalidKeyException {
+
+<span class="nc" id="L750">        Authenticator authenticator = null;</span>
+<span class="nc bnc" id="L751" title="All 2 branches missed.">        if (cipherSuite.cipher.cipherType == AEAD_CIPHER) {</span>
+<span class="nc" id="L752">            authenticator = new Authenticator(protocolVersion);</span>
+        } else {
+<span class="nc" id="L754">            MacAlg macAlg = cipherSuite.macAlg;</span>
+<span class="nc bnc" id="L755" title="All 2 branches missed.">            if (isClient) {</span>
+<span class="nc" id="L756">                authenticator = macAlg.newMac(protocolVersion, svrMacSecret);</span>
+<span class="nc" id="L757">                svrMacSecret = null;</span>
+            } else {
+<span class="nc" id="L759">                authenticator = macAlg.newMac(protocolVersion, clntMacSecret);</span>
+<span class="nc" id="L760">                clntMacSecret = null;</span>
+            }
+        }
+
+<span class="nc" id="L764">        return authenticator;</span>
+    }
+
+    /**
+     * Create a new write MAC and return it to caller.
+     */
+    Authenticator newWriteAuthenticator()
+            throws NoSuchAlgorithmException, InvalidKeyException {
+
+<span class="nc" id="L773">        Authenticator authenticator = null;</span>
+<span class="nc bnc" id="L774" title="All 2 branches missed.">        if (cipherSuite.cipher.cipherType == AEAD_CIPHER) {</span>
+<span class="nc" id="L775">            authenticator = new Authenticator(protocolVersion);</span>
+        } else {
+<span class="nc" id="L777">            MacAlg macAlg = cipherSuite.macAlg;</span>
+<span class="nc bnc" id="L778" title="All 2 branches missed.">            if (isClient) {</span>
+<span class="nc" id="L779">                authenticator = macAlg.newMac(protocolVersion, clntMacSecret);</span>
+<span class="nc" id="L780">                clntMacSecret = null;</span>
+            } else {
+<span class="nc" id="L782">                authenticator = macAlg.newMac(protocolVersion, svrMacSecret);</span>
+<span class="nc" id="L783">                svrMacSecret = null;</span>
+            }
+        }
+
+<span class="nc" id="L787">        return authenticator;</span>
+    }
+
+    /*
+     * Returns true iff the handshake sequence is done, so that
+     * this freshly created session can become the current one.
+     */
+    boolean isDone() {
+<span class="nc bnc" id="L795" title="All 2 branches missed.">        return state == HandshakeMessage.ht_finished;</span>
+    }
+
+
+    /*
+     * Returns the session which was created through this
+     * handshake sequence ... should be called after isDone()
+     * returns true.
+     */
+    SSLSessionImpl getSession() {
+<span class="nc" id="L805">        return session;</span>
+    }
+
+    /*
+     * Set the handshake session
+     */
+    void setHandshakeSessionSE(SSLSessionImpl handshakeSession) {
+<span class="nc bnc" id="L812" title="All 2 branches missed.">        if (conn != null) {</span>
+<span class="nc" id="L813">            conn.setHandshakeSession(handshakeSession);</span>
+        } else {
+<span class="nc" id="L815">            engine.setHandshakeSession(handshakeSession);</span>
+        }
+<span class="nc" id="L817">    }</span>
+
+    /*
+     * Returns true if renegotiation is in use for this connection.
+     */
+    boolean isSecureRenegotiation() {
+<span class="nc" id="L823">        return secureRenegotiation;</span>
+    }
+
+    /*
+     * Returns the verify_data from the Finished message sent by the client.
+     */
+    byte[] getClientVerifyData() {
+<span class="nc" id="L830">        return clientVerifyData;</span>
+    }
+
+    /*
+     * Returns the verify_data from the Finished message sent by the server.
+     */
+    byte[] getServerVerifyData() {
+<span class="nc" id="L837">        return serverVerifyData;</span>
+    }
+
+    /*
+     * This routine is fed SSL handshake records when they become available,
+     * and processes messages found therein.
+     */
+    void process_record(InputRecord r, boolean expectingFinished)
+            throws IOException {
+
+<span class="nc" id="L847">        checkThrown();</span>
+
+        /*
+         * Store the incoming handshake data, then see if we can
+         * now process any completed handshake messages
+         */
+<span class="nc" id="L853">        input.incomingRecord(r);</span>
+
+        /*
+         * We don't need to create a separate delegatable task
+         * for finished messages.
+         */
+<span class="nc bnc" id="L859" title="All 4 branches missed.">        if ((conn != null) || expectingFinished) {</span>
+<span class="nc" id="L860">            processLoop();</span>
+        } else {
+<span class="nc" id="L862">            delegateTask(new PrivilegedExceptionAction&lt;Void&gt;() {</span>
+                @Override
+                public Void run() throws Exception {
+<span class="nc" id="L865">                    processLoop();</span>
+<span class="nc" id="L866">                    return null;</span>
+                }
+            });
+        }
+<span class="nc" id="L870">    }</span>
+
+    /*
+     * On input, we hash messages one at a time since servers may need
+     * to access an intermediate hash to validate a CertificateVerify
+     * message.
+     *
+     * Note that many handshake messages can come in one record (and often
+     * do, to reduce network resource utilization), and one message can also
+     * require multiple records (e.g. very large Certificate messages).
+     */
+    void processLoop() throws IOException {
+
+        // need to read off 4 bytes at least to get the handshake
+        // message type and length.
+<span class="nc bnc" id="L885" title="All 2 branches missed.">        while (input.available() &gt;= 4) {</span>
+            byte messageType;
+            int messageLen;
+
+            /*
+             * See if we can read the handshake message header, and
+             * then the entire handshake message.  If not, wait till
+             * we can read and process an entire message.
+             */
+<span class="nc" id="L894">            input.mark(4);</span>
+
+<span class="nc" id="L896">            messageType = (byte)input.getInt8();</span>
+<span class="nc" id="L897">            messageLen = input.getInt24();</span>
+
+<span class="nc bnc" id="L899" title="All 2 branches missed.">            if (input.available() &lt; messageLen) {</span>
+<span class="nc" id="L900">                input.reset();</span>
+<span class="nc" id="L901">                return;</span>
+            }
+
+            /*
+             * Process the message.  We require
+             * that processMessage() consumes the entire message.  In
+             * lieu of explicit error checks (how?!) we assume that the
+             * data will look like garbage on encoding/processing errors,
+             * and that other protocol code will detect such errors.
+             *
+             * Note that digesting is normally deferred till after the
+             * message has been processed, though to process at least the
+             * client's Finished message (i.e. send the server's) we need
+             * to acccelerate that digesting.
+             *
+             * Also, note that hello request messages are never hashed;
+             * that includes the hello request header, too.
+             */
+<span class="nc bnc" id="L919" title="All 2 branches missed.">            if (messageType == HandshakeMessage.ht_hello_request) {</span>
+<span class="nc" id="L920">                input.reset();</span>
+<span class="nc" id="L921">                processMessage(messageType, messageLen);</span>
+<span class="nc" id="L922">                input.ignore(4 + messageLen);</span>
+            } else {
+<span class="nc" id="L924">                input.mark(messageLen);</span>
+<span class="nc" id="L925">                processMessage(messageType, messageLen);</span>
+<span class="nc" id="L926">                input.digestNow();</span>
+            }
+<span class="nc" id="L928">        }</span>
+<span class="nc" id="L929">    }</span>
+
+
+    /**
+     * Returns true iff the handshaker has been activated.
+     *
+     * In activated state, the handshaker may not send any messages out.
+     */
+    boolean activated() {
+<span class="nc bnc" id="L938" title="All 2 branches missed.">        return state &gt;= -1;</span>
+    }
+
+    /**
+     * Returns true iff the handshaker has sent any messages.
+     */
+    boolean started() {
+<span class="nc bnc" id="L945" title="All 2 branches missed.">        return state &gt;= 0;  // 0: HandshakeMessage.ht_hello_request</span>
+                            // 1: HandshakeMessage.ht_client_hello
+    }
+
+
+    /*
+     * Used to kickstart the negotiation ... either writing a
+     * ClientHello or a HelloRequest as appropriate, whichever
+     * the subclass returns.  NOP if handshaking's already started.
+     */
+    void kickstart() throws IOException {
+<span class="nc bnc" id="L956" title="All 2 branches missed.">        if (state &gt;= 0) {</span>
+<span class="nc" id="L957">            return;</span>
+        }
+
+<span class="nc" id="L960">        HandshakeMessage m = getKickstartMessage();</span>
+
+<span class="nc bnc" id="L962" title="All 4 branches missed.">        if (debug != null &amp;&amp; Debug.isOn(&quot;handshake&quot;)) {</span>
+<span class="nc" id="L963">            m.print(System.out);</span>
+        }
+<span class="nc" id="L965">        m.write(output);</span>
+<span class="nc" id="L966">        output.flush();</span>
+
+<span class="nc" id="L968">        state = m.messageType();</span>
+<span class="nc" id="L969">    }</span>
+
+    /**
+     * Both client and server modes can start handshaking; but the
+     * message they send to do so is different.
+     */
+    abstract HandshakeMessage getKickstartMessage() throws SSLException;
+
+    /*
+     * Client and Server side protocols are each driven though this
+     * call, which processes a single message and drives the appropriate
+     * side of the protocol state machine (depending on the subclass).
+     */
+    abstract void processMessage(byte messageType, int messageLen)
+        throws IOException;
+
+    /*
+     * Most alerts in the protocol relate to handshaking problems.
+     * Alerts are detected as the connection reads data.
+     */
+    abstract void handshakeAlert(byte description) throws SSLProtocolException;
+
+    /*
+     * Sends a change cipher spec message and updates the write side
+     * cipher state so that future messages use the just-negotiated spec.
+     */
+    void sendChangeCipherSpec(Finished mesg, boolean lastMessage)
+            throws IOException {
+
+<span class="nc" id="L998">        output.flush(); // i.e. handshake data</span>
+
+        /*
+         * The write cipher state is protected by the connection write lock
+         * so we must grab it while making the change. We also
+         * make sure no writes occur between sending the ChangeCipherSpec
+         * message, installing the new cipher state, and sending the
+         * Finished message.
+         *
+         * We already hold SSLEngine/SSLSocket &quot;this&quot; by virtue
+         * of this being called from the readRecord code.
+         */
+        OutputRecord r;
+<span class="nc bnc" id="L1011" title="All 2 branches missed.">        if (conn != null) {</span>
+<span class="nc" id="L1012">            r = new OutputRecord(Record.ct_change_cipher_spec);</span>
+        } else {
+<span class="nc" id="L1014">            r = new EngineOutputRecord(Record.ct_change_cipher_spec, engine);</span>
+        }
+
+<span class="nc" id="L1017">        r.setVersion(protocolVersion);</span>
+<span class="nc" id="L1018">        r.write(1);     // single byte of data</span>
+
+<span class="nc bnc" id="L1020" title="All 2 branches missed.">        if (conn != null) {</span>
+<span class="nc" id="L1021">            conn.writeLock.lock();</span>
+            try {
+<span class="nc" id="L1023">                conn.writeRecord(r);</span>
+<span class="nc" id="L1024">                conn.changeWriteCiphers();</span>
+<span class="nc bnc" id="L1025" title="All 4 branches missed.">                if (debug != null &amp;&amp; Debug.isOn(&quot;handshake&quot;)) {</span>
+<span class="nc" id="L1026">                    mesg.print(System.out);</span>
+                }
+<span class="nc" id="L1028">                mesg.write(output);</span>
+<span class="nc" id="L1029">                output.flush();</span>
+            } finally {
+<span class="nc" id="L1031">                conn.writeLock.unlock();</span>
+<span class="nc" id="L1032">            }</span>
+        } else {
+<span class="nc" id="L1034">            synchronized (engine.writeLock) {</span>
+<span class="nc" id="L1035">                engine.writeRecord((EngineOutputRecord)r);</span>
+<span class="nc" id="L1036">                engine.changeWriteCiphers();</span>
+<span class="nc bnc" id="L1037" title="All 4 branches missed.">                if (debug != null &amp;&amp; Debug.isOn(&quot;handshake&quot;)) {</span>
+<span class="nc" id="L1038">                    mesg.print(System.out);</span>
+                }
+<span class="nc" id="L1040">                mesg.write(output);</span>
+
+<span class="nc bnc" id="L1042" title="All 2 branches missed.">                if (lastMessage) {</span>
+<span class="nc" id="L1043">                    output.setFinishedMsg();</span>
+                }
+<span class="nc" id="L1045">                output.flush();</span>
+<span class="nc" id="L1046">            }</span>
+        }
+<span class="nc" id="L1048">    }</span>
+
+    /*
+     * Single access point to key calculation logic.  Given the
+     * pre-master secret and the nonces from client and server,
+     * produce all the keying material to be used.
+     */
+    void calculateKeys(SecretKey preMasterSecret, ProtocolVersion version) {
+<span class="nc" id="L1056">        SecretKey master = calculateMasterSecret(preMasterSecret, version);</span>
+<span class="nc" id="L1057">        session.setMasterSecret(master);</span>
+<span class="nc" id="L1058">        calculateConnectionKeys(master);</span>
+<span class="nc" id="L1059">    }</span>
+
+
+    /*
+     * Calculate the master secret from its various components.  This is
+     * used for key exchange by all cipher suites.
+     *
+     * The master secret is the catenation of three MD5 hashes, each
+     * consisting of the pre-master secret and a SHA1 hash.  Those three
+     * SHA1 hashes are of (different) constant strings, the pre-master
+     * secret, and the nonces provided by the client and the server.
+     */
+    private SecretKey calculateMasterSecret(SecretKey preMasterSecret,
+            ProtocolVersion requestedVersion) {
+
+<span class="nc bnc" id="L1074" title="All 4 branches missed.">        if (debug != null &amp;&amp; Debug.isOn(&quot;keygen&quot;)) {</span>
+<span class="nc" id="L1075">            HexDumpEncoder      dump = new HexDumpEncoder();</span>
+
+<span class="nc" id="L1077">            System.out.println(&quot;SESSION KEYGEN:&quot;);</span>
+
+<span class="nc" id="L1079">            System.out.println(&quot;PreMaster Secret:&quot;);</span>
+<span class="nc" id="L1080">            printHex(dump, preMasterSecret.getEncoded());</span>
+
+            // Nonces are dumped with connection keygen, no
+            // benefit to doing it twice
+        }
+
+        // What algs/params do we need to use?
+        String masterAlg;
+        PRF prf;
+
+<span class="nc bnc" id="L1090" title="All 2 branches missed.">        if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L1091">            masterAlg = &quot;SunTls12MasterSecret&quot;;</span>
+<span class="nc" id="L1092">            prf = cipherSuite.prfAlg;</span>
+        } else {
+<span class="nc" id="L1094">            masterAlg = &quot;SunTlsMasterSecret&quot;;</span>
+<span class="nc" id="L1095">            prf = P_NONE;</span>
+        }
+
+<span class="nc" id="L1098">        String prfHashAlg = prf.getPRFHashAlg();</span>
+<span class="nc" id="L1099">        int prfHashLength = prf.getPRFHashLength();</span>
+<span class="nc" id="L1100">        int prfBlockSize = prf.getPRFBlockSize();</span>
+
+<span class="nc" id="L1102">        TlsMasterSecretParameterSpec spec = new TlsMasterSecretParameterSpec(</span>
+                preMasterSecret, protocolVersion.major, protocolVersion.minor,
+                clnt_random.random_bytes, svr_random.random_bytes,
+                prfHashAlg, prfHashLength, prfBlockSize);
+
+        SecretKey masterSecret;
+        try {
+<span class="nc" id="L1109">            KeyGenerator kg = JsseJce.getKeyGenerator(masterAlg);</span>
+<span class="nc" id="L1110">            kg.init(spec);</span>
+<span class="nc" id="L1111">            masterSecret = kg.generateKey();</span>
+<span class="nc" id="L1112">        } catch (GeneralSecurityException e) {</span>
+            // For RSA premaster secrets, do not signal a protocol error
+            // due to the Bleichenbacher attack. See comments further down.
+<span class="nc bnc" id="L1115" title="All 2 branches missed.">            if (!preMasterSecret.getAlgorithm().equals(</span>
+                    &quot;TlsRsaPremasterSecret&quot;)) {
+<span class="nc" id="L1117">                throw new ProviderException(e);</span>
+            }
+
+<span class="nc bnc" id="L1120" title="All 4 branches missed.">            if (debug != null &amp;&amp; Debug.isOn(&quot;handshake&quot;)) {</span>
+<span class="nc" id="L1121">                System.out.println(&quot;RSA master secret generation error:&quot;);</span>
+<span class="nc" id="L1122">                e.printStackTrace(System.out);</span>
+            }
+
+<span class="nc bnc" id="L1125" title="All 2 branches missed.">            if (requestedVersion != null) {</span>
+<span class="nc" id="L1126">                preMasterSecret =</span>
+<span class="nc" id="L1127">                    RSAClientKeyExchange.generateDummySecret(requestedVersion);</span>
+            } else {
+<span class="nc" id="L1129">                preMasterSecret =</span>
+<span class="nc" id="L1130">                    RSAClientKeyExchange.generateDummySecret(protocolVersion);</span>
+            }
+
+            // recursive call with new premaster secret
+<span class="nc" id="L1134">            return calculateMasterSecret(preMasterSecret, null);</span>
+<span class="nc" id="L1135">        }</span>
+
+        // if no version check requested (client side handshake), or version
+        // information is not available (not an RSA premaster secret),
+        // return master secret immediately.
+<span class="nc bnc" id="L1140" title="All 4 branches missed.">        if ((requestedVersion == null) ||</span>
+                !(masterSecret instanceof TlsMasterSecret)) {
+<span class="nc" id="L1142">            return masterSecret;</span>
+        }
+
+        // we have checked the ClientKeyExchange message when reading TLS
+        // record, the following check is necessary to ensure that
+        // JCE provider does not ignore the checking, or the previous
+        // checking process bypassed the premaster secret version checking.
+<span class="nc" id="L1149">        TlsMasterSecret tlsKey = (TlsMasterSecret)masterSecret;</span>
+<span class="nc" id="L1150">        int major = tlsKey.getMajorVersion();</span>
+<span class="nc" id="L1151">        int minor = tlsKey.getMinorVersion();</span>
+<span class="nc bnc" id="L1152" title="All 4 branches missed.">        if ((major &lt; 0) || (minor &lt; 0)) {</span>
+<span class="nc" id="L1153">            return masterSecret;</span>
+        }
+
+        // check if the premaster secret version is ok
+        // the specification says that it must be the maximum version supported
+        // by the client from its ClientHello message. However, many
+        // implementations send the negotiated version, so accept both
+        // for SSL v3.0 and TLS v1.0.
+        // NOTE that we may be comparing two unsupported version numbers, which
+        // is why we cannot use object reference equality in this special case.
+<span class="nc" id="L1163">        ProtocolVersion premasterVersion =</span>
+<span class="nc" id="L1164">                                    ProtocolVersion.valueOf(major, minor);</span>
+<span class="nc bnc" id="L1165" title="All 2 branches missed.">        boolean versionMismatch = (premasterVersion.v != requestedVersion.v);</span>
+
+        /*
+         * we never checked the client_version in server side
+         * for TLS v1.0 and SSL v3.0. For compatibility, we
+         * maintain this behavior.
+         */
+<span class="nc bnc" id="L1172" title="All 4 branches missed.">        if (versionMismatch &amp;&amp; requestedVersion.v &lt;= ProtocolVersion.TLS10.v) {</span>
+<span class="nc bnc" id="L1173" title="All 2 branches missed.">            versionMismatch = (premasterVersion.v != protocolVersion.v);</span>
+        }
+
+<span class="nc bnc" id="L1176" title="All 2 branches missed.">        if (versionMismatch == false) {</span>
+            // check passed, return key
+<span class="nc" id="L1178">            return masterSecret;</span>
+        }
+
+        // Due to the Bleichenbacher attack, do not signal a protocol error.
+        // Generate a random premaster secret and continue with the handshake,
+        // which will fail when verifying the finished messages.
+        // For more information, see comments in PreMasterSecret.
+<span class="nc bnc" id="L1185" title="All 4 branches missed.">        if (debug != null &amp;&amp; Debug.isOn(&quot;handshake&quot;)) {</span>
+<span class="nc" id="L1186">            System.out.println(&quot;RSA PreMasterSecret version error: expected&quot;</span>
+                + protocolVersion + &quot; or &quot; + requestedVersion + &quot;, decrypted: &quot;
+                + premasterVersion);
+        }
+<span class="nc" id="L1190">        preMasterSecret =</span>
+<span class="nc" id="L1191">            RSAClientKeyExchange.generateDummySecret(requestedVersion);</span>
+
+        // recursive call with new premaster secret
+<span class="nc" id="L1194">        return calculateMasterSecret(preMasterSecret, null);</span>
+    }
+
+    /*
+     * Calculate the keys needed for this connection, once the session's
+     * master secret has been calculated.  Uses the master key and nonces;
+     * the amount of keying material generated is a function of the cipher
+     * suite that's been negotiated.
+     *
+     * This gets called both on the &quot;full handshake&quot; (where we exchanged
+     * a premaster secret and started a new session) as well as on the
+     * &quot;fast handshake&quot; (where we just resumed a pre-existing session).
+     */
+    void calculateConnectionKeys(SecretKey masterKey) {
+        /*
+         * For both the read and write sides of the protocol, we use the
+         * master to generate MAC secrets and cipher keying material.  Block
+         * ciphers need initialization vectors, which we also generate.
+         *
+         * First we figure out how much keying material is needed.
+         */
+<span class="nc" id="L1215">        int hashSize = cipherSuite.macAlg.size;</span>
+<span class="nc" id="L1216">        boolean is_exportable = cipherSuite.exportable;</span>
+<span class="nc" id="L1217">        BulkCipher cipher = cipherSuite.cipher;</span>
+<span class="nc bnc" id="L1218" title="All 2 branches missed.">        int expandedKeySize = is_exportable ? cipher.expandedKeySize : 0;</span>
+
+        // Which algs/params do we need to use?
+        String keyMaterialAlg;
+        PRF prf;
+
+<span class="nc bnc" id="L1224" title="All 2 branches missed.">        if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L1225">            keyMaterialAlg = &quot;SunTls12KeyMaterial&quot;;</span>
+<span class="nc" id="L1226">            prf = cipherSuite.prfAlg;</span>
+        } else {
+<span class="nc" id="L1228">            keyMaterialAlg = &quot;SunTlsKeyMaterial&quot;;</span>
+<span class="nc" id="L1229">            prf = P_NONE;</span>
+        }
+
+<span class="nc" id="L1232">        String prfHashAlg = prf.getPRFHashAlg();</span>
+<span class="nc" id="L1233">        int prfHashLength = prf.getPRFHashLength();</span>
+<span class="nc" id="L1234">        int prfBlockSize = prf.getPRFBlockSize();</span>
+
+        // TLS v1.1 or later uses an explicit IV in CBC cipher suites to
+        // protect against the CBC attacks.  AEAD/GCM cipher suites in TLS
+        // v1.2 or later use a fixed IV as the implicit part of the partially
+        // implicit nonce technique described in RFC 5116.
+<span class="nc" id="L1240">        int ivSize = cipher.ivSize;</span>
+<span class="nc bnc" id="L1241" title="All 2 branches missed.">        if (cipher.cipherType == AEAD_CIPHER) {</span>
+<span class="nc" id="L1242">            ivSize = cipher.fixedIvSize;</span>
+<span class="nc bnc" id="L1243" title="All 4 branches missed.">        } else if (protocolVersion.v &gt;= ProtocolVersion.TLS11.v &amp;&amp;</span>
+                cipher.cipherType == BLOCK_CIPHER) {
+<span class="nc" id="L1245">            ivSize = 0;</span>
+        }
+
+<span class="nc" id="L1248">        TlsKeyMaterialParameterSpec spec = new TlsKeyMaterialParameterSpec(</span>
+            masterKey, protocolVersion.major, protocolVersion.minor,
+            clnt_random.random_bytes, svr_random.random_bytes,
+            cipher.algorithm, cipher.keySize, expandedKeySize,
+            ivSize, hashSize,
+            prfHashAlg, prfHashLength, prfBlockSize);
+
+        try {
+<span class="nc" id="L1256">            KeyGenerator kg = JsseJce.getKeyGenerator(keyMaterialAlg);</span>
+<span class="nc" id="L1257">            kg.init(spec);</span>
+<span class="nc" id="L1258">            TlsKeyMaterialSpec keySpec = (TlsKeyMaterialSpec)kg.generateKey();</span>
+
+            // Return null if cipher keys are not supposed to be generated.
+<span class="nc" id="L1261">            clntWriteKey = keySpec.getClientCipherKey();</span>
+<span class="nc" id="L1262">            svrWriteKey = keySpec.getServerCipherKey();</span>
+
+            // Return null if IVs are not supposed to be generated.
+<span class="nc" id="L1265">            clntWriteIV = keySpec.getClientIv();</span>
+<span class="nc" id="L1266">            svrWriteIV = keySpec.getServerIv();</span>
+
+            // Return null if MAC keys are not supposed to be generated.
+<span class="nc" id="L1269">            clntMacSecret = keySpec.getClientMacKey();</span>
+<span class="nc" id="L1270">            svrMacSecret = keySpec.getServerMacKey();</span>
+<span class="nc" id="L1271">        } catch (GeneralSecurityException e) {</span>
+<span class="nc" id="L1272">            throw new ProviderException(e);</span>
+<span class="nc" id="L1273">        }</span>
+
+        //
+        // Dump the connection keys as they're generated.
+        //
+<span class="nc bnc" id="L1278" title="All 4 branches missed.">        if (debug != null &amp;&amp; Debug.isOn(&quot;keygen&quot;)) {</span>
+<span class="nc" id="L1279">            synchronized (System.out) {</span>
+<span class="nc" id="L1280">                HexDumpEncoder  dump = new HexDumpEncoder();</span>
+
+<span class="nc" id="L1282">                System.out.println(&quot;CONNECTION KEYGEN:&quot;);</span>
+
+                // Inputs:
+<span class="nc" id="L1285">                System.out.println(&quot;Client Nonce:&quot;);</span>
+<span class="nc" id="L1286">                printHex(dump, clnt_random.random_bytes);</span>
+<span class="nc" id="L1287">                System.out.println(&quot;Server Nonce:&quot;);</span>
+<span class="nc" id="L1288">                printHex(dump, svr_random.random_bytes);</span>
+<span class="nc" id="L1289">                System.out.println(&quot;Master Secret:&quot;);</span>
+<span class="nc" id="L1290">                printHex(dump, masterKey.getEncoded());</span>
+
+                // Outputs:
+<span class="nc bnc" id="L1293" title="All 2 branches missed.">                if (clntMacSecret != null) {</span>
+<span class="nc" id="L1294">                    System.out.println(&quot;Client MAC write Secret:&quot;);</span>
+<span class="nc" id="L1295">                    printHex(dump, clntMacSecret.getEncoded());</span>
+<span class="nc" id="L1296">                    System.out.println(&quot;Server MAC write Secret:&quot;);</span>
+<span class="nc" id="L1297">                    printHex(dump, svrMacSecret.getEncoded());</span>
+                } else {
+<span class="nc" id="L1299">                    System.out.println(&quot;... no MAC keys used for this cipher&quot;);</span>
+                }
+
+<span class="nc bnc" id="L1302" title="All 2 branches missed.">                if (clntWriteKey != null) {</span>
+<span class="nc" id="L1303">                    System.out.println(&quot;Client write key:&quot;);</span>
+<span class="nc" id="L1304">                    printHex(dump, clntWriteKey.getEncoded());</span>
+<span class="nc" id="L1305">                    System.out.println(&quot;Server write key:&quot;);</span>
+<span class="nc" id="L1306">                    printHex(dump, svrWriteKey.getEncoded());</span>
+                } else {
+<span class="nc" id="L1308">                    System.out.println(&quot;... no encryption keys used&quot;);</span>
+                }
+
+<span class="nc bnc" id="L1311" title="All 2 branches missed.">                if (clntWriteIV != null) {</span>
+<span class="nc" id="L1312">                    System.out.println(&quot;Client write IV:&quot;);</span>
+<span class="nc" id="L1313">                    printHex(dump, clntWriteIV.getIV());</span>
+<span class="nc" id="L1314">                    System.out.println(&quot;Server write IV:&quot;);</span>
+<span class="nc" id="L1315">                    printHex(dump, svrWriteIV.getIV());</span>
+                } else {
+<span class="nc bnc" id="L1317" title="All 2 branches missed.">                    if (protocolVersion.v &gt;= ProtocolVersion.TLS11.v) {</span>
+<span class="nc" id="L1318">                        System.out.println(</span>
+                                &quot;... no IV derived for this protocol&quot;);
+                    } else {
+<span class="nc" id="L1321">                        System.out.println(&quot;... no IV used for this cipher&quot;);</span>
+                    }
+                }
+<span class="nc" id="L1324">                System.out.flush();</span>
+<span class="nc" id="L1325">            }</span>
+        }
+<span class="nc" id="L1327">    }</span>
+
+    private static void printHex(HexDumpEncoder dump, byte[] bytes) {
+<span class="nc bnc" id="L1330" title="All 2 branches missed.">        if (bytes == null) {</span>
+<span class="nc" id="L1331">            System.out.println(&quot;(key bytes not available)&quot;);</span>
+        } else {
+            try {
+<span class="nc" id="L1334">                dump.encodeBuffer(bytes, System.out);</span>
+<span class="nc" id="L1335">            } catch (IOException e) {</span>
+                // just for debugging, ignore this
+<span class="nc" id="L1337">            }</span>
+        }
+<span class="nc" id="L1339">    }</span>
+
+    /**
+     * Throw an SSLException with the specified message and cause.
+     * Shorthand until a new SSLException constructor is added.
+     * This method never returns.
+     */
+    static void throwSSLException(String msg, Throwable cause)
+            throws SSLException {
+<span class="nc" id="L1348">        SSLException e = new SSLException(msg);</span>
+<span class="nc" id="L1349">        e.initCause(cause);</span>
+<span class="nc" id="L1350">        throw e;</span>
+    }
+
+
+    /*
+     * Implement a simple task delegator.
+     *
+     * We are currently implementing this as a single delegator, may
+     * try for parallel tasks later.  Client Authentication could
+     * benefit from this, where ClientKeyExchange/CertificateVerify
+     * could be carried out in parallel.
+     */
+    class DelegatedTask&lt;E&gt; implements Runnable {
+
+        private PrivilegedExceptionAction&lt;E&gt; pea;
+
+<span class="nc" id="L1366">        DelegatedTask(PrivilegedExceptionAction&lt;E&gt; pea) {</span>
+<span class="nc" id="L1367">            this.pea = pea;</span>
+<span class="nc" id="L1368">        }</span>
+
+        public void run() {
+<span class="nc" id="L1371">            synchronized (engine) {</span>
+                try {
+<span class="nc" id="L1373">                    AccessController.doPrivileged(pea, engine.getAcc());</span>
+<span class="nc" id="L1374">                } catch (PrivilegedActionException pae) {</span>
+<span class="nc" id="L1375">                    thrown = pae.getException();</span>
+<span class="nc" id="L1376">                } catch (RuntimeException rte) {</span>
+<span class="nc" id="L1377">                    thrown = rte;</span>
+<span class="nc" id="L1378">                }</span>
+<span class="nc" id="L1379">                delegatedTask = null;</span>
+<span class="nc" id="L1380">                taskDelegated = false;</span>
+<span class="nc" id="L1381">            }</span>
+<span class="nc" id="L1382">        }</span>
+    }
+
+    private &lt;T&gt; void delegateTask(PrivilegedExceptionAction&lt;T&gt; pea) {
+<span class="nc" id="L1386">        delegatedTask = new DelegatedTask&lt;T&gt;(pea);</span>
+<span class="nc" id="L1387">        taskDelegated = false;</span>
+<span class="nc" id="L1388">        thrown = null;</span>
+<span class="nc" id="L1389">    }</span>
+
+    DelegatedTask&lt;?&gt; getTask() {
+<span class="nc bnc" id="L1392" title="All 2 branches missed.">        if (!taskDelegated) {</span>
+<span class="nc" id="L1393">            taskDelegated = true;</span>
+<span class="nc" id="L1394">            return delegatedTask;</span>
+        } else {
+<span class="nc" id="L1396">            return null;</span>
+        }
+    }
+
+    /*
+     * See if there are any tasks which need to be delegated
+     *
+     * Locked by SSLEngine.this.
+     */
+    boolean taskOutstanding() {
+<span class="nc bnc" id="L1406" title="All 2 branches missed.">        return (delegatedTask != null);</span>
+    }
+
+    /*
+     * The previous caller failed for some reason, report back the
+     * Exception.  We won't worry about Error's.
+     *
+     * Locked by SSLEngine.this.
+     */
+    void checkThrown() throws SSLException {
+<span class="nc" id="L1416">        synchronized (thrownLock) {</span>
+<span class="nc bnc" id="L1417" title="All 2 branches missed.">            if (thrown != null) {</span>
+
+<span class="nc" id="L1419">                String msg = thrown.getMessage();</span>
+
+<span class="nc bnc" id="L1421" title="All 2 branches missed.">                if (msg == null) {</span>
+<span class="nc" id="L1422">                    msg = &quot;Delegated task threw Exception/Error&quot;;</span>
+                }
+
+                /*
+                 * See what the underlying type of exception is.  We should
+                 * throw the same thing.  Chain thrown to the new exception.
+                 */
+<span class="nc" id="L1429">                Exception e = thrown;</span>
+<span class="nc" id="L1430">                thrown = null;</span>
+
+<span class="nc bnc" id="L1432" title="All 2 branches missed.">                if (e instanceof RuntimeException) {</span>
+<span class="nc" id="L1433">                    throw new RuntimeException(msg, e);</span>
+<span class="nc bnc" id="L1434" title="All 2 branches missed.">                } else if (e instanceof SSLHandshakeException) {</span>
+<span class="nc" id="L1435">                    throw (SSLHandshakeException)</span>
+<span class="nc" id="L1436">                        new SSLHandshakeException(msg).initCause(e);</span>
+<span class="nc bnc" id="L1437" title="All 2 branches missed.">                } else if (e instanceof SSLKeyException) {</span>
+<span class="nc" id="L1438">                    throw (SSLKeyException)</span>
+<span class="nc" id="L1439">                        new SSLKeyException(msg).initCause(e);</span>
+<span class="nc bnc" id="L1440" title="All 2 branches missed.">                } else if (e instanceof SSLPeerUnverifiedException) {</span>
+<span class="nc" id="L1441">                    throw (SSLPeerUnverifiedException)</span>
+<span class="nc" id="L1442">                        new SSLPeerUnverifiedException(msg).initCause(e);</span>
+<span class="nc bnc" id="L1443" title="All 2 branches missed.">                } else if (e instanceof SSLProtocolException) {</span>
+<span class="nc" id="L1444">                    throw (SSLProtocolException)</span>
+<span class="nc" id="L1445">                        new SSLProtocolException(msg).initCause(e);</span>
+                } else {
+                    /*
+                     * If it's SSLException or any other Exception,
+                     * we'll wrap it in an SSLException.
+                     */
+<span class="nc" id="L1451">                    throw new SSLException(msg, e);</span>
+                }
+            }
+<span class="nc" id="L1454">        }</span>
+<span class="nc" id="L1455">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

@@ -1,0 +1,492 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>URICertStore.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.provider.certpath</a> &gt; <span class="el_source">URICertStore.java</span></div><h1>URICertStore.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2006, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.security.provider.certpath;
+
+import java.io.InputStream;
+import java.io.IOException;
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URLConnection;
+import java.security.InvalidAlgorithmParameterException;
+import java.security.NoSuchAlgorithmException;
+import java.security.Provider;
+import java.security.cert.CertificateException;
+import java.security.cert.CertificateFactory;
+import java.security.cert.CertSelector;
+import java.security.cert.CertStore;
+import java.security.cert.CertStoreException;
+import java.security.cert.CertStoreParameters;
+import java.security.cert.CertStoreSpi;
+import java.security.cert.CRLException;
+import java.security.cert.CRLSelector;
+import java.security.cert.X509Certificate;
+import java.security.cert.X509CertSelector;
+import java.security.cert.X509CRL;
+import java.security.cert.X509CRLSelector;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Locale;
+import sun.security.action.GetIntegerAction;
+import sun.security.x509.AccessDescription;
+import sun.security.x509.GeneralNameInterface;
+import sun.security.x509.URIName;
+import sun.security.util.Cache;
+import sun.security.util.Debug;
+
+/**
+ * A &lt;code&gt;CertStore&lt;/code&gt; that retrieves &lt;code&gt;Certificates&lt;/code&gt; or
+ * &lt;code&gt;CRL&lt;/code&gt;s from a URI, for example, as specified in an X.509
+ * AuthorityInformationAccess or CRLDistributionPoint extension.
+ * &lt;p&gt;
+ * For CRLs, this implementation retrieves a single DER encoded CRL per URI.
+ * For Certificates, this implementation retrieves a single DER encoded CRL or
+ * a collection of Certificates encoded as a PKCS#7 &quot;certs-only&quot; CMS message.
+ * &lt;p&gt;
+ * This &lt;code&gt;CertStore&lt;/code&gt; also implements Certificate/CRL caching.
+ * Currently, the cache is shared between all applications in the VM and uses a
+ * hardcoded policy. The cache has a maximum size of 185 entries, which are held
+ * by SoftReferences. A request will be satisfied from the cache if we last
+ * checked for an update within CHECK_INTERVAL (last 30 seconds). Otherwise,
+ * we open an URLConnection to download the Certificate(s)/CRL using an
+ * If-Modified-Since request (HTTP) if possible. Note that both positive and
+ * negative responses are cached, i.e. if we are unable to open the connection
+ * or the Certificate(s)/CRL cannot be parsed, we remember this result and
+ * additional calls during the CHECK_INTERVAL period do not try to open another
+ * connection.
+ * &lt;p&gt;
+ * The URICertStore is not currently a standard CertStore type. We should
+ * consider adding a standard &quot;URI&quot; CertStore type.
+ *
+ * @author Andreas Sterbenz
+ * @author Sean Mullan
+ * @since 7.0
+ */
+class URICertStore extends CertStoreSpi {
+
+<span class="nc" id="L91">    private static final Debug debug = Debug.getInstance(&quot;certpath&quot;);</span>
+
+    // interval between checks for update of cached Certificates/CRLs
+    // (30 seconds)
+    private final static int CHECK_INTERVAL = 30 * 1000;
+
+    // size of the cache (see Cache class for sizing recommendations)
+    private final static int CACHE_SIZE = 185;
+
+    // X.509 certificate factory instance
+    private final CertificateFactory factory;
+
+    // cached Collection of X509Certificates (may be empty, never null)
+<span class="nc" id="L104">    private Collection&lt;X509Certificate&gt; certs = Collections.emptySet();</span>
+
+    // cached X509CRL (may be null)
+    private X509CRL crl;
+
+    // time we last checked for an update
+    private long lastChecked;
+
+    // time server returned as last modified time stamp
+    // or 0 if not available
+    private long lastModified;
+
+    // the URI of this CertStore
+    private URI uri;
+
+    // true if URI is ldap
+<span class="nc" id="L120">    private boolean ldap = false;</span>
+    private CertStoreHelper ldapHelper;
+    private CertStore ldapCertStore;
+    private String ldapPath;
+
+    // Default maximum connect timeout in milliseconds (15 seconds)
+    // allowed when downloading CRLs
+    private static final int DEFAULT_CRL_CONNECT_TIMEOUT = 15000;
+
+    /**
+     * Integer value indicating the connect timeout, in seconds, to be
+     * used for the CRL download. A timeout of zero is interpreted as
+     * an infinite timeout.
+     */
+<span class="nc" id="L134">    private static final int CRL_CONNECT_TIMEOUT = initializeTimeout();</span>
+
+    /**
+     * Initialize the timeout length by getting the CRL timeout
+     * system property. If the property has not been set, or if its
+     * value is negative, set the timeout length to the default.
+     */
+    private static int initializeTimeout() {
+<span class="nc" id="L142">        Integer tmp = java.security.AccessController.doPrivileged(</span>
+                new GetIntegerAction(&quot;com.sun.security.crl.timeout&quot;));
+<span class="nc bnc" id="L144" title="All 4 branches missed.">        if (tmp == null || tmp &lt; 0) {</span>
+<span class="nc" id="L145">            return DEFAULT_CRL_CONNECT_TIMEOUT;</span>
+        }
+        // Convert to milliseconds, as the system property will be
+        // specified in seconds
+<span class="nc" id="L149">        return tmp * 1000;</span>
+    }
+
+    /**
+     * Creates a URICertStore.
+     *
+     * @param parameters specifying the URI
+     */
+    URICertStore(CertStoreParameters params)
+        throws InvalidAlgorithmParameterException, NoSuchAlgorithmException {
+<span class="nc" id="L159">        super(params);</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">        if (!(params instanceof URICertStoreParameters)) {</span>
+<span class="nc" id="L161">            throw new InvalidAlgorithmParameterException</span>
+                (&quot;params must be instanceof URICertStoreParameters&quot;);
+        }
+<span class="nc" id="L164">        this.uri = ((URICertStoreParameters) params).uri;</span>
+        // if ldap URI, use an LDAPCertStore to fetch certs and CRLs
+<span class="nc bnc" id="L166" title="All 2 branches missed.">        if (uri.getScheme().toLowerCase(Locale.ENGLISH).equals(&quot;ldap&quot;)) {</span>
+<span class="nc" id="L167">            ldap = true;</span>
+<span class="nc" id="L168">            ldapHelper = CertStoreHelper.getInstance(&quot;LDAP&quot;);</span>
+<span class="nc" id="L169">            ldapCertStore = ldapHelper.getCertStore(uri);</span>
+<span class="nc" id="L170">            ldapPath = uri.getPath();</span>
+            // strip off leading '/'
+<span class="nc bnc" id="L172" title="All 2 branches missed.">            if (ldapPath.charAt(0) == '/') {</span>
+<span class="nc" id="L173">                ldapPath = ldapPath.substring(1);</span>
+            }
+        }
+        try {
+<span class="nc" id="L177">            factory = CertificateFactory.getInstance(&quot;X.509&quot;);</span>
+<span class="nc" id="L178">        } catch (CertificateException e) {</span>
+<span class="nc" id="L179">            throw new RuntimeException();</span>
+<span class="nc" id="L180">        }</span>
+<span class="nc" id="L181">    }</span>
+
+    /**
+     * Returns a URI CertStore. This method consults a cache of
+     * CertStores (shared per JVM) using the URI as a key.
+     */
+    private static final Cache&lt;URICertStoreParameters, CertStore&gt;
+<span class="nc" id="L188">        certStoreCache = Cache.newSoftMemoryCache(CACHE_SIZE);</span>
+    static synchronized CertStore getInstance(URICertStoreParameters params)
+        throws NoSuchAlgorithmException, InvalidAlgorithmParameterException {
+<span class="nc bnc" id="L191" title="All 2 branches missed.">        if (debug != null) {</span>
+<span class="nc" id="L192">            debug.println(&quot;CertStore URI:&quot; + params.uri);</span>
+        }
+<span class="nc" id="L194">        CertStore ucs = certStoreCache.get(params);</span>
+<span class="nc bnc" id="L195" title="All 2 branches missed.">        if (ucs == null) {</span>
+<span class="nc" id="L196">            ucs = new UCS(new URICertStore(params), null, &quot;URI&quot;, params);</span>
+<span class="nc" id="L197">            certStoreCache.put(params, ucs);</span>
+        } else {
+<span class="nc bnc" id="L199" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L200">                debug.println(&quot;URICertStore.getInstance: cache hit&quot;);</span>
+            }
+        }
+<span class="nc" id="L203">        return ucs;</span>
+    }
+
+    /**
+     * Creates a CertStore from information included in the AccessDescription
+     * object of a certificate's Authority Information Access Extension.
+     */
+    static CertStore getInstance(AccessDescription ad) {
+<span class="nc bnc" id="L211" title="All 2 branches missed.">        if (!ad.getAccessMethod().equals((Object)</span>
+                AccessDescription.Ad_CAISSUERS_Id)) {
+<span class="nc" id="L213">            return null;</span>
+        }
+<span class="nc" id="L215">        GeneralNameInterface gn = ad.getAccessLocation().getName();</span>
+<span class="nc bnc" id="L216" title="All 2 branches missed.">        if (!(gn instanceof URIName)) {</span>
+<span class="nc" id="L217">            return null;</span>
+        }
+<span class="nc" id="L219">        URI uri = ((URIName) gn).getURI();</span>
+        try {
+<span class="nc" id="L221">            return URICertStore.getInstance</span>
+<span class="nc" id="L222">                (new URICertStore.URICertStoreParameters(uri));</span>
+<span class="nc" id="L223">        } catch (Exception ex) {</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L225">                debug.println(&quot;exception creating CertStore: &quot; + ex);</span>
+<span class="nc" id="L226">                ex.printStackTrace();</span>
+            }
+<span class="nc" id="L228">            return null;</span>
+        }
+    }
+
+    /**
+     * Returns a &lt;code&gt;Collection&lt;/code&gt; of &lt;code&gt;X509Certificate&lt;/code&gt;s that
+     * match the specified selector. If no &lt;code&gt;X509Certificate&lt;/code&gt;s
+     * match the selector, an empty &lt;code&gt;Collection&lt;/code&gt; will be returned.
+     *
+     * @param selector a &lt;code&gt;CertSelector&lt;/code&gt; used to select which
+     *  &lt;code&gt;X509Certificate&lt;/code&gt;s should be returned. Specify
+     *  &lt;code&gt;null&lt;/code&gt; to return all &lt;code&gt;X509Certificate&lt;/code&gt;s.
+     * @return a &lt;code&gt;Collection&lt;/code&gt; of &lt;code&gt;X509Certificate&lt;/code&gt;s that
+     *         match the specified selector
+     * @throws CertStoreException if an exception occurs
+     */
+    @Override
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public synchronized Collection&lt;X509Certificate&gt; engineGetCertificates
+        (CertSelector selector) throws CertStoreException {
+
+        // if ldap URI we wrap the CertSelector in an LDAPCertSelector to
+        // avoid LDAP DN matching issues (see LDAPCertSelector for more info)
+<span class="nc bnc" id="L251" title="All 2 branches missed.">        if (ldap) {</span>
+<span class="nc" id="L252">            X509CertSelector xsel = (X509CertSelector) selector;</span>
+            try {
+<span class="nc" id="L254">                xsel = ldapHelper.wrap(xsel, xsel.getSubject(), ldapPath);</span>
+<span class="nc" id="L255">            } catch (IOException ioe) {</span>
+<span class="nc" id="L256">                throw new CertStoreException(ioe);</span>
+<span class="nc" id="L257">            }</span>
+            // Fetch the certificates via LDAP. LDAPCertStore has its own
+            // caching mechanism, see the class description for more info.
+            // Safe cast since xsel is an X509 certificate selector.
+<span class="nc" id="L261">            return (Collection&lt;X509Certificate&gt;)</span>
+<span class="nc" id="L262">                ldapCertStore.getCertificates(xsel);</span>
+        }
+
+        // Return the Certificates for this entry. It returns the cached value
+        // if it is still current and fetches the Certificates otherwise.
+        // For the caching details, see the top of this class.
+<span class="nc" id="L268">        long time = System.currentTimeMillis();</span>
+<span class="nc bnc" id="L269" title="All 2 branches missed.">        if (time - lastChecked &lt; CHECK_INTERVAL) {</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L271">                debug.println(&quot;Returning certificates from cache&quot;);</span>
+            }
+<span class="nc" id="L273">            return getMatchingCerts(certs, selector);</span>
+        }
+<span class="nc" id="L275">        lastChecked = time;</span>
+        try {
+<span class="nc" id="L277">            URLConnection connection = uri.toURL().openConnection();</span>
+<span class="nc bnc" id="L278" title="All 2 branches missed.">            if (lastModified != 0) {</span>
+<span class="nc" id="L279">                connection.setIfModifiedSince(lastModified);</span>
+            }
+<span class="nc" id="L281">            long oldLastModified = lastModified;</span>
+<span class="nc" id="L282">            try (InputStream in = connection.getInputStream()) {</span>
+<span class="nc" id="L283">                lastModified = connection.getLastModified();</span>
+<span class="nc bnc" id="L284" title="All 2 branches missed.">                if (oldLastModified != 0) {</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">                    if (oldLastModified == lastModified) {</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">                        if (debug != null) {</span>
+<span class="nc" id="L287">                            debug.println(&quot;Not modified, using cached copy&quot;);</span>
+                        }
+<span class="nc" id="L289">                        return getMatchingCerts(certs, selector);</span>
+<span class="nc bnc" id="L290" title="All 2 branches missed.">                    } else if (connection instanceof HttpURLConnection) {</span>
+                        // some proxy servers omit last modified
+<span class="nc" id="L292">                        HttpURLConnection hconn = (HttpURLConnection)connection;</span>
+<span class="nc bnc" id="L293" title="All 2 branches missed.">                        if (hconn.getResponseCode()</span>
+                                    == HttpURLConnection.HTTP_NOT_MODIFIED) {
+<span class="nc bnc" id="L295" title="All 2 branches missed.">                            if (debug != null) {</span>
+<span class="nc" id="L296">                                debug.println(&quot;Not modified, using cached copy&quot;);</span>
+                            }
+<span class="nc" id="L298">                            return getMatchingCerts(certs, selector);</span>
+                        }
+                    }
+                }
+<span class="nc bnc" id="L302" title="All 2 branches missed.">                if (debug != null) {</span>
+<span class="nc" id="L303">                    debug.println(&quot;Downloading new certificates...&quot;);</span>
+                }
+                // Safe cast since factory is an X.509 certificate factory
+<span class="nc" id="L306">                certs = (Collection&lt;X509Certificate&gt;)</span>
+<span class="nc" id="L307">                    factory.generateCertificates(in);</span>
+<span class="nc bnc" id="L308" title="All 16 branches missed.">            }</span>
+<span class="nc" id="L309">            return getMatchingCerts(certs, selector);</span>
+<span class="nc" id="L310">        } catch (IOException | CertificateException e) {</span>
+<span class="nc bnc" id="L311" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L312">                debug.println(&quot;Exception fetching certificates:&quot;);</span>
+<span class="nc" id="L313">                e.printStackTrace();</span>
+            }
+        }
+        // exception, forget previous values
+<span class="nc" id="L317">        lastModified = 0;</span>
+<span class="nc" id="L318">        certs = Collections.emptySet();</span>
+<span class="nc" id="L319">        return certs;</span>
+    }
+
+    /**
+     * Iterates over the specified Collection of X509Certificates and
+     * returns only those that match the criteria specified in the
+     * CertSelector.
+     */
+    private static Collection&lt;X509Certificate&gt; getMatchingCerts
+        (Collection&lt;X509Certificate&gt; certs, CertSelector selector) {
+        // if selector not specified, all certs match
+<span class="nc bnc" id="L330" title="All 2 branches missed.">        if (selector == null) {</span>
+<span class="nc" id="L331">            return certs;</span>
+        }
+<span class="nc" id="L333">        List&lt;X509Certificate&gt; matchedCerts = new ArrayList&lt;&gt;(certs.size());</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">        for (X509Certificate cert : certs) {</span>
+<span class="nc bnc" id="L335" title="All 2 branches missed.">            if (selector.match(cert)) {</span>
+<span class="nc" id="L336">                matchedCerts.add(cert);</span>
+            }
+<span class="nc" id="L338">        }</span>
+<span class="nc" id="L339">        return matchedCerts;</span>
+    }
+
+    /**
+     * Returns a &lt;code&gt;Collection&lt;/code&gt; of &lt;code&gt;X509CRL&lt;/code&gt;s that
+     * match the specified selector. If no &lt;code&gt;X509CRL&lt;/code&gt;s
+     * match the selector, an empty &lt;code&gt;Collection&lt;/code&gt; will be returned.
+     *
+     * @param selector A &lt;code&gt;CRLSelector&lt;/code&gt; used to select which
+     *  &lt;code&gt;X509CRL&lt;/code&gt;s should be returned. Specify &lt;code&gt;null&lt;/code&gt;
+     *  to return all &lt;code&gt;X509CRL&lt;/code&gt;s.
+     * @return A &lt;code&gt;Collection&lt;/code&gt; of &lt;code&gt;X509CRL&lt;/code&gt;s that
+     *         match the specified selector
+     * @throws CertStoreException if an exception occurs
+     */
+    @Override
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public synchronized Collection&lt;X509CRL&gt; engineGetCRLs(CRLSelector selector)
+        throws CertStoreException {
+
+        // if ldap URI we wrap the CRLSelector in an LDAPCRLSelector to
+        // avoid LDAP DN matching issues (see LDAPCRLSelector for more info)
+<span class="nc bnc" id="L361" title="All 2 branches missed.">        if (ldap) {</span>
+<span class="nc" id="L362">            X509CRLSelector xsel = (X509CRLSelector) selector;</span>
+            try {
+<span class="nc" id="L364">                xsel = ldapHelper.wrap(xsel, null, ldapPath);</span>
+<span class="nc" id="L365">            } catch (IOException ioe) {</span>
+<span class="nc" id="L366">                throw new CertStoreException(ioe);</span>
+<span class="nc" id="L367">            }</span>
+            // Fetch the CRLs via LDAP. LDAPCertStore has its own
+            // caching mechanism, see the class description for more info.
+            // Safe cast since xsel is an X509 certificate selector.
+            try {
+<span class="nc" id="L372">                return (Collection&lt;X509CRL&gt;) ldapCertStore.getCRLs(xsel);</span>
+<span class="nc" id="L373">            } catch (CertStoreException cse) {</span>
+<span class="nc" id="L374">                throw new PKIX.CertStoreTypeException(&quot;LDAP&quot;, cse);</span>
+            }
+        }
+
+        // Return the CRLs for this entry. It returns the cached value
+        // if it is still current and fetches the CRLs otherwise.
+        // For the caching details, see the top of this class.
+<span class="nc" id="L381">        long time = System.currentTimeMillis();</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">        if (time - lastChecked &lt; CHECK_INTERVAL) {</span>
+<span class="nc bnc" id="L383" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L384">                debug.println(&quot;Returning CRL from cache&quot;);</span>
+            }
+<span class="nc" id="L386">            return getMatchingCRLs(crl, selector);</span>
+        }
+<span class="nc" id="L388">        lastChecked = time;</span>
+        try {
+<span class="nc" id="L390">            URLConnection connection = uri.toURL().openConnection();</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">            if (lastModified != 0) {</span>
+<span class="nc" id="L392">                connection.setIfModifiedSince(lastModified);</span>
+            }
+<span class="nc" id="L394">            long oldLastModified = lastModified;</span>
+<span class="nc" id="L395">            connection.setConnectTimeout(CRL_CONNECT_TIMEOUT);</span>
+<span class="nc" id="L396">            try (InputStream in = connection.getInputStream()) {</span>
+<span class="nc" id="L397">                lastModified = connection.getLastModified();</span>
+<span class="nc bnc" id="L398" title="All 2 branches missed.">                if (oldLastModified != 0) {</span>
+<span class="nc bnc" id="L399" title="All 2 branches missed.">                    if (oldLastModified == lastModified) {</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">                        if (debug != null) {</span>
+<span class="nc" id="L401">                            debug.println(&quot;Not modified, using cached copy&quot;);</span>
+                        }
+<span class="nc" id="L403">                        return getMatchingCRLs(crl, selector);</span>
+<span class="nc bnc" id="L404" title="All 2 branches missed.">                    } else if (connection instanceof HttpURLConnection) {</span>
+                        // some proxy servers omit last modified
+<span class="nc" id="L406">                        HttpURLConnection hconn = (HttpURLConnection)connection;</span>
+<span class="nc bnc" id="L407" title="All 2 branches missed.">                        if (hconn.getResponseCode()</span>
+                                    == HttpURLConnection.HTTP_NOT_MODIFIED) {
+<span class="nc bnc" id="L409" title="All 2 branches missed.">                            if (debug != null) {</span>
+<span class="nc" id="L410">                                debug.println(&quot;Not modified, using cached copy&quot;);</span>
+                            }
+<span class="nc" id="L412">                            return getMatchingCRLs(crl, selector);</span>
+                        }
+                    }
+                }
+<span class="nc bnc" id="L416" title="All 2 branches missed.">                if (debug != null) {</span>
+<span class="nc" id="L417">                    debug.println(&quot;Downloading new CRL...&quot;);</span>
+                }
+<span class="nc" id="L419">                crl = (X509CRL) factory.generateCRL(in);</span>
+<span class="nc bnc" id="L420" title="All 16 branches missed.">            }</span>
+<span class="nc" id="L421">            return getMatchingCRLs(crl, selector);</span>
+<span class="nc" id="L422">        } catch (IOException | CRLException e) {</span>
+<span class="nc bnc" id="L423" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L424">                debug.println(&quot;Exception fetching CRL:&quot;);</span>
+<span class="nc" id="L425">                e.printStackTrace();</span>
+            }
+            // exception, forget previous values
+<span class="nc" id="L428">            lastModified = 0;</span>
+<span class="nc" id="L429">            crl = null;</span>
+<span class="nc" id="L430">            throw new PKIX.CertStoreTypeException(&quot;URI&quot;,</span>
+                                                  new CertStoreException(e));
+        }
+    }
+
+    /**
+     * Checks if the specified X509CRL matches the criteria specified in the
+     * CRLSelector.
+     */
+    private static Collection&lt;X509CRL&gt; getMatchingCRLs
+        (X509CRL crl, CRLSelector selector) {
+<span class="nc bnc" id="L441" title="All 6 branches missed.">        if (selector == null || (crl != null &amp;&amp; selector.match(crl))) {</span>
+<span class="nc" id="L442">            return Collections.singletonList(crl);</span>
+        } else {
+<span class="nc" id="L444">            return Collections.emptyList();</span>
+        }
+    }
+
+    /**
+     * CertStoreParameters for the URICertStore.
+     */
+    static class URICertStoreParameters implements CertStoreParameters {
+        private final URI uri;
+<span class="nc" id="L453">        private volatile int hashCode = 0;</span>
+<span class="nc" id="L454">        URICertStoreParameters(URI uri) {</span>
+<span class="nc" id="L455">            this.uri = uri;</span>
+<span class="nc" id="L456">        }</span>
+        @Override public boolean equals(Object obj) {
+<span class="nc bnc" id="L458" title="All 2 branches missed.">            if (!(obj instanceof URICertStoreParameters)) {</span>
+<span class="nc" id="L459">                return false;</span>
+            }
+<span class="nc" id="L461">            URICertStoreParameters params = (URICertStoreParameters) obj;</span>
+<span class="nc" id="L462">            return uri.equals(params.uri);</span>
+        }
+        @Override public int hashCode() {
+<span class="nc bnc" id="L465" title="All 2 branches missed.">            if (hashCode == 0) {</span>
+<span class="nc" id="L466">                int result = 17;</span>
+<span class="nc" id="L467">                result = 37*result + uri.hashCode();</span>
+<span class="nc" id="L468">                hashCode = result;</span>
+            }
+<span class="nc" id="L470">            return hashCode;</span>
+        }
+        @Override public Object clone() {
+            try {
+<span class="nc" id="L474">                return super.clone();</span>
+<span class="nc" id="L475">            } catch (CloneNotSupportedException e) {</span>
+                /* Cannot happen */
+<span class="nc" id="L477">                throw new InternalError(e.toString(), e);</span>
+            }
+        }
+    }
+
+    /**
+     * This class allows the URICertStore to be accessed as a CertStore.
+     */
+    private static class UCS extends CertStore {
+        protected UCS(CertStoreSpi spi, Provider p, String type,
+            CertStoreParameters params) {
+<span class="nc" id="L488">            super(spi, p, type, params);</span>
+<span class="nc" id="L489">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

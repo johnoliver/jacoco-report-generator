@@ -1,0 +1,425 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ReflectionFactory.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.reflect</a> &gt; <span class="el_source">ReflectionFactory.java</span></div><h1>ReflectionFactory.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2001, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.reflect;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Executable;
+import java.lang.reflect.Method;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Modifier;
+import java.security.AccessController;
+import java.security.Permission;
+import java.security.PrivilegedAction;
+import sun.reflect.misc.ReflectUtil;
+
+/** &lt;P&gt; The master factory for all reflective objects, both those in
+    java.lang.reflect (Fields, Methods, Constructors) as well as their
+    delegates (FieldAccessors, MethodAccessors, ConstructorAccessors).
+    &lt;/P&gt;
+
+    &lt;P&gt; The methods in this class are extremely unsafe and can cause
+    subversion of both the language and the verifier. For this reason,
+    they are all instance methods, and access to the constructor of
+    this factory is guarded by a security check, in similar style to
+    {@link sun.misc.Unsafe}. &lt;/P&gt;
+*/
+
+public class ReflectionFactory {
+
+<span class="fc" id="L52">    private static boolean initted = false;</span>
+<span class="fc" id="L53">    private static Permission reflectionFactoryAccessPerm</span>
+        = new RuntimePermission(&quot;reflectionFactoryAccess&quot;);
+<span class="fc" id="L55">    private static ReflectionFactory soleInstance = new ReflectionFactory();</span>
+    // Provides access to package-private mechanisms in java.lang.reflect
+    private static volatile LangReflectAccess langReflectAccess;
+
+    //
+    // &quot;Inflation&quot; mechanism. Loading bytecodes to implement
+    // Method.invoke() and Constructor.newInstance() currently costs
+    // 3-4x more than an invocation via native code for the first
+    // invocation (though subsequent invocations have been benchmarked
+    // to be over 20x faster). Unfortunately this cost increases
+    // startup time for certain applications that use reflection
+    // intensively (but only once per class) to bootstrap themselves.
+    // To avoid this penalty we reuse the existing JVM entry points
+    // for the first few invocations of Methods and Constructors and
+    // then switch to the bytecode-based implementations.
+    //
+    // Package-private to be accessible to NativeMethodAccessorImpl
+    // and NativeConstructorAccessorImpl
+<span class="fc" id="L73">    private static boolean noInflation        = false;</span>
+<span class="fc" id="L74">    private static int     inflationThreshold = 15;</span>
+
+<span class="fc" id="L76">    private ReflectionFactory() {</span>
+<span class="fc" id="L77">    }</span>
+
+    /**
+     * A convenience class for acquiring the capability to instantiate
+     * reflective objects.  Use this instead of a raw call to {@link
+     * #getReflectionFactory} in order to avoid being limited by the
+     * permissions of your callers.
+     *
+     * &lt;p&gt;An instance of this class can be used as the argument of
+     * &lt;code&gt;AccessController.doPrivileged&lt;/code&gt;.
+     */
+<span class="fc" id="L88">    public static final class GetReflectionFactoryAction</span>
+        implements PrivilegedAction&lt;ReflectionFactory&gt; {
+        public ReflectionFactory run() {
+<span class="fc" id="L91">            return getReflectionFactory();</span>
+        }
+    }
+
+    /**
+     * Provides the caller with the capability to instantiate reflective
+     * objects.
+     *
+     * &lt;p&gt; First, if there is a security manager, its
+     * &lt;code&gt;checkPermission&lt;/code&gt; method is called with a {@link
+     * java.lang.RuntimePermission} with target
+     * &lt;code&gt;&quot;reflectionFactoryAccess&quot;&lt;/code&gt;.  This may result in a
+     * security exception.
+     *
+     * &lt;p&gt; The returned &lt;code&gt;ReflectionFactory&lt;/code&gt; object should be
+     * carefully guarded by the caller, since it can be used to read and
+     * write private data and invoke private methods, as well as to load
+     * unverified bytecodes.  It must never be passed to untrusted code.
+     *
+     * @exception SecurityException if a security manager exists and its
+     *             &lt;code&gt;checkPermission&lt;/code&gt; method doesn't allow
+     *             access to the RuntimePermission &quot;reflectionFactoryAccess&quot;.  */
+    public static ReflectionFactory getReflectionFactory() {
+<span class="fc" id="L114">        SecurityManager security = System.getSecurityManager();</span>
+<span class="fc bfc" id="L115" title="All 2 branches covered.">        if (security != null) {</span>
+            // TO DO: security.checkReflectionFactoryAccess();
+<span class="fc" id="L117">            security.checkPermission(reflectionFactoryAccessPerm);</span>
+        }
+<span class="fc" id="L119">        return soleInstance;</span>
+    }
+
+    //--------------------------------------------------------------------------
+    //
+    // Routines used by java.lang.reflect
+    //
+    //
+
+    /** Called only by java.lang.reflect.Modifier's static initializer */
+    public void setLangReflectAccess(LangReflectAccess access) {
+<span class="fc" id="L130">        langReflectAccess = access;</span>
+<span class="fc" id="L131">    }</span>
+
+    /**
+     * Note: this routine can cause the declaring class for the field
+     * be initialized and therefore must not be called until the
+     * first get/set of this field.
+     * @param field the field
+     * @param override true if caller has overridden aaccessibility
+     */
+    public FieldAccessor newFieldAccessor(Field field, boolean override) {
+<span class="fc" id="L141">        checkInitted();</span>
+<span class="fc" id="L142">        return UnsafeFieldAccessorFactory.newFieldAccessor(field, override);</span>
+    }
+
+    public MethodAccessor newMethodAccessor(Method method) {
+<span class="fc" id="L146">        checkInitted();</span>
+
+<span class="fc bfc" id="L148" title="All 4 branches covered.">        if (noInflation &amp;&amp; !ReflectUtil.isVMAnonymousClass(method.getDeclaringClass())) {</span>
+<span class="fc" id="L149">            return new MethodAccessorGenerator().</span>
+<span class="fc" id="L150">                generateMethod(method.getDeclaringClass(),</span>
+<span class="fc" id="L151">                               method.getName(),</span>
+<span class="fc" id="L152">                               method.getParameterTypes(),</span>
+<span class="fc" id="L153">                               method.getReturnType(),</span>
+<span class="fc" id="L154">                               method.getExceptionTypes(),</span>
+<span class="fc" id="L155">                               method.getModifiers());</span>
+        } else {
+<span class="fc" id="L157">            NativeMethodAccessorImpl acc =</span>
+                new NativeMethodAccessorImpl(method);
+<span class="fc" id="L159">            DelegatingMethodAccessorImpl res =</span>
+                new DelegatingMethodAccessorImpl(acc);
+<span class="fc" id="L161">            acc.setParent(res);</span>
+<span class="fc" id="L162">            return res;</span>
+        }
+    }
+
+    public ConstructorAccessor newConstructorAccessor(Constructor&lt;?&gt; c) {
+<span class="fc" id="L167">        checkInitted();</span>
+
+<span class="fc" id="L169">        Class&lt;?&gt; declaringClass = c.getDeclaringClass();</span>
+<span class="fc bfc" id="L170" title="All 2 branches covered.">        if (Modifier.isAbstract(declaringClass.getModifiers())) {</span>
+<span class="fc" id="L171">            return new InstantiationExceptionConstructorAccessorImpl(null);</span>
+        }
+<span class="pc bpc" id="L173" title="1 of 2 branches missed.">        if (declaringClass == Class.class) {</span>
+<span class="nc" id="L174">            return new InstantiationExceptionConstructorAccessorImpl</span>
+                (&quot;Can not instantiate java.lang.Class&quot;);
+        }
+        // Bootstrapping issue: since we use Class.newInstance() in
+        // the ConstructorAccessor generation process, we have to
+        // break the cycle here.
+<span class="fc bfc" id="L180" title="All 2 branches covered.">        if (Reflection.isSubclassOf(declaringClass,</span>
+                                    ConstructorAccessorImpl.class)) {
+<span class="fc" id="L182">            return new BootstrapConstructorAccessorImpl(c);</span>
+        }
+
+<span class="fc bfc" id="L185" title="All 4 branches covered.">        if (noInflation &amp;&amp; !ReflectUtil.isVMAnonymousClass(c.getDeclaringClass())) {</span>
+<span class="fc" id="L186">            return new MethodAccessorGenerator().</span>
+<span class="fc" id="L187">                generateConstructor(c.getDeclaringClass(),</span>
+<span class="fc" id="L188">                                    c.getParameterTypes(),</span>
+<span class="fc" id="L189">                                    c.getExceptionTypes(),</span>
+<span class="fc" id="L190">                                    c.getModifiers());</span>
+        } else {
+<span class="fc" id="L192">            NativeConstructorAccessorImpl acc =</span>
+                new NativeConstructorAccessorImpl(c);
+<span class="fc" id="L194">            DelegatingConstructorAccessorImpl res =</span>
+                new DelegatingConstructorAccessorImpl(acc);
+<span class="fc" id="L196">            acc.setParent(res);</span>
+<span class="fc" id="L197">            return res;</span>
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    //
+    // Routines used by java.lang
+    //
+    //
+
+    /** Creates a new java.lang.reflect.Field. Access checks as per
+        java.lang.reflect.AccessibleObject are not overridden. */
+    public Field newField(Class&lt;?&gt; declaringClass,
+                          String name,
+                          Class&lt;?&gt; type,
+                          int modifiers,
+                          int slot,
+                          String signature,
+                          byte[] annotations)
+    {
+<span class="nc" id="L217">        return langReflectAccess().newField(declaringClass,</span>
+                                            name,
+                                            type,
+                                            modifiers,
+                                            slot,
+                                            signature,
+                                            annotations);
+    }
+
+    /** Creates a new java.lang.reflect.Method. Access checks as per
+        java.lang.reflect.AccessibleObject are not overridden. */
+    public Method newMethod(Class&lt;?&gt; declaringClass,
+                            String name,
+                            Class&lt;?&gt;[] parameterTypes,
+                            Class&lt;?&gt; returnType,
+                            Class&lt;?&gt;[] checkedExceptions,
+                            int modifiers,
+                            int slot,
+                            String signature,
+                            byte[] annotations,
+                            byte[] parameterAnnotations,
+                            byte[] annotationDefault)
+    {
+<span class="nc" id="L240">        return langReflectAccess().newMethod(declaringClass,</span>
+                                             name,
+                                             parameterTypes,
+                                             returnType,
+                                             checkedExceptions,
+                                             modifiers,
+                                             slot,
+                                             signature,
+                                             annotations,
+                                             parameterAnnotations,
+                                             annotationDefault);
+    }
+
+    /** Creates a new java.lang.reflect.Constructor. Access checks as
+        per java.lang.reflect.AccessibleObject are not overridden. */
+    public Constructor&lt;?&gt; newConstructor(Class&lt;?&gt; declaringClass,
+                                         Class&lt;?&gt;[] parameterTypes,
+                                         Class&lt;?&gt;[] checkedExceptions,
+                                         int modifiers,
+                                         int slot,
+                                         String signature,
+                                         byte[] annotations,
+                                         byte[] parameterAnnotations)
+    {
+<span class="fc" id="L264">        return langReflectAccess().newConstructor(declaringClass,</span>
+                                                  parameterTypes,
+                                                  checkedExceptions,
+                                                  modifiers,
+                                                  slot,
+                                                  signature,
+                                                  annotations,
+                                                  parameterAnnotations);
+    }
+
+    /** Gets the MethodAccessor object for a java.lang.reflect.Method */
+    public MethodAccessor getMethodAccessor(Method m) {
+<span class="nc" id="L276">        return langReflectAccess().getMethodAccessor(m);</span>
+    }
+
+    /** Sets the MethodAccessor object for a java.lang.reflect.Method */
+    public void setMethodAccessor(Method m, MethodAccessor accessor) {
+<span class="nc" id="L281">        langReflectAccess().setMethodAccessor(m, accessor);</span>
+<span class="nc" id="L282">    }</span>
+
+    /** Gets the ConstructorAccessor object for a
+        java.lang.reflect.Constructor */
+    public ConstructorAccessor getConstructorAccessor(Constructor&lt;?&gt; c) {
+<span class="nc" id="L287">        return langReflectAccess().getConstructorAccessor(c);</span>
+    }
+
+    /** Sets the ConstructorAccessor object for a
+        java.lang.reflect.Constructor */
+    public void setConstructorAccessor(Constructor&lt;?&gt; c,
+                                       ConstructorAccessor accessor)
+    {
+<span class="fc" id="L295">        langReflectAccess().setConstructorAccessor(c, accessor);</span>
+<span class="fc" id="L296">    }</span>
+
+    /** Makes a copy of the passed method. The returned method is a
+        &quot;child&quot; of the passed one; see the comments in Method.java for
+        details. */
+    public Method copyMethod(Method arg) {
+<span class="fc" id="L302">        return langReflectAccess().copyMethod(arg);</span>
+    }
+
+    /** Makes a copy of the passed field. The returned field is a
+        &quot;child&quot; of the passed one; see the comments in Field.java for
+        details. */
+    public Field copyField(Field arg) {
+<span class="fc" id="L309">        return langReflectAccess().copyField(arg);</span>
+    }
+
+    /** Makes a copy of the passed constructor. The returned
+        constructor is a &quot;child&quot; of the passed one; see the comments
+        in Constructor.java for details. */
+    public &lt;T&gt; Constructor&lt;T&gt; copyConstructor(Constructor&lt;T&gt; arg) {
+<span class="fc" id="L316">        return langReflectAccess().copyConstructor(arg);</span>
+    }
+
+    /** Gets the byte[] that encodes TypeAnnotations on an executable.
+     */
+    public byte[] getExecutableTypeAnnotationBytes(Executable ex) {
+<span class="fc" id="L322">        return langReflectAccess().getExecutableTypeAnnotationBytes(ex);</span>
+    }
+
+    //--------------------------------------------------------------------------
+    //
+    // Routines used by serialization
+    //
+    //
+
+    public Constructor&lt;?&gt; newConstructorForSerialization
+        (Class&lt;?&gt; classToInstantiate, Constructor&lt;?&gt; constructorToCall)
+    {
+        // Fast path
+<span class="pc bpc" id="L335" title="1 of 2 branches missed.">        if (constructorToCall.getDeclaringClass() == classToInstantiate) {</span>
+<span class="nc" id="L336">            return constructorToCall;</span>
+        }
+
+<span class="fc" id="L339">        ConstructorAccessor acc = new MethodAccessorGenerator().</span>
+<span class="fc" id="L340">            generateSerializationConstructor(classToInstantiate,</span>
+<span class="fc" id="L341">                                             constructorToCall.getParameterTypes(),</span>
+<span class="fc" id="L342">                                             constructorToCall.getExceptionTypes(),</span>
+<span class="fc" id="L343">                                             constructorToCall.getModifiers(),</span>
+<span class="fc" id="L344">                                             constructorToCall.getDeclaringClass());</span>
+<span class="fc" id="L345">        Constructor&lt;?&gt; c = newConstructor(constructorToCall.getDeclaringClass(),</span>
+<span class="fc" id="L346">                                          constructorToCall.getParameterTypes(),</span>
+<span class="fc" id="L347">                                          constructorToCall.getExceptionTypes(),</span>
+<span class="fc" id="L348">                                          constructorToCall.getModifiers(),</span>
+<span class="fc" id="L349">                                          langReflectAccess().</span>
+<span class="fc" id="L350">                                          getConstructorSlot(constructorToCall),</span>
+<span class="fc" id="L351">                                          langReflectAccess().</span>
+<span class="fc" id="L352">                                          getConstructorSignature(constructorToCall),</span>
+<span class="fc" id="L353">                                          langReflectAccess().</span>
+<span class="fc" id="L354">                                          getConstructorAnnotations(constructorToCall),</span>
+<span class="fc" id="L355">                                          langReflectAccess().</span>
+<span class="fc" id="L356">                                          getConstructorParameterAnnotations(constructorToCall));</span>
+<span class="fc" id="L357">        setConstructorAccessor(c, acc);</span>
+<span class="fc" id="L358">        return c;</span>
+    }
+
+    //--------------------------------------------------------------------------
+    //
+    // Internals only below this point
+    //
+
+    static int inflationThreshold() {
+<span class="fc" id="L367">        return inflationThreshold;</span>
+    }
+
+    /** We have to defer full initialization of this class until after
+        the static initializer is run since java.lang.reflect.Method's
+        static initializer (more properly, that for
+        java.lang.reflect.AccessibleObject) causes this class's to be
+        run, before the system properties are set up. */
+    private static void checkInitted() {
+<span class="fc bfc" id="L376" title="All 2 branches covered.">        if (initted) return;</span>
+<span class="fc" id="L377">        AccessController.doPrivileged(</span>
+<span class="fc" id="L378">            new PrivilegedAction&lt;Void&gt;() {</span>
+                public Void run() {
+                    // Tests to ensure the system properties table is fully
+                    // initialized. This is needed because reflection code is
+                    // called very early in the initialization process (before
+                    // command-line arguments have been parsed and therefore
+                    // these user-settable properties installed.) We assume that
+                    // if System.out is non-null then the System class has been
+                    // fully initialized and that the bulk of the startup code
+                    // has been run.
+
+<span class="fc bfc" id="L389" title="All 2 branches covered.">                    if (System.out == null) {</span>
+                        // java.lang.System not yet fully initialized
+<span class="fc" id="L391">                        return null;</span>
+                    }
+
+<span class="fc" id="L394">                    String val = System.getProperty(&quot;sun.reflect.noInflation&quot;);</span>
+<span class="pc bpc" id="L395" title="1 of 4 branches missed.">                    if (val != null &amp;&amp; val.equals(&quot;true&quot;)) {</span>
+<span class="fc" id="L396">                        noInflation = true;</span>
+                    }
+
+<span class="fc" id="L399">                    val = System.getProperty(&quot;sun.reflect.inflationThreshold&quot;);</span>
+<span class="pc bpc" id="L400" title="1 of 2 branches missed.">                    if (val != null) {</span>
+                        try {
+<span class="nc" id="L402">                            inflationThreshold = Integer.parseInt(val);</span>
+<span class="nc" id="L403">                        } catch (NumberFormatException e) {</span>
+<span class="nc" id="L404">                            throw new RuntimeException(&quot;Unable to parse property sun.reflect.inflationThreshold&quot;, e);</span>
+<span class="nc" id="L405">                        }</span>
+                    }
+
+<span class="fc" id="L408">                    initted = true;</span>
+<span class="fc" id="L409">                    return null;</span>
+                }
+            });
+<span class="fc" id="L412">    }</span>
+
+    private static LangReflectAccess langReflectAccess() {
+<span class="fc bfc" id="L415" title="All 2 branches covered.">        if (langReflectAccess == null) {</span>
+            // Call a static method to get class java.lang.reflect.Modifier
+            // initialized. Its static initializer will cause
+            // setLangReflectAccess() to be called from the context of the
+            // java.lang.reflect package.
+<span class="fc" id="L420">            Modifier.isPublic(Modifier.PUBLIC);</span>
+        }
+<span class="fc" id="L422">        return langReflectAccess;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

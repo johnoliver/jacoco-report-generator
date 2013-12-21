@@ -1,0 +1,1443 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>VirtualMachineImpl.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">com.sun.tools.jdi</a> &gt; <span class="el_source">VirtualMachineImpl.java</span></div><h1>VirtualMachineImpl.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1998, 2011, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package com.sun.tools.jdi;
+
+import com.sun.jdi.*;
+import com.sun.jdi.connect.spi.Connection;
+import com.sun.jdi.request.EventRequestManager;
+import com.sun.jdi.request.EventRequest;
+import com.sun.jdi.request.BreakpointRequest;
+import com.sun.jdi.event.EventQueue;
+
+import java.util.*;
+import java.text.MessageFormat;
+import java.lang.ref.ReferenceQueue;
+import java.lang.ref.Reference;
+import java.lang.ref.SoftReference;
+import java.lang.ref.WeakReference;
+
+class VirtualMachineImpl extends MirrorImpl
+             implements PathSearchingVirtualMachine, ThreadListener {
+    // VM Level exported variables, these
+    // are unique to a given vm
+    public final int sizeofFieldRef;
+    public final int sizeofMethodRef;
+    public final int sizeofObjectRef;
+    public final int sizeofClassRef;
+    public final int sizeofFrameRef;
+
+    final int sequenceNumber;
+
+    private final TargetVM target;
+    private final EventQueueImpl eventQueue;
+    private final EventRequestManagerImpl internalEventRequestManager;
+    private final EventRequestManagerImpl eventRequestManager;
+    final VirtualMachineManagerImpl vmManager;
+    private final ThreadGroup threadGroupForJDI;
+
+    // Allow direct access to this field so that that tracing code slows down
+    // JDI as little as possible when not enabled.
+<span class="nc" id="L63">    int traceFlags = TRACE_NONE;</span>
+
+<span class="nc" id="L65">    static int TRACE_RAW_SENDS     = 0x01000000;</span>
+<span class="nc" id="L66">    static int TRACE_RAW_RECEIVES  = 0x02000000;</span>
+
+<span class="nc" id="L68">    boolean traceReceives = false;   // pre-compute because of frequency</span>
+
+    // ReferenceType access - updated with class prepare and unload events
+    // Protected by &quot;synchronized(this)&quot;. &quot;retrievedAllTypes&quot; may be
+    // tested unsynchronized (since once true, it stays true), but must
+    // be set synchronously
+    private Map&lt;Long, ReferenceType&gt; typesByID;
+    private TreeSet&lt;ReferenceType&gt; typesBySignature;
+<span class="nc" id="L76">    private boolean retrievedAllTypes = false;</span>
+
+    // For other languages support
+<span class="nc" id="L79">    private String defaultStratum = null;</span>
+
+    // ObjectReference cache
+    // &quot;objectsByID&quot; protected by &quot;synchronized(this)&quot;.
+<span class="nc" id="L83">    private final Map&lt;Long, SoftObjectReference&gt; objectsByID = new HashMap&lt;Long, SoftObjectReference&gt;();</span>
+<span class="nc" id="L84">    private final ReferenceQueue&lt;ObjectReferenceImpl&gt; referenceQueue = new ReferenceQueue&lt;ObjectReferenceImpl&gt;();</span>
+    static private final int DISPOSE_THRESHOLD = 50;
+<span class="nc" id="L86">    private final List&lt;SoftObjectReference&gt; batchedDisposeRequests =</span>
+<span class="nc" id="L87">            Collections.synchronizedList(new ArrayList&lt;SoftObjectReference&gt;(DISPOSE_THRESHOLD + 10));</span>
+
+    // These are cached once for the life of the VM
+    private JDWP.VirtualMachine.Version versionInfo;
+    private JDWP.VirtualMachine.ClassPaths pathInfo;
+<span class="nc" id="L92">    private JDWP.VirtualMachine.Capabilities capabilities = null;</span>
+<span class="nc" id="L93">    private JDWP.VirtualMachine.CapabilitiesNew capabilitiesNew = null;</span>
+
+    // Per-vm singletons for primitive types and for void.
+    // singleton-ness protected by &quot;synchronized(this)&quot;.
+    private BooleanType theBooleanType;
+    private ByteType    theByteType;
+    private CharType    theCharType;
+    private ShortType   theShortType;
+    private IntegerType theIntegerType;
+    private LongType    theLongType;
+    private FloatType   theFloatType;
+    private DoubleType  theDoubleType;
+
+    private VoidType    theVoidType;
+
+    private VoidValue voidVal;
+
+    // Launched debuggee process
+    private Process process;
+
+    // coordinates state changes and corresponding listener notifications
+<span class="nc" id="L114">    private VMState state = new VMState(this);</span>
+
+<span class="nc" id="L116">    private Object initMonitor = new Object();</span>
+<span class="nc" id="L117">    private boolean initComplete = false;</span>
+<span class="nc" id="L118">    private boolean shutdown = false;</span>
+
+    private void notifyInitCompletion() {
+<span class="nc" id="L121">        synchronized(initMonitor) {</span>
+<span class="nc" id="L122">            initComplete = true;</span>
+<span class="nc" id="L123">            initMonitor.notifyAll();</span>
+<span class="nc" id="L124">        }</span>
+<span class="nc" id="L125">    }</span>
+
+    void waitInitCompletion() {
+<span class="nc" id="L128">        synchronized(initMonitor) {</span>
+<span class="nc bnc" id="L129" title="All 2 branches missed.">            while (!initComplete) {</span>
+                try {
+<span class="nc" id="L131">                    initMonitor.wait();</span>
+<span class="nc" id="L132">                } catch (InterruptedException e) {</span>
+                    // ignore
+<span class="nc" id="L134">                }</span>
+            }
+<span class="nc" id="L136">        }</span>
+<span class="nc" id="L137">    }</span>
+
+    VMState state() {
+<span class="nc" id="L140">        return state;</span>
+    }
+
+    /*
+     * ThreadListener implementation
+     */
+    public boolean threadResumable(ThreadAction action) {
+        /*
+         * If any thread is resumed, the VM is considered not suspended.
+         * Just one thread is being resumed so pass it to thaw.
+         */
+<span class="nc" id="L151">        state.thaw(action.thread());</span>
+<span class="nc" id="L152">        return true;</span>
+    }
+
+    VirtualMachineImpl(VirtualMachineManager manager,
+                       Connection connection, Process process,
+                       int sequenceNumber) {
+<span class="nc" id="L158">        super(null);  // Can't use super(this)</span>
+<span class="nc" id="L159">        vm = this;</span>
+
+<span class="nc" id="L161">        this.vmManager = (VirtualMachineManagerImpl)manager;</span>
+<span class="nc" id="L162">        this.process = process;</span>
+<span class="nc" id="L163">        this.sequenceNumber = sequenceNumber;</span>
+
+        /* Create ThreadGroup to be used by all threads servicing
+         * this VM.
+         */
+<span class="nc" id="L168">        threadGroupForJDI = new ThreadGroup(vmManager.mainGroupForJDI(),</span>
+                                            &quot;JDI [&quot; +
+<span class="nc" id="L170">                                            this.hashCode() + &quot;]&quot;);</span>
+
+        /*
+         * Set up a thread to communicate with the target VM over
+         * the specified transport.
+         */
+<span class="nc" id="L176">        target = new TargetVM(this, connection);</span>
+
+        /*
+         * Set up a thread to handle events processed internally
+         * the JDI implementation.
+         */
+<span class="nc" id="L182">        EventQueueImpl internalEventQueue = new EventQueueImpl(this, target);</span>
+<span class="nc" id="L183">        new InternalEventHandler(this, internalEventQueue);</span>
+        /*
+         * Initialize client access to event setting and handling
+         */
+<span class="nc" id="L187">        eventQueue = new EventQueueImpl(this, target);</span>
+<span class="nc" id="L188">        eventRequestManager = new EventRequestManagerImpl(this);</span>
+
+<span class="nc" id="L190">        target.start();</span>
+
+        /*
+         * Many ids are variably sized, depending on target VM.
+         * Find out the sizes right away.
+         */
+        JDWP.VirtualMachine.IDSizes idSizes;
+        try {
+<span class="nc" id="L198">            idSizes = JDWP.VirtualMachine.IDSizes.process(vm);</span>
+<span class="nc" id="L199">        } catch (JDWPException exc) {</span>
+<span class="nc" id="L200">            throw exc.toJDIException();</span>
+<span class="nc" id="L201">        }</span>
+<span class="nc" id="L202">        sizeofFieldRef  = idSizes.fieldIDSize;</span>
+<span class="nc" id="L203">        sizeofMethodRef = idSizes.methodIDSize;</span>
+<span class="nc" id="L204">        sizeofObjectRef = idSizes.objectIDSize;</span>
+<span class="nc" id="L205">        sizeofClassRef = idSizes.referenceTypeIDSize;</span>
+<span class="nc" id="L206">        sizeofFrameRef  = idSizes.frameIDSize;</span>
+
+        /**
+         * Set up requests needed by internal event handler.
+         * Make sure they are distinguished by creating them with
+         * an internal event request manager.
+         *
+         * Warning: create events only with SUSPEND_NONE policy.
+         * In the current implementation other policies will not
+         * be handled correctly when the event comes in. (notfiySuspend()
+         * will not be properly called, and if the event is combined
+         * with external events in the same set, suspend policy is not
+         * correctly determined for the internal vs. external event sets)
+         */
+<span class="nc" id="L220">        internalEventRequestManager = new EventRequestManagerImpl(this);</span>
+<span class="nc" id="L221">        EventRequest er = internalEventRequestManager.createClassPrepareRequest();</span>
+<span class="nc" id="L222">        er.setSuspendPolicy(EventRequest.SUSPEND_NONE);</span>
+<span class="nc" id="L223">        er.enable();</span>
+<span class="nc" id="L224">        er = internalEventRequestManager.createClassUnloadRequest();</span>
+<span class="nc" id="L225">        er.setSuspendPolicy(EventRequest.SUSPEND_NONE);</span>
+<span class="nc" id="L226">        er.enable();</span>
+
+        /*
+         * Tell other threads, notably TargetVM, that initialization
+         * is complete.
+         */
+<span class="nc" id="L232">        notifyInitCompletion();</span>
+<span class="nc" id="L233">    }</span>
+
+    EventRequestManagerImpl getInternalEventRequestManager() {
+<span class="nc" id="L236">        return internalEventRequestManager;</span>
+    }
+
+    void validateVM() {
+        /*
+         * We no longer need to do this.  The spec now says
+         * that a VMDisconnected _may_ be thrown in these
+         * cases, not that it _will_ be thrown.
+         * So, to simplify things we will just let the
+         * caller's of this method proceed with their business.
+         * If the debuggee is disconnected, either because it
+         * crashed or finished or something, or because the
+         * debugger called exit() or dispose(), then if
+         * we end up trying to communicate with the debuggee,
+         * code in TargetVM will throw a VMDisconnectedException.
+         * This means that if we can satisfy a request without
+         * talking to the debuggee, (eg, with cached data) then
+         * VMDisconnectedException will _not_ be thrown.
+         * if (shutdown) {
+         *    throw new VMDisconnectedException();
+         * }
+         */
+<span class="nc" id="L258">    }</span>
+
+    public boolean equals(Object obj) {
+<span class="nc bnc" id="L261" title="All 2 branches missed.">        return this == obj;</span>
+    }
+
+    public int hashCode() {
+<span class="nc" id="L265">        return System.identityHashCode(this);</span>
+    }
+
+    public List&lt;ReferenceType&gt; classesByName(String className) {
+<span class="nc" id="L269">        validateVM();</span>
+<span class="nc" id="L270">        String signature = JNITypeParser.typeNameToSignature(className);</span>
+        List&lt;ReferenceType&gt; list;
+<span class="nc bnc" id="L272" title="All 2 branches missed.">        if (retrievedAllTypes) {</span>
+<span class="nc" id="L273">           list = findReferenceTypes(signature);</span>
+        } else {
+<span class="nc" id="L275">           list = retrieveClassesBySignature(signature);</span>
+        }
+<span class="nc" id="L277">        return Collections.unmodifiableList(list);</span>
+    }
+
+    public List&lt;ReferenceType&gt; allClasses() {
+<span class="nc" id="L281">        validateVM();</span>
+
+<span class="nc bnc" id="L283" title="All 2 branches missed.">        if (!retrievedAllTypes) {</span>
+<span class="nc" id="L284">            retrieveAllClasses();</span>
+        }
+        ArrayList&lt;ReferenceType&gt; a;
+<span class="nc" id="L287">        synchronized (this) {</span>
+<span class="nc" id="L288">            a = new ArrayList&lt;ReferenceType&gt;(typesBySignature);</span>
+<span class="nc" id="L289">        }</span>
+<span class="nc" id="L290">        return Collections.unmodifiableList(a);</span>
+    }
+
+    public void
+        redefineClasses(Map&lt;? extends ReferenceType,byte[]&gt; classToBytes)
+    {
+<span class="nc" id="L296">        int cnt = classToBytes.size();</span>
+<span class="nc" id="L297">        JDWP.VirtualMachine.RedefineClasses.ClassDef[] defs =</span>
+            new JDWP.VirtualMachine.RedefineClasses.ClassDef[cnt];
+<span class="nc" id="L299">        validateVM();</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">        if (!canRedefineClasses()) {</span>
+<span class="nc" id="L301">            throw new UnsupportedOperationException();</span>
+        }
+<span class="nc" id="L303">        Iterator&lt;?&gt; it = classToBytes.entrySet().iterator();</span>
+<span class="nc bnc" id="L304" title="All 2 branches missed.">        for (int i = 0; it.hasNext(); i++) {</span>
+<span class="nc" id="L305">            Map.Entry&lt;?,?&gt; entry = (Map.Entry)it.next();</span>
+<span class="nc" id="L306">            ReferenceTypeImpl refType = (ReferenceTypeImpl)entry.getKey();</span>
+<span class="nc" id="L307">            validateMirror(refType);</span>
+<span class="nc" id="L308">            defs[i] = new JDWP.VirtualMachine.RedefineClasses</span>
+<span class="nc" id="L309">                       .ClassDef(refType, (byte[])entry.getValue());</span>
+        }
+
+        // flush caches and disable caching until the next suspend
+<span class="nc" id="L313">        vm.state().thaw();</span>
+
+        try {
+<span class="nc" id="L316">            JDWP.VirtualMachine.RedefineClasses.</span>
+<span class="nc" id="L317">                process(vm, defs);</span>
+<span class="nc" id="L318">        } catch (JDWPException exc) {</span>
+<span class="nc bnc" id="L319" title="All 12 branches missed.">            switch (exc.errorCode()) {</span>
+            case JDWP.Error.INVALID_CLASS_FORMAT :
+<span class="nc" id="L321">                throw new ClassFormatError(</span>
+                        &quot;class not in class file format&quot;);
+            case JDWP.Error.CIRCULAR_CLASS_DEFINITION :
+<span class="nc" id="L324">                throw new ClassCircularityError(</span>
+       &quot;circularity has been detected while initializing a class&quot;);
+            case JDWP.Error.FAILS_VERIFICATION :
+<span class="nc" id="L327">                throw new VerifyError(</span>
+   &quot;verifier detected internal inconsistency or security problem&quot;);
+            case JDWP.Error.UNSUPPORTED_VERSION :
+<span class="nc" id="L330">                throw new UnsupportedClassVersionError(</span>
+                    &quot;version numbers of class are not supported&quot;);
+            case JDWP.Error.ADD_METHOD_NOT_IMPLEMENTED:
+<span class="nc" id="L333">                throw new UnsupportedOperationException(</span>
+                              &quot;add method not implemented&quot;);
+            case JDWP.Error.SCHEMA_CHANGE_NOT_IMPLEMENTED :
+<span class="nc" id="L336">                throw new UnsupportedOperationException(</span>
+                              &quot;schema change not implemented&quot;);
+            case JDWP.Error.HIERARCHY_CHANGE_NOT_IMPLEMENTED:
+<span class="nc" id="L339">                throw new UnsupportedOperationException(</span>
+                              &quot;hierarchy change not implemented&quot;);
+            case JDWP.Error.DELETE_METHOD_NOT_IMPLEMENTED :
+<span class="nc" id="L342">                throw new UnsupportedOperationException(</span>
+                              &quot;delete method not implemented&quot;);
+            case JDWP.Error.CLASS_MODIFIERS_CHANGE_NOT_IMPLEMENTED:
+<span class="nc" id="L345">                throw new UnsupportedOperationException(</span>
+                       &quot;changes to class modifiers not implemented&quot;);
+            case JDWP.Error.METHOD_MODIFIERS_CHANGE_NOT_IMPLEMENTED :
+<span class="nc" id="L348">                throw new UnsupportedOperationException(</span>
+                       &quot;changes to method modifiers not implemented&quot;);
+            case JDWP.Error.NAMES_DONT_MATCH :
+<span class="nc" id="L351">                throw new NoClassDefFoundError(</span>
+                              &quot;class names do not match&quot;);
+            default:
+<span class="nc" id="L354">                throw exc.toJDIException();</span>
+            }
+<span class="nc" id="L356">        }</span>
+
+        // Delete any record of the breakpoints
+<span class="nc" id="L359">        List&lt;BreakpointRequest&gt; toDelete = new ArrayList&lt;BreakpointRequest&gt;();</span>
+<span class="nc" id="L360">        EventRequestManager erm = eventRequestManager();</span>
+<span class="nc" id="L361">        it = erm.breakpointRequests().iterator();</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">        while (it.hasNext()) {</span>
+<span class="nc" id="L363">            BreakpointRequest req = (BreakpointRequest)it.next();</span>
+<span class="nc bnc" id="L364" title="All 2 branches missed.">            if (classToBytes.containsKey(req.location().declaringType())) {</span>
+<span class="nc" id="L365">                toDelete.add(req);</span>
+            }
+<span class="nc" id="L367">        }</span>
+<span class="nc" id="L368">        erm.deleteEventRequests(toDelete);</span>
+
+        // Invalidate any information cached for the classes just redefined.
+<span class="nc" id="L371">        it = classToBytes.keySet().iterator();</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">        while (it.hasNext()) {</span>
+<span class="nc" id="L373">            ReferenceTypeImpl rti = (ReferenceTypeImpl)it.next();</span>
+<span class="nc" id="L374">            rti.noticeRedefineClass();</span>
+<span class="nc" id="L375">        }</span>
+<span class="nc" id="L376">    }</span>
+
+    public List&lt;ThreadReference&gt; allThreads() {
+<span class="nc" id="L379">        validateVM();</span>
+<span class="nc" id="L380">        return state.allThreads();</span>
+    }
+
+    public List&lt;ThreadGroupReference&gt; topLevelThreadGroups() {
+<span class="nc" id="L384">        validateVM();</span>
+<span class="nc" id="L385">        return state.topLevelThreadGroups();</span>
+    }
+
+    /*
+     * Sends a command to the back end which is defined to do an
+     * implicit vm-wide resume. The VM can no longer be considered
+     * suspended, so certain cached data must be invalidated.
+     */
+    PacketStream sendResumingCommand(CommandSender sender) {
+<span class="nc" id="L394">        return state.thawCommand(sender);</span>
+    }
+
+    /*
+     * The VM has been suspended. Additional caching can be done
+     * as long as there are no pending resumes.
+     */
+    void notifySuspend() {
+<span class="nc" id="L402">        state.freeze();</span>
+<span class="nc" id="L403">    }</span>
+
+    public void suspend() {
+<span class="nc" id="L406">        validateVM();</span>
+        try {
+<span class="nc" id="L408">            JDWP.VirtualMachine.Suspend.process(vm);</span>
+<span class="nc" id="L409">        } catch (JDWPException exc) {</span>
+<span class="nc" id="L410">            throw exc.toJDIException();</span>
+<span class="nc" id="L411">        }</span>
+<span class="nc" id="L412">        notifySuspend();</span>
+<span class="nc" id="L413">    }</span>
+
+    public void resume() {
+<span class="nc" id="L416">        validateVM();</span>
+<span class="nc" id="L417">        CommandSender sender =</span>
+<span class="nc" id="L418">            new CommandSender() {</span>
+                public PacketStream send() {
+<span class="nc" id="L420">                    return JDWP.VirtualMachine.Resume.enqueueCommand(vm);</span>
+                }
+        };
+        try {
+<span class="nc" id="L424">            PacketStream stream = state.thawCommand(sender);</span>
+<span class="nc" id="L425">            JDWP.VirtualMachine.Resume.waitForReply(vm, stream);</span>
+<span class="nc" id="L426">        } catch (VMDisconnectedException exc) {</span>
+            /*
+             * If the debugger makes a VMDeathRequest with SUSPEND_ALL,
+             * then when it does an EventSet.resume after getting the
+             * VMDeathEvent, the normal flow of events is that the
+             * BE shuts down, but the waitForReply comes back ok.  In this
+             * case, the run loop in TargetVM that is waiting for a packet
+             * gets an EOF because the socket closes. It generates a
+             * VMDisconnectedEvent and everyone is happy.
+             * However, sometimes, the BE gets shutdown before this
+             * waitForReply completes.  In this case, TargetVM.waitForReply
+             * gets awakened with no reply and so gens a VMDisconnectedException
+             * which is not what we want.  It might be possible to fix this
+             * in the BE, but it is ok to just ignore the VMDisconnectedException
+             * here.  This will allow the VMDisconnectedEvent to be generated
+             * correctly.  And, if the debugger should happen to make another
+             * request, it will get a VMDisconnectedException at that time.
+             */
+<span class="nc" id="L444">        } catch (JDWPException exc) {</span>
+<span class="nc bnc" id="L445" title="All 2 branches missed.">            switch (exc.errorCode()) {</span>
+                case JDWP.Error.VM_DEAD:
+<span class="nc" id="L447">                    return;</span>
+                default:
+<span class="nc" id="L449">                    throw exc.toJDIException();</span>
+            }
+<span class="nc" id="L451">        }</span>
+<span class="nc" id="L452">    }</span>
+
+    public EventQueue eventQueue() {
+        /*
+         * No VM validation here. We allow access to the event queue
+         * after disconnection, so that there is access to the terminating
+         * events.
+         */
+<span class="nc" id="L460">        return eventQueue;</span>
+    }
+
+    public EventRequestManager eventRequestManager() {
+<span class="nc" id="L464">        validateVM();</span>
+<span class="nc" id="L465">        return eventRequestManager;</span>
+    }
+
+    EventRequestManagerImpl eventRequestManagerImpl() {
+<span class="nc" id="L469">        return eventRequestManager;</span>
+    }
+
+    public BooleanValue mirrorOf(boolean value) {
+<span class="nc" id="L473">        validateVM();</span>
+<span class="nc" id="L474">        return new BooleanValueImpl(this,value);</span>
+    }
+
+    public ByteValue mirrorOf(byte value) {
+<span class="nc" id="L478">        validateVM();</span>
+<span class="nc" id="L479">        return new ByteValueImpl(this,value);</span>
+    }
+
+    public CharValue mirrorOf(char value) {
+<span class="nc" id="L483">        validateVM();</span>
+<span class="nc" id="L484">        return new CharValueImpl(this,value);</span>
+    }
+
+    public ShortValue mirrorOf(short value) {
+<span class="nc" id="L488">        validateVM();</span>
+<span class="nc" id="L489">        return new ShortValueImpl(this,value);</span>
+    }
+
+    public IntegerValue mirrorOf(int value) {
+<span class="nc" id="L493">        validateVM();</span>
+<span class="nc" id="L494">        return new IntegerValueImpl(this,value);</span>
+    }
+
+    public LongValue mirrorOf(long value) {
+<span class="nc" id="L498">        validateVM();</span>
+<span class="nc" id="L499">        return new LongValueImpl(this,value);</span>
+    }
+
+    public FloatValue mirrorOf(float value) {
+<span class="nc" id="L503">        validateVM();</span>
+<span class="nc" id="L504">        return new FloatValueImpl(this,value);</span>
+    }
+
+    public DoubleValue mirrorOf(double value) {
+<span class="nc" id="L508">        validateVM();</span>
+<span class="nc" id="L509">        return new DoubleValueImpl(this,value);</span>
+    }
+
+    public StringReference mirrorOf(String value) {
+<span class="nc" id="L513">        validateVM();</span>
+        try {
+<span class="nc" id="L515">            return (StringReference)JDWP.VirtualMachine.CreateString.</span>
+<span class="nc" id="L516">                             process(vm, value).stringObject;</span>
+<span class="nc" id="L517">        } catch (JDWPException exc) {</span>
+<span class="nc" id="L518">            throw exc.toJDIException();</span>
+        }
+    }
+
+    public VoidValue mirrorOfVoid() {
+<span class="nc bnc" id="L523" title="All 2 branches missed.">        if (voidVal == null) {</span>
+<span class="nc" id="L524">            voidVal = new VoidValueImpl(this);</span>
+        }
+<span class="nc" id="L526">        return voidVal;</span>
+    }
+
+    public long[] instanceCounts(List&lt;? extends ReferenceType&gt; classes) {
+<span class="nc bnc" id="L530" title="All 2 branches missed.">        if (!canGetInstanceInfo()) {</span>
+<span class="nc" id="L531">            throw new UnsupportedOperationException(</span>
+                &quot;target does not support getting instances&quot;);
+        }
+        long[] retValue ;
+<span class="nc" id="L535">        ReferenceTypeImpl[] rtArray = new ReferenceTypeImpl[classes.size()];</span>
+<span class="nc" id="L536">        int ii = 0;</span>
+<span class="nc bnc" id="L537" title="All 2 branches missed.">        for (ReferenceType rti: classes) {</span>
+<span class="nc" id="L538">            validateMirror(rti);</span>
+<span class="nc" id="L539">            rtArray[ii++] = (ReferenceTypeImpl)rti;</span>
+<span class="nc" id="L540">        }</span>
+        try {
+<span class="nc" id="L542">            retValue = JDWP.VirtualMachine.InstanceCounts.</span>
+<span class="nc" id="L543">                                process(vm, rtArray).counts;</span>
+<span class="nc" id="L544">        } catch (JDWPException exc) {</span>
+<span class="nc" id="L545">            throw exc.toJDIException();</span>
+<span class="nc" id="L546">        }</span>
+
+<span class="nc" id="L548">        return retValue;</span>
+    }
+
+    public void dispose() {
+<span class="nc" id="L552">        validateVM();</span>
+<span class="nc" id="L553">        shutdown = true;</span>
+        try {
+<span class="nc" id="L555">            JDWP.VirtualMachine.Dispose.process(vm);</span>
+<span class="nc" id="L556">        } catch (JDWPException exc) {</span>
+<span class="nc" id="L557">            throw exc.toJDIException();</span>
+<span class="nc" id="L558">        }</span>
+<span class="nc" id="L559">        target.stopListening();</span>
+<span class="nc" id="L560">    }</span>
+
+    public void exit(int exitCode) {
+<span class="nc" id="L563">        validateVM();</span>
+<span class="nc" id="L564">        shutdown = true;</span>
+        try {
+<span class="nc" id="L566">            JDWP.VirtualMachine.Exit.process(vm, exitCode);</span>
+<span class="nc" id="L567">        } catch (JDWPException exc) {</span>
+<span class="nc" id="L568">            throw exc.toJDIException();</span>
+<span class="nc" id="L569">        }</span>
+<span class="nc" id="L570">        target.stopListening();</span>
+<span class="nc" id="L571">    }</span>
+
+    public Process process() {
+<span class="nc" id="L574">        validateVM();</span>
+<span class="nc" id="L575">        return process;</span>
+    }
+
+    private JDWP.VirtualMachine.Version versionInfo() {
+       try {
+<span class="nc bnc" id="L580" title="All 2 branches missed.">           if (versionInfo == null) {</span>
+               // Need not be synchronized since it is static information
+<span class="nc" id="L582">               versionInfo = JDWP.VirtualMachine.Version.process(vm);</span>
+           }
+<span class="nc" id="L584">           return versionInfo;</span>
+<span class="nc" id="L585">       } catch (JDWPException exc) {</span>
+<span class="nc" id="L586">           throw exc.toJDIException();</span>
+       }
+   }
+    public String description() {
+<span class="nc" id="L590">        validateVM();</span>
+
+<span class="nc" id="L592">        return MessageFormat.format(vmManager.getString(&quot;version_format&quot;),</span>
+<span class="nc" id="L593">                                    &quot;&quot; + vmManager.majorInterfaceVersion(),</span>
+<span class="nc" id="L594">                                    &quot;&quot; + vmManager.minorInterfaceVersion(),</span>
+<span class="nc" id="L595">                                     versionInfo().description);</span>
+    }
+
+    public String version() {
+<span class="nc" id="L599">        validateVM();</span>
+<span class="nc" id="L600">        return versionInfo().vmVersion;</span>
+    }
+
+    public String name() {
+<span class="nc" id="L604">        validateVM();</span>
+<span class="nc" id="L605">        return versionInfo().vmName;</span>
+    }
+
+    public boolean canWatchFieldModification() {
+<span class="nc" id="L609">        validateVM();</span>
+<span class="nc" id="L610">        return capabilities().canWatchFieldModification;</span>
+    }
+    public boolean canWatchFieldAccess() {
+<span class="nc" id="L613">        validateVM();</span>
+<span class="nc" id="L614">        return capabilities().canWatchFieldAccess;</span>
+    }
+    public boolean canGetBytecodes() {
+<span class="nc" id="L617">        validateVM();</span>
+<span class="nc" id="L618">        return capabilities().canGetBytecodes;</span>
+    }
+    public boolean canGetSyntheticAttribute() {
+<span class="nc" id="L621">        validateVM();</span>
+<span class="nc" id="L622">        return capabilities().canGetSyntheticAttribute;</span>
+    }
+    public boolean canGetOwnedMonitorInfo() {
+<span class="nc" id="L625">        validateVM();</span>
+<span class="nc" id="L626">        return capabilities().canGetOwnedMonitorInfo;</span>
+    }
+    public boolean canGetCurrentContendedMonitor() {
+<span class="nc" id="L629">        validateVM();</span>
+<span class="nc" id="L630">        return capabilities().canGetCurrentContendedMonitor;</span>
+    }
+    public boolean canGetMonitorInfo() {
+<span class="nc" id="L633">        validateVM();</span>
+<span class="nc" id="L634">        return capabilities().canGetMonitorInfo;</span>
+    }
+
+    private boolean hasNewCapabilities() {
+<span class="nc bnc" id="L638" title="All 2 branches missed.">        return versionInfo().jdwpMajor &gt; 1 ||</span>
+<span class="nc bnc" id="L639" title="All 2 branches missed.">            versionInfo().jdwpMinor &gt;= 4;</span>
+    }
+
+    boolean canGet1_5LanguageFeatures() {
+<span class="nc bnc" id="L643" title="All 2 branches missed.">        return versionInfo().jdwpMajor &gt; 1 ||</span>
+<span class="nc bnc" id="L644" title="All 2 branches missed.">            versionInfo().jdwpMinor &gt;= 5;</span>
+    }
+
+    public boolean canUseInstanceFilters() {
+<span class="nc" id="L648">        validateVM();</span>
+<span class="nc bnc" id="L649" title="All 2 branches missed.">        return hasNewCapabilities() &amp;&amp;</span>
+<span class="nc bnc" id="L650" title="All 2 branches missed.">            capabilitiesNew().canUseInstanceFilters;</span>
+    }
+    public boolean canRedefineClasses() {
+<span class="nc" id="L653">        validateVM();</span>
+<span class="nc bnc" id="L654" title="All 2 branches missed.">        return hasNewCapabilities() &amp;&amp;</span>
+<span class="nc bnc" id="L655" title="All 2 branches missed.">            capabilitiesNew().canRedefineClasses;</span>
+    }
+    public boolean canAddMethod() {
+<span class="nc" id="L658">        validateVM();</span>
+<span class="nc bnc" id="L659" title="All 2 branches missed.">        return hasNewCapabilities() &amp;&amp;</span>
+<span class="nc bnc" id="L660" title="All 2 branches missed.">            capabilitiesNew().canAddMethod;</span>
+    }
+    public boolean canUnrestrictedlyRedefineClasses() {
+<span class="nc" id="L663">        validateVM();</span>
+<span class="nc bnc" id="L664" title="All 2 branches missed.">        return hasNewCapabilities() &amp;&amp;</span>
+<span class="nc bnc" id="L665" title="All 2 branches missed.">            capabilitiesNew().canUnrestrictedlyRedefineClasses;</span>
+    }
+    public boolean canPopFrames() {
+<span class="nc" id="L668">        validateVM();</span>
+<span class="nc bnc" id="L669" title="All 2 branches missed.">        return hasNewCapabilities() &amp;&amp;</span>
+<span class="nc bnc" id="L670" title="All 2 branches missed.">            capabilitiesNew().canPopFrames;</span>
+    }
+    public boolean canGetMethodReturnValues() {
+<span class="nc bnc" id="L673" title="All 2 branches missed.">        return versionInfo().jdwpMajor &gt; 1 ||</span>
+<span class="nc bnc" id="L674" title="All 2 branches missed.">            versionInfo().jdwpMinor &gt;= 6;</span>
+    }
+    public boolean canGetInstanceInfo() {
+<span class="nc bnc" id="L677" title="All 2 branches missed.">        if (versionInfo().jdwpMajor &lt; 1 ||</span>
+<span class="nc bnc" id="L678" title="All 2 branches missed.">            versionInfo().jdwpMinor &lt; 6) {</span>
+<span class="nc" id="L679">            return false;</span>
+        }
+<span class="nc" id="L681">        validateVM();</span>
+<span class="nc bnc" id="L682" title="All 2 branches missed.">        return hasNewCapabilities() &amp;&amp;</span>
+<span class="nc bnc" id="L683" title="All 2 branches missed.">            capabilitiesNew().canGetInstanceInfo;</span>
+    }
+    public boolean canUseSourceNameFilters() {
+<span class="nc bnc" id="L686" title="All 2 branches missed.">        if (versionInfo().jdwpMajor &lt; 1 ||</span>
+<span class="nc bnc" id="L687" title="All 2 branches missed.">            versionInfo().jdwpMinor &lt; 6) {</span>
+<span class="nc" id="L688">            return false;</span>
+        }
+<span class="nc" id="L690">        return true;</span>
+    }
+    public boolean canForceEarlyReturn() {
+<span class="nc" id="L693">        validateVM();</span>
+<span class="nc bnc" id="L694" title="All 2 branches missed.">        return hasNewCapabilities() &amp;&amp;</span>
+<span class="nc bnc" id="L695" title="All 2 branches missed.">            capabilitiesNew().canForceEarlyReturn;</span>
+    }
+    public boolean canBeModified() {
+<span class="nc" id="L698">        return true;</span>
+    }
+    public boolean canGetSourceDebugExtension() {
+<span class="nc" id="L701">        validateVM();</span>
+<span class="nc bnc" id="L702" title="All 2 branches missed.">        return hasNewCapabilities() &amp;&amp;</span>
+<span class="nc bnc" id="L703" title="All 2 branches missed.">            capabilitiesNew().canGetSourceDebugExtension;</span>
+    }
+    public boolean canGetClassFileVersion() {
+<span class="nc bnc" id="L706" title="All 2 branches missed.">        if ( versionInfo().jdwpMajor &lt; 1 &amp;&amp;</span>
+<span class="nc bnc" id="L707" title="All 2 branches missed.">             versionInfo().jdwpMinor  &lt; 6) {</span>
+<span class="nc" id="L708">            return false;</span>
+        } else {
+<span class="nc" id="L710">            return true;</span>
+        }
+    }
+    public boolean canGetConstantPool() {
+<span class="nc" id="L714">        validateVM();</span>
+<span class="nc bnc" id="L715" title="All 2 branches missed.">        return hasNewCapabilities() &amp;&amp;</span>
+<span class="nc bnc" id="L716" title="All 2 branches missed.">            capabilitiesNew().canGetConstantPool;</span>
+    }
+    public boolean canRequestVMDeathEvent() {
+<span class="nc" id="L719">        validateVM();</span>
+<span class="nc bnc" id="L720" title="All 2 branches missed.">        return hasNewCapabilities() &amp;&amp;</span>
+<span class="nc bnc" id="L721" title="All 2 branches missed.">            capabilitiesNew().canRequestVMDeathEvent;</span>
+    }
+    public boolean canRequestMonitorEvents() {
+<span class="nc" id="L724">        validateVM();</span>
+<span class="nc bnc" id="L725" title="All 2 branches missed.">        return hasNewCapabilities() &amp;&amp;</span>
+<span class="nc bnc" id="L726" title="All 2 branches missed.">            capabilitiesNew().canRequestMonitorEvents;</span>
+    }
+    public boolean canGetMonitorFrameInfo() {
+<span class="nc" id="L729">        validateVM();</span>
+<span class="nc bnc" id="L730" title="All 2 branches missed.">        return hasNewCapabilities() &amp;&amp;</span>
+<span class="nc bnc" id="L731" title="All 2 branches missed.">            capabilitiesNew().canGetMonitorFrameInfo;</span>
+    }
+
+    public void setDebugTraceMode(int traceFlags) {
+<span class="nc" id="L735">        validateVM();</span>
+<span class="nc" id="L736">        this.traceFlags = traceFlags;</span>
+<span class="nc bnc" id="L737" title="All 2 branches missed.">        this.traceReceives = (traceFlags &amp; TRACE_RECEIVES) != 0;</span>
+<span class="nc" id="L738">    }</span>
+
+    void printTrace(String string) {
+<span class="nc" id="L741">        System.err.println(&quot;[JDI: &quot; + string + &quot;]&quot;);</span>
+<span class="nc" id="L742">    }</span>
+
+    void printReceiveTrace(int depth, String string) {
+<span class="nc" id="L745">        StringBuffer sb = new StringBuffer(&quot;Receiving:&quot;);</span>
+<span class="nc bnc" id="L746" title="All 2 branches missed.">        for (int i = depth; i &gt; 0; --i) {</span>
+<span class="nc" id="L747">            sb.append(&quot;    &quot;);</span>
+        }
+<span class="nc" id="L749">        sb.append(string);</span>
+<span class="nc" id="L750">        printTrace(sb.toString());</span>
+<span class="nc" id="L751">    }</span>
+
+    private synchronized ReferenceTypeImpl addReferenceType(long id,
+                                                       int tag,
+                                                       String signature) {
+<span class="nc bnc" id="L756" title="All 2 branches missed.">        if (typesByID == null) {</span>
+<span class="nc" id="L757">            initReferenceTypes();</span>
+        }
+<span class="nc" id="L759">        ReferenceTypeImpl type = null;</span>
+<span class="nc bnc" id="L760" title="All 4 branches missed.">        switch(tag) {</span>
+            case JDWP.TypeTag.CLASS:
+<span class="nc" id="L762">                type = new ClassTypeImpl(vm, id);</span>
+<span class="nc" id="L763">                break;</span>
+            case JDWP.TypeTag.INTERFACE:
+<span class="nc" id="L765">                type = new InterfaceTypeImpl(vm, id);</span>
+<span class="nc" id="L766">                break;</span>
+            case JDWP.TypeTag.ARRAY:
+<span class="nc" id="L768">                type = new ArrayTypeImpl(vm, id);</span>
+<span class="nc" id="L769">                break;</span>
+            default:
+<span class="nc" id="L771">                throw new InternalException(&quot;Invalid reference type tag&quot;);</span>
+        }
+
+        /*
+         * If a signature was specified, make sure to set it ASAP, to
+         * prevent any needless JDWP command to retrieve it. (for example,
+         * typesBySignature.add needs the signature, to maintain proper
+         * ordering.
+         */
+<span class="nc bnc" id="L780" title="All 2 branches missed.">        if (signature != null) {</span>
+<span class="nc" id="L781">            type.setSignature(signature);</span>
+        }
+
+<span class="nc" id="L784">        typesByID.put(new Long(id), type);</span>
+<span class="nc" id="L785">        typesBySignature.add(type);</span>
+
+<span class="nc bnc" id="L787" title="All 2 branches missed.">        if ((vm.traceFlags &amp; VirtualMachine.TRACE_REFTYPES) != 0) {</span>
+<span class="nc" id="L788">           vm.printTrace(&quot;Caching new ReferenceType, sig=&quot; + signature +</span>
+                         &quot;, id=&quot; + id);
+        }
+
+<span class="nc" id="L792">        return type;</span>
+    }
+
+    synchronized void removeReferenceType(String signature) {
+<span class="nc bnc" id="L796" title="All 2 branches missed.">        if (typesByID == null) {</span>
+<span class="nc" id="L797">            return;</span>
+        }
+        /*
+         * There can be multiple classes with the same name. Since
+         * we can't differentiate here, we first remove all
+         * matching classes from our cache...
+         */
+<span class="nc" id="L804">        Iterator&lt;ReferenceType&gt; iter = typesBySignature.iterator();</span>
+<span class="nc" id="L805">        int matches = 0;</span>
+<span class="nc bnc" id="L806" title="All 2 branches missed.">        while (iter.hasNext()) {</span>
+<span class="nc" id="L807">            ReferenceTypeImpl type = (ReferenceTypeImpl)iter.next();</span>
+<span class="nc" id="L808">            int comp = signature.compareTo(type.signature());</span>
+<span class="nc bnc" id="L809" title="All 2 branches missed.">            if (comp == 0) {</span>
+<span class="nc" id="L810">                matches++;</span>
+<span class="nc" id="L811">                iter.remove();</span>
+<span class="nc" id="L812">                typesByID.remove(new Long(type.ref()));</span>
+<span class="nc bnc" id="L813" title="All 2 branches missed.">                if ((vm.traceFlags &amp; VirtualMachine.TRACE_REFTYPES) != 0) {</span>
+<span class="nc" id="L814">                   vm.printTrace(&quot;Uncaching ReferenceType, sig=&quot; + signature +</span>
+<span class="nc" id="L815">                                 &quot;, id=&quot; + type.ref());</span>
+                }
+/* fix for 4359077 , don't break out. list is no longer sorted
+        in the order we think
+ */
+            }
+<span class="nc" id="L821">        }</span>
+
+        /*
+         * ...and if there was more than one, re-retrieve the classes
+         * with that name
+         */
+<span class="nc bnc" id="L827" title="All 2 branches missed.">        if (matches &gt; 1) {</span>
+<span class="nc" id="L828">            retrieveClassesBySignature(signature);</span>
+        }
+<span class="nc" id="L830">    }</span>
+
+    private synchronized List&lt;ReferenceType&gt; findReferenceTypes(String signature) {
+<span class="nc bnc" id="L833" title="All 2 branches missed.">        if (typesByID == null) {</span>
+<span class="nc" id="L834">            return new ArrayList&lt;ReferenceType&gt;(0);</span>
+        }
+<span class="nc" id="L836">        Iterator&lt;ReferenceType&gt; iter = typesBySignature.iterator();</span>
+<span class="nc" id="L837">        List&lt;ReferenceType&gt; list = new ArrayList&lt;ReferenceType&gt;();</span>
+<span class="nc bnc" id="L838" title="All 2 branches missed.">        while (iter.hasNext()) {</span>
+<span class="nc" id="L839">            ReferenceTypeImpl type = (ReferenceTypeImpl)iter.next();</span>
+<span class="nc" id="L840">            int comp = signature.compareTo(type.signature());</span>
+<span class="nc bnc" id="L841" title="All 2 branches missed.">            if (comp == 0) {</span>
+<span class="nc" id="L842">                list.add(type);</span>
+/* fix for 4359077 , don't break out. list is no longer sorted
+        in the order we think
+ */
+            }
+<span class="nc" id="L847">        }</span>
+<span class="nc" id="L848">        return list;</span>
+    }
+
+    private void initReferenceTypes() {
+<span class="nc" id="L852">        typesByID = new HashMap&lt;Long, ReferenceType&gt;(300);</span>
+<span class="nc" id="L853">        typesBySignature = new TreeSet&lt;ReferenceType&gt;();</span>
+<span class="nc" id="L854">    }</span>
+
+    ReferenceTypeImpl referenceType(long ref, byte tag) {
+<span class="nc" id="L857">        return referenceType(ref, tag, null);</span>
+    }
+
+    ClassTypeImpl classType(long ref) {
+<span class="nc" id="L861">        return (ClassTypeImpl)referenceType(ref, JDWP.TypeTag.CLASS, null);</span>
+    }
+
+    InterfaceTypeImpl interfaceType(long ref) {
+<span class="nc" id="L865">        return (InterfaceTypeImpl)referenceType(ref, JDWP.TypeTag.INTERFACE, null);</span>
+    }
+
+    ArrayTypeImpl arrayType(long ref) {
+<span class="nc" id="L869">        return (ArrayTypeImpl)referenceType(ref, JDWP.TypeTag.ARRAY, null);</span>
+    }
+
+    ReferenceTypeImpl referenceType(long id, int tag,
+                                                 String signature) {
+<span class="nc bnc" id="L874" title="All 2 branches missed.">        if ((vm.traceFlags &amp; VirtualMachine.TRACE_REFTYPES) != 0) {</span>
+<span class="nc" id="L875">            StringBuffer sb = new StringBuffer();</span>
+<span class="nc" id="L876">            sb.append(&quot;Looking up &quot;);</span>
+<span class="nc bnc" id="L877" title="All 2 branches missed.">            if (tag == JDWP.TypeTag.CLASS) {</span>
+<span class="nc" id="L878">                sb.append(&quot;Class&quot;);</span>
+<span class="nc bnc" id="L879" title="All 2 branches missed.">            } else if (tag == JDWP.TypeTag.INTERFACE) {</span>
+<span class="nc" id="L880">                sb.append(&quot;Interface&quot;);</span>
+<span class="nc bnc" id="L881" title="All 2 branches missed.">            } else if (tag == JDWP.TypeTag.ARRAY) {</span>
+<span class="nc" id="L882">                sb.append(&quot;ArrayType&quot;);</span>
+            } else {
+<span class="nc" id="L884">                sb.append(&quot;UNKNOWN TAG: &quot; + tag);</span>
+            }
+<span class="nc bnc" id="L886" title="All 2 branches missed.">            if (signature != null) {</span>
+<span class="nc" id="L887">                sb.append(&quot;, signature='&quot; + signature + &quot;'&quot;);</span>
+            }
+<span class="nc" id="L889">            sb.append(&quot;, id=&quot; + id);</span>
+<span class="nc" id="L890">            vm.printTrace(sb.toString());</span>
+        }
+<span class="nc bnc" id="L892" title="All 2 branches missed.">        if (id == 0) {</span>
+<span class="nc" id="L893">            return null;</span>
+        } else {
+<span class="nc" id="L895">            ReferenceTypeImpl retType = null;</span>
+<span class="nc" id="L896">            synchronized (this) {</span>
+<span class="nc bnc" id="L897" title="All 2 branches missed.">                if (typesByID != null) {</span>
+<span class="nc" id="L898">                    retType = (ReferenceTypeImpl)typesByID.get(new Long(id));</span>
+                }
+<span class="nc bnc" id="L900" title="All 2 branches missed.">                if (retType == null) {</span>
+<span class="nc" id="L901">                    retType = addReferenceType(id, tag, signature);</span>
+                }
+<span class="nc" id="L903">            }</span>
+<span class="nc" id="L904">            return retType;</span>
+        }
+    }
+
+    private JDWP.VirtualMachine.Capabilities capabilities() {
+<span class="nc bnc" id="L909" title="All 2 branches missed.">        if (capabilities == null) {</span>
+            try {
+<span class="nc" id="L911">                capabilities = JDWP.VirtualMachine</span>
+<span class="nc" id="L912">                                 .Capabilities.process(vm);</span>
+<span class="nc" id="L913">            } catch (JDWPException exc) {</span>
+<span class="nc" id="L914">                throw exc.toJDIException();</span>
+<span class="nc" id="L915">            }</span>
+        }
+<span class="nc" id="L917">        return capabilities;</span>
+    }
+
+    private JDWP.VirtualMachine.CapabilitiesNew capabilitiesNew() {
+<span class="nc bnc" id="L921" title="All 2 branches missed.">        if (capabilitiesNew == null) {</span>
+            try {
+<span class="nc" id="L923">                capabilitiesNew = JDWP.VirtualMachine</span>
+<span class="nc" id="L924">                                 .CapabilitiesNew.process(vm);</span>
+<span class="nc" id="L925">            } catch (JDWPException exc) {</span>
+<span class="nc" id="L926">                throw exc.toJDIException();</span>
+<span class="nc" id="L927">            }</span>
+        }
+<span class="nc" id="L929">        return capabilitiesNew;</span>
+    }
+
+    private List&lt;ReferenceType&gt; retrieveClassesBySignature(String signature) {
+<span class="nc bnc" id="L933" title="All 2 branches missed.">        if ((vm.traceFlags &amp; VirtualMachine.TRACE_REFTYPES) != 0) {</span>
+<span class="nc" id="L934">            vm.printTrace(&quot;Retrieving matching ReferenceTypes, sig=&quot; + signature);</span>
+        }
+        JDWP.VirtualMachine.ClassesBySignature.ClassInfo[] cinfos;
+        try {
+<span class="nc" id="L938">            cinfos = JDWP.VirtualMachine.ClassesBySignature.</span>
+<span class="nc" id="L939">                                      process(vm, signature).classes;</span>
+<span class="nc" id="L940">        } catch (JDWPException exc) {</span>
+<span class="nc" id="L941">            throw exc.toJDIException();</span>
+<span class="nc" id="L942">        }</span>
+
+<span class="nc" id="L944">        int count = cinfos.length;</span>
+<span class="nc" id="L945">        List&lt;ReferenceType&gt; list = new ArrayList&lt;ReferenceType&gt;(count);</span>
+
+        // Hold lock during processing to improve performance
+<span class="nc" id="L948">        synchronized (this) {</span>
+<span class="nc bnc" id="L949" title="All 2 branches missed.">            for (int i = 0; i &lt; count; i++) {</span>
+<span class="nc" id="L950">                JDWP.VirtualMachine.ClassesBySignature.ClassInfo ci =</span>
+                                                               cinfos[i];
+<span class="nc" id="L952">                ReferenceTypeImpl type = referenceType(ci.typeID,</span>
+                                                       ci.refTypeTag,
+                                                       signature);
+<span class="nc" id="L955">                type.setStatus(ci.status);</span>
+<span class="nc" id="L956">                list.add(type);</span>
+            }
+<span class="nc" id="L958">        }</span>
+<span class="nc" id="L959">        return list;</span>
+    }
+
+    private void retrieveAllClasses1_4() {
+        JDWP.VirtualMachine.AllClasses.ClassInfo[] cinfos;
+        try {
+<span class="nc" id="L965">            cinfos = JDWP.VirtualMachine.AllClasses.process(vm).classes;</span>
+<span class="nc" id="L966">        } catch (JDWPException exc) {</span>
+<span class="nc" id="L967">            throw exc.toJDIException();</span>
+<span class="nc" id="L968">        }</span>
+
+        // Hold lock during processing to improve performance
+        // and to have safe check/set of retrievedAllTypes
+<span class="nc" id="L972">        synchronized (this) {</span>
+<span class="nc bnc" id="L973" title="All 2 branches missed.">            if (!retrievedAllTypes) {</span>
+                // Number of classes
+<span class="nc" id="L975">                int count = cinfos.length;</span>
+<span class="nc bnc" id="L976" title="All 2 branches missed.">                for (int i=0; i&lt;count; i++) {</span>
+<span class="nc" id="L977">                    JDWP.VirtualMachine.AllClasses.ClassInfo ci =</span>
+                                                               cinfos[i];
+<span class="nc" id="L979">                    ReferenceTypeImpl type = referenceType(ci.typeID,</span>
+                                                           ci.refTypeTag,
+                                                           ci.signature);
+<span class="nc" id="L982">                    type.setStatus(ci.status);</span>
+                }
+<span class="nc" id="L984">                retrievedAllTypes = true;</span>
+            }
+<span class="nc" id="L986">        }</span>
+<span class="nc" id="L987">    }</span>
+
+    private void retrieveAllClasses() {
+<span class="nc bnc" id="L990" title="All 2 branches missed.">        if ((vm.traceFlags &amp; VirtualMachine.TRACE_REFTYPES) != 0) {</span>
+<span class="nc" id="L991">            vm.printTrace(&quot;Retrieving all ReferenceTypes&quot;);</span>
+        }
+
+<span class="nc bnc" id="L994" title="All 2 branches missed.">        if (!vm.canGet1_5LanguageFeatures()) {</span>
+<span class="nc" id="L995">            retrieveAllClasses1_4();</span>
+<span class="nc" id="L996">            return;</span>
+        }
+
+        /*
+         * To save time (assuming the caller will be
+         * using then) we will get the generic sigs too.
+         */
+
+        JDWP.VirtualMachine.AllClassesWithGeneric.ClassInfo[] cinfos;
+        try {
+<span class="nc" id="L1006">            cinfos = JDWP.VirtualMachine.AllClassesWithGeneric.process(vm).classes;</span>
+<span class="nc" id="L1007">        } catch (JDWPException exc) {</span>
+<span class="nc" id="L1008">            throw exc.toJDIException();</span>
+<span class="nc" id="L1009">        }</span>
+
+        // Hold lock during processing to improve performance
+        // and to have safe check/set of retrievedAllTypes
+<span class="nc" id="L1013">        synchronized (this) {</span>
+<span class="nc bnc" id="L1014" title="All 2 branches missed.">            if (!retrievedAllTypes) {</span>
+                // Number of classes
+<span class="nc" id="L1016">                int count = cinfos.length;</span>
+<span class="nc bnc" id="L1017" title="All 2 branches missed.">                for (int i=0; i&lt;count; i++) {</span>
+<span class="nc" id="L1018">                    JDWP.VirtualMachine.AllClassesWithGeneric.ClassInfo ci =</span>
+                                                               cinfos[i];
+<span class="nc" id="L1020">                    ReferenceTypeImpl type = referenceType(ci.typeID,</span>
+                                                           ci.refTypeTag,
+                                                           ci.signature);
+<span class="nc" id="L1023">                    type.setGenericSignature(ci.genericSignature);</span>
+<span class="nc" id="L1024">                    type.setStatus(ci.status);</span>
+                }
+<span class="nc" id="L1026">                retrievedAllTypes = true;</span>
+            }
+<span class="nc" id="L1028">        }</span>
+<span class="nc" id="L1029">    }</span>
+
+    void sendToTarget(Packet packet) {
+<span class="nc" id="L1032">        target.send(packet);</span>
+<span class="nc" id="L1033">    }</span>
+
+    void waitForTargetReply(Packet packet) {
+<span class="nc" id="L1036">        target.waitForReply(packet);</span>
+        /*
+         * If any object disposes have been batched up, send them now.
+         */
+<span class="nc" id="L1040">        processBatchedDisposes();</span>
+<span class="nc" id="L1041">    }</span>
+
+    Type findBootType(String signature) throws ClassNotLoadedException {
+<span class="nc" id="L1044">        List&lt;ReferenceType&gt; types = allClasses();</span>
+<span class="nc" id="L1045">        Iterator&lt;ReferenceType&gt; iter = types.iterator();</span>
+<span class="nc bnc" id="L1046" title="All 2 branches missed.">        while (iter.hasNext()) {</span>
+<span class="nc" id="L1047">            ReferenceType type = iter.next();</span>
+<span class="nc bnc" id="L1048" title="All 2 branches missed.">            if ((type.classLoader() == null) &amp;&amp;</span>
+<span class="nc bnc" id="L1049" title="All 2 branches missed.">                (type.signature().equals(signature))) {</span>
+<span class="nc" id="L1050">                return type;</span>
+            }
+<span class="nc" id="L1052">        }</span>
+<span class="nc" id="L1053">        JNITypeParser parser = new JNITypeParser(signature);</span>
+<span class="nc" id="L1054">        throw new ClassNotLoadedException(parser.typeName(),</span>
+<span class="nc" id="L1055">                                         &quot;Type &quot; + parser.typeName() + &quot; not loaded&quot;);</span>
+    }
+
+    BooleanType theBooleanType() {
+<span class="nc bnc" id="L1059" title="All 2 branches missed.">        if (theBooleanType == null) {</span>
+<span class="nc" id="L1060">            synchronized(this) {</span>
+<span class="nc bnc" id="L1061" title="All 2 branches missed.">                if (theBooleanType == null) {</span>
+<span class="nc" id="L1062">                    theBooleanType = new BooleanTypeImpl(this);</span>
+                }
+<span class="nc" id="L1064">            }</span>
+        }
+<span class="nc" id="L1066">        return theBooleanType;</span>
+    }
+
+    ByteType theByteType() {
+<span class="nc bnc" id="L1070" title="All 2 branches missed.">        if (theByteType == null) {</span>
+<span class="nc" id="L1071">            synchronized(this) {</span>
+<span class="nc bnc" id="L1072" title="All 2 branches missed.">                if (theByteType == null) {</span>
+<span class="nc" id="L1073">                    theByteType = new ByteTypeImpl(this);</span>
+                }
+<span class="nc" id="L1075">            }</span>
+        }
+<span class="nc" id="L1077">        return theByteType;</span>
+    }
+
+    CharType theCharType() {
+<span class="nc bnc" id="L1081" title="All 2 branches missed.">        if (theCharType == null) {</span>
+<span class="nc" id="L1082">            synchronized(this) {</span>
+<span class="nc bnc" id="L1083" title="All 2 branches missed.">                if (theCharType == null) {</span>
+<span class="nc" id="L1084">                    theCharType = new CharTypeImpl(this);</span>
+                }
+<span class="nc" id="L1086">            }</span>
+        }
+<span class="nc" id="L1088">        return theCharType;</span>
+    }
+
+    ShortType theShortType() {
+<span class="nc bnc" id="L1092" title="All 2 branches missed.">        if (theShortType == null) {</span>
+<span class="nc" id="L1093">            synchronized(this) {</span>
+<span class="nc bnc" id="L1094" title="All 2 branches missed.">                if (theShortType == null) {</span>
+<span class="nc" id="L1095">                    theShortType = new ShortTypeImpl(this);</span>
+                }
+<span class="nc" id="L1097">            }</span>
+        }
+<span class="nc" id="L1099">        return theShortType;</span>
+    }
+
+    IntegerType theIntegerType() {
+<span class="nc bnc" id="L1103" title="All 2 branches missed.">        if (theIntegerType == null) {</span>
+<span class="nc" id="L1104">            synchronized(this) {</span>
+<span class="nc bnc" id="L1105" title="All 2 branches missed.">                if (theIntegerType == null) {</span>
+<span class="nc" id="L1106">                    theIntegerType = new IntegerTypeImpl(this);</span>
+                }
+<span class="nc" id="L1108">            }</span>
+        }
+<span class="nc" id="L1110">        return theIntegerType;</span>
+    }
+
+    LongType theLongType() {
+<span class="nc bnc" id="L1114" title="All 2 branches missed.">        if (theLongType == null) {</span>
+<span class="nc" id="L1115">            synchronized(this) {</span>
+<span class="nc bnc" id="L1116" title="All 2 branches missed.">                if (theLongType == null) {</span>
+<span class="nc" id="L1117">                    theLongType = new LongTypeImpl(this);</span>
+                }
+<span class="nc" id="L1119">            }</span>
+        }
+<span class="nc" id="L1121">        return theLongType;</span>
+    }
+
+    FloatType theFloatType() {
+<span class="nc bnc" id="L1125" title="All 2 branches missed.">        if (theFloatType == null) {</span>
+<span class="nc" id="L1126">            synchronized(this) {</span>
+<span class="nc bnc" id="L1127" title="All 2 branches missed.">                if (theFloatType == null) {</span>
+<span class="nc" id="L1128">                    theFloatType = new FloatTypeImpl(this);</span>
+                }
+<span class="nc" id="L1130">            }</span>
+        }
+<span class="nc" id="L1132">        return theFloatType;</span>
+    }
+
+    DoubleType theDoubleType() {
+<span class="nc bnc" id="L1136" title="All 2 branches missed.">        if (theDoubleType == null) {</span>
+<span class="nc" id="L1137">            synchronized(this) {</span>
+<span class="nc bnc" id="L1138" title="All 2 branches missed.">                if (theDoubleType == null) {</span>
+<span class="nc" id="L1139">                    theDoubleType = new DoubleTypeImpl(this);</span>
+                }
+<span class="nc" id="L1141">            }</span>
+        }
+<span class="nc" id="L1143">        return theDoubleType;</span>
+    }
+
+    VoidType theVoidType() {
+<span class="nc bnc" id="L1147" title="All 2 branches missed.">        if (theVoidType == null) {</span>
+<span class="nc" id="L1148">            synchronized(this) {</span>
+<span class="nc bnc" id="L1149" title="All 2 branches missed.">                if (theVoidType == null) {</span>
+<span class="nc" id="L1150">                    theVoidType = new VoidTypeImpl(this);</span>
+                }
+<span class="nc" id="L1152">            }</span>
+        }
+<span class="nc" id="L1154">        return theVoidType;</span>
+    }
+
+    PrimitiveType primitiveTypeMirror(byte tag) {
+<span class="nc bnc" id="L1158" title="All 9 branches missed.">        switch (tag) {</span>
+            case JDWP.Tag.BOOLEAN:
+<span class="nc" id="L1160">                return theBooleanType();</span>
+            case JDWP.Tag.BYTE:
+<span class="nc" id="L1162">                return theByteType();</span>
+            case JDWP.Tag.CHAR:
+<span class="nc" id="L1164">                return theCharType();</span>
+            case JDWP.Tag.SHORT:
+<span class="nc" id="L1166">                return theShortType();</span>
+            case JDWP.Tag.INT:
+<span class="nc" id="L1168">                return theIntegerType();</span>
+            case JDWP.Tag.LONG:
+<span class="nc" id="L1170">                return theLongType();</span>
+            case JDWP.Tag.FLOAT:
+<span class="nc" id="L1172">                return theFloatType();</span>
+            case JDWP.Tag.DOUBLE:
+<span class="nc" id="L1174">                return theDoubleType();</span>
+            default:
+<span class="nc" id="L1176">                throw new IllegalArgumentException(&quot;Unrecognized primitive tag &quot; + tag);</span>
+        }
+    }
+
+    private void processBatchedDisposes() {
+<span class="nc bnc" id="L1181" title="All 2 branches missed.">        if (shutdown) {</span>
+<span class="nc" id="L1182">            return;</span>
+        }
+
+<span class="nc" id="L1185">        JDWP.VirtualMachine.DisposeObjects.Request[] requests = null;</span>
+<span class="nc" id="L1186">        synchronized(batchedDisposeRequests) {</span>
+<span class="nc" id="L1187">            int size = batchedDisposeRequests.size();</span>
+<span class="nc bnc" id="L1188" title="All 2 branches missed.">            if (size &gt;= DISPOSE_THRESHOLD) {</span>
+<span class="nc bnc" id="L1189" title="All 2 branches missed.">                if ((traceFlags &amp; TRACE_OBJREFS) != 0) {</span>
+<span class="nc" id="L1190">                    printTrace(&quot;Dispose threashold reached. Will dispose &quot;</span>
+                               + size + &quot; object references...&quot;);
+                }
+<span class="nc" id="L1193">                requests = new JDWP.VirtualMachine.DisposeObjects.Request[size];</span>
+<span class="nc bnc" id="L1194" title="All 2 branches missed.">                for (int i = 0; i &lt; requests.length; i++) {</span>
+<span class="nc" id="L1195">                    SoftObjectReference ref = batchedDisposeRequests.get(i);</span>
+<span class="nc bnc" id="L1196" title="All 2 branches missed.">                    if ((traceFlags &amp; TRACE_OBJREFS) != 0) {</span>
+<span class="nc" id="L1197">                        printTrace(&quot;Disposing object &quot; + ref.key().longValue() +</span>
+<span class="nc" id="L1198">                                   &quot; (ref count = &quot; + ref.count() + &quot;)&quot;);</span>
+                    }
+
+                    // This is kludgy. We temporarily re-create an object
+                    // reference so that we can correctly pass its id to the
+                    // JDWP command.
+<span class="nc" id="L1204">                    requests[i] =</span>
+                        new JDWP.VirtualMachine.DisposeObjects.Request(
+<span class="nc" id="L1206">                            new ObjectReferenceImpl(this, ref.key().longValue()),</span>
+<span class="nc" id="L1207">                            ref.count());</span>
+                }
+<span class="nc" id="L1209">                batchedDisposeRequests.clear();</span>
+            }
+<span class="nc" id="L1211">        }</span>
+<span class="nc bnc" id="L1212" title="All 2 branches missed.">        if (requests != null) {</span>
+            try {
+<span class="nc" id="L1214">                JDWP.VirtualMachine.DisposeObjects.process(vm, requests);</span>
+<span class="nc" id="L1215">            } catch (JDWPException exc) {</span>
+<span class="nc" id="L1216">                throw exc.toJDIException();</span>
+<span class="nc" id="L1217">            }</span>
+        }
+<span class="nc" id="L1219">    }</span>
+
+    private void batchForDispose(SoftObjectReference ref) {
+<span class="nc bnc" id="L1222" title="All 2 branches missed.">        if ((traceFlags &amp; TRACE_OBJREFS) != 0) {</span>
+<span class="nc" id="L1223">            printTrace(&quot;Batching object &quot; + ref.key().longValue() +</span>
+<span class="nc" id="L1224">                       &quot; for dispose (ref count = &quot; + ref.count() + &quot;)&quot;);</span>
+        }
+<span class="nc" id="L1226">        batchedDisposeRequests.add(ref);</span>
+<span class="nc" id="L1227">    }</span>
+
+    private void processQueue() {
+        Reference&lt;?&gt; ref;
+        //if ((traceFlags &amp; TRACE_OBJREFS) != 0) {
+        //    printTrace(&quot;Checking for softly reachable objects&quot;);
+        //}
+<span class="nc bnc" id="L1234" title="All 2 branches missed.">        while ((ref = referenceQueue.poll()) != null) {</span>
+<span class="nc" id="L1235">            SoftObjectReference softRef = (SoftObjectReference)ref;</span>
+<span class="nc" id="L1236">            removeObjectMirror(softRef);</span>
+<span class="nc" id="L1237">            batchForDispose(softRef);</span>
+<span class="nc" id="L1238">        }</span>
+<span class="nc" id="L1239">    }</span>
+
+    synchronized ObjectReferenceImpl objectMirror(long id, int tag) {
+
+        // Handle any queue elements that are not strongly reachable
+<span class="nc" id="L1244">        processQueue();</span>
+
+<span class="nc bnc" id="L1246" title="All 2 branches missed.">        if (id == 0) {</span>
+<span class="nc" id="L1247">            return null;</span>
+        }
+<span class="nc" id="L1249">        ObjectReferenceImpl object = null;</span>
+<span class="nc" id="L1250">        Long key = new Long(id);</span>
+
+        /*
+         * Attempt to retrieve an existing object object reference
+         */
+<span class="nc" id="L1255">        SoftObjectReference ref = objectsByID.get(key);</span>
+<span class="nc bnc" id="L1256" title="All 2 branches missed.">        if (ref != null) {</span>
+<span class="nc" id="L1257">            object = ref.object();</span>
+        }
+
+        /*
+         * If the object wasn't in the table, or it's soft reference was
+         * cleared, create a new instance.
+         */
+<span class="nc bnc" id="L1264" title="All 2 branches missed.">        if (object == null) {</span>
+<span class="nc bnc" id="L1265" title="All 8 branches missed.">            switch (tag) {</span>
+                case JDWP.Tag.OBJECT:
+<span class="nc" id="L1267">                    object = new ObjectReferenceImpl(vm, id);</span>
+<span class="nc" id="L1268">                    break;</span>
+                case JDWP.Tag.STRING:
+<span class="nc" id="L1270">                    object = new StringReferenceImpl(vm, id);</span>
+<span class="nc" id="L1271">                    break;</span>
+                case JDWP.Tag.ARRAY:
+<span class="nc" id="L1273">                    object = new ArrayReferenceImpl(vm, id);</span>
+<span class="nc" id="L1274">                    break;</span>
+                case JDWP.Tag.THREAD:
+<span class="nc" id="L1276">                    ThreadReferenceImpl thread =</span>
+                        new ThreadReferenceImpl(vm, id);
+<span class="nc" id="L1278">                    thread.addListener(this);</span>
+<span class="nc" id="L1279">                    object = thread;</span>
+<span class="nc" id="L1280">                    break;</span>
+                case JDWP.Tag.THREAD_GROUP:
+<span class="nc" id="L1282">                    object = new ThreadGroupReferenceImpl(vm, id);</span>
+<span class="nc" id="L1283">                    break;</span>
+                case JDWP.Tag.CLASS_LOADER:
+<span class="nc" id="L1285">                    object = new ClassLoaderReferenceImpl(vm, id);</span>
+<span class="nc" id="L1286">                    break;</span>
+                case JDWP.Tag.CLASS_OBJECT:
+<span class="nc" id="L1288">                    object = new ClassObjectReferenceImpl(vm, id);</span>
+<span class="nc" id="L1289">                    break;</span>
+                default:
+<span class="nc" id="L1291">                    throw new IllegalArgumentException(&quot;Invalid object tag: &quot; + tag);</span>
+            }
+<span class="nc" id="L1293">            ref = new SoftObjectReference(key, object, referenceQueue);</span>
+
+            /*
+             * If there was no previous entry in the table, we add one here
+             * If the previous entry was cleared, we replace it here.
+             */
+<span class="nc" id="L1299">            objectsByID.put(key, ref);</span>
+<span class="nc bnc" id="L1300" title="All 2 branches missed.">            if ((traceFlags &amp; TRACE_OBJREFS) != 0) {</span>
+<span class="nc" id="L1301">                printTrace(&quot;Creating new &quot; +</span>
+<span class="nc" id="L1302">                           object.getClass().getName() + &quot; (id = &quot; + id + &quot;)&quot;);</span>
+            }
+        } else {
+<span class="nc" id="L1305">            ref.incrementCount();</span>
+        }
+
+<span class="nc" id="L1308">        return object;</span>
+    }
+
+    synchronized void removeObjectMirror(ObjectReferenceImpl object) {
+
+        // Handle any queue elements that are not strongly reachable
+<span class="nc" id="L1314">        processQueue();</span>
+
+<span class="nc" id="L1316">        SoftObjectReference ref = objectsByID.remove(new Long(object.ref()));</span>
+<span class="nc bnc" id="L1317" title="All 2 branches missed.">        if (ref != null) {</span>
+<span class="nc" id="L1318">            batchForDispose(ref);</span>
+        } else {
+            /*
+             * If there's a live ObjectReference about, it better be part
+             * of the cache.
+             */
+<span class="nc" id="L1324">            throw new InternalException(&quot;ObjectReference &quot; + object.ref() +</span>
+                                        &quot; not found in object cache&quot;);
+        }
+<span class="nc" id="L1327">    }</span>
+
+    synchronized void removeObjectMirror(SoftObjectReference ref) {
+        /*
+         * This will remove the soft reference if it has not been
+         * replaced in the cache.
+         */
+<span class="nc" id="L1334">        objectsByID.remove(ref.key());</span>
+<span class="nc" id="L1335">    }</span>
+
+    ObjectReferenceImpl objectMirror(long id) {
+<span class="nc" id="L1338">        return objectMirror(id, JDWP.Tag.OBJECT);</span>
+    }
+
+    StringReferenceImpl stringMirror(long id) {
+<span class="nc" id="L1342">        return (StringReferenceImpl)objectMirror(id, JDWP.Tag.STRING);</span>
+    }
+
+    ArrayReferenceImpl arrayMirror(long id) {
+<span class="nc" id="L1346">       return (ArrayReferenceImpl)objectMirror(id, JDWP.Tag.ARRAY);</span>
+    }
+
+    ThreadReferenceImpl threadMirror(long id) {
+<span class="nc" id="L1350">        return (ThreadReferenceImpl)objectMirror(id, JDWP.Tag.THREAD);</span>
+    }
+
+    ThreadGroupReferenceImpl threadGroupMirror(long id) {
+<span class="nc" id="L1354">        return (ThreadGroupReferenceImpl)objectMirror(id,</span>
+                                                      JDWP.Tag.THREAD_GROUP);
+    }
+
+    ClassLoaderReferenceImpl classLoaderMirror(long id) {
+<span class="nc" id="L1359">        return (ClassLoaderReferenceImpl)objectMirror(id,</span>
+                                                      JDWP.Tag.CLASS_LOADER);
+    }
+
+    ClassObjectReferenceImpl classObjectMirror(long id) {
+<span class="nc" id="L1364">        return (ClassObjectReferenceImpl)objectMirror(id,</span>
+                                                      JDWP.Tag.CLASS_OBJECT);
+    }
+
+    /*
+     * Implementation of PathSearchingVirtualMachine
+     */
+    private JDWP.VirtualMachine.ClassPaths getClasspath() {
+<span class="nc bnc" id="L1372" title="All 2 branches missed.">        if (pathInfo == null) {</span>
+            try {
+<span class="nc" id="L1374">                pathInfo = JDWP.VirtualMachine.ClassPaths.process(vm);</span>
+<span class="nc" id="L1375">            } catch (JDWPException exc) {</span>
+<span class="nc" id="L1376">                throw exc.toJDIException();</span>
+<span class="nc" id="L1377">            }</span>
+        }
+<span class="nc" id="L1379">        return pathInfo;</span>
+    }
+
+   public List&lt;String&gt; classPath() {
+<span class="nc" id="L1383">       return Arrays.asList(getClasspath().classpaths);</span>
+   }
+
+   public List&lt;String&gt; bootClassPath() {
+<span class="nc" id="L1387">       return Arrays.asList(getClasspath().bootclasspaths);</span>
+   }
+
+   public String baseDirectory() {
+<span class="nc" id="L1391">       return getClasspath().baseDir;</span>
+   }
+
+    public void setDefaultStratum(String stratum) {
+<span class="nc" id="L1395">        defaultStratum = stratum;</span>
+<span class="nc bnc" id="L1396" title="All 2 branches missed.">        if (stratum == null) {</span>
+<span class="nc" id="L1397">            stratum = &quot;&quot;;</span>
+        }
+        try {
+<span class="nc" id="L1400">            JDWP.VirtualMachine.SetDefaultStratum.process(vm,</span>
+                                                          stratum);
+<span class="nc" id="L1402">        } catch (JDWPException exc) {</span>
+<span class="nc" id="L1403">            throw exc.toJDIException();</span>
+<span class="nc" id="L1404">        }</span>
+<span class="nc" id="L1405">    }</span>
+
+    public String getDefaultStratum() {
+<span class="nc" id="L1408">        return defaultStratum;</span>
+    }
+
+    ThreadGroup threadGroupForJDI() {
+<span class="nc" id="L1412">        return threadGroupForJDI;</span>
+    }
+
+   static private class SoftObjectReference extends SoftReference&lt;ObjectReferenceImpl&gt; {
+       int count;
+       Long key;
+
+       SoftObjectReference(Long key, ObjectReferenceImpl mirror,
+                           ReferenceQueue&lt;ObjectReferenceImpl&gt; queue) {
+<span class="nc" id="L1421">           super(mirror, queue);</span>
+<span class="nc" id="L1422">           this.count = 1;</span>
+<span class="nc" id="L1423">           this.key = key;</span>
+<span class="nc" id="L1424">       }</span>
+
+       int count() {
+<span class="nc" id="L1427">           return count;</span>
+       }
+
+       void incrementCount() {
+<span class="nc" id="L1431">           count++;</span>
+<span class="nc" id="L1432">       }</span>
+
+       Long key() {
+<span class="nc" id="L1435">           return key;</span>
+       }
+
+       ObjectReferenceImpl object() {
+<span class="nc" id="L1439">           return get();</span>
+       }
+   }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

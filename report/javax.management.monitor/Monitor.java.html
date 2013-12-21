@@ -1,0 +1,1652 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>Monitor.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">javax.management.monitor</a> &gt; <span class="el_source">Monitor.java</span></div><h1>Monitor.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1999, 2008, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package javax.management.monitor;
+
+import static com.sun.jmx.defaults.JmxProperties.MONITOR_LOGGER;
+import com.sun.jmx.mbeanserver.GetPropertyAction;
+import com.sun.jmx.mbeanserver.Introspector;
+import java.io.IOException;
+import java.security.AccessControlContext;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
+import java.security.ProtectionDomain;
+import java.util.List;
+import java.util.Map;
+import java.util.WeakHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.logging.Level;
+import javax.management.AttributeNotFoundException;
+import javax.management.InstanceNotFoundException;
+import javax.management.IntrospectionException;
+import javax.management.MBeanAttributeInfo;
+import javax.management.MBeanException;
+import javax.management.MBeanInfo;
+import javax.management.MBeanRegistration;
+import javax.management.MBeanServer;
+import javax.management.MBeanServerConnection;
+import javax.management.NotificationBroadcasterSupport;
+import javax.management.ObjectName;
+import javax.management.ReflectionException;
+import static javax.management.monitor.MonitorNotification.*;
+
+/**
+ * Defines the part common to all monitor MBeans.
+ * A monitor MBean monitors values of an attribute common to a set of observed
+ * MBeans. The observed attribute is monitored at intervals specified by the
+ * granularity period. A gauge value (derived gauge) is derived from the values
+ * of the observed attribute.
+ *
+ *
+ * @since 1.5
+ */
+<span class="nc" id="L75">public abstract class Monitor</span>
+    extends NotificationBroadcasterSupport
+    implements MonitorMBean, MBeanRegistration {
+
+    /*
+     * ------------------------------------------
+     *  PACKAGE CLASSES
+     * ------------------------------------------
+     */
+
+    static class ObservedObject {
+
+<span class="nc" id="L87">        public ObservedObject(ObjectName observedObject) {</span>
+<span class="nc" id="L88">            this.observedObject = observedObject;</span>
+<span class="nc" id="L89">        }</span>
+
+        public final ObjectName getObservedObject() {
+<span class="nc" id="L92">            return observedObject;</span>
+        }
+        public final synchronized int getAlreadyNotified() {
+<span class="nc" id="L95">            return alreadyNotified;</span>
+        }
+        public final synchronized void setAlreadyNotified(int alreadyNotified) {
+<span class="nc" id="L98">            this.alreadyNotified = alreadyNotified;</span>
+<span class="nc" id="L99">        }</span>
+        public final synchronized Object getDerivedGauge() {
+<span class="nc" id="L101">            return derivedGauge;</span>
+        }
+        public final synchronized void setDerivedGauge(Object derivedGauge) {
+<span class="nc" id="L104">            this.derivedGauge = derivedGauge;</span>
+<span class="nc" id="L105">        }</span>
+        public final synchronized long getDerivedGaugeTimeStamp() {
+<span class="nc" id="L107">            return derivedGaugeTimeStamp;</span>
+        }
+        public final synchronized void setDerivedGaugeTimeStamp(
+                                                 long derivedGaugeTimeStamp) {
+<span class="nc" id="L111">            this.derivedGaugeTimeStamp = derivedGaugeTimeStamp;</span>
+<span class="nc" id="L112">        }</span>
+
+        private final ObjectName observedObject;
+        private int alreadyNotified;
+        private Object derivedGauge;
+        private long derivedGaugeTimeStamp;
+    }
+
+    /*
+     * ------------------------------------------
+     *  PRIVATE VARIABLES
+     * ------------------------------------------
+     */
+
+    /**
+     * Attribute to observe.
+     */
+    private String observedAttribute;
+
+    /**
+     * Monitor granularity period (in milliseconds).
+     * The default value is set to 10 seconds.
+     */
+<span class="nc" id="L135">    private long granularityPeriod = 10000;</span>
+
+    /**
+     * Monitor state.
+     * The default value is set to &lt;CODE&gt;false&lt;/CODE&gt;.
+     */
+<span class="nc" id="L141">    private boolean isActive = false;</span>
+
+    /**
+     * Monitor sequence number.
+     * The default value is set to 0.
+     */
+<span class="nc" id="L147">    private final AtomicLong sequenceNumber = new AtomicLong();</span>
+
+    /**
+     * Complex type attribute flag.
+     * The default value is set to &lt;CODE&gt;false&lt;/CODE&gt;.
+     */
+<span class="nc" id="L153">    private boolean isComplexTypeAttribute = false;</span>
+
+    /**
+     * First attribute name extracted from complex type attribute name.
+     */
+    private String firstAttribute;
+
+    /**
+     * Remaining attribute names extracted from complex type attribute name.
+     */
+<span class="nc" id="L163">    private final List&lt;String&gt; remainingAttributes =</span>
+        new CopyOnWriteArrayList&lt;String&gt;();
+
+    /**
+     * AccessControlContext of the Monitor.start() caller.
+     */
+<span class="nc" id="L169">    private static final AccessControlContext noPermissionsACC =</span>
+            new AccessControlContext(
+            new ProtectionDomain[] {new ProtectionDomain(null, null)});
+<span class="nc" id="L172">    private volatile AccessControlContext acc = noPermissionsACC;</span>
+
+    /**
+     * Scheduler Service.
+     */
+<span class="nc" id="L177">    private static final ScheduledExecutorService scheduler =</span>
+<span class="nc" id="L178">        Executors.newSingleThreadScheduledExecutor(</span>
+            new DaemonThreadFactory(&quot;Scheduler&quot;));
+
+    /**
+     * Map containing the thread pool executor per thread group.
+     */
+<span class="nc" id="L184">    private static final Map&lt;ThreadPoolExecutor, Void&gt; executors =</span>
+            new WeakHashMap&lt;ThreadPoolExecutor, Void&gt;();
+
+    /**
+     * Lock for executors map.
+     */
+<span class="nc" id="L190">    private static final Object executorsLock = new Object();</span>
+
+    /**
+     * Maximum Pool Size
+     */
+    private static final int maximumPoolSize;
+    static {
+        final String maximumPoolSizeSysProp = &quot;jmx.x.monitor.maximum.pool.size&quot;;
+<span class="nc" id="L198">        final String maximumPoolSizeStr = AccessController.doPrivileged(</span>
+            new GetPropertyAction(maximumPoolSizeSysProp));
+<span class="nc bnc" id="L200" title="All 2 branches missed.">        if (maximumPoolSizeStr == null ||</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">            maximumPoolSizeStr.trim().length() == 0) {</span>
+<span class="nc" id="L202">            maximumPoolSize = 10;</span>
+        } else {
+<span class="nc" id="L204">            int maximumPoolSizeTmp = 10;</span>
+            try {
+<span class="nc" id="L206">                maximumPoolSizeTmp = Integer.parseInt(maximumPoolSizeStr);</span>
+<span class="nc" id="L207">            } catch (NumberFormatException e) {</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">                if (MONITOR_LOGGER.isLoggable(Level.FINER)) {</span>
+<span class="nc" id="L209">                    MONITOR_LOGGER.logp(Level.FINER, Monitor.class.getName(),</span>
+                            &quot;&lt;static initializer&gt;&quot;,
+                            &quot;Wrong value for &quot; + maximumPoolSizeSysProp +
+                            &quot; system property&quot;, e);
+<span class="nc" id="L213">                    MONITOR_LOGGER.logp(Level.FINER, Monitor.class.getName(),</span>
+                            &quot;&lt;static initializer&gt;&quot;,
+                            maximumPoolSizeSysProp + &quot; defaults to 10&quot;);
+                }
+<span class="nc" id="L217">                maximumPoolSizeTmp = 10;</span>
+<span class="nc" id="L218">            }</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">            if (maximumPoolSizeTmp &lt; 1) {</span>
+<span class="nc" id="L220">                maximumPoolSize = 1;</span>
+            } else {
+<span class="nc" id="L222">                maximumPoolSize = maximumPoolSizeTmp;</span>
+            }
+        }
+    }
+
+    /**
+     * Future associated to the current monitor task.
+     */
+    private Future&lt;?&gt; monitorFuture;
+
+    /**
+     * Scheduler task to be executed by the Scheduler Service.
+     */
+<span class="nc" id="L235">    private final SchedulerTask schedulerTask = new SchedulerTask();</span>
+
+    /**
+     * ScheduledFuture associated to the current scheduler task.
+     */
+    private ScheduledFuture&lt;?&gt; schedulerFuture;
+
+    /*
+     * ------------------------------------------
+     *  PROTECTED VARIABLES
+     * ------------------------------------------
+     */
+
+    /**
+     * The amount by which the capacity of the monitor arrays are
+     * automatically incremented when their size becomes greater than
+     * their capacity.
+     */
+    protected final static int capacityIncrement = 16;
+
+    /**
+     * The number of valid components in the vector of observed objects.
+     *
+     */
+<span class="nc" id="L259">    protected int elementCount = 0;</span>
+
+    /**
+     * Monitor errors that have already been notified.
+     * @deprecated equivalent to {@link #alreadyNotifieds}[0].
+     */
+<span class="nc" id="L265">    @Deprecated</span>
+    protected int alreadyNotified = 0;
+
+    /**
+     * &lt;p&gt;Selected monitor errors that have already been notified.&lt;/p&gt;
+     *
+     * &lt;p&gt;Each element in this array corresponds to an observed object
+     * in the vector.  It contains a bit mask of the flags {@link
+     * #OBSERVED_OBJECT_ERROR_NOTIFIED} etc, indicating whether the
+     * corresponding notification has already been sent for the MBean
+     * being monitored.&lt;/p&gt;
+     *
+     */
+<span class="nc" id="L278">    protected int alreadyNotifieds[] = new int[capacityIncrement];</span>
+
+    /**
+     * Reference to the MBean server.  This reference is null when the
+     * monitor MBean is not registered in an MBean server.  This
+     * reference is initialized before the monitor MBean is registered
+     * in the MBean server.
+     * @see #preRegister(MBeanServer server, ObjectName name)
+     */
+    protected MBeanServer server;
+
+    // Flags defining possible monitor errors.
+    //
+
+    /**
+     * This flag is used to reset the {@link #alreadyNotifieds
+     * alreadyNotifieds} monitor attribute.
+     */
+    protected static final int RESET_FLAGS_ALREADY_NOTIFIED             = 0;
+
+    /**
+     * Flag denoting that a notification has occurred after changing
+     * the observed object.  This flag is used to check that the new
+     * observed object is registered in the MBean server at the time
+     * of the first notification.
+     */
+    protected static final int OBSERVED_OBJECT_ERROR_NOTIFIED           = 1;
+
+    /**
+     * Flag denoting that a notification has occurred after changing
+     * the observed attribute.  This flag is used to check that the
+     * new observed attribute belongs to the observed object at the
+     * time of the first notification.
+     */
+    protected static final int OBSERVED_ATTRIBUTE_ERROR_NOTIFIED        = 2;
+
+    /**
+     * Flag denoting that a notification has occurred after changing
+     * the observed object or the observed attribute.  This flag is
+     * used to check that the observed attribute type is correct
+     * (depending on the monitor in use) at the time of the first
+     * notification.
+     */
+    protected static final int OBSERVED_ATTRIBUTE_TYPE_ERROR_NOTIFIED   = 4;
+
+    /**
+     * Flag denoting that a notification has occurred after changing
+     * the observed object or the observed attribute.  This flag is
+     * used to notify any exception (except the cases described above)
+     * when trying to get the value of the observed attribute at the
+     * time of the first notification.
+     */
+    protected static final int RUNTIME_ERROR_NOTIFIED                   = 8;
+
+    /**
+     * This field is retained for compatibility but should not be referenced.
+     *
+     * @deprecated No replacement.
+     */
+<span class="nc" id="L337">    @Deprecated</span>
+<span class="nc" id="L338">    protected String dbgTag = Monitor.class.getName();</span>
+
+    /*
+     * ------------------------------------------
+     *  PACKAGE VARIABLES
+     * ------------------------------------------
+     */
+
+    /**
+     * List of ObservedObjects to which the attribute to observe belongs.
+     */
+<span class="nc" id="L349">    final List&lt;ObservedObject&gt; observedObjects =</span>
+        new CopyOnWriteArrayList&lt;ObservedObject&gt;();
+
+    /**
+     * Flag denoting that a notification has occurred after changing
+     * the threshold. This flag is used to notify any exception
+     * related to invalid thresholds settings.
+     */
+    static final int THRESHOLD_ERROR_NOTIFIED                           = 16;
+
+    /**
+     * Enumeration used to keep trace of the derived gauge type
+     * in counter and gauge monitors.
+     */
+<span class="nc" id="L363">    enum NumericalType { BYTE, SHORT, INTEGER, LONG, FLOAT, DOUBLE };</span>
+
+    /**
+     * Constant used to initialize all the numeric values.
+     */
+<span class="nc" id="L368">    static final Integer INTEGER_ZERO = 0;</span>
+
+
+    /*
+     * ------------------------------------------
+     *  PUBLIC METHODS
+     * ------------------------------------------
+     */
+
+    /**
+     * Allows the monitor MBean to perform any operations it needs
+     * before being registered in the MBean server.
+     * &lt;P&gt;
+     * Initializes the reference to the MBean server.
+     *
+     * @param server The MBean server in which the monitor MBean will
+     * be registered.
+     * @param name The object name of the monitor MBean.
+     *
+     * @return The name of the monitor MBean registered.
+     *
+     * @exception Exception
+     */
+    public ObjectName preRegister(MBeanServer server, ObjectName name)
+        throws Exception {
+
+<span class="nc" id="L394">        MONITOR_LOGGER.logp(Level.FINER, Monitor.class.getName(),</span>
+                &quot;preRegister(MBeanServer, ObjectName)&quot;,
+                &quot;initialize the reference on the MBean server&quot;);
+
+<span class="nc" id="L398">        this.server = server;</span>
+<span class="nc" id="L399">        return name;</span>
+    }
+
+    /**
+     * Allows the monitor MBean to perform any operations needed after
+     * having been registered in the MBean server or after the
+     * registration has failed.
+     * &lt;P&gt;
+     * Not used in this context.
+     */
+    public void postRegister(Boolean registrationDone) {
+<span class="nc" id="L410">    }</span>
+
+    /**
+     * Allows the monitor MBean to perform any operations it needs
+     * before being unregistered by the MBean server.
+     * &lt;P&gt;
+     * Stops the monitor.
+     *
+     * @exception Exception
+     */
+    public void preDeregister() throws Exception {
+
+<span class="nc" id="L422">        MONITOR_LOGGER.logp(Level.FINER, Monitor.class.getName(),</span>
+                &quot;preDeregister()&quot;, &quot;stop the monitor&quot;);
+
+        // Stop the Monitor.
+        //
+<span class="nc" id="L427">        stop();</span>
+<span class="nc" id="L428">    }</span>
+
+    /**
+     * Allows the monitor MBean to perform any operations needed after
+     * having been unregistered by the MBean server.
+     * &lt;P&gt;
+     * Not used in this context.
+     */
+    public void postDeregister() {
+<span class="nc" id="L437">    }</span>
+
+    /**
+     * Starts the monitor.
+     */
+    public abstract void start();
+
+    /**
+     * Stops the monitor.
+     */
+    public abstract void stop();
+
+    // GETTERS AND SETTERS
+    //--------------------
+
+    /**
+     * Returns the object name of the first object in the set of observed
+     * MBeans, or &lt;code&gt;null&lt;/code&gt; if there is no such object.
+     *
+     * @return The object being observed.
+     *
+     * @see #setObservedObject(ObjectName)
+     *
+     * @deprecated As of JMX 1.2, replaced by {@link #getObservedObjects}
+     */
+    @Deprecated
+    public synchronized ObjectName getObservedObject() {
+<span class="nc bnc" id="L464" title="All 2 branches missed.">        if (observedObjects.isEmpty()) {</span>
+<span class="nc" id="L465">            return null;</span>
+        } else {
+<span class="nc" id="L467">            return observedObjects.get(0).getObservedObject();</span>
+        }
+    }
+
+    /**
+     * Removes all objects from the set of observed objects, and then adds the
+     * specified object.
+     *
+     * @param object The object to observe.
+     * @exception IllegalArgumentException The specified
+     * object is null.
+     *
+     * @see #getObservedObject()
+     *
+     * @deprecated As of JMX 1.2, replaced by {@link #addObservedObject}
+     */
+    @Deprecated
+    public synchronized void setObservedObject(ObjectName object)
+        throws IllegalArgumentException {
+<span class="nc bnc" id="L486" title="All 2 branches missed.">        if (object == null)</span>
+<span class="nc" id="L487">            throw new IllegalArgumentException(&quot;Null observed object&quot;);</span>
+<span class="nc bnc" id="L488" title="All 4 branches missed.">        if (observedObjects.size() == 1 &amp;&amp; containsObservedObject(object))</span>
+<span class="nc" id="L489">            return;</span>
+<span class="nc" id="L490">        observedObjects.clear();</span>
+<span class="nc" id="L491">        addObservedObject(object);</span>
+<span class="nc" id="L492">    }</span>
+
+    /**
+     * Adds the specified object in the set of observed MBeans, if this object
+     * is not already present.
+     *
+     * @param object The object to observe.
+     * @exception IllegalArgumentException The specified object is null.
+     *
+     */
+    public synchronized void addObservedObject(ObjectName object)
+        throws IllegalArgumentException {
+
+<span class="nc bnc" id="L505" title="All 2 branches missed.">        if (object == null) {</span>
+<span class="nc" id="L506">            throw new IllegalArgumentException(&quot;Null observed object&quot;);</span>
+        }
+
+        // Check that the specified object is not already contained.
+        //
+<span class="nc bnc" id="L511" title="All 2 branches missed.">        if (containsObservedObject(object))</span>
+<span class="nc" id="L512">            return;</span>
+
+        // Add the specified object in the list.
+        //
+<span class="nc" id="L516">        ObservedObject o = createObservedObject(object);</span>
+<span class="nc" id="L517">        o.setAlreadyNotified(RESET_FLAGS_ALREADY_NOTIFIED);</span>
+<span class="nc" id="L518">        o.setDerivedGauge(INTEGER_ZERO);</span>
+<span class="nc" id="L519">        o.setDerivedGaugeTimeStamp(System.currentTimeMillis());</span>
+<span class="nc" id="L520">        observedObjects.add(o);</span>
+
+        // Update legacy protected stuff.
+        //
+<span class="nc" id="L524">        createAlreadyNotified();</span>
+<span class="nc" id="L525">    }</span>
+
+    /**
+     * Removes the specified object from the set of observed MBeans.
+     *
+     * @param object The object to remove.
+     *
+     */
+    public synchronized void removeObservedObject(ObjectName object) {
+        // Check for null object.
+        //
+<span class="nc bnc" id="L536" title="All 2 branches missed.">        if (object == null)</span>
+<span class="nc" id="L537">            return;</span>
+
+<span class="nc" id="L539">        final ObservedObject o = getObservedObject(object);</span>
+<span class="nc bnc" id="L540" title="All 2 branches missed.">        if (o != null) {</span>
+            // Remove the specified object from the list.
+            //
+<span class="nc" id="L543">            observedObjects.remove(o);</span>
+            // Update legacy protected stuff.
+            //
+<span class="nc" id="L546">            createAlreadyNotified();</span>
+        }
+<span class="nc" id="L548">    }</span>
+
+    /**
+     * Tests whether the specified object is in the set of observed MBeans.
+     *
+     * @param object The object to check.
+     * @return &lt;CODE&gt;true&lt;/CODE&gt; if the specified object is present,
+     * &lt;CODE&gt;false&lt;/CODE&gt; otherwise.
+     *
+     */
+    public synchronized boolean containsObservedObject(ObjectName object) {
+<span class="nc bnc" id="L559" title="All 2 branches missed.">        return getObservedObject(object) != null;</span>
+    }
+
+    /**
+     * Returns an array containing the objects being observed.
+     *
+     * @return The objects being observed.
+     *
+     */
+    public synchronized ObjectName[] getObservedObjects() {
+<span class="nc" id="L569">        ObjectName[] names = new ObjectName[observedObjects.size()];</span>
+<span class="nc bnc" id="L570" title="All 2 branches missed.">        for (int i = 0; i &lt; names.length; i++)</span>
+<span class="nc" id="L571">            names[i] = observedObjects.get(i).getObservedObject();</span>
+<span class="nc" id="L572">        return names;</span>
+    }
+
+    /**
+     * Gets the attribute being observed.
+     * &lt;BR&gt;The observed attribute is not initialized by default (set to null).
+     *
+     * @return The attribute being observed.
+     *
+     * @see #setObservedAttribute
+     */
+    public synchronized String getObservedAttribute() {
+<span class="nc" id="L584">        return observedAttribute;</span>
+    }
+
+    /**
+     * Sets the attribute to observe.
+     * &lt;BR&gt;The observed attribute is not initialized by default (set to null).
+     *
+     * @param attribute The attribute to observe.
+     * @exception IllegalArgumentException The specified
+     * attribute is null.
+     *
+     * @see #getObservedAttribute
+     */
+    public void setObservedAttribute(String attribute)
+        throws IllegalArgumentException {
+
+<span class="nc bnc" id="L600" title="All 2 branches missed.">        if (attribute == null) {</span>
+<span class="nc" id="L601">            throw new IllegalArgumentException(&quot;Null observed attribute&quot;);</span>
+        }
+
+        // Update alreadyNotified array.
+        //
+<span class="nc" id="L606">        synchronized (this) {</span>
+<span class="nc bnc" id="L607" title="All 2 branches missed.">            if (observedAttribute != null &amp;&amp;</span>
+<span class="nc bnc" id="L608" title="All 2 branches missed.">                observedAttribute.equals(attribute))</span>
+<span class="nc" id="L609">                return;</span>
+<span class="nc" id="L610">            observedAttribute = attribute;</span>
+
+            // Reset the complex type attribute information
+            // such that it is recalculated again.
+            //
+<span class="nc" id="L615">            cleanupIsComplexTypeAttribute();</span>
+
+<span class="nc" id="L617">            int index = 0;</span>
+<span class="nc bnc" id="L618" title="All 2 branches missed.">            for (ObservedObject o : observedObjects) {</span>
+<span class="nc" id="L619">                resetAlreadyNotified(o, index++,</span>
+                                     OBSERVED_ATTRIBUTE_ERROR_NOTIFIED |
+                                     OBSERVED_ATTRIBUTE_TYPE_ERROR_NOTIFIED);
+<span class="nc" id="L622">            }</span>
+<span class="nc" id="L623">        }</span>
+<span class="nc" id="L624">    }</span>
+
+    /**
+     * Gets the granularity period (in milliseconds).
+     * &lt;BR&gt;The default value of the granularity period is 10 seconds.
+     *
+     * @return The granularity period value.
+     *
+     * @see #setGranularityPeriod
+     */
+    public synchronized long getGranularityPeriod() {
+<span class="nc" id="L635">        return granularityPeriod;</span>
+    }
+
+    /**
+     * Sets the granularity period (in milliseconds).
+     * &lt;BR&gt;The default value of the granularity period is 10 seconds.
+     *
+     * @param period The granularity period value.
+     * @exception IllegalArgumentException The granularity
+     * period is less than or equal to zero.
+     *
+     * @see #getGranularityPeriod
+     */
+    public synchronized void setGranularityPeriod(long period)
+        throws IllegalArgumentException {
+
+<span class="nc bnc" id="L651" title="All 2 branches missed.">        if (period &lt;= 0) {</span>
+<span class="nc" id="L652">            throw new IllegalArgumentException(&quot;Nonpositive granularity &quot; +</span>
+                                               &quot;period&quot;);
+        }
+
+<span class="nc bnc" id="L656" title="All 2 branches missed.">        if (granularityPeriod == period)</span>
+<span class="nc" id="L657">            return;</span>
+<span class="nc" id="L658">        granularityPeriod = period;</span>
+
+        // Reschedule the scheduler task if the monitor is active.
+        //
+<span class="nc bnc" id="L662" title="All 2 branches missed.">        if (isActive()) {</span>
+<span class="nc" id="L663">            cleanupFutures();</span>
+<span class="nc" id="L664">            schedulerFuture = scheduler.schedule(schedulerTask,</span>
+                                                 period,
+                                                 TimeUnit.MILLISECONDS);
+        }
+<span class="nc" id="L668">    }</span>
+
+    /**
+     * Tests whether the monitor MBean is active.  A monitor MBean is
+     * marked active when the {@link #start start} method is called.
+     * It becomes inactive when the {@link #stop stop} method is
+     * called.
+     *
+     * @return &lt;CODE&gt;true&lt;/CODE&gt; if the monitor MBean is active,
+     * &lt;CODE&gt;false&lt;/CODE&gt; otherwise.
+     */
+    /* This method must be synchronized so that the monitoring thread will
+       correctly see modifications to the isActive variable. See the MonitorTask
+       action executed by the Scheduled Executor Service. */
+    public synchronized boolean isActive() {
+<span class="nc" id="L683">        return isActive;</span>
+    }
+
+    /*
+     * ------------------------------------------
+     *  PACKAGE METHODS
+     * ------------------------------------------
+     */
+
+    /**
+     * Starts the monitor.
+     */
+    void doStart() {
+<span class="nc" id="L696">            MONITOR_LOGGER.logp(Level.FINER, Monitor.class.getName(),</span>
+                &quot;doStart()&quot;, &quot;start the monitor&quot;);
+
+<span class="nc" id="L699">        synchronized (this) {</span>
+<span class="nc bnc" id="L700" title="All 2 branches missed.">            if (isActive()) {</span>
+<span class="nc" id="L701">                MONITOR_LOGGER.logp(Level.FINER, Monitor.class.getName(),</span>
+                        &quot;doStart()&quot;, &quot;the monitor is already active&quot;);
+<span class="nc" id="L703">                return;</span>
+            }
+
+<span class="nc" id="L706">            isActive = true;</span>
+
+            // Reset the complex type attribute information
+            // such that it is recalculated again.
+            //
+<span class="nc" id="L711">            cleanupIsComplexTypeAttribute();</span>
+
+            // Cache the AccessControlContext of the Monitor.start() caller.
+            // The monitor tasks will be executed within this context.
+            //
+<span class="nc" id="L716">            acc = AccessController.getContext();</span>
+
+            // Start the scheduler.
+            //
+<span class="nc" id="L720">            cleanupFutures();</span>
+<span class="nc" id="L721">            schedulerTask.setMonitorTask(new MonitorTask());</span>
+<span class="nc" id="L722">            schedulerFuture = scheduler.schedule(schedulerTask,</span>
+<span class="nc" id="L723">                                                 getGranularityPeriod(),</span>
+                                                 TimeUnit.MILLISECONDS);
+<span class="nc" id="L725">        }</span>
+<span class="nc" id="L726">    }</span>
+
+    /**
+     * Stops the monitor.
+     */
+    void doStop() {
+<span class="nc" id="L732">        MONITOR_LOGGER.logp(Level.FINER, Monitor.class.getName(),</span>
+                &quot;doStop()&quot;, &quot;stop the monitor&quot;);
+
+<span class="nc" id="L735">        synchronized (this) {</span>
+<span class="nc bnc" id="L736" title="All 2 branches missed.">            if (!isActive()) {</span>
+<span class="nc" id="L737">                MONITOR_LOGGER.logp(Level.FINER, Monitor.class.getName(),</span>
+                        &quot;doStop()&quot;, &quot;the monitor is not active&quot;);
+<span class="nc" id="L739">                return;</span>
+            }
+
+<span class="nc" id="L742">            isActive = false;</span>
+
+            // Cancel the scheduler task associated with the
+            // scheduler and its associated monitor task.
+            //
+<span class="nc" id="L747">            cleanupFutures();</span>
+
+            // Reset the AccessControlContext.
+            //
+<span class="nc" id="L751">            acc = noPermissionsACC;</span>
+
+            // Reset the complex type attribute information
+            // such that it is recalculated again.
+            //
+<span class="nc" id="L756">            cleanupIsComplexTypeAttribute();</span>
+<span class="nc" id="L757">        }</span>
+<span class="nc" id="L758">    }</span>
+
+    /**
+     * Gets the derived gauge of the specified object, if this object is
+     * contained in the set of observed MBeans, or &lt;code&gt;null&lt;/code&gt; otherwise.
+     *
+     * @param object the name of the object whose derived gauge is to
+     * be returned.
+     *
+     * @return The derived gauge of the specified object.
+     *
+     * @since 1.6
+     */
+    synchronized Object getDerivedGauge(ObjectName object) {
+<span class="nc" id="L772">        final ObservedObject o = getObservedObject(object);</span>
+<span class="nc bnc" id="L773" title="All 2 branches missed.">        return o == null ? null : o.getDerivedGauge();</span>
+    }
+
+    /**
+     * Gets the derived gauge timestamp of the specified object, if
+     * this object is contained in the set of observed MBeans, or
+     * &lt;code&gt;0&lt;/code&gt; otherwise.
+     *
+     * @param object the name of the object whose derived gauge
+     * timestamp is to be returned.
+     *
+     * @return The derived gauge timestamp of the specified object.
+     *
+     */
+    synchronized long getDerivedGaugeTimeStamp(ObjectName object) {
+<span class="nc" id="L788">        final ObservedObject o = getObservedObject(object);</span>
+<span class="nc bnc" id="L789" title="All 2 branches missed.">        return o == null ? 0 : o.getDerivedGaugeTimeStamp();</span>
+    }
+
+    Object getAttribute(MBeanServerConnection mbsc,
+                        ObjectName object,
+                        String attribute)
+        throws AttributeNotFoundException,
+               InstanceNotFoundException,
+               MBeanException,
+               ReflectionException,
+               IOException {
+        // Check for &quot;ObservedAttribute&quot; replacement.
+        // This could happen if a thread A called setObservedAttribute()
+        // while other thread B was in the middle of the monitor() method
+        // and received the old observed attribute value.
+        //
+        final boolean lookupMBeanInfo;
+<span class="nc" id="L806">        synchronized (this) {</span>
+<span class="nc bnc" id="L807" title="All 2 branches missed.">            if (!isActive())</span>
+<span class="nc" id="L808">                throw new IllegalArgumentException(</span>
+                    &quot;The monitor has been stopped&quot;);
+<span class="nc bnc" id="L810" title="All 2 branches missed.">            if (!attribute.equals(getObservedAttribute()))</span>
+<span class="nc" id="L811">                throw new IllegalArgumentException(</span>
+                    &quot;The observed attribute has been changed&quot;);
+<span class="nc bnc" id="L813" title="All 2 branches missed.">            lookupMBeanInfo =</span>
+<span class="nc bnc" id="L814" title="All 2 branches missed.">                (firstAttribute == null &amp;&amp; attribute.indexOf('.') != -1);</span>
+<span class="nc" id="L815">        }</span>
+
+        // Look up MBeanInfo if needed
+        //
+        final MBeanInfo mbi;
+<span class="nc bnc" id="L820" title="All 2 branches missed.">        if (lookupMBeanInfo) {</span>
+            try {
+<span class="nc" id="L822">                mbi = mbsc.getMBeanInfo(object);</span>
+<span class="nc" id="L823">            } catch (IntrospectionException e) {</span>
+<span class="nc" id="L824">                throw new IllegalArgumentException(e);</span>
+<span class="nc" id="L825">            }</span>
+        } else {
+<span class="nc" id="L827">            mbi = null;</span>
+        }
+
+        // Check for complex type attribute
+        //
+        final String fa;
+<span class="nc" id="L833">        synchronized (this) {</span>
+<span class="nc bnc" id="L834" title="All 2 branches missed.">            if (!isActive())</span>
+<span class="nc" id="L835">                throw new IllegalArgumentException(</span>
+                    &quot;The monitor has been stopped&quot;);
+<span class="nc bnc" id="L837" title="All 2 branches missed.">            if (!attribute.equals(getObservedAttribute()))</span>
+<span class="nc" id="L838">                throw new IllegalArgumentException(</span>
+                    &quot;The observed attribute has been changed&quot;);
+<span class="nc bnc" id="L840" title="All 2 branches missed.">            if (firstAttribute == null) {</span>
+<span class="nc bnc" id="L841" title="All 2 branches missed.">                if (attribute.indexOf('.') != -1) {</span>
+<span class="nc" id="L842">                    MBeanAttributeInfo mbaiArray[] = mbi.getAttributes();</span>
+<span class="nc bnc" id="L843" title="All 2 branches missed.">                    for (MBeanAttributeInfo mbai : mbaiArray) {</span>
+<span class="nc bnc" id="L844" title="All 2 branches missed.">                        if (attribute.equals(mbai.getName())) {</span>
+<span class="nc" id="L845">                            firstAttribute = attribute;</span>
+<span class="nc" id="L846">                            break;</span>
+                        }
+                    }
+<span class="nc bnc" id="L849" title="All 2 branches missed.">                    if (firstAttribute == null) {</span>
+<span class="nc" id="L850">                        String tokens[] = attribute.split(&quot;\\.&quot;, -1);</span>
+<span class="nc" id="L851">                        firstAttribute = tokens[0];</span>
+<span class="nc bnc" id="L852" title="All 2 branches missed.">                        for (int i = 1; i &lt; tokens.length; i++)</span>
+<span class="nc" id="L853">                            remainingAttributes.add(tokens[i]);</span>
+<span class="nc" id="L854">                        isComplexTypeAttribute = true;</span>
+                    }
+<span class="nc" id="L856">                } else {</span>
+<span class="nc" id="L857">                    firstAttribute = attribute;</span>
+                }
+            }
+<span class="nc" id="L860">            fa = firstAttribute;</span>
+<span class="nc" id="L861">        }</span>
+<span class="nc" id="L862">        return mbsc.getAttribute(object, fa);</span>
+    }
+
+    Comparable&lt;?&gt; getComparableFromAttribute(ObjectName object,
+                                             String attribute,
+                                             Object value)
+        throws AttributeNotFoundException {
+<span class="nc bnc" id="L869" title="All 2 branches missed.">        if (isComplexTypeAttribute) {</span>
+<span class="nc" id="L870">            Object v = value;</span>
+<span class="nc bnc" id="L871" title="All 2 branches missed.">            for (String attr : remainingAttributes)</span>
+<span class="nc" id="L872">                v = Introspector.elementFromComplex(v, attr);</span>
+<span class="nc" id="L873">            return (Comparable&lt;?&gt;) v;</span>
+        } else {
+<span class="nc" id="L875">            return (Comparable&lt;?&gt;) value;</span>
+        }
+    }
+
+    boolean isComparableTypeValid(ObjectName object,
+                                  String attribute,
+                                  Comparable&lt;?&gt; value) {
+<span class="nc" id="L882">        return true;</span>
+    }
+
+    String buildErrorNotification(ObjectName object,
+                                  String attribute,
+                                  Comparable&lt;?&gt; value) {
+<span class="nc" id="L888">        return null;</span>
+    }
+
+    void onErrorNotification(MonitorNotification notification) {
+<span class="nc" id="L892">    }</span>
+
+    Comparable&lt;?&gt; getDerivedGaugeFromComparable(ObjectName object,
+                                                String attribute,
+                                                Comparable&lt;?&gt; value) {
+<span class="nc" id="L897">        return (Comparable&lt;?&gt;) value;</span>
+    }
+
+    MonitorNotification buildAlarmNotification(ObjectName object,
+                                               String attribute,
+                                               Comparable&lt;?&gt; value){
+<span class="nc" id="L903">        return null;</span>
+    }
+
+    boolean isThresholdTypeValid(ObjectName object,
+                                 String attribute,
+                                 Comparable&lt;?&gt; value) {
+<span class="nc" id="L909">        return true;</span>
+    }
+
+    static Class&lt;? extends Number&gt; classForType(NumericalType type) {
+<span class="nc bnc" id="L913" title="All 7 branches missed.">        switch (type) {</span>
+            case BYTE:
+<span class="nc" id="L915">                return Byte.class;</span>
+            case SHORT:
+<span class="nc" id="L917">                return Short.class;</span>
+            case INTEGER:
+<span class="nc" id="L919">                return Integer.class;</span>
+            case LONG:
+<span class="nc" id="L921">                return Long.class;</span>
+            case FLOAT:
+<span class="nc" id="L923">                return Float.class;</span>
+            case DOUBLE:
+<span class="nc" id="L925">                return Double.class;</span>
+            default:
+<span class="nc" id="L927">                throw new IllegalArgumentException(</span>
+                    &quot;Unsupported numerical type&quot;);
+        }
+    }
+
+    static boolean isValidForType(Object value, Class&lt;? extends Number&gt; c) {
+<span class="nc bnc" id="L933" title="All 4 branches missed.">        return ((value == INTEGER_ZERO) || c.isInstance(value));</span>
+    }
+
+    /**
+     * Get the specified {@code ObservedObject} if this object is
+     * contained in the set of observed MBeans, or {@code null}
+     * otherwise.
+     *
+     * @param object the name of the {@code ObservedObject} to retrieve.
+     *
+     * @return The {@code ObservedObject} associated to the supplied
+     * {@code ObjectName}.
+     *
+     * @since 1.6
+     */
+    synchronized ObservedObject getObservedObject(ObjectName object) {
+<span class="nc bnc" id="L949" title="All 2 branches missed.">        for (ObservedObject o : observedObjects)</span>
+<span class="nc bnc" id="L950" title="All 2 branches missed.">            if (o.getObservedObject().equals(object))</span>
+<span class="nc" id="L951">                return o;</span>
+<span class="nc" id="L952">        return null;</span>
+    }
+
+    /**
+     * Factory method for ObservedObject creation.
+     *
+     * @since 1.6
+     */
+    ObservedObject createObservedObject(ObjectName object) {
+<span class="nc" id="L961">        return new ObservedObject(object);</span>
+    }
+
+    /**
+     * Create the {@link #alreadyNotified} array from
+     * the {@code ObservedObject} array list.
+     */
+    synchronized void createAlreadyNotified() {
+        // Update elementCount.
+        //
+<span class="nc" id="L971">        elementCount = observedObjects.size();</span>
+
+        // Update arrays.
+        //
+<span class="nc" id="L975">        alreadyNotifieds = new int[elementCount];</span>
+<span class="nc bnc" id="L976" title="All 2 branches missed.">        for (int i = 0; i &lt; elementCount; i++) {</span>
+<span class="nc" id="L977">            alreadyNotifieds[i] = observedObjects.get(i).getAlreadyNotified();</span>
+        }
+<span class="nc" id="L979">        updateDeprecatedAlreadyNotified();</span>
+<span class="nc" id="L980">    }</span>
+
+    /**
+     * Update the deprecated {@link #alreadyNotified} field.
+     */
+    synchronized void updateDeprecatedAlreadyNotified() {
+<span class="nc bnc" id="L986" title="All 2 branches missed.">        if (elementCount &gt; 0)</span>
+<span class="nc" id="L987">            alreadyNotified = alreadyNotifieds[0];</span>
+        else
+<span class="nc" id="L989">            alreadyNotified = 0;</span>
+<span class="nc" id="L990">    }</span>
+
+    /**
+     * Update the {@link #alreadyNotifieds} array element at the given index
+     * with the already notified flag in the given {@code ObservedObject}.
+     * Ensure the deprecated {@link #alreadyNotified} field is updated
+     * if appropriate.
+     */
+    synchronized void updateAlreadyNotified(ObservedObject o, int index) {
+<span class="nc" id="L999">        alreadyNotifieds[index] = o.getAlreadyNotified();</span>
+<span class="nc bnc" id="L1000" title="All 2 branches missed.">        if (index == 0)</span>
+<span class="nc" id="L1001">            updateDeprecatedAlreadyNotified();</span>
+<span class="nc" id="L1002">    }</span>
+
+    /**
+     * Check if the given bits in the given element of {@link #alreadyNotifieds}
+     * are set.
+     */
+    synchronized boolean isAlreadyNotified(ObservedObject o, int mask) {
+<span class="nc bnc" id="L1009" title="All 2 branches missed.">        return ((o.getAlreadyNotified() &amp; mask) != 0);</span>
+    }
+
+    /**
+     * Set the given bits in the given element of {@link #alreadyNotifieds}.
+     * Ensure the deprecated {@link #alreadyNotified} field is updated
+     * if appropriate.
+     */
+    synchronized void setAlreadyNotified(ObservedObject o, int index,
+                                         int mask, int an[]) {
+<span class="nc" id="L1019">        final int i = computeAlreadyNotifiedIndex(o, index, an);</span>
+<span class="nc bnc" id="L1020" title="All 2 branches missed.">        if (i == -1)</span>
+<span class="nc" id="L1021">            return;</span>
+<span class="nc" id="L1022">        o.setAlreadyNotified(o.getAlreadyNotified() | mask);</span>
+<span class="nc" id="L1023">        updateAlreadyNotified(o, i);</span>
+<span class="nc" id="L1024">    }</span>
+
+    /**
+     * Reset the given bits in the given element of {@link #alreadyNotifieds}.
+     * Ensure the deprecated {@link #alreadyNotified} field is updated
+     * if appropriate.
+     */
+    synchronized void resetAlreadyNotified(ObservedObject o,
+                                           int index, int mask) {
+<span class="nc" id="L1033">        o.setAlreadyNotified(o.getAlreadyNotified() &amp; ~mask);</span>
+<span class="nc" id="L1034">        updateAlreadyNotified(o, index);</span>
+<span class="nc" id="L1035">    }</span>
+
+    /**
+     * Reset all bits in the given element of {@link #alreadyNotifieds}.
+     * Ensure the deprecated {@link #alreadyNotified} field is updated
+     * if appropriate.
+     */
+    synchronized void resetAllAlreadyNotified(ObservedObject o,
+                                              int index, int an[]) {
+<span class="nc" id="L1044">        final int i = computeAlreadyNotifiedIndex(o, index, an);</span>
+<span class="nc bnc" id="L1045" title="All 2 branches missed.">        if (i == -1)</span>
+<span class="nc" id="L1046">            return;</span>
+<span class="nc" id="L1047">        o.setAlreadyNotified(RESET_FLAGS_ALREADY_NOTIFIED);</span>
+<span class="nc" id="L1048">        updateAlreadyNotified(o, index);</span>
+<span class="nc" id="L1049">    }</span>
+
+    /**
+     * Check if the {@link #alreadyNotifieds} array has been modified.
+     * If true recompute the index for the given observed object.
+     */
+    synchronized int computeAlreadyNotifiedIndex(ObservedObject o,
+                                                 int index, int an[]) {
+<span class="nc bnc" id="L1057" title="All 2 branches missed.">        if (an == alreadyNotifieds) {</span>
+<span class="nc" id="L1058">            return index;</span>
+        } else {
+<span class="nc" id="L1060">            return observedObjects.indexOf(o);</span>
+        }
+    }
+
+    /*
+     * ------------------------------------------
+     *  PRIVATE METHODS
+     * ------------------------------------------
+     */
+
+    /**
+     * This method is used by the monitor MBean to create and send a
+     * monitor notification to all the listeners registered for this
+     * kind of notification.
+     *
+     * @param type The notification type.
+     * @param timeStamp The notification emission date.
+     * @param msg The notification message.
+     * @param derGauge The derived gauge.
+     * @param trigger The threshold/string (depending on the monitor
+     * type) that triggered off the notification.
+     * @param object The ObjectName of the observed object that triggered
+     * off the notification.
+     * @param onError Flag indicating if this monitor notification is
+     * an error notification or an alarm notification.
+     */
+    private void sendNotification(String type, long timeStamp, String msg,
+                                  Object derGauge, Object trigger,
+                                  ObjectName object, boolean onError) {
+<span class="nc bnc" id="L1089" title="All 2 branches missed.">        if (!isActive())</span>
+<span class="nc" id="L1090">            return;</span>
+
+<span class="nc bnc" id="L1092" title="All 2 branches missed.">        if (MONITOR_LOGGER.isLoggable(Level.FINER)) {</span>
+<span class="nc" id="L1093">            MONITOR_LOGGER.logp(Level.FINER, Monitor.class.getName(),</span>
+                    &quot;sendNotification&quot;, &quot;send notification: &quot; +
+                    &quot;\n\tNotification observed object = &quot; + object +
+                    &quot;\n\tNotification observed attribute = &quot; + observedAttribute +
+                    &quot;\n\tNotification derived gauge = &quot; + derGauge);
+        }
+
+<span class="nc" id="L1100">        long seqno = sequenceNumber.getAndIncrement();</span>
+
+<span class="nc" id="L1102">        MonitorNotification mn =</span>
+            new MonitorNotification(type,
+                                    this,
+                                    seqno,
+                                    timeStamp,
+                                    msg,
+                                    object,
+                                    observedAttribute,
+                                    derGauge,
+                                    trigger);
+<span class="nc bnc" id="L1112" title="All 2 branches missed.">        if (onError)</span>
+<span class="nc" id="L1113">            onErrorNotification(mn);</span>
+<span class="nc" id="L1114">        sendNotification(mn);</span>
+<span class="nc" id="L1115">    }</span>
+
+    /**
+     * This method is called by the monitor each time
+     * the granularity period has been exceeded.
+     * @param o The observed object.
+     */
+    private void monitor(ObservedObject o, int index, int an[]) {
+
+        String attribute;
+<span class="nc" id="L1125">        String notifType = null;</span>
+<span class="nc" id="L1126">        String msg = null;</span>
+<span class="nc" id="L1127">        Object derGauge = null;</span>
+<span class="nc" id="L1128">        Object trigger = null;</span>
+        ObjectName object;
+<span class="nc" id="L1130">        Comparable&lt;?&gt; value = null;</span>
+<span class="nc" id="L1131">        MonitorNotification alarm = null;</span>
+
+<span class="nc bnc" id="L1133" title="All 2 branches missed.">        if (!isActive())</span>
+<span class="nc" id="L1134">            return;</span>
+
+        // Check that neither the observed object nor the
+        // observed attribute are null.  If the observed
+        // object or observed attribute is null, this means
+        // that the monitor started before a complete
+        // initialization and nothing is done.
+        //
+<span class="nc" id="L1142">        synchronized (this) {</span>
+<span class="nc" id="L1143">            object = o.getObservedObject();</span>
+<span class="nc" id="L1144">            attribute = getObservedAttribute();</span>
+<span class="nc bnc" id="L1145" title="All 4 branches missed.">            if (object == null || attribute == null) {</span>
+<span class="nc" id="L1146">                return;</span>
+            }
+<span class="nc" id="L1148">        }</span>
+
+        // Check that the observed object is registered in the
+        // MBean server and that the observed attribute
+        // belongs to the observed object.
+        //
+<span class="nc" id="L1154">        Object attributeValue = null;</span>
+        try {
+<span class="nc" id="L1156">            attributeValue = getAttribute(server, object, attribute);</span>
+<span class="nc bnc" id="L1157" title="All 2 branches missed.">            if (attributeValue == null)</span>
+<span class="nc bnc" id="L1158" title="All 2 branches missed.">                if (isAlreadyNotified(</span>
+                        o, OBSERVED_ATTRIBUTE_TYPE_ERROR_NOTIFIED))
+<span class="nc" id="L1160">                    return;</span>
+                else {
+<span class="nc" id="L1162">                    notifType = OBSERVED_ATTRIBUTE_TYPE_ERROR;</span>
+<span class="nc" id="L1163">                    setAlreadyNotified(</span>
+                        o, index, OBSERVED_ATTRIBUTE_TYPE_ERROR_NOTIFIED, an);
+<span class="nc" id="L1165">                    msg = &quot;The observed attribute value is null.&quot;;</span>
+<span class="nc" id="L1166">                    MONITOR_LOGGER.logp(Level.FINEST, Monitor.class.getName(),</span>
+                            &quot;monitor&quot;, msg);
+                }
+<span class="nc" id="L1169">        } catch (NullPointerException np_ex) {</span>
+<span class="nc bnc" id="L1170" title="All 2 branches missed.">            if (isAlreadyNotified(o, RUNTIME_ERROR_NOTIFIED))</span>
+<span class="nc" id="L1171">                return;</span>
+            else {
+<span class="nc" id="L1173">                notifType = RUNTIME_ERROR;</span>
+<span class="nc" id="L1174">                setAlreadyNotified(o, index, RUNTIME_ERROR_NOTIFIED, an);</span>
+<span class="nc" id="L1175">                msg =</span>
+                    &quot;The monitor must be registered in the MBean &quot; +
+                    &quot;server or an MBeanServerConnection must be &quot; +
+                    &quot;explicitly supplied.&quot;;
+<span class="nc" id="L1179">                MONITOR_LOGGER.logp(Level.FINEST, Monitor.class.getName(),</span>
+                        &quot;monitor&quot;, msg);
+<span class="nc" id="L1181">                MONITOR_LOGGER.logp(Level.FINEST, Monitor.class.getName(),</span>
+<span class="nc" id="L1182">                        &quot;monitor&quot;, np_ex.toString());</span>
+            }
+<span class="nc" id="L1184">        } catch (InstanceNotFoundException inf_ex) {</span>
+<span class="nc bnc" id="L1185" title="All 2 branches missed.">            if (isAlreadyNotified(o, OBSERVED_OBJECT_ERROR_NOTIFIED))</span>
+<span class="nc" id="L1186">                return;</span>
+            else {
+<span class="nc" id="L1188">                notifType = OBSERVED_OBJECT_ERROR;</span>
+<span class="nc" id="L1189">                setAlreadyNotified(</span>
+                    o, index, OBSERVED_OBJECT_ERROR_NOTIFIED, an);
+<span class="nc" id="L1191">                msg =</span>
+                    &quot;The observed object must be accessible in &quot; +
+                    &quot;the MBeanServerConnection.&quot;;
+<span class="nc" id="L1194">                MONITOR_LOGGER.logp(Level.FINEST, Monitor.class.getName(),</span>
+                        &quot;monitor&quot;, msg);
+<span class="nc" id="L1196">                MONITOR_LOGGER.logp(Level.FINEST, Monitor.class.getName(),</span>
+<span class="nc" id="L1197">                        &quot;monitor&quot;, inf_ex.toString());</span>
+            }
+<span class="nc" id="L1199">        } catch (AttributeNotFoundException anf_ex) {</span>
+<span class="nc bnc" id="L1200" title="All 2 branches missed.">            if (isAlreadyNotified(o, OBSERVED_ATTRIBUTE_ERROR_NOTIFIED))</span>
+<span class="nc" id="L1201">                return;</span>
+            else {
+<span class="nc" id="L1203">                notifType = OBSERVED_ATTRIBUTE_ERROR;</span>
+<span class="nc" id="L1204">                setAlreadyNotified(</span>
+                    o, index, OBSERVED_ATTRIBUTE_ERROR_NOTIFIED, an);
+<span class="nc" id="L1206">                msg =</span>
+                    &quot;The observed attribute must be accessible in &quot; +
+                    &quot;the observed object.&quot;;
+<span class="nc" id="L1209">                MONITOR_LOGGER.logp(Level.FINEST, Monitor.class.getName(),</span>
+                        &quot;monitor&quot;, msg);
+<span class="nc" id="L1211">                MONITOR_LOGGER.logp(Level.FINEST, Monitor.class.getName(),</span>
+<span class="nc" id="L1212">                        &quot;monitor&quot;, anf_ex.toString());</span>
+            }
+<span class="nc" id="L1214">        } catch (MBeanException mb_ex) {</span>
+<span class="nc bnc" id="L1215" title="All 2 branches missed.">            if (isAlreadyNotified(o, RUNTIME_ERROR_NOTIFIED))</span>
+<span class="nc" id="L1216">                return;</span>
+            else {
+<span class="nc" id="L1218">                notifType = RUNTIME_ERROR;</span>
+<span class="nc" id="L1219">                setAlreadyNotified(o, index, RUNTIME_ERROR_NOTIFIED, an);</span>
+<span class="nc bnc" id="L1220" title="All 2 branches missed.">                msg = mb_ex.getMessage() == null ? &quot;&quot; : mb_ex.getMessage();</span>
+<span class="nc" id="L1221">                MONITOR_LOGGER.logp(Level.FINEST, Monitor.class.getName(),</span>
+                        &quot;monitor&quot;, msg);
+<span class="nc" id="L1223">                MONITOR_LOGGER.logp(Level.FINEST, Monitor.class.getName(),</span>
+<span class="nc" id="L1224">                        &quot;monitor&quot;, mb_ex.toString());</span>
+            }
+<span class="nc" id="L1226">        } catch (ReflectionException ref_ex) {</span>
+<span class="nc bnc" id="L1227" title="All 2 branches missed.">            if (isAlreadyNotified(o, RUNTIME_ERROR_NOTIFIED)) {</span>
+<span class="nc" id="L1228">                return;</span>
+            } else {
+<span class="nc" id="L1230">                notifType = RUNTIME_ERROR;</span>
+<span class="nc" id="L1231">                setAlreadyNotified(o, index, RUNTIME_ERROR_NOTIFIED, an);</span>
+<span class="nc bnc" id="L1232" title="All 2 branches missed.">                msg = ref_ex.getMessage() == null ? &quot;&quot; : ref_ex.getMessage();</span>
+<span class="nc" id="L1233">                MONITOR_LOGGER.logp(Level.FINEST, Monitor.class.getName(),</span>
+                        &quot;monitor&quot;, msg);
+<span class="nc" id="L1235">                MONITOR_LOGGER.logp(Level.FINEST, Monitor.class.getName(),</span>
+<span class="nc" id="L1236">                        &quot;monitor&quot;, ref_ex.toString());</span>
+            }
+<span class="nc" id="L1238">        } catch (IOException io_ex) {</span>
+<span class="nc bnc" id="L1239" title="All 2 branches missed.">            if (isAlreadyNotified(o, RUNTIME_ERROR_NOTIFIED))</span>
+<span class="nc" id="L1240">                return;</span>
+            else {
+<span class="nc" id="L1242">                notifType = RUNTIME_ERROR;</span>
+<span class="nc" id="L1243">                setAlreadyNotified(o, index, RUNTIME_ERROR_NOTIFIED, an);</span>
+<span class="nc bnc" id="L1244" title="All 2 branches missed.">                msg = io_ex.getMessage() == null ? &quot;&quot; : io_ex.getMessage();</span>
+<span class="nc" id="L1245">                MONITOR_LOGGER.logp(Level.FINEST, Monitor.class.getName(),</span>
+                        &quot;monitor&quot;, msg);
+<span class="nc" id="L1247">                MONITOR_LOGGER.logp(Level.FINEST, Monitor.class.getName(),</span>
+<span class="nc" id="L1248">                        &quot;monitor&quot;, io_ex.toString());</span>
+            }
+<span class="nc" id="L1250">        } catch (RuntimeException rt_ex) {</span>
+<span class="nc bnc" id="L1251" title="All 2 branches missed.">            if (isAlreadyNotified(o, RUNTIME_ERROR_NOTIFIED))</span>
+<span class="nc" id="L1252">                return;</span>
+            else {
+<span class="nc" id="L1254">                notifType = RUNTIME_ERROR;</span>
+<span class="nc" id="L1255">                setAlreadyNotified(o, index, RUNTIME_ERROR_NOTIFIED, an);</span>
+<span class="nc bnc" id="L1256" title="All 2 branches missed.">                msg = rt_ex.getMessage() == null ? &quot;&quot; : rt_ex.getMessage();</span>
+<span class="nc" id="L1257">                MONITOR_LOGGER.logp(Level.FINEST, Monitor.class.getName(),</span>
+                        &quot;monitor&quot;, msg);
+<span class="nc" id="L1259">                MONITOR_LOGGER.logp(Level.FINEST, Monitor.class.getName(),</span>
+<span class="nc" id="L1260">                        &quot;monitor&quot;, rt_ex.toString());</span>
+            }
+<span class="nc" id="L1262">        }</span>
+
+<span class="nc" id="L1264">        synchronized (this) {</span>
+
+            // Check if the monitor has been stopped.
+            //
+<span class="nc bnc" id="L1268" title="All 2 branches missed.">            if (!isActive())</span>
+<span class="nc" id="L1269">                return;</span>
+
+            // Check if the observed attribute has been changed.
+            //
+            // Avoid race condition where mbs.getAttribute() succeeded but
+            // another thread replaced the observed attribute meanwhile.
+            //
+            // Avoid setting computed derived gauge on erroneous attribute.
+            //
+<span class="nc bnc" id="L1278" title="All 2 branches missed.">            if (!attribute.equals(getObservedAttribute()))</span>
+<span class="nc" id="L1279">                return;</span>
+
+            // Derive a Comparable object from the ObservedAttribute value
+            // if the type of the ObservedAttribute value is a complex type.
+            //
+<span class="nc bnc" id="L1284" title="All 2 branches missed.">            if (msg == null) {</span>
+                try {
+<span class="nc" id="L1286">                    value = getComparableFromAttribute(object,</span>
+                                                       attribute,
+                                                       attributeValue);
+<span class="nc" id="L1289">                } catch (ClassCastException e) {</span>
+<span class="nc bnc" id="L1290" title="All 2 branches missed.">                    if (isAlreadyNotified(</span>
+                            o, OBSERVED_ATTRIBUTE_TYPE_ERROR_NOTIFIED))
+<span class="nc" id="L1292">                        return;</span>
+                    else {
+<span class="nc" id="L1294">                        notifType = OBSERVED_ATTRIBUTE_TYPE_ERROR;</span>
+<span class="nc" id="L1295">                        setAlreadyNotified(o, index,</span>
+                            OBSERVED_ATTRIBUTE_TYPE_ERROR_NOTIFIED, an);
+<span class="nc" id="L1297">                        msg =</span>
+                            &quot;The observed attribute value does not &quot; +
+                            &quot;implement the Comparable interface.&quot;;
+<span class="nc" id="L1300">                        MONITOR_LOGGER.logp(Level.FINEST,</span>
+<span class="nc" id="L1301">                                Monitor.class.getName(), &quot;monitor&quot;, msg);</span>
+<span class="nc" id="L1302">                        MONITOR_LOGGER.logp(Level.FINEST,</span>
+<span class="nc" id="L1303">                                Monitor.class.getName(), &quot;monitor&quot;, e.toString());</span>
+                    }
+<span class="nc" id="L1305">                } catch (AttributeNotFoundException e) {</span>
+<span class="nc bnc" id="L1306" title="All 2 branches missed.">                    if (isAlreadyNotified(o, OBSERVED_ATTRIBUTE_ERROR_NOTIFIED))</span>
+<span class="nc" id="L1307">                        return;</span>
+                    else {
+<span class="nc" id="L1309">                        notifType = OBSERVED_ATTRIBUTE_ERROR;</span>
+<span class="nc" id="L1310">                        setAlreadyNotified(</span>
+                            o, index, OBSERVED_ATTRIBUTE_ERROR_NOTIFIED, an);
+<span class="nc" id="L1312">                        msg =</span>
+                            &quot;The observed attribute must be accessible in &quot; +
+                            &quot;the observed object.&quot;;
+<span class="nc" id="L1315">                        MONITOR_LOGGER.logp(Level.FINEST,</span>
+<span class="nc" id="L1316">                                Monitor.class.getName(), &quot;monitor&quot;, msg);</span>
+<span class="nc" id="L1317">                        MONITOR_LOGGER.logp(Level.FINEST,</span>
+<span class="nc" id="L1318">                                Monitor.class.getName(), &quot;monitor&quot;, e.toString());</span>
+                    }
+<span class="nc" id="L1320">                } catch (RuntimeException e) {</span>
+<span class="nc bnc" id="L1321" title="All 2 branches missed.">                    if (isAlreadyNotified(o, RUNTIME_ERROR_NOTIFIED))</span>
+<span class="nc" id="L1322">                        return;</span>
+                    else {
+<span class="nc" id="L1324">                        notifType = RUNTIME_ERROR;</span>
+<span class="nc" id="L1325">                        setAlreadyNotified(o, index,</span>
+                            RUNTIME_ERROR_NOTIFIED, an);
+<span class="nc bnc" id="L1327" title="All 2 branches missed.">                        msg = e.getMessage() == null ? &quot;&quot; : e.getMessage();</span>
+<span class="nc" id="L1328">                        MONITOR_LOGGER.logp(Level.FINEST,</span>
+<span class="nc" id="L1329">                                Monitor.class.getName(), &quot;monitor&quot;, msg);</span>
+<span class="nc" id="L1330">                        MONITOR_LOGGER.logp(Level.FINEST,</span>
+<span class="nc" id="L1331">                                Monitor.class.getName(), &quot;monitor&quot;, e.toString());</span>
+                    }
+<span class="nc" id="L1333">                }</span>
+            }
+
+            // Check that the observed attribute type is supported by this
+            // monitor.
+            //
+<span class="nc bnc" id="L1339" title="All 2 branches missed.">            if (msg == null) {</span>
+<span class="nc bnc" id="L1340" title="All 2 branches missed.">                if (!isComparableTypeValid(object, attribute, value)) {</span>
+<span class="nc bnc" id="L1341" title="All 2 branches missed.">                    if (isAlreadyNotified(</span>
+                            o, OBSERVED_ATTRIBUTE_TYPE_ERROR_NOTIFIED))
+<span class="nc" id="L1343">                        return;</span>
+                    else {
+<span class="nc" id="L1345">                        notifType = OBSERVED_ATTRIBUTE_TYPE_ERROR;</span>
+<span class="nc" id="L1346">                        setAlreadyNotified(o, index,</span>
+                            OBSERVED_ATTRIBUTE_TYPE_ERROR_NOTIFIED, an);
+<span class="nc" id="L1348">                        msg = &quot;The observed attribute type is not valid.&quot;;</span>
+<span class="nc" id="L1349">                        MONITOR_LOGGER.logp(Level.FINEST,</span>
+<span class="nc" id="L1350">                                Monitor.class.getName(), &quot;monitor&quot;, msg);</span>
+                    }
+                }
+            }
+
+            // Check that threshold type is supported by this monitor.
+            //
+<span class="nc bnc" id="L1357" title="All 2 branches missed.">            if (msg == null) {</span>
+<span class="nc bnc" id="L1358" title="All 2 branches missed.">                if (!isThresholdTypeValid(object, attribute, value)) {</span>
+<span class="nc bnc" id="L1359" title="All 2 branches missed.">                    if (isAlreadyNotified(o, THRESHOLD_ERROR_NOTIFIED))</span>
+<span class="nc" id="L1360">                        return;</span>
+                    else {
+<span class="nc" id="L1362">                        notifType = THRESHOLD_ERROR;</span>
+<span class="nc" id="L1363">                        setAlreadyNotified(o, index,</span>
+                            THRESHOLD_ERROR_NOTIFIED, an);
+<span class="nc" id="L1365">                        msg = &quot;The threshold type is not valid.&quot;;</span>
+<span class="nc" id="L1366">                        MONITOR_LOGGER.logp(Level.FINEST,</span>
+<span class="nc" id="L1367">                                Monitor.class.getName(), &quot;monitor&quot;, msg);</span>
+                    }
+                }
+            }
+
+            // Let someone subclassing the monitor to perform additional
+            // monitor consistency checks and report errors if necessary.
+            //
+<span class="nc bnc" id="L1375" title="All 2 branches missed.">            if (msg == null) {</span>
+<span class="nc" id="L1376">                msg = buildErrorNotification(object, attribute, value);</span>
+<span class="nc bnc" id="L1377" title="All 2 branches missed.">                if (msg != null) {</span>
+<span class="nc bnc" id="L1378" title="All 2 branches missed.">                    if (isAlreadyNotified(o, RUNTIME_ERROR_NOTIFIED))</span>
+<span class="nc" id="L1379">                        return;</span>
+                    else {
+<span class="nc" id="L1381">                        notifType = RUNTIME_ERROR;</span>
+<span class="nc" id="L1382">                        setAlreadyNotified(o, index,</span>
+                            RUNTIME_ERROR_NOTIFIED, an);
+<span class="nc" id="L1384">                        MONITOR_LOGGER.logp(Level.FINEST,</span>
+<span class="nc" id="L1385">                                Monitor.class.getName(), &quot;monitor&quot;, msg);</span>
+                    }
+                }
+            }
+
+            // If no errors were found then clear all error flags and
+            // let the monitor decide if a notification must be sent.
+            //
+<span class="nc bnc" id="L1393" title="All 2 branches missed.">            if (msg == null) {</span>
+                // Clear all already notified flags.
+                //
+<span class="nc" id="L1396">                resetAllAlreadyNotified(o, index, an);</span>
+
+                // Get derived gauge from comparable value.
+                //
+<span class="nc" id="L1400">                derGauge = getDerivedGaugeFromComparable(object,</span>
+                                                         attribute,
+                                                         value);
+
+<span class="nc" id="L1404">                o.setDerivedGauge(derGauge);</span>
+<span class="nc" id="L1405">                o.setDerivedGaugeTimeStamp(System.currentTimeMillis());</span>
+
+                // Check if an alarm must be fired.
+                //
+<span class="nc" id="L1409">                alarm = buildAlarmNotification(object,</span>
+                                               attribute,
+                                               (Comparable&lt;?&gt;) derGauge);
+            }
+
+<span class="nc" id="L1414">        }</span>
+
+        // Notify monitor errors
+        //
+<span class="nc bnc" id="L1418" title="All 2 branches missed.">        if (msg != null)</span>
+<span class="nc" id="L1419">            sendNotification(notifType,</span>
+<span class="nc" id="L1420">                             System.currentTimeMillis(),</span>
+                             msg,
+                             derGauge,
+                             trigger,
+                             object,
+                             true);
+
+        // Notify monitor alarms
+        //
+<span class="nc bnc" id="L1429" title="All 4 branches missed.">        if (alarm != null &amp;&amp; alarm.getType() != null)</span>
+<span class="nc" id="L1430">            sendNotification(alarm.getType(),</span>
+<span class="nc" id="L1431">                             System.currentTimeMillis(),</span>
+<span class="nc" id="L1432">                             alarm.getMessage(),</span>
+                             derGauge,
+<span class="nc" id="L1434">                             alarm.getTrigger(),</span>
+                             object,
+                             false);
+<span class="nc" id="L1437">    }</span>
+
+    /**
+     * Cleanup the scheduler and monitor tasks futures.
+     */
+    private synchronized void cleanupFutures() {
+<span class="nc bnc" id="L1443" title="All 2 branches missed.">        if (schedulerFuture != null) {</span>
+<span class="nc" id="L1444">            schedulerFuture.cancel(false);</span>
+<span class="nc" id="L1445">            schedulerFuture = null;</span>
+        }
+<span class="nc bnc" id="L1447" title="All 2 branches missed.">        if (monitorFuture != null) {</span>
+<span class="nc" id="L1448">            monitorFuture.cancel(false);</span>
+<span class="nc" id="L1449">            monitorFuture = null;</span>
+        }
+<span class="nc" id="L1451">    }</span>
+
+    /**
+     * Cleanup the &quot;is complex type attribute&quot; info.
+     */
+    private synchronized void cleanupIsComplexTypeAttribute() {
+<span class="nc" id="L1457">        firstAttribute = null;</span>
+<span class="nc" id="L1458">        remainingAttributes.clear();</span>
+<span class="nc" id="L1459">        isComplexTypeAttribute = false;</span>
+<span class="nc" id="L1460">    }</span>
+
+    /**
+     * SchedulerTask nested class: This class implements the Runnable interface.
+     *
+     * The SchedulerTask is executed periodically with a given fixed delay by
+     * the Scheduled Executor Service.
+     */
+    private class SchedulerTask implements Runnable {
+
+        private MonitorTask task;
+
+        /*
+         * ------------------------------------------
+         *  CONSTRUCTORS
+         * ------------------------------------------
+         */
+
+<span class="nc" id="L1478">        public SchedulerTask() {</span>
+<span class="nc" id="L1479">        }</span>
+
+        /*
+         * ------------------------------------------
+         *  GETTERS/SETTERS
+         * ------------------------------------------
+         */
+
+        public void setMonitorTask(MonitorTask task) {
+<span class="nc" id="L1488">            this.task = task;</span>
+<span class="nc" id="L1489">        }</span>
+
+        /*
+         * ------------------------------------------
+         *  PUBLIC METHODS
+         * ------------------------------------------
+         */
+
+        public void run() {
+<span class="nc" id="L1498">            synchronized (Monitor.this) {</span>
+<span class="nc" id="L1499">                Monitor.this.monitorFuture = task.submit();</span>
+<span class="nc" id="L1500">            }</span>
+<span class="nc" id="L1501">        }</span>
+    }
+
+    /**
+     * MonitorTask nested class: This class implements the Runnable interface.
+     *
+     * The MonitorTask is executed periodically with a given fixed delay by the
+     * Scheduled Executor Service.
+     */
+    private class MonitorTask implements Runnable {
+
+        private ThreadPoolExecutor executor;
+
+        /*
+         * ------------------------------------------
+         *  CONSTRUCTORS
+         * ------------------------------------------
+         */
+
+<span class="nc" id="L1520">        public MonitorTask() {</span>
+            // Find out if there's already an existing executor for the calling
+            // thread and reuse it. Otherwise, create a new one and store it in
+            // the executors map. If there is a SecurityManager, the group of
+            // System.getSecurityManager() is used, else the group of the thread
+            // instantiating this MonitorTask, i.e. the group of the thread that
+            // calls &quot;Monitor.start()&quot;.
+<span class="nc" id="L1527">            SecurityManager s = System.getSecurityManager();</span>
+<span class="nc bnc" id="L1528" title="All 2 branches missed.">            ThreadGroup group = (s != null) ? s.getThreadGroup() :</span>
+<span class="nc" id="L1529">                Thread.currentThread().getThreadGroup();</span>
+<span class="nc" id="L1530">            synchronized (executorsLock) {</span>
+<span class="nc bnc" id="L1531" title="All 2 branches missed.">                for (ThreadPoolExecutor e : executors.keySet()) {</span>
+<span class="nc" id="L1532">                    DaemonThreadFactory tf =</span>
+<span class="nc" id="L1533">                            (DaemonThreadFactory) e.getThreadFactory();</span>
+<span class="nc" id="L1534">                    ThreadGroup tg = tf.getThreadGroup();</span>
+<span class="nc bnc" id="L1535" title="All 2 branches missed.">                    if (tg == group) {</span>
+<span class="nc" id="L1536">                        executor = e;</span>
+<span class="nc" id="L1537">                        break;</span>
+                    }
+<span class="nc" id="L1539">                }</span>
+<span class="nc bnc" id="L1540" title="All 2 branches missed.">                if (executor == null) {</span>
+<span class="nc" id="L1541">                    executor = new ThreadPoolExecutor(</span>
+<span class="nc" id="L1542">                            maximumPoolSize,</span>
+<span class="nc" id="L1543">                            maximumPoolSize,</span>
+                            60L,
+                            TimeUnit.SECONDS,
+                            new LinkedBlockingQueue&lt;Runnable&gt;(),
+                            new DaemonThreadFactory(&quot;ThreadGroup&lt;&quot; +
+<span class="nc" id="L1548">                            group.getName() + &quot;&gt; Executor&quot;, group));</span>
+<span class="nc" id="L1549">                    executor.allowCoreThreadTimeOut(true);</span>
+<span class="nc" id="L1550">                    executors.put(executor, null);</span>
+                }
+<span class="nc" id="L1552">            }</span>
+<span class="nc" id="L1553">        }</span>
+
+        /*
+         * ------------------------------------------
+         *  PUBLIC METHODS
+         * ------------------------------------------
+         */
+
+        public Future&lt;?&gt; submit() {
+<span class="nc" id="L1562">            return executor.submit(this);</span>
+        }
+
+        public void run() {
+            final ScheduledFuture&lt;?&gt; sf;
+            final AccessControlContext ac;
+<span class="nc" id="L1568">            synchronized (Monitor.this) {</span>
+<span class="nc" id="L1569">                sf = Monitor.this.schedulerFuture;</span>
+<span class="nc" id="L1570">                ac = Monitor.this.acc;</span>
+<span class="nc" id="L1571">            }</span>
+<span class="nc" id="L1572">            PrivilegedAction&lt;Void&gt; action = new PrivilegedAction&lt;Void&gt;() {</span>
+                public Void run() {
+<span class="nc bnc" id="L1574" title="All 2 branches missed.">                    if (Monitor.this.isActive()) {</span>
+<span class="nc" id="L1575">                        final int an[] = alreadyNotifieds;</span>
+<span class="nc" id="L1576">                        int index = 0;</span>
+<span class="nc bnc" id="L1577" title="All 2 branches missed.">                        for (ObservedObject o : Monitor.this.observedObjects) {</span>
+<span class="nc bnc" id="L1578" title="All 2 branches missed.">                            if (Monitor.this.isActive()) {</span>
+<span class="nc" id="L1579">                                Monitor.this.monitor(o, index++, an);</span>
+                            }
+<span class="nc" id="L1581">                        }</span>
+                    }
+<span class="nc" id="L1583">                    return null;</span>
+                }
+            };
+<span class="nc bnc" id="L1586" title="All 2 branches missed.">            if (ac == null) {</span>
+<span class="nc" id="L1587">                throw new SecurityException(&quot;AccessControlContext cannot be null&quot;);</span>
+            }
+<span class="nc" id="L1589">            AccessController.doPrivileged(action, ac);</span>
+<span class="nc" id="L1590">            synchronized (Monitor.this) {</span>
+<span class="nc bnc" id="L1591" title="All 2 branches missed.">                if (Monitor.this.isActive() &amp;&amp;</span>
+<span class="nc bnc" id="L1592" title="All 2 branches missed.">                    Monitor.this.schedulerFuture == sf) {</span>
+<span class="nc" id="L1593">                    Monitor.this.monitorFuture = null;</span>
+<span class="nc" id="L1594">                    Monitor.this.schedulerFuture =</span>
+<span class="nc" id="L1595">                        scheduler.schedule(Monitor.this.schedulerTask,</span>
+<span class="nc" id="L1596">                                           Monitor.this.getGranularityPeriod(),</span>
+                                           TimeUnit.MILLISECONDS);
+                }
+<span class="nc" id="L1599">            }</span>
+<span class="nc" id="L1600">        }</span>
+    }
+
+    /**
+     * Daemon thread factory used by the monitor executors.
+     * &lt;P&gt;
+     * This factory creates all new threads used by an Executor in
+     * the same ThreadGroup. If there is a SecurityManager, it uses
+     * the group of System.getSecurityManager(), else the group of
+     * the thread instantiating this DaemonThreadFactory. Each new
+     * thread is created as a daemon thread with priority
+     * Thread.NORM_PRIORITY. New threads have names accessible via
+     * Thread.getName() of &quot;{@literal JMX Monitor &lt;pool-name&gt; Pool [Thread-M]}&quot;,
+     * where M is the sequence number of the thread created by this
+     * factory.
+     */
+<span class="nc" id="L1616">    private static class DaemonThreadFactory implements ThreadFactory {</span>
+        final ThreadGroup group;
+<span class="nc" id="L1618">        final AtomicInteger threadNumber = new AtomicInteger(1);</span>
+        final String namePrefix;
+        static final String nameSuffix = &quot;]&quot;;
+
+<span class="nc" id="L1622">        public DaemonThreadFactory(String poolName) {</span>
+<span class="nc" id="L1623">            SecurityManager s = System.getSecurityManager();</span>
+<span class="nc bnc" id="L1624" title="All 2 branches missed.">            group = (s != null) ? s.getThreadGroup() :</span>
+<span class="nc" id="L1625">                                  Thread.currentThread().getThreadGroup();</span>
+<span class="nc" id="L1626">            namePrefix = &quot;JMX Monitor &quot; + poolName + &quot; Pool [Thread-&quot;;</span>
+<span class="nc" id="L1627">        }</span>
+
+<span class="nc" id="L1629">        public DaemonThreadFactory(String poolName, ThreadGroup threadGroup) {</span>
+<span class="nc" id="L1630">            group = threadGroup;</span>
+<span class="nc" id="L1631">            namePrefix = &quot;JMX Monitor &quot; + poolName + &quot; Pool [Thread-&quot;;</span>
+<span class="nc" id="L1632">        }</span>
+
+        public ThreadGroup getThreadGroup() {
+<span class="nc" id="L1635">            return group;</span>
+        }
+
+        public Thread newThread(Runnable r) {
+<span class="nc" id="L1639">            Thread t = new Thread(group,</span>
+                                  r,
+                                  namePrefix +
+<span class="nc" id="L1642">                                  threadNumber.getAndIncrement() +</span>
+                                  nameSuffix,
+                                  0);
+<span class="nc" id="L1645">            t.setDaemon(true);</span>
+<span class="nc bnc" id="L1646" title="All 2 branches missed.">            if (t.getPriority() != Thread.NORM_PRIORITY)</span>
+<span class="nc" id="L1647">                t.setPriority(Thread.NORM_PRIORITY);</span>
+<span class="nc" id="L1648">            return t;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

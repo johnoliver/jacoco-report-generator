@@ -1,0 +1,648 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>Timer.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.misc</a> &gt; <span class="el_source">Timer.java</span></div><h1>Timer.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1995, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.misc;
+
+/**
+    A Timer object is used by algorithms that require timed events.
+    For example, in an animation loop, a timer would help in
+    determining when to change frames.
+
+    A timer has an interval which determines when it &quot;ticks&quot;;
+    that is, a timer delays for the specified interval and then
+    it calls the owner's tick() method.
+
+    Here's an example of creating a timer with a 5 sec interval:
+
+    &lt;pre&gt;
+    class Main implements Timeable {
+        public void tick(Timer timer) {
+            System.out.println(&quot;tick&quot;);
+        }
+        public static void main(String args[]) {
+            (new Timer(this, 5000)).cont();
+        }
+    }
+    &lt;/pre&gt;
+
+    A timer can be stopped, continued, or reset at any time.
+    A timer's state is not stopped while it's calling the
+    owner's tick() method.
+
+    A timer can be regular or irregular.  If in regular mode,
+    a timer ticks at the specified interval, regardless of
+    how long the owner's tick() method takes.  While the timer
+    is running, no ticks are ever discarded.  That means that if
+    the owner's tick() method takes longer than the interval,
+    the ticks that would have occurred are delivered immediately.
+
+    In irregular mode, a timer starts delaying for exactly
+    the specified interval only after the tick() method returns.
+
+    Synchronization issues: do not hold the timer's monitor
+    while calling any of the Timer operations below otherwise
+    the Timer class will deadlock.
+
+    @author     Patrick Chan
+*/
+
+/*
+    Synchronization issues:  there are two data structures that
+    require locking.  A Timer object and the Timer queue
+    (described in the TimerThread class).  To avoid deadlock,
+    the timer queue monitor is always acquired before the timer
+    object's monitor.  However, the timer queue monitor is acquired
+    only if the timer operation will make use of the timer
+    queue, e.g. stop().
+
+    The class monitor on the class TimerThread severs as the monitor
+    to the timer queue.
+
+    Possible feature: perhaps a timer should have an associated
+    thread priority.  The thread that makes the callback temporarily
+    takes on that priority before calling the owner's tick() method.
+*/
+
+public class Timer {
+    /**
+     * This is the owner of the timer.  Its tick method is
+     * called when the timer ticks.
+     */
+    public Timeable owner;
+
+    /*
+     * This is the interval of time in ms.
+     */
+    long interval;
+
+    /*
+     * This variable is used for two different purposes.
+     * This is done in order to save space.
+     * If 'stopped' is true, this variable holds the time
+     * that the timer was stopped; otherwise, this variable
+     * is used by the TimerThread to determine when the timer
+     * should tick.
+     */
+    long sleepUntil;
+
+    /*
+     * This is the time remaining before the timer ticks.  It
+     * is only valid if 'stopped' is true.  If the timer is
+     * continued, the next tick will happen remaingTime
+     * milliseconds later.
+     */
+    long remainingTime;
+
+    /*
+     * True iff the timer is in regular mode.
+     */
+    boolean regular;
+
+    /*
+     * True iff the timer has been stopped.
+     */
+    boolean stopped;
+
+    /* **************************************************************
+     * Timer queue-related variables
+     * ************************************************************** */
+
+    /*
+     * A link to another timer object.  This is used while the
+     * timer object is enqueued in the timer queue.
+     */
+    Timer next;
+
+    /* **************************************************************
+     * Timer methods
+     * ************************************************************** */
+
+    /*
+     * This variable holds a handle to the TimerThread class for
+     * the purpose of getting at the class monitor.  The reason
+     * why Class.forName(&quot;TimerThread&quot;) is not used is because it
+     * doesn't appear to work when loaded via a net class loader.
+     */
+<span class="nc" id="L148">    static TimerThread timerThread = null;</span>
+
+    /**
+     * Creates a timer object that is owned by 'owner' and
+     * with the interval 'interval' milliseconds.  The new timer
+     * object is stopped and is regular.  getRemainingTime()
+     * return 'interval' at this point.  getStopTime() returns
+     * the time this object was created.
+     * @param owner    owner of the timer object
+     * @param interval interval of the timer in milliseconds
+     */
+<span class="nc" id="L159">    public Timer(Timeable owner, long interval) {</span>
+<span class="nc" id="L160">        this.owner = owner;</span>
+<span class="nc" id="L161">        this.interval = interval;</span>
+<span class="nc" id="L162">        remainingTime = interval;</span>
+<span class="nc" id="L163">        regular = true;</span>
+<span class="nc" id="L164">        sleepUntil = System.currentTimeMillis();</span>
+<span class="nc" id="L165">        stopped = true;</span>
+<span class="nc" id="L166">        synchronized (getClass()) {</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">            if (timerThread == null) {</span>
+<span class="nc" id="L168">                timerThread = new TimerThread();</span>
+            }
+<span class="nc" id="L170">        }</span>
+<span class="nc" id="L171">    }</span>
+
+    /**
+     * Returns true if this timer is stopped.
+     */
+    public synchronized boolean isStopped() {
+<span class="nc" id="L177">        return stopped;</span>
+    }
+
+    /**
+     * Stops the timer.  The amount of time the timer has already
+     * delayed is saved so if the timer is continued, it will only
+     * delay for the amount of time remaining.
+     * Note that even after stopping a timer, one more tick may
+     * still occur.
+     * This method is MT-safe; i.e. it is synchronized but for
+     * implementation reasons, the synchronized modifier cannot
+     * be included in the method declaration.
+     */
+    public void stop() {
+<span class="nc" id="L191">        long now = System.currentTimeMillis();</span>
+
+<span class="nc" id="L193">        synchronized (timerThread) {</span>
+<span class="nc" id="L194">            synchronized (this) {</span>
+<span class="nc bnc" id="L195" title="All 2 branches missed.">                if (!stopped) {</span>
+<span class="nc" id="L196">                    TimerThread.dequeue(this);</span>
+<span class="nc" id="L197">                    remainingTime = Math.max(0, sleepUntil - now);</span>
+<span class="nc" id="L198">                    sleepUntil = now;        // stop time</span>
+<span class="nc" id="L199">                    stopped = true;</span>
+                }
+<span class="nc" id="L201">            }</span>
+<span class="nc" id="L202">        }</span>
+<span class="nc" id="L203">    }</span>
+
+    /**
+     * Continue the timer.  The next tick will come at getRemainingTime()
+     * milliseconds later.  If the timer is not stopped, this
+     * call will be a no-op.
+     * This method is MT-safe; i.e. it is synchronized but for
+     * implementation reasons, the synchronized modifier cannot
+     * be included in the method declaration.
+     */
+    public void cont() {
+<span class="nc" id="L214">        synchronized (timerThread) {</span>
+<span class="nc" id="L215">            synchronized (this) {</span>
+<span class="nc bnc" id="L216" title="All 2 branches missed.">                if (stopped) {</span>
+                    // The TimerTickThread avoids requeuing the
+                    // timer only if the sleepUntil value has changed.
+                    // The following guarantees that the sleepUntil
+                    // value will be different; without this guarantee,
+                    // it's theoretically possible for the timer to be
+                    // inserted twice.
+<span class="nc" id="L223">                    sleepUntil = Math.max(sleepUntil + 1,</span>
+<span class="nc" id="L224">                        System.currentTimeMillis() + remainingTime);</span>
+<span class="nc" id="L225">                    TimerThread.enqueue(this);</span>
+<span class="nc" id="L226">                    stopped = false;</span>
+                }
+<span class="nc" id="L228">            }</span>
+<span class="nc" id="L229">        }</span>
+<span class="nc" id="L230">    }</span>
+
+    /**
+     * Resets the timer's remaining time to the timer's interval.
+     * If the timer's running state is not altered.
+     */
+    public void reset() {
+<span class="nc" id="L237">        synchronized (timerThread) {</span>
+<span class="nc" id="L238">            synchronized (this) {</span>
+<span class="nc" id="L239">                setRemainingTime(interval);</span>
+<span class="nc" id="L240">            }</span>
+<span class="nc" id="L241">        }</span>
+<span class="nc" id="L242">    }</span>
+
+    /**
+     * Returns the time at which the timer was last stopped.  The
+     * return value is valid only if the timer is stopped.
+     */
+    public synchronized long getStopTime() {
+<span class="nc" id="L249">        return sleepUntil;</span>
+    }
+
+    /**
+     * Returns the timer's interval.
+     */
+    public synchronized long getInterval() {
+<span class="nc" id="L256">        return interval;</span>
+    }
+
+    /**
+     * Changes the timer's interval.  The new interval setting
+     * does not take effect until after the next tick.
+     * This method does not alter the remaining time or the
+     * running state of the timer.
+     * @param interval new interval of the timer in milliseconds
+     */
+    public synchronized void setInterval(long interval) {
+<span class="nc" id="L267">        this.interval = interval;</span>
+<span class="nc" id="L268">    }</span>
+
+    /**
+     * Returns the remaining time before the timer's next tick.
+     * The return value is valid only if timer is stopped.
+     */
+    public synchronized long getRemainingTime() {
+<span class="nc" id="L275">        return remainingTime;</span>
+    }
+
+    /**
+     * Sets the remaining time before the timer's next tick.
+     * This method does not alter the timer's running state.
+     * This method is MT-safe; i.e. it is synchronized but for
+     * implementation reasons, the synchronized modifier cannot
+     * be included in the method declaration.
+     * @param time new remaining time in milliseconds.
+     */
+    public void setRemainingTime(long time) {
+<span class="nc" id="L287">        synchronized (timerThread) {</span>
+<span class="nc" id="L288">            synchronized (this) {</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">                if (stopped) {</span>
+<span class="nc" id="L290">                    remainingTime = time;</span>
+                } else {
+<span class="nc" id="L292">                    stop();</span>
+<span class="nc" id="L293">                    remainingTime = time;</span>
+<span class="nc" id="L294">                    cont();</span>
+                }
+<span class="nc" id="L296">            }</span>
+<span class="nc" id="L297">        }</span>
+<span class="nc" id="L298">    }</span>
+
+    /**
+     * In regular mode, a timer ticks at the specified interval,
+     * regardless of how long the owner's tick() method takes.
+     * While the timer is running, no ticks are ever discarded.
+     * That means that if the owner's tick() method takes longer
+     * than the interval, the ticks that would have occurred are
+     * delivered immediately.
+     *
+     * In irregular mode, a timer starts delaying for exactly
+     * the specified interval only after the tick() method returns.
+     */
+    public synchronized void setRegular(boolean regular) {
+<span class="nc" id="L312">        this.regular = regular;</span>
+<span class="nc" id="L313">    }</span>
+
+    /*
+     * This method is used only for testing purposes.
+     */
+    protected Thread getTimerThread() {
+<span class="nc" id="L319">        return TimerThread.timerThread;</span>
+    }
+}
+
+
+/*
+
+This class implements the timer queue and is exclusively used by the
+Timer class.  There are only two methods exported to the Timer class -
+enqueue, for inserting a timer into queue and dequeue, for removing
+a timer from the queue.
+
+A timer in the timer queue is awaiting a tick.  When a timer is to be
+ticked, it is removed from the timer queue before the owner's tick()
+method is called.
+
+A single timer thread manages the timer queue.  This timer thread
+looks at the head of the timer queue and delays until it's time for
+the timer to tick.  When the time comes, the timer thread creates a
+callback thread to call the timer owner's tick() method.  The timer
+thread then processes the next timer in the queue.
+
+When a timer is inserted at the head of the queue, the timer thread is
+notified.  This causes the timer thread to prematurely wake up and
+process the new head of the queue.
+
+*/
+
+class TimerThread extends Thread {
+    /*
+     * Set to true to get debugging output.
+     */
+<span class="nc" id="L351">    public static boolean debug = false;</span>
+
+    /*
+     * This is a handle to the thread managing the thread queue.
+     */
+    static TimerThread timerThread;
+
+    /*
+     * This flag is set if the timer thread has been notified
+     * while it was in the timed wait.  This flag allows the
+     * timer thread to tell whether or not the wait completed.
+     */
+<span class="nc" id="L363">    static boolean notified = false;</span>
+
+    protected TimerThread() {
+<span class="nc" id="L366">        super(&quot;TimerThread&quot;);</span>
+<span class="nc" id="L367">        timerThread = this;</span>
+<span class="nc" id="L368">        start();</span>
+<span class="nc" id="L369">    }</span>
+
+    public synchronized void run() {
+        while (true) {
+            long delay;
+
+<span class="nc bnc" id="L375" title="All 2 branches missed.">            while (timerQueue == null) {</span>
+                try {
+<span class="nc" id="L377">                    wait();</span>
+<span class="nc" id="L378">                } catch (InterruptedException ex) {</span>
+                   // Just drop through and check timerQueue.
+<span class="nc" id="L380">                }</span>
+            }
+<span class="nc" id="L382">            notified = false;</span>
+<span class="nc" id="L383">            delay = timerQueue.sleepUntil - System.currentTimeMillis();</span>
+<span class="nc bnc" id="L384" title="All 2 branches missed.">            if (delay &gt; 0) {</span>
+                try {
+<span class="nc" id="L386">                    wait(delay);</span>
+<span class="nc" id="L387">                } catch (InterruptedException ex) {</span>
+                    // Just drop through.
+<span class="nc" id="L389">                }</span>
+            }
+            // remove from timer queue.
+<span class="nc bnc" id="L392" title="All 2 branches missed.">            if (!notified) {</span>
+<span class="nc" id="L393">                Timer timer = timerQueue;</span>
+<span class="nc" id="L394">                timerQueue = timerQueue.next;</span>
+<span class="nc" id="L395">                TimerTickThread thr = TimerTickThread.call(</span>
+                    timer, timer.sleepUntil);
+<span class="nc bnc" id="L397" title="All 2 branches missed.">                if (debug) {</span>
+<span class="nc" id="L398">                    long delta = (System.currentTimeMillis() - timer.sleepUntil);</span>
+<span class="nc" id="L399">                    System.out.println(&quot;tick(&quot; + thr.getName() + &quot;,&quot;</span>
+                        + timer.interval + &quot;,&quot;+delta+ &quot;)&quot;);
+<span class="nc bnc" id="L401" title="All 2 branches missed.">                    if (delta &gt; 250) {</span>
+<span class="nc" id="L402">                        System.out.println(&quot;*** BIG DELAY ***&quot;);</span>
+                    }
+                }
+            }
+<span class="nc" id="L406">        }</span>
+    }
+
+    /* *******************************************************
+       Timer Queue
+       ******************************************************* */
+
+    /*
+     * The timer queue is a queue of timers waiting to tick.
+     */
+<span class="nc" id="L416">    static Timer timerQueue = null;</span>
+
+    /*
+     * Uses timer.sleepUntil to determine where in the queue
+     * to insert the timer object.
+     * A new ticker thread is created only if the timer
+     * is inserted at the beginning of the queue.
+     * The timer must not already be in the queue.
+     * Assumes the caller has the TimerThread monitor.
+     */
+    static protected void enqueue(Timer timer) {
+<span class="nc" id="L427">        Timer prev = null;</span>
+<span class="nc" id="L428">        Timer cur = timerQueue;</span>
+
+<span class="nc bnc" id="L430" title="All 4 branches missed.">        if (cur == null || timer.sleepUntil &lt;= cur.sleepUntil) {</span>
+            // insert at front of queue
+<span class="nc" id="L432">            timer.next = timerQueue;</span>
+<span class="nc" id="L433">            timerQueue = timer;</span>
+<span class="nc" id="L434">            notified = true;</span>
+<span class="nc" id="L435">            timerThread.notify();</span>
+        } else {
+            do {
+<span class="nc" id="L438">                prev = cur;</span>
+<span class="nc" id="L439">                cur = cur.next;</span>
+<span class="nc bnc" id="L440" title="All 4 branches missed.">            } while (cur != null &amp;&amp; timer.sleepUntil &gt; cur.sleepUntil);</span>
+            // insert or append to the timer queue
+<span class="nc" id="L442">            timer.next = cur;</span>
+<span class="nc" id="L443">            prev.next = timer;</span>
+        }
+<span class="nc bnc" id="L445" title="All 2 branches missed.">        if (debug) {</span>
+<span class="nc" id="L446">            long now = System.currentTimeMillis();</span>
+
+<span class="nc" id="L448">            System.out.print(Thread.currentThread().getName()</span>
+                + &quot;: enqueue &quot; + timer.interval + &quot;: &quot;);
+<span class="nc" id="L450">            cur = timerQueue;</span>
+<span class="nc bnc" id="L451" title="All 2 branches missed.">            while(cur != null) {</span>
+<span class="nc" id="L452">                long delta = cur.sleepUntil - now;</span>
+<span class="nc" id="L453">                System.out.print(cur.interval + &quot;(&quot; + delta + &quot;) &quot;);</span>
+<span class="nc" id="L454">                cur = cur.next;</span>
+<span class="nc" id="L455">            }</span>
+<span class="nc" id="L456">            System.out.println();</span>
+        }
+<span class="nc" id="L458">    }</span>
+
+    /*
+     * If the timer is not in the queue, returns false;
+     * otherwise removes the timer from the timer queue and returns true.
+     * Assumes the caller has the TimerThread monitor.
+     */
+    static protected boolean dequeue(Timer timer) {
+<span class="nc" id="L466">        Timer prev = null;</span>
+<span class="nc" id="L467">        Timer cur = timerQueue;</span>
+
+<span class="nc bnc" id="L469" title="All 4 branches missed.">        while (cur != null &amp;&amp; cur != timer) {</span>
+<span class="nc" id="L470">            prev = cur;</span>
+<span class="nc" id="L471">            cur = cur.next;</span>
+        }
+<span class="nc bnc" id="L473" title="All 2 branches missed.">        if (cur == null) {</span>
+<span class="nc bnc" id="L474" title="All 2 branches missed.">            if (debug) {</span>
+<span class="nc" id="L475">                System.out.println(Thread.currentThread().getName()</span>
+                    + &quot;: dequeue &quot; + timer.interval + &quot;: no-op&quot;);
+            }
+<span class="nc" id="L478">            return false;</span>
+<span class="nc bnc" id="L479" title="All 2 branches missed.">        }       if (prev == null) {</span>
+<span class="nc" id="L480">            timerQueue = timer.next;</span>
+<span class="nc" id="L481">            notified = true;</span>
+<span class="nc" id="L482">            timerThread.notify();</span>
+        } else {
+<span class="nc" id="L484">            prev.next = timer.next;</span>
+        }
+<span class="nc" id="L486">        timer.next = null;</span>
+<span class="nc bnc" id="L487" title="All 2 branches missed.">        if (debug) {</span>
+<span class="nc" id="L488">            long now = System.currentTimeMillis();</span>
+
+<span class="nc" id="L490">            System.out.print(Thread.currentThread().getName()</span>
+                + &quot;: dequeue &quot; + timer.interval + &quot;: &quot;);
+<span class="nc" id="L492">            cur = timerQueue;</span>
+<span class="nc bnc" id="L493" title="All 2 branches missed.">            while(cur != null) {</span>
+<span class="nc" id="L494">                long delta = cur.sleepUntil - now;</span>
+<span class="nc" id="L495">                System.out.print(cur.interval + &quot;(&quot; + delta + &quot;) &quot;);</span>
+<span class="nc" id="L496">                cur = cur.next;</span>
+<span class="nc" id="L497">            }</span>
+<span class="nc" id="L498">            System.out.println();</span>
+        }
+<span class="nc" id="L500">        return true;</span>
+    }
+
+    /*
+     * Inserts the timer back into the queue.  This method
+     * is used by a callback thread after it has called the
+     * timer owner's tick() method.  This method recomputes
+     * the sleepUntil field.
+     * Assumes the caller has the TimerThread and Timer monitor.
+     */
+    protected static void requeue(Timer timer) {
+<span class="nc bnc" id="L511" title="All 2 branches missed.">        if (!timer.stopped) {</span>
+<span class="nc" id="L512">            long now = System.currentTimeMillis();</span>
+<span class="nc bnc" id="L513" title="All 2 branches missed.">            if (timer.regular) {</span>
+<span class="nc" id="L514">                timer.sleepUntil += timer.interval;</span>
+            } else {
+<span class="nc" id="L516">                timer.sleepUntil = now + timer.interval;</span>
+            }
+<span class="nc" id="L518">            enqueue(timer);</span>
+<span class="nc bnc" id="L519" title="All 2 branches missed.">        } else if (debug) {</span>
+<span class="nc" id="L520">            System.out.println(Thread.currentThread().getName()</span>
+                + &quot;: requeue &quot; + timer.interval + &quot;: no-op&quot;);
+        }
+<span class="nc" id="L523">    }</span>
+}
+
+/*
+
+This class implements a simple thread whose only purpose is to call a
+timer owner's tick() method.  A small fixed-sized pool of threads is
+maintained and is protected by the class monitor.  If the pool is
+exhausted, a new thread is temporarily created and destroyed when
+done.
+
+A thread that's in the pool waits on it's own monitor.  When the
+thread is retrieved from the pool, the retriever notifies the thread's
+monitor.
+
+*/
+
+<span class="nc" id="L540">class TimerTickThread extends Thread {</span>
+    /*
+     * Maximum size of the thread pool.
+     */
+    static final int MAX_POOL_SIZE = 3;
+
+    /*
+     * Number of threads in the pool.
+     */
+<span class="nc" id="L549">    static int curPoolSize = 0;</span>
+
+    /*
+     * The pool of timer threads.
+     */
+<span class="nc" id="L554">    static TimerTickThread pool = null;</span>
+
+    /*
+     * Is used when linked into the thread pool.
+     */
+<span class="nc" id="L559">    TimerTickThread next = null;</span>
+
+    /*
+     * This is the handle to the timer whose owner's
+     * tick() method will be called.
+     */
+    Timer timer;
+
+    /*
+     * The value of a timer's sleepUntil value is captured here.
+     * This is used to determine whether or not the timer should
+     * be reinserted into the queue.  If the timer's sleepUntil
+     * value has changed, the timer is not reinserted.
+     */
+    long lastSleepUntil;
+
+    /*
+     * Creates a new callback thread to call the timer owner's
+     * tick() method.  A thread is taken from the pool if one
+     * is available, otherwise, a new thread is created.
+     * The thread handle is returned.
+     */
+    protected static synchronized TimerTickThread call(
+            Timer timer, long sleepUntil) {
+<span class="nc" id="L583">        TimerTickThread thread = pool;</span>
+
+<span class="nc bnc" id="L585" title="All 2 branches missed.">        if (thread == null) {</span>
+            // create one.
+<span class="nc" id="L587">            thread = new TimerTickThread();</span>
+<span class="nc" id="L588">            thread.timer = timer;</span>
+<span class="nc" id="L589">            thread.lastSleepUntil = sleepUntil;</span>
+<span class="nc" id="L590">            thread.start();</span>
+        } else {
+<span class="nc" id="L592">            pool = pool.next;</span>
+<span class="nc" id="L593">            thread.timer = timer;</span>
+<span class="nc" id="L594">            thread.lastSleepUntil = sleepUntil;</span>
+<span class="nc" id="L595">            synchronized (thread) {</span>
+<span class="nc" id="L596">                thread.notify();</span>
+<span class="nc" id="L597">            }</span>
+        }
+<span class="nc" id="L599">        return thread;</span>
+    }
+
+    /*
+     * Returns false if the thread should simply exit;
+     * otherwise the thread is returned the pool, where
+     * it waits to be notified.  (I did try to use the
+     * class monitor but the time between the notify
+     * and breaking out of the wait seemed to take
+     * significantly longer; need to look into this later.)
+     */
+    private boolean returnToPool() {
+<span class="nc" id="L611">        synchronized (getClass()) {</span>
+<span class="nc bnc" id="L612" title="All 2 branches missed.">            if (curPoolSize &gt;= MAX_POOL_SIZE) {</span>
+<span class="nc" id="L613">                return false;</span>
+            }
+<span class="nc" id="L615">            next = pool;</span>
+<span class="nc" id="L616">            pool = this;</span>
+<span class="nc" id="L617">            curPoolSize++;</span>
+<span class="nc" id="L618">            timer = null;</span>
+<span class="nc" id="L619">        }</span>
+<span class="nc bnc" id="L620" title="All 2 branches missed.">        while (timer == null) {</span>
+<span class="nc" id="L621">            synchronized (this) {</span>
+                try {
+<span class="nc" id="L623">                    wait();</span>
+<span class="nc" id="L624">                } catch (InterruptedException ex) {</span>
+                   // Just drop through and retest timer.
+<span class="nc" id="L626">                }</span>
+<span class="nc" id="L627">            }</span>
+        }
+<span class="nc" id="L629">        synchronized (getClass()) {</span>
+<span class="nc" id="L630">            curPoolSize--;</span>
+<span class="nc" id="L631">        }</span>
+<span class="nc" id="L632">        return true;</span>
+    }
+
+    public void run() {
+        do {
+<span class="nc" id="L637">            timer.owner.tick(timer);</span>
+<span class="nc" id="L638">            synchronized (TimerThread.timerThread) {</span>
+<span class="nc" id="L639">                synchronized (timer) {</span>
+<span class="nc bnc" id="L640" title="All 2 branches missed.">                    if (lastSleepUntil == timer.sleepUntil) {</span>
+<span class="nc" id="L641">                        TimerThread.requeue(timer);</span>
+                    }
+<span class="nc" id="L643">                }</span>
+<span class="nc" id="L644">            }</span>
+<span class="nc bnc" id="L645" title="All 2 branches missed.">        } while (returnToPool());</span>
+<span class="nc" id="L646">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

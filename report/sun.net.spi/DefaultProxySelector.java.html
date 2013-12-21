@@ -1,0 +1,359 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>DefaultProxySelector.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.net.spi</a> &gt; <span class="el_source">DefaultProxySelector.java</span></div><h1>DefaultProxySelector.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2003, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.net.spi;
+
+import java.net.InetSocketAddress;
+import java.net.Proxy;
+import java.net.ProxySelector;
+import java.net.SocketAddress;
+import java.net.URI;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.StringTokenizer;
+import java.io.IOException;
+import sun.misc.RegexpPool;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
+import sun.net.NetProperties;
+import sun.net.SocksProxy;
+
+/**
+ * Supports proxy settings using system properties This proxy selector
+ * provides backward compatibility with the old http protocol handler
+ * as far as how proxy is set
+ *
+ * Most of the implementation copied from the old http protocol handler
+ *
+ * Supports http/https/ftp.proxyHost, http/https/ftp.proxyPort,
+ * proxyHost, proxyPort, and http/https/ftp.nonProxyHost, and socks.
+ * NOTE: need to do gopher as well
+ */
+<span class="fc" id="L54">public class DefaultProxySelector extends ProxySelector {</span>
+
+    /**
+     * This is where we define all the valid System Properties we have to
+     * support for each given protocol.
+     * The format of this 2 dimensional array is :
+     * - 1 row per protocol (http, ftp, ...)
+     * - 1st element of each row is the protocol name
+     * - subsequent elements are prefixes for Host &amp; Port properties
+     *   listed in order of priority.
+     * Example:
+     * {&quot;ftp&quot;, &quot;ftp.proxy&quot;, &quot;ftpProxy&quot;, &quot;proxy&quot;, &quot;socksProxy&quot;},
+     * means for FTP we try in that oder:
+     *          + ftp.proxyHost &amp; ftp.proxyPort
+     *          + ftpProxyHost &amp; ftpProxyPort
+     *          + proxyHost &amp; proxyPort
+     *          + socksProxyHost &amp; socksProxyPort
+     *
+     * Note that the socksProxy should *always* be the last on the list
+     */
+<span class="fc" id="L74">    final static String[][] props = {</span>
+        /*
+         * protocol, Property prefix 1, Property prefix 2, ...
+         */
+        {&quot;http&quot;, &quot;http.proxy&quot;, &quot;proxy&quot;, &quot;socksProxy&quot;},
+        {&quot;https&quot;, &quot;https.proxy&quot;, &quot;proxy&quot;, &quot;socksProxy&quot;},
+        {&quot;ftp&quot;, &quot;ftp.proxy&quot;, &quot;ftpProxy&quot;, &quot;proxy&quot;, &quot;socksProxy&quot;},
+        {&quot;gopher&quot;, &quot;gopherProxy&quot;, &quot;socksProxy&quot;},
+        {&quot;socket&quot;, &quot;socksProxy&quot;}
+    };
+
+    private static final String SOCKS_PROXY_VERSION = &quot;socksProxyVersion&quot;;
+
+<span class="fc" id="L87">    private static boolean hasSystemProxies = false;</span>
+
+    static {
+        final String key = &quot;java.net.useSystemProxies&quot;;
+<span class="fc" id="L91">        Boolean b = AccessController.doPrivileged(</span>
+<span class="fc" id="L92">            new PrivilegedAction&lt;Boolean&gt;() {</span>
+                public Boolean run() {
+<span class="fc" id="L94">                    return NetProperties.getBoolean(key);</span>
+                }});
+<span class="pc bpc" id="L96" title="1 of 4 branches missed.">        if (b != null &amp;&amp; b.booleanValue()) {</span>
+<span class="fc" id="L97">            java.security.AccessController.doPrivileged(</span>
+<span class="fc" id="L98">                new java.security.PrivilegedAction&lt;Void&gt;() {</span>
+                    public Void run() {
+<span class="fc" id="L100">                        System.loadLibrary(&quot;net&quot;);</span>
+<span class="fc" id="L101">                        return null;</span>
+                    }
+                });
+<span class="fc" id="L104">            hasSystemProxies = init();</span>
+        }
+<span class="fc" id="L106">    }</span>
+
+    /**
+     * How to deal with &quot;non proxy hosts&quot;:
+     * since we do have to generate a RegexpPool we don't want to do that if
+     * it's not necessary. Therefore we do cache the result, on a per-protocol
+     * basis, and change it only when the &quot;source&quot;, i.e. the system property,
+     * did change.
+     */
+
+<span class="fc" id="L116">    static class NonProxyInfo {</span>
+        // Default value for nonProxyHosts, this provides backward compatibility
+        // by excluding localhost and its litteral notations.
+        static final String defStringVal = &quot;localhost|127.*|[::1]|0.0.0.0|[::0]&quot;;
+
+        String hostsSource;
+        RegexpPool hostsPool;
+        final String property;
+        final String defaultVal;
+<span class="fc" id="L125">        static NonProxyInfo ftpNonProxyInfo = new NonProxyInfo(&quot;ftp.nonProxyHosts&quot;, null, null, defStringVal);</span>
+<span class="fc" id="L126">        static NonProxyInfo httpNonProxyInfo = new NonProxyInfo(&quot;http.nonProxyHosts&quot;, null, null, defStringVal);</span>
+<span class="fc" id="L127">        static NonProxyInfo socksNonProxyInfo = new NonProxyInfo(&quot;socksNonProxyHosts&quot;, null, null, defStringVal);</span>
+
+<span class="fc" id="L129">        NonProxyInfo(String p, String s, RegexpPool pool, String d) {</span>
+<span class="fc" id="L130">            property = p;</span>
+<span class="fc" id="L131">            hostsSource = s;</span>
+<span class="fc" id="L132">            hostsPool = pool;</span>
+<span class="fc" id="L133">            defaultVal = d;</span>
+<span class="fc" id="L134">        }</span>
+    }
+
+
+    /**
+     * select() method. Where all the hard work is done.
+     * Build a list of proxies depending on URI.
+     * Since we're only providing compatibility with the system properties
+     * from previous releases (see list above), that list will always
+     * contain 1 single proxy, default being NO_PROXY.
+     */
+    public java.util.List&lt;Proxy&gt; select(URI uri) {
+<span class="pc bpc" id="L146" title="1 of 2 branches missed.">        if (uri == null) {</span>
+<span class="nc" id="L147">            throw new IllegalArgumentException(&quot;URI can't be null.&quot;);</span>
+        }
+<span class="fc" id="L149">        String protocol = uri.getScheme();</span>
+<span class="fc" id="L150">        String host = uri.getHost();</span>
+
+<span class="fc bfc" id="L152" title="All 2 branches covered.">        if (host == null) {</span>
+            // This is a hack to ensure backward compatibility in two
+            // cases: 1. hostnames contain non-ascii characters,
+            // internationalized domain names. in which case, URI will
+            // return null, see BugID 4957669; 2. Some hostnames can
+            // contain '_' chars even though it's not supposed to be
+            // legal, in which case URI will return null for getHost,
+            // but not for getAuthority() See BugID 4913253
+<span class="fc" id="L160">            String auth = uri.getAuthority();</span>
+<span class="pc bpc" id="L161" title="1 of 2 branches missed.">            if (auth != null) {</span>
+                int i;
+<span class="fc" id="L163">                i = auth.indexOf('@');</span>
+<span class="pc bpc" id="L164" title="1 of 2 branches missed.">                if (i &gt;= 0) {</span>
+<span class="nc" id="L165">                    auth = auth.substring(i+1);</span>
+                }
+<span class="fc" id="L167">                i = auth.lastIndexOf(':');</span>
+<span class="fc bfc" id="L168" title="All 2 branches covered.">                if (i &gt;= 0) {</span>
+<span class="fc" id="L169">                    auth = auth.substring(0,i);</span>
+                }
+<span class="fc" id="L171">                host = auth;</span>
+            }
+        }
+
+<span class="pc bpc" id="L175" title="2 of 4 branches missed.">        if (protocol == null || host == null) {</span>
+<span class="nc" id="L176">            throw new IllegalArgumentException(&quot;protocol = &quot;+protocol+&quot; host = &quot;+host);</span>
+        }
+<span class="fc" id="L178">        List&lt;Proxy&gt; proxyl = new ArrayList&lt;Proxy&gt;(1);</span>
+
+<span class="fc" id="L180">        NonProxyInfo pinfo = null;</span>
+
+<span class="fc bfc" id="L182" title="All 2 branches covered.">        if (&quot;http&quot;.equalsIgnoreCase(protocol)) {</span>
+<span class="fc" id="L183">            pinfo = NonProxyInfo.httpNonProxyInfo;</span>
+<span class="fc bfc" id="L184" title="All 2 branches covered.">        } else if (&quot;https&quot;.equalsIgnoreCase(protocol)) {</span>
+            // HTTPS uses the same property as HTTP, for backward
+            // compatibility
+<span class="fc" id="L187">            pinfo = NonProxyInfo.httpNonProxyInfo;</span>
+<span class="fc bfc" id="L188" title="All 2 branches covered.">        } else if (&quot;ftp&quot;.equalsIgnoreCase(protocol)) {</span>
+<span class="fc" id="L189">            pinfo = NonProxyInfo.ftpNonProxyInfo;</span>
+<span class="pc bpc" id="L190" title="1 of 2 branches missed.">        } else if (&quot;socket&quot;.equalsIgnoreCase(protocol)) {</span>
+<span class="fc" id="L191">            pinfo = NonProxyInfo.socksNonProxyInfo;</span>
+        }
+
+        /**
+         * Let's check the System properties for that protocol
+         */
+<span class="fc" id="L197">        final String proto = protocol;</span>
+<span class="fc" id="L198">        final NonProxyInfo nprop = pinfo;</span>
+<span class="fc" id="L199">        final String urlhost = host.toLowerCase();</span>
+
+        /**
+         * This is one big doPrivileged call, but we're trying to optimize
+         * the code as much as possible. Since we're checking quite a few
+         * System properties it does help having only 1 call to doPrivileged.
+         * Be mindful what you do in here though!
+         */
+<span class="fc" id="L207">        Proxy p = AccessController.doPrivileged(</span>
+<span class="fc" id="L208">            new PrivilegedAction&lt;Proxy&gt;() {</span>
+                public Proxy run() {
+                    int i, j;
+<span class="fc" id="L211">                    String phost =  null;</span>
+<span class="fc" id="L212">                    int pport = 0;</span>
+<span class="fc" id="L213">                    String nphosts =  null;</span>
+<span class="fc" id="L214">                    InetSocketAddress saddr = null;</span>
+
+                    // Then let's walk the list of protocols in our array
+<span class="pc bpc" id="L217" title="1 of 2 branches missed.">                    for (i=0; i&lt;props.length; i++) {</span>
+<span class="fc bfc" id="L218" title="All 2 branches covered.">                        if (props[i][0].equalsIgnoreCase(proto)) {</span>
+<span class="fc bfc" id="L219" title="All 2 branches covered.">                            for (j = 1; j &lt; props[i].length; j++) {</span>
+                                /* System.getProp() will give us an empty
+                                 * String, &quot;&quot; for a defined but &quot;empty&quot;
+                                 * property.
+                                 */
+<span class="fc" id="L224">                                phost =  NetProperties.get(props[i][j]+&quot;Host&quot;);</span>
+<span class="pc bpc" id="L225" title="1 of 4 branches missed.">                                if (phost != null &amp;&amp; phost.length() != 0)</span>
+<span class="fc" id="L226">                                    break;</span>
+                            }
+<span class="pc bpc" id="L228" title="1 of 4 branches missed.">                            if (phost == null || phost.length() == 0) {</span>
+                                /**
+                                 * No system property defined for that
+                                 * protocol. Let's check System Proxy
+                                 * settings (Gnome &amp; Windows) if we were
+                                 * instructed to.
+                                 */
+<span class="fc bfc" id="L235" title="All 2 branches covered.">                                if (hasSystemProxies) {</span>
+                                    String sproto;
+<span class="pc bpc" id="L237" title="1 of 2 branches missed.">                                    if (proto.equalsIgnoreCase(&quot;socket&quot;))</span>
+<span class="nc" id="L238">                                        sproto = &quot;socks&quot;;</span>
+                                    else
+<span class="fc" id="L240">                                        sproto = proto;</span>
+<span class="fc" id="L241">                                    Proxy sproxy = getSystemProxy(sproto, urlhost);</span>
+<span class="pc bpc" id="L242" title="1 of 2 branches missed.">                                    if (sproxy != null) {</span>
+<span class="fc" id="L243">                                        return sproxy;</span>
+                                    }
+                                }
+<span class="fc" id="L246">                                return Proxy.NO_PROXY;</span>
+                            }
+                            // If a Proxy Host is defined for that protocol
+                            // Let's get the NonProxyHosts property
+<span class="pc bpc" id="L250" title="1 of 2 branches missed.">                            if (nprop != null) {</span>
+<span class="fc" id="L251">                                nphosts = NetProperties.get(nprop.property);</span>
+<span class="fc" id="L252">                                synchronized (nprop) {</span>
+<span class="pc bpc" id="L253" title="1 of 2 branches missed.">                                    if (nphosts == null) {</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">                                        if (nprop.defaultVal != null) {</span>
+<span class="nc" id="L255">                                            nphosts = nprop.defaultVal;</span>
+                                        } else {
+<span class="nc" id="L257">                                            nprop.hostsSource = null;</span>
+<span class="nc" id="L258">                                            nprop.hostsPool = null;</span>
+                                        }
+<span class="fc bfc" id="L260" title="All 2 branches covered.">                                    } else if (nphosts.length() != 0) {</span>
+                                        // add the required default patterns
+                                        // but only if property no set. If it
+                                        // is empty, leave empty.
+<span class="fc" id="L264">                                        nphosts += &quot;|&quot; + NonProxyInfo</span>
+                                                         .defStringVal;
+                                    }
+<span class="pc bpc" id="L267" title="1 of 2 branches missed.">                                    if (nphosts != null) {</span>
+<span class="fc bfc" id="L268" title="All 2 branches covered.">                                        if (!nphosts.equals(nprop.hostsSource)) {</span>
+<span class="fc" id="L269">                                            RegexpPool pool = new RegexpPool();</span>
+<span class="fc" id="L270">                                            StringTokenizer st = new StringTokenizer(nphosts, &quot;|&quot;, false);</span>
+                                            try {
+<span class="fc bfc" id="L272" title="All 2 branches covered.">                                                while (st.hasMoreTokens()) {</span>
+<span class="fc" id="L273">                                                    pool.add(st.nextToken().toLowerCase(), Boolean.TRUE);</span>
+                                                }
+<span class="fc" id="L275">                                            } catch (sun.misc.REException ex) {</span>
+<span class="fc" id="L276">                                            }</span>
+<span class="fc" id="L277">                                            nprop.hostsPool = pool;</span>
+<span class="fc" id="L278">                                            nprop.hostsSource = nphosts;</span>
+                                        }
+                                    }
+<span class="pc bpc" id="L281" title="1 of 2 branches missed.">                                    if (nprop.hostsPool != null &amp;&amp;</span>
+<span class="fc bfc" id="L282" title="All 2 branches covered.">                                        nprop.hostsPool.match(urlhost) != null) {</span>
+<span class="fc" id="L283">                                        return Proxy.NO_PROXY;</span>
+                                    }
+<span class="pc" id="L285">                                }</span>
+                            }
+                            // We got a host, let's check for port
+
+<span class="fc" id="L289">                            pport = NetProperties.getInteger(props[i][j]+&quot;Port&quot;, 0).intValue();</span>
+<span class="pc bpc" id="L290" title="3 of 4 branches missed.">                            if (pport == 0 &amp;&amp; j &lt; (props[i].length - 1)) {</span>
+                                // Can't find a port with same prefix as Host
+                                // AND it's not a SOCKS proxy
+                                // Let's try the other prefixes for that proto
+<span class="nc bnc" id="L294" title="All 2 branches missed.">                                for (int k = 1; k &lt; (props[i].length - 1); k++) {</span>
+<span class="nc bnc" id="L295" title="All 4 branches missed.">                                    if ((k != j) &amp;&amp; (pport == 0))</span>
+<span class="nc" id="L296">                                        pport = NetProperties.getInteger(props[i][k]+&quot;Port&quot;, 0).intValue();</span>
+                                }
+                            }
+
+                            // Still couldn't find a port, let's use default
+<span class="pc bpc" id="L301" title="1 of 2 branches missed.">                            if (pport == 0) {</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">                                if (j == (props[i].length - 1)) // SOCKS</span>
+<span class="nc" id="L303">                                    pport = defaultPort(&quot;socket&quot;);</span>
+                                else
+<span class="nc" id="L305">                                    pport = defaultPort(proto);</span>
+                            }
+                            // We did find a proxy definition.
+                            // Let's create the address, but don't resolve it
+                            // as this will be done at connection time
+<span class="fc" id="L310">                            saddr = InetSocketAddress.createUnresolved(phost, pport);</span>
+                            // Socks is *always* the last on the list.
+<span class="pc bpc" id="L312" title="1 of 2 branches missed.">                            if (j == (props[i].length - 1)) {</span>
+<span class="nc" id="L313">                                int version = NetProperties.getInteger(SOCKS_PROXY_VERSION, 5).intValue();</span>
+<span class="nc" id="L314">                                return SocksProxy.create(saddr, version);</span>
+                            } else {
+<span class="fc" id="L316">                                return new Proxy(Proxy.Type.HTTP, saddr);</span>
+                            }
+                        }
+                    }
+<span class="nc" id="L320">                    return Proxy.NO_PROXY;</span>
+                }});
+
+<span class="fc" id="L323">        proxyl.add(p);</span>
+
+        /*
+         * If no specific property was set for that URI, we should be
+         * returning an iterator to an empty List.
+         */
+<span class="fc" id="L329">        return proxyl;</span>
+    }
+
+    public void connectFailed(URI uri, SocketAddress sa, IOException ioe) {
+<span class="nc bnc" id="L333" title="All 6 branches missed.">        if (uri == null || sa == null || ioe == null) {</span>
+<span class="nc" id="L334">            throw new IllegalArgumentException(&quot;Arguments can't be null.&quot;);</span>
+        }
+        // ignored
+<span class="nc" id="L337">    }</span>
+
+
+    private int defaultPort(String protocol) {
+<span class="nc bnc" id="L341" title="All 2 branches missed.">        if (&quot;http&quot;.equalsIgnoreCase(protocol)) {</span>
+<span class="nc" id="L342">            return 80;</span>
+<span class="nc bnc" id="L343" title="All 2 branches missed.">        } else if (&quot;https&quot;.equalsIgnoreCase(protocol)) {</span>
+<span class="nc" id="L344">            return 443;</span>
+<span class="nc bnc" id="L345" title="All 2 branches missed.">        } else if (&quot;ftp&quot;.equalsIgnoreCase(protocol)) {</span>
+<span class="nc" id="L346">            return 80;</span>
+<span class="nc bnc" id="L347" title="All 2 branches missed.">        } else if (&quot;socket&quot;.equalsIgnoreCase(protocol)) {</span>
+<span class="nc" id="L348">            return 1080;</span>
+<span class="nc bnc" id="L349" title="All 2 branches missed.">        } else if (&quot;gopher&quot;.equalsIgnoreCase(protocol)) {</span>
+<span class="nc" id="L350">            return 80;</span>
+        } else {
+<span class="nc" id="L352">            return -1;</span>
+        }
+    }
+
+    private native static boolean init();
+    private synchronized native Proxy getSystemProxy(String protocol, String host);
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

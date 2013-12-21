@@ -1,0 +1,488 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>StringPrep.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.net.idn</a> &gt; <span class="el_source">StringPrep.java</span></div><h1>StringPrep.java</h1><pre class="source lang-java linenums">/*
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+/*
+/*
+ *******************************************************************************
+ * Copyright (C) 2003-2004, International Business Machines Corporation and         *
+ * others. All Rights Reserved.                                                *
+ *******************************************************************************
+ */
+//
+// CHANGELOG
+//      2005-05-19 Edward Wang
+//          - copy this file from icu4jsrc_3_2/src/com/ibm/icu/text/StringPrep.java
+//          - move from package com.ibm.icu.text to package sun.net.idn
+//          - use ParseException instead of StringPrepParseException
+//          - change 'Normalizer.getUnicodeVersion()' to 'NormalizerImpl.getUnicodeVersion()'
+//          - remove all @deprecated tag to make compiler happy
+//      2007-08-14 Martin Buchholz
+//          - remove redundant casts
+//
+package sun.net.idn;
+
+import java.io.BufferedInputStream;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.text.ParseException;
+
+import sun.text.Normalizer;
+import sun.text.normalizer.CharTrie;
+import sun.text.normalizer.Trie;
+import sun.text.normalizer.NormalizerImpl;
+import sun.text.normalizer.VersionInfo;
+import sun.text.normalizer.UCharacter;
+import sun.text.normalizer.UCharacterIterator;
+import sun.text.normalizer.UTF16;
+import sun.net.idn.UCharacterDirection;
+import sun.net.idn.StringPrepDataReader;
+
+/**
+ * StringPrep API implements the StingPrep framework as described by
+ * &lt;a href=&quot;http://www.ietf.org/rfc/rfc3454.txt&quot;&gt;RFC 3454&lt;/a&gt;.
+ * StringPrep prepares Unicode strings for use in network protocols.
+ * Profiles of StingPrep are set of rules and data according to which the
+ * Unicode Strings are prepared. Each profiles contains tables which describe
+ * how a code point should be treated. The tables are broadly classied into
+ * &lt;ul&gt;
+ *     &lt;li&gt; Unassigned Table: Contains code points that are unassigned
+ *          in the Unicode Version supported by StringPrep. Currently
+ *          RFC 3454 supports Unicode 3.2. &lt;/li&gt;
+ *     &lt;li&gt; Prohibited Table: Contains code points that are prohibted from
+ *          the output of the StringPrep processing function. &lt;/li&gt;
+ *     &lt;li&gt; Mapping Table: Contains code ponts that are deleted from the output or case mapped. &lt;/li&gt;
+ * &lt;/ul&gt;
+ *
+ * The procedure for preparing Unicode strings:
+ * &lt;ol&gt;
+ *      &lt;li&gt; Map: For each character in the input, check if it has a mapping
+ *           and, if so, replace it with its mapping. &lt;/li&gt;
+ *      &lt;li&gt; Normalize: Possibly normalize the result of step 1 using Unicode
+ *           normalization. &lt;/li&gt;
+ *      &lt;li&gt; Prohibit: Check for any characters that are not allowed in the
+ *           output.  If any are found, return an error.&lt;/li&gt;
+ *      &lt;li&gt; Check bidi: Possibly check for right-to-left characters, and if
+ *           any are found, make sure that the whole string satisfies the
+ *           requirements for bidirectional strings.  If the string does not
+ *           satisfy the requirements for bidirectional strings, return an
+ *           error.  &lt;/li&gt;
+ * &lt;/ol&gt;
+ * @author Ram Viswanadha
+ * @draft ICU 2.8
+ */
+public final class StringPrep {
+    /**
+     * Option to prohibit processing of unassigned code points in the input
+     *
+     * @see   #prepare
+     * @draft ICU 2.8
+     */
+    public static final int DEFAULT = 0x0000;
+
+    /**
+     * Option to allow processing of unassigned code points in the input
+     *
+     * @see   #prepare
+     * @draft ICU 2.8
+     */
+    public static final int ALLOW_UNASSIGNED = 0x0001;
+
+    private static final int UNASSIGNED        = 0x0000;
+    private static final int MAP               = 0x0001;
+    private static final int PROHIBITED        = 0x0002;
+    private static final int DELETE            = 0x0003;
+    private static final int TYPE_LIMIT        = 0x0004;
+
+    private static final int NORMALIZATION_ON  = 0x0001;
+    private static final int CHECK_BIDI_ON     = 0x0002;
+
+    private static final int TYPE_THRESHOLD       = 0xFFF0;
+    private static final int MAX_INDEX_VALUE      = 0x3FBF;   /*16139*/
+    private static final int MAX_INDEX_TOP_LENGTH = 0x0003;
+
+    /* indexes[] value names */
+    private static final int INDEX_TRIE_SIZE                  =  0; /* number of bytes in normalization trie */
+    private static final int INDEX_MAPPING_DATA_SIZE          =  1; /* The array that contains the mapping   */
+    private static final int NORM_CORRECTNS_LAST_UNI_VERSION  =  2; /* The index of Unicode version of last entry in NormalizationCorrections.txt */
+    private static final int ONE_UCHAR_MAPPING_INDEX_START    =  3; /* The starting index of 1 UChar mapping index in the mapping data array */
+    private static final int TWO_UCHARS_MAPPING_INDEX_START   =  4; /* The starting index of 2 UChars mapping index in the mapping data array */
+    private static final int THREE_UCHARS_MAPPING_INDEX_START =  5;
+    private static final int FOUR_UCHARS_MAPPING_INDEX_START  =  6;
+    private static final int OPTIONS                          =  7; /* Bit set of options to turn on in the profile */
+    private static final int INDEX_TOP                        = 16;                          /* changing this requires a new formatVersion */
+
+
+    /**
+     * Default buffer size of datafile
+     */
+    private static final int DATA_BUFFER_SIZE = 25000;
+
+    /* Wrappers for Trie implementations */
+<span class="fc" id="L142">    private static final class StringPrepTrieImpl implements Trie.DataManipulate{</span>
+<span class="fc" id="L143">        private CharTrie sprepTrie = null;</span>
+       /**
+        * Called by com.ibm.icu.util.Trie to extract from a lead surrogate's
+        * data the index array offset of the indexes for that lead surrogate.
+        * @param property data value for a surrogate from the trie, including
+        *        the folding offset
+        * @return data offset or 0 if there is no data for the lead surrogate
+        */
+         public int getFoldingOffset(int value){
+<span class="nc" id="L152">            return value;</span>
+        }
+    }
+
+    // CharTrie implementation for reading the trie data
+    private StringPrepTrieImpl sprepTrieImpl;
+    // Indexes read from the data file
+    private int[] indexes;
+    // mapping data read from the data file
+    private char[] mappingData;
+    // format version of the data file
+    private byte[] formatVersion;
+    // the version of Unicode supported by the data file
+    private VersionInfo sprepUniVer;
+    // the Unicode version of last entry in the
+    // NormalizationCorrections.txt file if normalization
+    // is turned on
+    private VersionInfo normCorrVer;
+    // Option to turn on Normalization
+    private boolean doNFKC;
+    // Option to turn on checking for BiDi rules
+    private boolean checkBiDi;
+
+
+    private char getCodePointValue(int ch){
+<span class="nc" id="L177">        return sprepTrieImpl.sprepTrie.getCodePointValue(ch);</span>
+    }
+
+    private static VersionInfo getVersionInfo(int comp){
+<span class="fc" id="L181">        int micro = comp &amp; 0xFF;</span>
+<span class="fc" id="L182">        int milli =(comp &gt;&gt; 8)  &amp; 0xFF;</span>
+<span class="fc" id="L183">        int minor =(comp &gt;&gt; 16) &amp; 0xFF;</span>
+<span class="fc" id="L184">        int major =(comp &gt;&gt; 24) &amp; 0xFF;</span>
+<span class="fc" id="L185">        return VersionInfo.getInstance(major,minor,milli,micro);</span>
+    }
+    private static VersionInfo getVersionInfo(byte[] version){
+<span class="pc bpc" id="L188" title="1 of 2 branches missed.">        if(version.length != 4){</span>
+<span class="nc" id="L189">            return null;</span>
+        }
+<span class="fc" id="L191">        return VersionInfo.getInstance((int)version[0],(int) version[1],(int) version[2],(int) version[3]);</span>
+    }
+    /**
+     * Creates an StringPrep object after reading the input stream.
+     * The object does not hold a reference to the input steam, so the stream can be
+     * closed after the method returns.
+     *
+     * @param inputStream The stream for reading the StringPrep profile binarySun
+     * @throws IOException
+     * @draft ICU 2.8
+     */
+<span class="fc" id="L202">    public StringPrep(InputStream inputStream) throws IOException{</span>
+
+<span class="fc" id="L204">        BufferedInputStream b = new BufferedInputStream(inputStream,DATA_BUFFER_SIZE);</span>
+
+<span class="fc" id="L206">        StringPrepDataReader reader = new StringPrepDataReader(b);</span>
+
+        // read the indexes
+<span class="fc" id="L209">        indexes = reader.readIndexes(INDEX_TOP);</span>
+
+<span class="fc" id="L211">        byte[] sprepBytes = new byte[indexes[INDEX_TRIE_SIZE]];</span>
+
+
+        //indexes[INDEX_MAPPING_DATA_SIZE] store the size of mappingData in bytes
+<span class="fc" id="L215">        mappingData = new char[indexes[INDEX_MAPPING_DATA_SIZE]/2];</span>
+        // load the rest of the data data and initialize the data members
+<span class="fc" id="L217">        reader.read(sprepBytes,mappingData);</span>
+
+<span class="fc" id="L219">        sprepTrieImpl           = new StringPrepTrieImpl();</span>
+<span class="fc" id="L220">        sprepTrieImpl.sprepTrie = new CharTrie( new ByteArrayInputStream(sprepBytes),sprepTrieImpl  );</span>
+
+        // get the data format version
+<span class="fc" id="L223">        formatVersion = reader.getDataFormatVersion();</span>
+
+        // get the options
+<span class="pc bpc" id="L226" title="1 of 2 branches missed.">        doNFKC            = ((indexes[OPTIONS] &amp; NORMALIZATION_ON) &gt; 0);</span>
+<span class="pc bpc" id="L227" title="1 of 2 branches missed.">        checkBiDi         = ((indexes[OPTIONS] &amp; CHECK_BIDI_ON) &gt; 0);</span>
+<span class="nc" id="L228">        sprepUniVer   = getVersionInfo(reader.getUnicodeVersion());</span>
+<span class="nc" id="L229">        normCorrVer   = getVersionInfo(indexes[NORM_CORRECTNS_LAST_UNI_VERSION]);</span>
+<span class="nc" id="L230">        VersionInfo normUniVer = NormalizerImpl.getUnicodeVersion();</span>
+<span class="nc bnc" id="L231" title="All 2 branches missed.">        if(normUniVer.compareTo(sprepUniVer) &lt; 0 &amp;&amp; /* the Unicode version of SPREP file must be less than the Unicode Vesion of the normalization data */</span>
+<span class="nc bnc" id="L232" title="All 4 branches missed.">           normUniVer.compareTo(normCorrVer) &lt; 0 &amp;&amp; /* the Unicode version of the NormalizationCorrections.txt file should be less than the Unicode Vesion of the normalization data */</span>
+           ((indexes[OPTIONS] &amp; NORMALIZATION_ON) &gt; 0) /* normalization turned on*/
+           ){
+<span class="nc" id="L235">            throw new IOException(&quot;Normalization Correction version not supported&quot;);</span>
+        }
+<span class="nc" id="L237">        b.close();</span>
+<span class="nc" id="L238">    }</span>
+
+<span class="nc" id="L240">    private static final class Values{</span>
+        boolean isIndex;
+        int value;
+        int type;
+        public void reset(){
+<span class="nc" id="L245">            isIndex = false;</span>
+<span class="nc" id="L246">            value = 0;</span>
+<span class="nc" id="L247">            type = -1;</span>
+<span class="nc" id="L248">        }</span>
+    }
+
+    private static final void getValues(char trieWord,Values values){
+<span class="nc" id="L252">        values.reset();</span>
+<span class="nc bnc" id="L253" title="All 2 branches missed.">        if(trieWord == 0){</span>
+            /*
+             * Initial value stored in the mapping table
+             * just return TYPE_LIMIT .. so that
+             * the source codepoint is copied to the destination
+             */
+<span class="nc" id="L259">            values.type = TYPE_LIMIT;</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        }else if(trieWord &gt;= TYPE_THRESHOLD){</span>
+<span class="nc" id="L261">            values.type = (trieWord - TYPE_THRESHOLD);</span>
+        }else{
+            /* get the type */
+<span class="nc" id="L264">            values.type = MAP;</span>
+            /* ascertain if the value is index or delta */
+<span class="nc bnc" id="L266" title="All 2 branches missed.">            if((trieWord &amp; 0x02)&gt;0){</span>
+<span class="nc" id="L267">                values.isIndex = true;</span>
+<span class="nc" id="L268">                values.value = trieWord  &gt;&gt; 2; //mask off the lower 2 bits and shift</span>
+
+            }else{
+<span class="nc" id="L271">                values.isIndex = false;</span>
+<span class="nc" id="L272">                values.value = (trieWord&lt;&lt;16)&gt;&gt;16;</span>
+<span class="nc" id="L273">                values.value =  (values.value &gt;&gt; 2);</span>
+
+            }
+
+<span class="nc bnc" id="L277" title="All 2 branches missed.">            if((trieWord&gt;&gt;2) == MAX_INDEX_VALUE){</span>
+<span class="nc" id="L278">                values.type = DELETE;</span>
+<span class="nc" id="L279">                values.isIndex = false;</span>
+<span class="nc" id="L280">                values.value = 0;</span>
+            }
+        }
+<span class="nc" id="L283">    }</span>
+
+
+
+    private StringBuffer map( UCharacterIterator iter, int options)
+                            throws ParseException {
+
+<span class="nc" id="L290">        Values val = new Values();</span>
+<span class="nc" id="L291">        char result = 0;</span>
+<span class="nc" id="L292">        int ch  = UCharacterIterator.DONE;</span>
+<span class="nc" id="L293">        StringBuffer dest = new StringBuffer();</span>
+<span class="nc bnc" id="L294" title="All 2 branches missed.">        boolean allowUnassigned = ((options &amp; ALLOW_UNASSIGNED)&gt;0);</span>
+
+<span class="nc bnc" id="L296" title="All 2 branches missed.">        while((ch=iter.nextCodePoint())!= UCharacterIterator.DONE){</span>
+
+<span class="nc" id="L298">            result = getCodePointValue(ch);</span>
+<span class="nc" id="L299">            getValues(result,val);</span>
+
+            // check if the source codepoint is unassigned
+<span class="nc bnc" id="L302" title="All 4 branches missed.">            if(val.type == UNASSIGNED &amp;&amp; allowUnassigned == false){</span>
+<span class="nc" id="L303">                 throw new ParseException(&quot;An unassigned code point was found in the input &quot; +</span>
+<span class="nc" id="L304">                                          iter.getText(), iter.getIndex());</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">            }else if((val.type == MAP)){</span>
+                int index, length;
+
+<span class="nc bnc" id="L308" title="All 2 branches missed.">                if(val.isIndex){</span>
+<span class="nc" id="L309">                    index = val.value;</span>
+<span class="nc bnc" id="L310" title="All 4 branches missed.">                    if(index &gt;= indexes[ONE_UCHAR_MAPPING_INDEX_START] &amp;&amp;</span>
+                             index &lt; indexes[TWO_UCHARS_MAPPING_INDEX_START]){
+<span class="nc" id="L312">                        length = 1;</span>
+<span class="nc bnc" id="L313" title="All 4 branches missed.">                    }else if(index &gt;= indexes[TWO_UCHARS_MAPPING_INDEX_START] &amp;&amp;</span>
+                             index &lt; indexes[THREE_UCHARS_MAPPING_INDEX_START]){
+<span class="nc" id="L315">                        length = 2;</span>
+<span class="nc bnc" id="L316" title="All 4 branches missed.">                    }else if(index &gt;= indexes[THREE_UCHARS_MAPPING_INDEX_START] &amp;&amp;</span>
+                             index &lt; indexes[FOUR_UCHARS_MAPPING_INDEX_START]){
+<span class="nc" id="L318">                        length = 3;</span>
+                    }else{
+<span class="nc" id="L320">                        length = mappingData[index++];</span>
+                    }
+                    /* copy mapping to destination */
+<span class="nc" id="L323">                    dest.append(mappingData,index,length);</span>
+<span class="nc" id="L324">                    continue;</span>
+
+                }else{
+<span class="nc" id="L327">                    ch -= val.value;</span>
+                }
+<span class="nc bnc" id="L329" title="All 2 branches missed.">            }else if(val.type == DELETE){</span>
+                // just consume the codepoint and contine
+<span class="nc" id="L331">                continue;</span>
+            }
+            //copy the source into destination
+<span class="nc" id="L334">            UTF16.append(dest,ch);</span>
+        }
+
+<span class="nc" id="L337">        return dest;</span>
+    }
+
+
+    private StringBuffer normalize(StringBuffer src){
+        /*
+         * Option UNORM_BEFORE_PRI_29:
+         *
+         * IDNA as interpreted by IETF members (see unicode mailing list 2004H1)
+         * requires strict adherence to Unicode 3.2 normalization,
+         * including buggy composition from before fixing Public Review Issue #29.
+         * Note that this results in some valid but nonsensical text to be
+         * either corrupted or rejected, depending on the text.
+         * See http://www.unicode.org/review/resolved-pri.html#pri29
+         * See unorm.cpp and cnormtst.c
+         */
+<span class="nc" id="L353">        return new StringBuffer(</span>
+<span class="nc" id="L354">            Normalizer.normalize(</span>
+<span class="nc" id="L355">                src.toString(),</span>
+                java.text.Normalizer.Form.NFKC,
+                Normalizer.UNICODE_3_2|NormalizerImpl.BEFORE_PRI_29));
+    }
+    /*
+    boolean isLabelSeparator(int ch){
+        int result = getCodePointValue(ch);
+        if( (result &amp; 0x07)  == LABEL_SEPARATOR){
+            return true;
+        }
+        return false;
+    }
+    */
+     /*
+       1) Map -- For each character in the input, check if it has a mapping
+          and, if so, replace it with its mapping.
+
+       2) Normalize -- Possibly normalize the result of step 1 using Unicode
+          normalization.
+
+       3) Prohibit -- Check for any characters that are not allowed in the
+          output.  If any are found, return an error.
+
+       4) Check bidi -- Possibly check for right-to-left characters, and if
+          any are found, make sure that the whole string satisfies the
+          requirements for bidirectional strings.  If the string does not
+          satisfy the requirements for bidirectional strings, return an
+          error.
+          [Unicode3.2] defines several bidirectional categories; each character
+           has one bidirectional category assigned to it.  For the purposes of
+           the requirements below, an &quot;RandALCat character&quot; is a character that
+           has Unicode bidirectional categories &quot;R&quot; or &quot;AL&quot;; an &quot;LCat character&quot;
+           is a character that has Unicode bidirectional category &quot;L&quot;.  Note
+
+
+           that there are many characters which fall in neither of the above
+           definitions; Latin digits (&lt;U+0030&gt; through &lt;U+0039&gt;) are examples of
+           this because they have bidirectional category &quot;EN&quot;.
+
+           In any profile that specifies bidirectional character handling, all
+           three of the following requirements MUST be met:
+
+           1) The characters in section 5.8 MUST be prohibited.
+
+           2) If a string contains any RandALCat character, the string MUST NOT
+              contain any LCat character.
+
+           3) If a string contains any RandALCat character, a RandALCat
+              character MUST be the first character of the string, and a
+              RandALCat character MUST be the last character of the string.
+    */
+    /**
+     * Prepare the input buffer for use in applications with the given profile. This operation maps, normalizes(NFKC),
+     * checks for prohited and BiDi characters in the order defined by RFC 3454
+     * depending on the options specified in the profile.
+     *
+     * @param src           A UCharacterIterator object containing the source string
+     * @param options       A bit set of options:
+     *
+     *  - StringPrep.NONE               Prohibit processing of unassigned code points in the input
+     *
+     *  - StringPrep.ALLOW_UNASSIGNED   Treat the unassigned code points are in the input
+     *                                  as normal Unicode code points.
+     *
+     * @return StringBuffer A StringBuffer containing the output
+     * @throws ParseException
+     * @draft ICU 2.8
+     */
+    public StringBuffer prepare(UCharacterIterator src, int options)
+                        throws ParseException{
+
+        // map
+<span class="nc" id="L427">        StringBuffer mapOut = map(src,options);</span>
+<span class="nc" id="L428">        StringBuffer normOut = mapOut;// initialize</span>
+
+<span class="nc bnc" id="L430" title="All 2 branches missed.">        if(doNFKC){</span>
+            // normalize
+<span class="nc" id="L432">            normOut = normalize(mapOut);</span>
+        }
+
+        int ch;
+        char result;
+<span class="nc" id="L437">        UCharacterIterator iter = UCharacterIterator.getInstance(normOut);</span>
+<span class="nc" id="L438">        Values val = new Values();</span>
+<span class="nc" id="L439">        int direction=UCharacterDirection.CHAR_DIRECTION_COUNT,</span>
+<span class="nc" id="L440">            firstCharDir=UCharacterDirection.CHAR_DIRECTION_COUNT;</span>
+<span class="nc" id="L441">        int rtlPos=-1, ltrPos=-1;</span>
+<span class="nc" id="L442">        boolean rightToLeft=false, leftToRight=false;</span>
+
+<span class="nc bnc" id="L444" title="All 2 branches missed.">        while((ch=iter.nextCodePoint())!= UCharacterIterator.DONE){</span>
+<span class="nc" id="L445">            result = getCodePointValue(ch);</span>
+<span class="nc" id="L446">            getValues(result,val);</span>
+
+<span class="nc bnc" id="L448" title="All 2 branches missed.">            if(val.type == PROHIBITED ){</span>
+<span class="nc" id="L449">                throw new ParseException(&quot;A prohibited code point was found in the input&quot; +</span>
+<span class="nc" id="L450">                                         iter.getText(), val.value);</span>
+            }
+
+<span class="nc" id="L453">            direction = UCharacter.getDirection(ch);</span>
+<span class="nc bnc" id="L454" title="All 2 branches missed.">            if(firstCharDir == UCharacterDirection.CHAR_DIRECTION_COUNT){</span>
+<span class="nc" id="L455">                firstCharDir = direction;</span>
+            }
+<span class="nc bnc" id="L457" title="All 2 branches missed.">            if(direction == UCharacterDirection.LEFT_TO_RIGHT){</span>
+<span class="nc" id="L458">                leftToRight = true;</span>
+<span class="nc" id="L459">                ltrPos = iter.getIndex()-1;</span>
+            }
+<span class="nc bnc" id="L461" title="All 4 branches missed.">            if(direction == UCharacterDirection.RIGHT_TO_LEFT || direction == UCharacterDirection.RIGHT_TO_LEFT_ARABIC){</span>
+<span class="nc" id="L462">                rightToLeft = true;</span>
+<span class="nc" id="L463">                rtlPos = iter.getIndex()-1;</span>
+            }
+        }
+<span class="nc bnc" id="L466" title="All 2 branches missed.">        if(checkBiDi == true){</span>
+            // satisfy 2
+<span class="nc bnc" id="L468" title="All 4 branches missed.">            if( leftToRight == true &amp;&amp; rightToLeft == true){</span>
+<span class="nc" id="L469">                throw new ParseException(&quot;The input does not conform to the rules for BiDi code points.&quot; +</span>
+<span class="nc bnc" id="L470" title="All 2 branches missed.">                                         iter.getText(),</span>
+                                         (rtlPos&gt;ltrPos) ? rtlPos : ltrPos);
+             }
+
+            //satisfy 3
+<span class="nc bnc" id="L475" title="All 10 branches missed.">            if( rightToLeft == true &amp;&amp;</span>
+                !((firstCharDir == UCharacterDirection.RIGHT_TO_LEFT || firstCharDir == UCharacterDirection.RIGHT_TO_LEFT_ARABIC) &amp;&amp;
+                (direction == UCharacterDirection.RIGHT_TO_LEFT || direction == UCharacterDirection.RIGHT_TO_LEFT_ARABIC))
+              ){
+<span class="nc" id="L479">                throw new ParseException(&quot;The input does not conform to the rules for BiDi code points.&quot; +</span>
+<span class="nc bnc" id="L480" title="All 2 branches missed.">                                         iter.getText(),</span>
+                                         (rtlPos&gt;ltrPos) ? rtlPos : ltrPos);
+            }
+        }
+<span class="nc" id="L484">        return normOut;</span>
+
+      }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

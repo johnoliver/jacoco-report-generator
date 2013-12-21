@@ -1,0 +1,645 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ThreadReferenceImpl.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">com.sun.tools.jdi</a> &gt; <span class="el_source">ThreadReferenceImpl.java</span></div><h1>ThreadReferenceImpl.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1998, 2011, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package com.sun.tools.jdi;
+
+import com.sun.jdi.*;
+import com.sun.jdi.request.BreakpointRequest;
+import java.util.*;
+import java.lang.ref.WeakReference;
+
+public class ThreadReferenceImpl extends ObjectReferenceImpl
+             implements ThreadReference, VMListener {
+    static final int SUSPEND_STATUS_SUSPENDED = 0x1;
+    static final int SUSPEND_STATUS_BREAK = 0x2;
+
+<span class="nc" id="L38">    private int suspendedZombieCount = 0;</span>
+
+    /*
+     * Some objects can only be created while a thread is suspended and are valid
+     * only while the thread remains suspended.  Examples are StackFrameImpl
+     * and MonitorInfoImpl.  When the thread resumes, these objects have to be
+     * marked as invalid so that their methods can throw
+     * InvalidStackFrameException if they are called.  To do this, such objects
+     * register themselves as listeners of the associated thread.  When the
+     * thread is resumed, its listeners are notified and mark themselves
+     * invalid.
+     * Also, note that ThreadReferenceImpl itself caches some info that
+     * is valid only as long as the thread is suspended.  When the thread
+     * is resumed, that cache must be purged.
+     * Lastly, note that ThreadReferenceImpl and its super, ObjectReferenceImpl
+     * cache some info that is only valid as long as the entire VM is suspended.
+     * If _any_ thread is resumed, this cache must be purged.  To handle this,
+     * both ThreadReferenceImpl and ObjectReferenceImpl register themselves as
+     * VMListeners so that they get notified when all threads are suspended and
+     * when any thread is resumed.
+     */
+
+    // This is cached for the life of the thread
+    private ThreadGroupReference threadGroup;
+
+    // This is cached only while this one thread is suspended.  Each time
+    // the thread is resumed, we abandon the current cache object and
+    // create a new initialized one.
+<span class="nc" id="L66">    private static class LocalCache {</span>
+<span class="nc" id="L67">        JDWP.ThreadReference.Status status = null;</span>
+<span class="nc" id="L68">        List&lt;StackFrame&gt; frames = null;</span>
+<span class="nc" id="L69">        int framesStart = -1;</span>
+<span class="nc" id="L70">        int framesLength = 0;</span>
+<span class="nc" id="L71">        int frameCount = -1;</span>
+<span class="nc" id="L72">        List&lt;ObjectReference&gt; ownedMonitors = null;</span>
+<span class="nc" id="L73">        List&lt;MonitorInfo&gt; ownedMonitorsInfo = null;</span>
+<span class="nc" id="L74">        ObjectReference contendedMonitor = null;</span>
+<span class="nc" id="L75">        boolean triedCurrentContended = false;</span>
+    }
+
+    /*
+     * The localCache instance var is set by resetLocalCache to an initialized
+     * object as shown above.  This occurs when the ThreadReference
+     * object is created, and when the mirrored thread is resumed.
+     * The fields are then filled in by the relevant methods as they
+     * are called.  A problem can occur if resetLocalCache is called
+     * (ie, a resume() is executed) at certain points in the execution
+     * of some of these methods - see 6751643.  To avoid this, each
+     * method that wants to use this cache must make a local copy of
+     * this variable and use that.  This means that each invocation of
+     * these methods will use a copy of the cache object that was in
+     * effect at the point that the copy was made; if a racy resume
+     * occurs, it won't affect the method's local copy.  This means that
+     * the values returned by these calls may not match the state of
+     * the debuggee at the time the caller gets the values.  EG,
+     * frameCount() is called and comes up with 5 frames.  But before
+     * it returns this, a resume of the debuggee thread is executed in a
+     * different debugger thread.  The thread is resumed and running at
+     * the time that the value 5 is returned.  Or even worse, the thread
+     * could be suspended again and have a different number of frames, eg, 24,
+     * but this call will still return 5.
+     */
+    private LocalCache localCache;
+
+    private void resetLocalCache() {
+<span class="nc" id="L103">        localCache = new LocalCache();</span>
+<span class="nc" id="L104">    }</span>
+
+    // This is cached only while all threads in the VM are suspended
+    // Yes, someone could change the name of a thread while it is suspended.
+<span class="nc" id="L108">    private static class Cache extends ObjectReferenceImpl.Cache {</span>
+<span class="nc" id="L109">        String name = null;</span>
+    }
+    protected ObjectReferenceImpl.Cache newCache() {
+<span class="nc" id="L112">        return new Cache();</span>
+    }
+
+    // Listeners - synchronized on vm.state()
+<span class="nc" id="L116">    private List&lt;WeakReference&lt;ThreadListener&gt;&gt; listeners = new ArrayList&lt;WeakReference&lt;ThreadListener&gt;&gt;();</span>
+
+
+    ThreadReferenceImpl(VirtualMachine aVm, long aRef) {
+<span class="nc" id="L120">        super(aVm,aRef);</span>
+<span class="nc" id="L121">        resetLocalCache();</span>
+<span class="nc" id="L122">        vm.state().addListener(this);</span>
+<span class="nc" id="L123">    }</span>
+
+    protected String description() {
+<span class="nc" id="L126">        return &quot;ThreadReference &quot; + uniqueID();</span>
+    }
+
+    /*
+     * VMListener implementation
+     */
+    public boolean vmNotSuspended(VMAction action) {
+<span class="nc bnc" id="L133" title="All 2 branches missed.">        if (action.resumingThread() == null) {</span>
+            // all threads are being resumed
+<span class="nc" id="L135">            synchronized (vm.state()) {</span>
+<span class="nc" id="L136">                processThreadAction(new ThreadAction(this,</span>
+                                            ThreadAction.THREAD_RESUMABLE));
+<span class="nc" id="L138">            }</span>
+
+        }
+
+        /*
+         * Othewise, only one thread is being resumed:
+         *   if it is us,
+         *      we have already done our processThreadAction to notify our
+         *      listeners when we processed the resume.
+         *   if it is not us,
+         *      we don't want to notify our listeners
+         *       because we are not being resumed.
+         */
+<span class="nc" id="L151">        return super.vmNotSuspended(action);</span>
+    }
+
+    /**
+     * Note that we only cache the name string while the entire VM is suspended
+     * because the name can change via Thread.setName arbitrarily while this
+     * thread is running.
+     */
+    public String name() {
+<span class="nc" id="L160">        String name = null;</span>
+        try {
+<span class="nc" id="L162">            Cache local = (Cache)getCache();</span>
+
+<span class="nc bnc" id="L164" title="All 2 branches missed.">            if (local != null) {</span>
+<span class="nc" id="L165">                name = local.name;</span>
+            }
+<span class="nc bnc" id="L167" title="All 2 branches missed.">            if (name == null) {</span>
+<span class="nc" id="L168">                name = JDWP.ThreadReference.Name.process(vm, this)</span>
+                                                             .threadName;
+<span class="nc bnc" id="L170" title="All 2 branches missed.">                if (local != null) {</span>
+<span class="nc" id="L171">                    local.name = name;</span>
+                }
+            }
+<span class="nc" id="L174">        } catch (JDWPException exc) {</span>
+<span class="nc" id="L175">            throw exc.toJDIException();</span>
+<span class="nc" id="L176">        }</span>
+<span class="nc" id="L177">        return name;</span>
+    }
+
+    /*
+     * Sends a command to the back end which is defined to do an
+     * implicit vm-wide resume.
+     */
+    PacketStream sendResumingCommand(CommandSender sender) {
+<span class="nc" id="L185">        synchronized (vm.state()) {</span>
+<span class="nc" id="L186">            processThreadAction(new ThreadAction(this,</span>
+                                        ThreadAction.THREAD_RESUMABLE));
+<span class="nc" id="L188">            return sender.send();</span>
+<span class="nc" id="L189">        }</span>
+    }
+
+    public void suspend() {
+        try {
+<span class="nc" id="L194">            JDWP.ThreadReference.Suspend.process(vm, this);</span>
+<span class="nc" id="L195">        } catch (JDWPException exc) {</span>
+<span class="nc" id="L196">            throw exc.toJDIException();</span>
+<span class="nc" id="L197">        }</span>
+        // Don't consider the thread suspended yet. On reply, notifySuspend()
+        // will be called.
+<span class="nc" id="L200">    }</span>
+
+    public void resume() {
+        /*
+         * If it's a zombie, we can just update internal state without
+         * going to back end.
+         */
+<span class="nc bnc" id="L207" title="All 2 branches missed.">        if (suspendedZombieCount &gt; 0) {</span>
+<span class="nc" id="L208">            suspendedZombieCount--;</span>
+<span class="nc" id="L209">            return;</span>
+        }
+
+        PacketStream stream;
+<span class="nc" id="L213">        synchronized (vm.state()) {</span>
+<span class="nc" id="L214">            processThreadAction(new ThreadAction(this,</span>
+                                      ThreadAction.THREAD_RESUMABLE));
+<span class="nc" id="L216">            stream = JDWP.ThreadReference.Resume.enqueueCommand(vm, this);</span>
+<span class="nc" id="L217">        }</span>
+        try {
+<span class="nc" id="L219">            JDWP.ThreadReference.Resume.waitForReply(vm, stream);</span>
+<span class="nc" id="L220">        } catch (JDWPException exc) {</span>
+<span class="nc" id="L221">            throw exc.toJDIException();</span>
+<span class="nc" id="L222">        }</span>
+<span class="nc" id="L223">    }</span>
+
+    public int suspendCount() {
+        /*
+         * If it's a zombie, we maintain the count in the front end.
+         */
+<span class="nc bnc" id="L229" title="All 2 branches missed.">        if (suspendedZombieCount &gt; 0) {</span>
+<span class="nc" id="L230">            return suspendedZombieCount;</span>
+        }
+
+        try {
+<span class="nc" id="L234">            return JDWP.ThreadReference.SuspendCount.process(vm, this).suspendCount;</span>
+<span class="nc" id="L235">        } catch (JDWPException exc) {</span>
+<span class="nc" id="L236">            throw exc.toJDIException();</span>
+        }
+    }
+
+    public void stop(ObjectReference throwable) throws InvalidTypeException {
+<span class="nc" id="L241">        validateMirror(throwable);</span>
+        // Verify that the given object is a Throwable instance
+<span class="nc" id="L243">        List&lt;ReferenceType&gt; list = vm.classesByName(&quot;java.lang.Throwable&quot;);</span>
+<span class="nc" id="L244">        ClassTypeImpl throwableClass = (ClassTypeImpl)list.get(0);</span>
+<span class="nc bnc" id="L245" title="All 2 branches missed.">        if ((throwable == null) ||</span>
+<span class="nc bnc" id="L246" title="All 2 branches missed.">            !throwableClass.isAssignableFrom(throwable)) {</span>
+<span class="nc" id="L247">             throw new InvalidTypeException(&quot;Not an instance of Throwable&quot;);</span>
+        }
+
+        try {
+<span class="nc" id="L251">            JDWP.ThreadReference.Stop.process(vm, this,</span>
+                                         (ObjectReferenceImpl)throwable);
+<span class="nc" id="L253">        } catch (JDWPException exc) {</span>
+<span class="nc" id="L254">            throw exc.toJDIException();</span>
+<span class="nc" id="L255">        }</span>
+<span class="nc" id="L256">    }</span>
+
+    public void interrupt() {
+        try {
+<span class="nc" id="L260">            JDWP.ThreadReference.Interrupt.process(vm, this);</span>
+<span class="nc" id="L261">        } catch (JDWPException exc) {</span>
+<span class="nc" id="L262">            throw exc.toJDIException();</span>
+<span class="nc" id="L263">        }</span>
+<span class="nc" id="L264">    }</span>
+
+    private JDWP.ThreadReference.Status jdwpStatus() {
+<span class="nc" id="L267">        LocalCache snapshot = localCache;</span>
+<span class="nc" id="L268">        JDWP.ThreadReference.Status myStatus = snapshot.status;</span>
+        try {
+<span class="nc bnc" id="L270" title="All 2 branches missed.">             if (myStatus == null) {</span>
+<span class="nc" id="L271">                 myStatus = JDWP.ThreadReference.Status.process(vm, this);</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">                if ((myStatus.suspendStatus &amp; SUSPEND_STATUS_SUSPENDED) != 0) {</span>
+                    // thread is suspended, we can cache the status.
+<span class="nc" id="L274">                    snapshot.status = myStatus;</span>
+                }
+            }
+<span class="nc" id="L277">         } catch (JDWPException exc) {</span>
+<span class="nc" id="L278">            throw exc.toJDIException();</span>
+<span class="nc" id="L279">        }</span>
+<span class="nc" id="L280">        return myStatus;</span>
+    }
+
+    public int status() {
+<span class="nc" id="L284">        return jdwpStatus().threadStatus;</span>
+    }
+
+    public boolean isSuspended() {
+<span class="nc bnc" id="L288" title="All 2 branches missed.">        return ((suspendedZombieCount &gt; 0) ||</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">                ((jdwpStatus().suspendStatus &amp; SUSPEND_STATUS_SUSPENDED) != 0));</span>
+    }
+
+    public boolean isAtBreakpoint() {
+        /*
+         * TO DO: This fails to take filters into account.
+         */
+        try {
+<span class="nc" id="L297">            StackFrame frame = frame(0);</span>
+<span class="nc" id="L298">            Location location = frame.location();</span>
+<span class="nc" id="L299">            List&lt;BreakpointRequest&gt; requests = vm.eventRequestManager().breakpointRequests();</span>
+<span class="nc" id="L300">            Iterator&lt;BreakpointRequest&gt; iter = requests.iterator();</span>
+<span class="nc bnc" id="L301" title="All 2 branches missed.">            while (iter.hasNext()) {</span>
+<span class="nc" id="L302">                BreakpointRequest request = iter.next();</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">                if (location.equals(request.location())) {</span>
+<span class="nc" id="L304">                    return true;</span>
+                }
+<span class="nc" id="L306">            }</span>
+<span class="nc" id="L307">            return false;</span>
+<span class="nc" id="L308">        } catch (IndexOutOfBoundsException iobe) {</span>
+<span class="nc" id="L309">            return false;  // no frames on stack =&gt; not at breakpoint</span>
+<span class="nc" id="L310">        } catch (IncompatibleThreadStateException itse) {</span>
+            // Per the javadoc, not suspended =&gt; return false
+<span class="nc" id="L312">            return false;</span>
+        }
+    }
+
+    public ThreadGroupReference threadGroup() {
+        /*
+         * Thread group can't change, so it's cached once and for all.
+         */
+<span class="nc bnc" id="L320" title="All 2 branches missed.">        if (threadGroup == null) {</span>
+            try {
+<span class="nc" id="L322">                threadGroup = JDWP.ThreadReference.ThreadGroup.</span>
+<span class="nc" id="L323">                    process(vm, this).group;</span>
+<span class="nc" id="L324">            } catch (JDWPException exc) {</span>
+<span class="nc" id="L325">                throw exc.toJDIException();</span>
+<span class="nc" id="L326">            }</span>
+        }
+<span class="nc" id="L328">        return threadGroup;</span>
+    }
+
+    public int frameCount() throws IncompatibleThreadStateException  {
+<span class="nc" id="L332">        LocalCache snapshot = localCache;</span>
+        try {
+<span class="nc bnc" id="L334" title="All 2 branches missed.">            if (snapshot.frameCount == -1) {</span>
+<span class="nc" id="L335">                snapshot.frameCount = JDWP.ThreadReference.FrameCount</span>
+<span class="nc" id="L336">                                          .process(vm, this).frameCount;</span>
+            }
+<span class="nc" id="L338">        } catch (JDWPException exc) {</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">            switch (exc.errorCode()) {</span>
+            case JDWP.Error.THREAD_NOT_SUSPENDED:
+            case JDWP.Error.INVALID_THREAD:   /* zombie */
+<span class="nc" id="L342">                throw new IncompatibleThreadStateException();</span>
+            default:
+<span class="nc" id="L344">                throw exc.toJDIException();</span>
+            }
+<span class="nc" id="L346">        }</span>
+<span class="nc" id="L347">        return snapshot.frameCount;</span>
+    }
+
+    public List&lt;StackFrame&gt; frames() throws IncompatibleThreadStateException  {
+<span class="nc" id="L351">        return privateFrames(0, -1);</span>
+    }
+
+    public StackFrame frame(int index) throws IncompatibleThreadStateException  {
+<span class="nc" id="L355">        List&lt;StackFrame&gt; list = privateFrames(index, 1);</span>
+<span class="nc" id="L356">        return list.get(0);</span>
+    }
+
+    /**
+     * Is the requested subrange within what has been retrieved?
+     * local is known to be non-null.  Should only be called from
+     * a sync method.
+     */
+    private boolean isSubrange(LocalCache snapshot,
+                               int start, int length) {
+<span class="nc bnc" id="L366" title="All 2 branches missed.">        if (start &lt; snapshot.framesStart) {</span>
+<span class="nc" id="L367">            return false;</span>
+        }
+<span class="nc bnc" id="L369" title="All 2 branches missed.">        if (length == -1) {</span>
+<span class="nc bnc" id="L370" title="All 2 branches missed.">            return (snapshot.framesLength == -1);</span>
+        }
+<span class="nc bnc" id="L372" title="All 2 branches missed.">        if (snapshot.framesLength == -1) {</span>
+<span class="nc" id="L373">            if ((start + length) &gt; (snapshot.framesStart +</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">                                    snapshot.frames.size())) {</span>
+<span class="nc" id="L375">                throw new IndexOutOfBoundsException();</span>
+            }
+<span class="nc" id="L377">            return true;</span>
+        }
+<span class="nc bnc" id="L379" title="All 2 branches missed.">        return ((start + length) &lt;= (snapshot.framesStart + snapshot.framesLength));</span>
+    }
+
+    public List&lt;StackFrame&gt; frames(int start, int length)
+                              throws IncompatibleThreadStateException  {
+<span class="nc bnc" id="L384" title="All 2 branches missed.">        if (length &lt; 0) {</span>
+<span class="nc" id="L385">            throw new IndexOutOfBoundsException(</span>
+                &quot;length must be greater than or equal to zero&quot;);
+        }
+<span class="nc" id="L388">        return privateFrames(start, length);</span>
+    }
+
+    /**
+     * Private version of frames() allows &quot;-1&quot; to specify all
+     * remaining frames.
+     */
+    synchronized private List&lt;StackFrame&gt; privateFrames(int start, int length)
+                              throws IncompatibleThreadStateException  {
+
+        // Lock must be held while creating stack frames so if that two threads
+        // do this at the same time, one won't clobber the subset created by the other.
+<span class="nc" id="L400">        LocalCache snapshot = localCache;</span>
+        try {
+<span class="nc bnc" id="L402" title="All 4 branches missed.">            if (snapshot.frames == null || !isSubrange(snapshot, start, length)) {</span>
+<span class="nc" id="L403">                JDWP.ThreadReference.Frames.Frame[] jdwpFrames</span>
+                    = JDWP.ThreadReference.Frames.
+<span class="nc" id="L405">                    process(vm, this, start, length).frames;</span>
+<span class="nc" id="L406">                int count = jdwpFrames.length;</span>
+<span class="nc" id="L407">                snapshot.frames = new ArrayList&lt;StackFrame&gt;(count);</span>
+
+<span class="nc bnc" id="L409" title="All 2 branches missed.">                for (int i = 0; i&lt;count; i++) {</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">                    if (jdwpFrames[i].location == null) {</span>
+<span class="nc" id="L411">                        throw new InternalException(&quot;Invalid frame location&quot;);</span>
+                    }
+<span class="nc" id="L413">                    StackFrame frame = new StackFrameImpl(vm, this,</span>
+                                                          jdwpFrames[i].frameID,
+                                                          jdwpFrames[i].location);
+                    // Add to the frame list
+<span class="nc" id="L417">                    snapshot.frames.add(frame);</span>
+                }
+<span class="nc" id="L419">                snapshot.framesStart = start;</span>
+<span class="nc" id="L420">                snapshot.framesLength = length;</span>
+<span class="nc" id="L421">                return Collections.unmodifiableList(snapshot.frames);</span>
+            } else {
+<span class="nc" id="L423">                int fromIndex = start - snapshot.framesStart;</span>
+                int toIndex;
+<span class="nc bnc" id="L425" title="All 2 branches missed.">                if (length == -1) {</span>
+<span class="nc" id="L426">                    toIndex = snapshot.frames.size() - fromIndex;</span>
+                } else {
+<span class="nc" id="L428">                    toIndex = fromIndex + length;</span>
+                }
+<span class="nc" id="L430">                return Collections.unmodifiableList(snapshot.frames.subList(fromIndex, toIndex));</span>
+            }
+<span class="nc" id="L432">        } catch (JDWPException exc) {</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">            switch (exc.errorCode()) {</span>
+            case JDWP.Error.THREAD_NOT_SUSPENDED:
+            case JDWP.Error.INVALID_THREAD:   /* zombie */
+<span class="nc" id="L436">                throw new IncompatibleThreadStateException();</span>
+            default:
+<span class="nc" id="L438">                throw exc.toJDIException();</span>
+            }
+        }
+    }
+
+    public List&lt;ObjectReference&gt; ownedMonitors()  throws IncompatibleThreadStateException  {
+<span class="nc" id="L444">        LocalCache snapshot = localCache;</span>
+        try {
+<span class="nc bnc" id="L446" title="All 2 branches missed.">            if (snapshot.ownedMonitors == null) {</span>
+<span class="nc" id="L447">                snapshot.ownedMonitors = Arrays.asList(</span>
+                                 (ObjectReference[])JDWP.ThreadReference.OwnedMonitors.
+<span class="nc" id="L449">                                         process(vm, this).owned);</span>
+<span class="nc bnc" id="L450" title="All 2 branches missed.">                if ((vm.traceFlags &amp; VirtualMachine.TRACE_OBJREFS) != 0) {</span>
+<span class="nc" id="L451">                    vm.printTrace(description() +</span>
+                                  &quot; temporarily caching owned monitors&quot;+
+<span class="nc" id="L453">                                  &quot; (count = &quot; + snapshot.ownedMonitors.size() + &quot;)&quot;);</span>
+                }
+            }
+<span class="nc" id="L456">        } catch (JDWPException exc) {</span>
+<span class="nc bnc" id="L457" title="All 2 branches missed.">            switch (exc.errorCode()) {</span>
+            case JDWP.Error.THREAD_NOT_SUSPENDED:
+            case JDWP.Error.INVALID_THREAD:   /* zombie */
+<span class="nc" id="L460">                throw new IncompatibleThreadStateException();</span>
+            default:
+<span class="nc" id="L462">                throw exc.toJDIException();</span>
+            }
+<span class="nc" id="L464">        }</span>
+<span class="nc" id="L465">        return snapshot.ownedMonitors;</span>
+    }
+
+    public ObjectReference currentContendedMonitor()
+                              throws IncompatibleThreadStateException  {
+<span class="nc" id="L470">        LocalCache snapshot = localCache;</span>
+        try {
+<span class="nc bnc" id="L472" title="All 4 branches missed.">            if (snapshot.contendedMonitor == null &amp;&amp;</span>
+                !snapshot.triedCurrentContended) {
+<span class="nc" id="L474">                snapshot.contendedMonitor = JDWP.ThreadReference.CurrentContendedMonitor.</span>
+<span class="nc" id="L475">                    process(vm, this).monitor;</span>
+<span class="nc" id="L476">                snapshot.triedCurrentContended = true;</span>
+<span class="nc bnc" id="L477" title="All 4 branches missed.">                if ((snapshot.contendedMonitor != null) &amp;&amp;</span>
+                    ((vm.traceFlags &amp; VirtualMachine.TRACE_OBJREFS) != 0)) {
+<span class="nc" id="L479">                    vm.printTrace(description() +</span>
+                                  &quot; temporarily caching contended monitor&quot;+
+<span class="nc" id="L481">                                  &quot; (id = &quot; + snapshot.contendedMonitor.uniqueID() + &quot;)&quot;);</span>
+                }
+            }
+<span class="nc" id="L484">        } catch (JDWPException exc) {</span>
+<span class="nc bnc" id="L485" title="All 2 branches missed.">            switch (exc.errorCode()) {</span>
+            case JDWP.Error.THREAD_NOT_SUSPENDED:
+            case JDWP.Error.INVALID_THREAD:   /* zombie */
+<span class="nc" id="L488">                throw new IncompatibleThreadStateException();</span>
+            default:
+<span class="nc" id="L490">                throw exc.toJDIException();</span>
+            }
+<span class="nc" id="L492">        }</span>
+<span class="nc" id="L493">        return snapshot.contendedMonitor;</span>
+    }
+
+    public List&lt;MonitorInfo&gt; ownedMonitorsAndFrames()  throws IncompatibleThreadStateException  {
+<span class="nc" id="L497">        LocalCache snapshot = localCache;</span>
+        try {
+<span class="nc bnc" id="L499" title="All 2 branches missed.">            if (snapshot.ownedMonitorsInfo == null) {</span>
+                JDWP.ThreadReference.OwnedMonitorsStackDepthInfo.monitor[] minfo;
+<span class="nc" id="L501">                minfo = JDWP.ThreadReference.OwnedMonitorsStackDepthInfo.process(vm, this).owned;</span>
+
+<span class="nc" id="L503">                snapshot.ownedMonitorsInfo = new ArrayList&lt;MonitorInfo&gt;(minfo.length);</span>
+
+<span class="nc bnc" id="L505" title="All 2 branches missed.">                for (int i=0; i &lt; minfo.length; i++) {</span>
+<span class="nc" id="L506">                    JDWP.ThreadReference.OwnedMonitorsStackDepthInfo.monitor mi =</span>
+                                                                         minfo[i];
+<span class="nc" id="L508">                    MonitorInfo mon = new MonitorInfoImpl(vm, minfo[i].monitor, this, minfo[i].stack_depth);</span>
+<span class="nc" id="L509">                    snapshot.ownedMonitorsInfo.add(mon);</span>
+                }
+
+<span class="nc bnc" id="L512" title="All 2 branches missed.">                if ((vm.traceFlags &amp; VirtualMachine.TRACE_OBJREFS) != 0) {</span>
+<span class="nc" id="L513">                    vm.printTrace(description() +</span>
+                                  &quot; temporarily caching owned monitors&quot;+
+<span class="nc" id="L515">                                  &quot; (count = &quot; + snapshot.ownedMonitorsInfo.size() + &quot;)&quot;);</span>
+                    }
+                }
+
+<span class="nc" id="L519">        } catch (JDWPException exc) {</span>
+<span class="nc bnc" id="L520" title="All 2 branches missed.">            switch (exc.errorCode()) {</span>
+            case JDWP.Error.THREAD_NOT_SUSPENDED:
+            case JDWP.Error.INVALID_THREAD:   /* zombie */
+<span class="nc" id="L523">                throw new IncompatibleThreadStateException();</span>
+            default:
+<span class="nc" id="L525">                throw exc.toJDIException();</span>
+            }
+<span class="nc" id="L527">        }</span>
+<span class="nc" id="L528">        return snapshot.ownedMonitorsInfo;</span>
+    }
+
+    public void popFrames(StackFrame frame) throws IncompatibleThreadStateException {
+        // Note that interface-wise this functionality belongs
+        // here in ThreadReference, but implementation-wise it
+        // belongs in StackFrame, so we just forward it.
+<span class="nc bnc" id="L535" title="All 2 branches missed.">        if (!frame.thread().equals(this)) {</span>
+<span class="nc" id="L536">            throw new IllegalArgumentException(&quot;frame does not belong to this thread&quot;);</span>
+        }
+<span class="nc bnc" id="L538" title="All 2 branches missed.">        if (!vm.canPopFrames()) {</span>
+<span class="nc" id="L539">            throw new UnsupportedOperationException(</span>
+                &quot;target does not support popping frames&quot;);
+        }
+<span class="nc" id="L542">        ((StackFrameImpl)frame).pop();</span>
+<span class="nc" id="L543">    }</span>
+
+    public void forceEarlyReturn(Value  returnValue) throws InvalidTypeException,
+                                                            ClassNotLoadedException,
+                                             IncompatibleThreadStateException {
+<span class="nc bnc" id="L548" title="All 2 branches missed.">        if (!vm.canForceEarlyReturn()) {</span>
+<span class="nc" id="L549">            throw new UnsupportedOperationException(</span>
+                &quot;target does not support the forcing of a method to return early&quot;);
+        }
+
+<span class="nc" id="L553">        validateMirrorOrNull(returnValue);</span>
+
+        StackFrameImpl sf;
+        try {
+<span class="nc" id="L557">           sf = (StackFrameImpl)frame(0);</span>
+<span class="nc" id="L558">        } catch (IndexOutOfBoundsException exc) {</span>
+<span class="nc" id="L559">           throw new InvalidStackFrameException(&quot;No more frames on the stack&quot;);</span>
+<span class="nc" id="L560">        }</span>
+<span class="nc" id="L561">        sf.validateStackFrame();</span>
+<span class="nc" id="L562">        MethodImpl meth = (MethodImpl)sf.location().method();</span>
+<span class="nc" id="L563">        ValueImpl convertedValue  = ValueImpl.prepareForAssignment(returnValue,</span>
+<span class="nc" id="L564">                                                                   meth.getReturnValueContainer());</span>
+
+        try {
+<span class="nc" id="L567">            JDWP.ThreadReference.ForceEarlyReturn.process(vm, this, convertedValue);</span>
+<span class="nc" id="L568">        } catch (JDWPException exc) {</span>
+<span class="nc bnc" id="L569" title="All 5 branches missed.">            switch (exc.errorCode()) {</span>
+            case JDWP.Error.OPAQUE_FRAME:
+<span class="nc" id="L571">                throw new NativeMethodException();</span>
+            case JDWP.Error.THREAD_NOT_SUSPENDED:
+<span class="nc" id="L573">                throw new IncompatibleThreadStateException(</span>
+                         &quot;Thread not suspended&quot;);
+            case JDWP.Error.THREAD_NOT_ALIVE:
+<span class="nc" id="L576">                throw new IncompatibleThreadStateException(</span>
+                                     &quot;Thread has not started or has finished&quot;);
+            case JDWP.Error.NO_MORE_FRAMES:
+<span class="nc" id="L579">                throw new InvalidStackFrameException(</span>
+                         &quot;No more frames on the stack&quot;);
+            default:
+<span class="nc" id="L582">                throw exc.toJDIException();</span>
+            }
+<span class="nc" id="L584">        }</span>
+<span class="nc" id="L585">    }</span>
+
+    public String toString() {
+<span class="nc" id="L588">        return &quot;instance of &quot; + referenceType().name() +</span>
+<span class="nc" id="L589">               &quot;(name='&quot; + name() + &quot;', &quot; + &quot;id=&quot; + uniqueID() + &quot;)&quot;;</span>
+    }
+
+    byte typeValueKey() {
+<span class="nc" id="L593">        return JDWP.Tag.THREAD;</span>
+    }
+
+    void addListener(ThreadListener listener) {
+<span class="nc" id="L597">        synchronized (vm.state()) {</span>
+<span class="nc" id="L598">            listeners.add(new WeakReference&lt;ThreadListener&gt;(listener));</span>
+<span class="nc" id="L599">        }</span>
+<span class="nc" id="L600">    }</span>
+
+    void removeListener(ThreadListener listener) {
+<span class="nc" id="L603">        synchronized (vm.state()) {</span>
+<span class="nc" id="L604">            Iterator&lt;WeakReference&lt;ThreadListener&gt;&gt; iter = listeners.iterator();</span>
+<span class="nc bnc" id="L605" title="All 2 branches missed.">            while (iter.hasNext()) {</span>
+<span class="nc" id="L606">                WeakReference&lt;ThreadListener&gt; ref = iter.next();</span>
+<span class="nc bnc" id="L607" title="All 2 branches missed.">                if (listener.equals(ref.get())) {</span>
+<span class="nc" id="L608">                    iter.remove();</span>
+<span class="nc" id="L609">                    break;</span>
+                }
+<span class="nc" id="L611">            }</span>
+<span class="nc" id="L612">        }</span>
+<span class="nc" id="L613">    }</span>
+
+    /**
+     * Propagate the the thread state change information
+     * to registered listeners.
+     * Must be entered while synchronized on vm.state()
+     */
+    private void processThreadAction(ThreadAction action) {
+<span class="nc" id="L621">        synchronized (vm.state()) {</span>
+<span class="nc" id="L622">            Iterator&lt;WeakReference&lt;ThreadListener&gt;&gt; iter = listeners.iterator();</span>
+<span class="nc bnc" id="L623" title="All 2 branches missed.">            while (iter.hasNext()) {</span>
+<span class="nc" id="L624">                WeakReference&lt;ThreadListener&gt; ref = iter.next();</span>
+<span class="nc" id="L625">                ThreadListener listener = ref.get();</span>
+<span class="nc bnc" id="L626" title="All 2 branches missed.">                if (listener != null) {</span>
+<span class="nc bnc" id="L627" title="All 2 branches missed.">                    switch (action.id()) {</span>
+                        case ThreadAction.THREAD_RESUMABLE:
+<span class="nc bnc" id="L629" title="All 2 branches missed.">                            if (!listener.threadResumable(action)) {</span>
+<span class="nc" id="L630">                                iter.remove();</span>
+                            }
+<span class="nc" id="L632">                            break;</span>
+                    }
+                } else {
+                    // Listener is unreachable; clean up
+<span class="nc" id="L636">                    iter.remove();</span>
+                }
+<span class="nc" id="L638">            }</span>
+
+            // Discard our local cache
+<span class="nc" id="L641">            resetLocalCache();</span>
+<span class="nc" id="L642">        }</span>
+<span class="nc" id="L643">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

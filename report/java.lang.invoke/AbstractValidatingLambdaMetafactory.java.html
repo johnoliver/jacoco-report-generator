@@ -1,0 +1,340 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>AbstractValidatingLambdaMetafactory.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">java.lang.invoke</a> &gt; <span class="el_source">AbstractValidatingLambdaMetafactory.java</span></div><h1>AbstractValidatingLambdaMetafactory.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package java.lang.invoke;
+
+import sun.invoke.util.Wrapper;
+
+import static sun.invoke.util.Wrapper.forPrimitiveType;
+import static sun.invoke.util.Wrapper.forWrapperType;
+import static sun.invoke.util.Wrapper.isWrapperType;
+
+/**
+ * Abstract implementation of a lambda metafactory which provides parameter
+ * unrolling and input validation.
+ *
+ * @see LambdaMetafactory
+ */
+/* package */ abstract class AbstractValidatingLambdaMetafactory {
+
+    /*
+     * For context, the comments for the following fields are marked in quotes
+     * with their values, given this program:
+     * interface II&lt;T&gt; {  Object foo(T x); }
+     * interface JJ&lt;R extends Number&gt; extends II&lt;R&gt; { }
+     * class CC {  String impl(int i) { return &quot;impl:&quot;+i; }}
+     * class X {
+     *     public static void main(String[] args) {
+     *         JJ&lt;Integer&gt; iii = (new CC())::impl;
+     *         System.out.printf(&quot;&gt;&gt;&gt; %s\n&quot;, iii.foo(44));
+     * }}
+     */
+    final Class&lt;?&gt; targetClass;               // The class calling the meta-factory via invokedynamic &quot;class X&quot;
+    final MethodType invokedType;             // The type of the invoked method &quot;(CC)II&quot;
+    final Class&lt;?&gt; samBase;                   // The type of the returned instance &quot;interface JJ&quot;
+    final String samMethodName;               // Name of the SAM method &quot;foo&quot;
+    final MethodType samMethodType;           // Type of the SAM method &quot;(Object)Object&quot;
+    final MethodHandle implMethod;            // Raw method handle for the implementation method
+    final MethodHandleInfo implInfo;          // Info about the implementation method handle &quot;MethodHandleInfo[5 CC.impl(int)String]&quot;
+    final int implKind;                       // Invocation kind for implementation &quot;5&quot;=invokevirtual
+    final boolean implIsInstanceMethod;       // Is the implementation an instance method &quot;true&quot;
+    final Class&lt;?&gt; implDefiningClass;         // Type defining the implementation &quot;class CC&quot;
+    final MethodType implMethodType;          // Type of the implementation method &quot;(int)String&quot;
+    final MethodType instantiatedMethodType;  // Instantiated erased functional interface method type &quot;(Integer)Object&quot;
+    final boolean isSerializable;             // Should the returned instance be serializable
+    final Class&lt;?&gt;[] markerInterfaces;        // Additional marker interfaces to be implemented
+    final MethodType[] additionalBridges;     // Signatures of additional methods to bridge
+
+
+    /**
+     * Meta-factory constructor.
+     *
+     * @param caller Stacked automatically by VM; represents a lookup context
+     *               with the accessibility privileges of the caller.
+     * @param invokedType Stacked automatically by VM; the signature of the
+     *                    invoked method, which includes the expected static
+     *                    type of the returned lambda object, and the static
+     *                    types of the captured arguments for the lambda.  In
+     *                    the event that the implementation method is an
+     *                    instance method, the first argument in the invocation
+     *                    signature will correspond to the receiver.
+     * @param samMethodName Name of the method in the functional interface to
+     *                      which the lambda or method reference is being
+     *                      converted, represented as a String.
+     * @param samMethodType Type of the method in the functional interface to
+     *                      which the lambda or method reference is being
+     *                      converted, represented as a MethodType.
+     * @param implMethod The implementation method which should be called
+     *                   (with suitable adaptation of argument types, return
+     *                   types, and adjustment for captured arguments) when
+     *                   methods of the resulting functional interface instance
+     *                   are invoked.
+     * @param instantiatedMethodType The signature of the primary functional
+     *                               interface method after type variables are
+     *                               substituted with their instantiation from
+     *                               the capture site
+     * @param isSerializable Should the lambda be made serializable?  If set,
+     *                       either the target type or one of the additional SAM
+     *                       types must extend {@code Serializable}.
+     * @param markerInterfaces Additional interfaces which the lambda object
+     *                       should implement.
+     * @param additionalBridges Method types for additional signatures to be
+     *                          bridged to the implementation method
+     * @throws LambdaConversionException If any of the meta-factory protocol
+     * invariants are violated
+     */
+    AbstractValidatingLambdaMetafactory(MethodHandles.Lookup caller,
+                                       MethodType invokedType,
+                                       String samMethodName,
+                                       MethodType samMethodType,
+                                       MethodHandle implMethod,
+                                       MethodType instantiatedMethodType,
+                                       boolean isSerializable,
+                                       Class&lt;?&gt;[] markerInterfaces,
+                                       MethodType[] additionalBridges)
+<span class="fc" id="L116">            throws LambdaConversionException {</span>
+<span class="fc" id="L117">        this.targetClass = caller.lookupClass();</span>
+<span class="fc" id="L118">        this.invokedType = invokedType;</span>
+
+<span class="fc" id="L120">        this.samBase = invokedType.returnType();</span>
+
+<span class="fc" id="L122">        this.samMethodName = samMethodName;</span>
+<span class="fc" id="L123">        this.samMethodType  = samMethodType;</span>
+
+<span class="fc" id="L125">        this.implMethod = implMethod;</span>
+<span class="fc" id="L126">        this.implInfo = caller.revealDirect(implMethod);</span>
+<span class="fc" id="L127">        this.implKind = implInfo.getReferenceKind();</span>
+<span class="fc bfc" id="L128" title="All 6 branches covered.">        this.implIsInstanceMethod =</span>
+                implKind == MethodHandleInfo.REF_invokeVirtual ||
+                implKind == MethodHandleInfo.REF_invokeSpecial ||
+                implKind == MethodHandleInfo.REF_invokeInterface;
+<span class="fc" id="L132">        this.implDefiningClass = implInfo.getDeclaringClass();</span>
+<span class="fc" id="L133">        this.implMethodType = implInfo.getMethodType();</span>
+<span class="fc" id="L134">        this.instantiatedMethodType = instantiatedMethodType;</span>
+<span class="fc" id="L135">        this.isSerializable = isSerializable;</span>
+<span class="fc" id="L136">        this.markerInterfaces = markerInterfaces;</span>
+<span class="fc" id="L137">        this.additionalBridges = additionalBridges;</span>
+
+<span class="pc bpc" id="L139" title="1 of 2 branches missed.">        if (!samBase.isInterface()) {</span>
+<span class="nc" id="L140">            throw new LambdaConversionException(String.format(</span>
+                    &quot;Functional interface %s is not an interface&quot;,
+<span class="nc" id="L142">                    samBase.getName()));</span>
+        }
+
+<span class="fc bfc" id="L145" title="All 2 branches covered.">        for (Class&lt;?&gt; c : markerInterfaces) {</span>
+<span class="pc bpc" id="L146" title="1 of 2 branches missed.">            if (!c.isInterface()) {</span>
+<span class="nc" id="L147">                throw new LambdaConversionException(String.format(</span>
+                        &quot;Marker interface %s is not an interface&quot;,
+<span class="nc" id="L149">                        c.getName()));</span>
+            }
+        }
+<span class="fc" id="L152">    }</span>
+
+    /**
+     * Build the CallSite.
+     *
+     * @return a CallSite, which, when invoked, will return an instance of the
+     * functional interface
+     * @throws ReflectiveOperationException
+     */
+    abstract CallSite buildCallSite()
+            throws LambdaConversionException;
+
+    /**
+     * Check the meta-factory arguments for errors
+     * @throws LambdaConversionException if there are improper conversions
+     */
+    void validateMetafactoryArgs() throws LambdaConversionException {
+<span class="pc bpc" id="L169" title="1 of 2 branches missed.">        switch (implKind) {</span>
+            case MethodHandleInfo.REF_invokeInterface:
+            case MethodHandleInfo.REF_invokeVirtual:
+            case MethodHandleInfo.REF_invokeStatic:
+            case MethodHandleInfo.REF_newInvokeSpecial:
+            case MethodHandleInfo.REF_invokeSpecial:
+<span class="fc" id="L175">                break;</span>
+            default:
+<span class="nc" id="L177">                throw new LambdaConversionException(String.format(&quot;Unsupported MethodHandle kind: %s&quot;, implInfo));</span>
+        }
+
+        // Check arity: optional-receiver + captured + SAM == impl
+<span class="fc" id="L181">        final int implArity = implMethodType.parameterCount();</span>
+<span class="fc bfc" id="L182" title="All 2 branches covered.">        final int receiverArity = implIsInstanceMethod ? 1 : 0;</span>
+<span class="fc" id="L183">        final int capturedArity = invokedType.parameterCount();</span>
+<span class="fc" id="L184">        final int samArity = samMethodType.parameterCount();</span>
+<span class="fc" id="L185">        final int instantiatedArity = instantiatedMethodType.parameterCount();</span>
+<span class="pc bpc" id="L186" title="1 of 2 branches missed.">        if (implArity + receiverArity != capturedArity + samArity) {</span>
+<span class="nc bnc" id="L187" title="All 2 branches missed.">            throw new LambdaConversionException(</span>
+<span class="nc" id="L188">                    String.format(&quot;Incorrect number of parameters for %s method %s; %d captured parameters, %d functional interface method parameters, %d implementation parameters&quot;,</span>
+                                  implIsInstanceMethod ? &quot;instance&quot; : &quot;static&quot;, implInfo,
+<span class="nc" id="L190">                                  capturedArity, samArity, implArity));</span>
+        }
+<span class="pc bpc" id="L192" title="1 of 2 branches missed.">        if (instantiatedArity != samArity) {</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">            throw new LambdaConversionException(</span>
+<span class="nc" id="L194">                    String.format(&quot;Incorrect number of parameters for %s method %s; %d instantiated parameters, %d functional interface method parameters&quot;,</span>
+                                  implIsInstanceMethod ? &quot;instance&quot; : &quot;static&quot;, implInfo,
+<span class="nc" id="L196">                                  instantiatedArity, samArity));</span>
+        }
+
+        // If instance: first captured arg (receiver) must be subtype of class where impl method is defined
+        final int capturedStart;
+        final int samStart;
+<span class="fc bfc" id="L202" title="All 2 branches covered.">        if (implIsInstanceMethod) {</span>
+            final Class&lt;?&gt; receiverClass;
+
+            // implementation is an instance method, adjust for receiver in captured variables / SAM arguments
+<span class="fc bfc" id="L206" title="All 2 branches covered.">            if (capturedArity == 0) {</span>
+                // receiver is function parameter
+<span class="fc" id="L208">                capturedStart = 0;</span>
+<span class="fc" id="L209">                samStart = 1;</span>
+<span class="fc" id="L210">                receiverClass = instantiatedMethodType.parameterType(0);</span>
+            } else {
+                // receiver is a captured variable
+<span class="fc" id="L213">                capturedStart = 1;</span>
+<span class="fc" id="L214">                samStart = 0;</span>
+<span class="fc" id="L215">                receiverClass = invokedType.parameterType(0);</span>
+            }
+
+            // check receiver type
+<span class="pc bpc" id="L219" title="1 of 2 branches missed.">            if (!implDefiningClass.isAssignableFrom(receiverClass)) {</span>
+<span class="nc" id="L220">                throw new LambdaConversionException(</span>
+<span class="nc" id="L221">                        String.format(&quot;Invalid receiver type %s; not a subtype of implementation type %s&quot;,</span>
+                                      receiverClass, implDefiningClass));
+            }
+<span class="fc" id="L224">        } else {</span>
+            // no receiver
+<span class="fc" id="L226">            capturedStart = 0;</span>
+<span class="fc" id="L227">            samStart = 0;</span>
+        }
+
+        // Check for exact match on non-receiver captured arguments
+<span class="fc" id="L231">        final int implFromCaptured = capturedArity - capturedStart;</span>
+<span class="fc bfc" id="L232" title="All 2 branches covered.">        for (int i=0; i&lt;implFromCaptured; i++) {</span>
+<span class="fc" id="L233">            Class&lt;?&gt; implParamType = implMethodType.parameterType(i);</span>
+<span class="fc" id="L234">            Class&lt;?&gt; capturedParamType = invokedType.parameterType(i + capturedStart);</span>
+<span class="pc bpc" id="L235" title="1 of 2 branches missed.">            if (!capturedParamType.equals(implParamType)) {</span>
+<span class="nc" id="L236">                throw new LambdaConversionException(</span>
+<span class="nc" id="L237">                        String.format(&quot;Type mismatch in captured lambda parameter %d: expecting %s, found %s&quot;,</span>
+<span class="nc" id="L238">                                      i, capturedParamType, implParamType));</span>
+            }
+        }
+        // Check for adaptation match on SAM arguments
+<span class="fc" id="L242">        final int samOffset = samStart - implFromCaptured;</span>
+<span class="fc bfc" id="L243" title="All 2 branches covered.">        for (int i=implFromCaptured; i&lt;implArity; i++) {</span>
+<span class="fc" id="L244">            Class&lt;?&gt; implParamType = implMethodType.parameterType(i);</span>
+<span class="fc" id="L245">            Class&lt;?&gt; instantiatedParamType = instantiatedMethodType.parameterType(i + samOffset);</span>
+<span class="pc bpc" id="L246" title="1 of 2 branches missed.">            if (!isAdaptableTo(instantiatedParamType, implParamType, true)) {</span>
+<span class="nc" id="L247">                throw new LambdaConversionException(</span>
+<span class="nc" id="L248">                        String.format(&quot;Type mismatch for lambda argument %d: %s is not convertible to %s&quot;,</span>
+<span class="nc" id="L249">                                      i, instantiatedParamType, implParamType));</span>
+            }
+        }
+
+        // Adaptation match: return type
+<span class="fc" id="L254">        Class&lt;?&gt; expectedType = instantiatedMethodType.returnType();</span>
+<span class="fc bfc" id="L255" title="All 2 branches covered.">        Class&lt;?&gt; actualReturnType =</span>
+                (implKind == MethodHandleInfo.REF_newInvokeSpecial)
+                  ? implDefiningClass
+<span class="fc" id="L258">                  : implMethodType.returnType();</span>
+<span class="pc bpc" id="L259" title="1 of 2 branches missed.">        if (!isAdaptableToAsReturn(actualReturnType, expectedType)) {</span>
+<span class="nc" id="L260">            throw new LambdaConversionException(</span>
+<span class="nc" id="L261">                    String.format(&quot;Type mismatch for lambda return: %s is not convertible to %s&quot;,</span>
+                                  actualReturnType, expectedType));
+        }
+<span class="fc" id="L264">     }</span>
+
+    /**
+     * Check type adaptability for parameter types.
+     * @param fromType Type to convert from
+     * @param toType Type to convert to
+     * @param strict If true, do strict checks, else allow that fromType may be parameterized
+     * @return True if 'fromType' can be passed to an argument of 'toType'
+     */
+    private boolean isAdaptableTo(Class&lt;?&gt; fromType, Class&lt;?&gt; toType, boolean strict) {
+<span class="fc bfc" id="L274" title="All 2 branches covered.">        if (fromType.equals(toType)) {</span>
+<span class="fc" id="L275">            return true;</span>
+        }
+<span class="fc bfc" id="L277" title="All 2 branches covered.">        if (fromType.isPrimitive()) {</span>
+<span class="fc" id="L278">            Wrapper wfrom = forPrimitiveType(fromType);</span>
+<span class="pc bpc" id="L279" title="1 of 2 branches missed.">            if (toType.isPrimitive()) {</span>
+                // both are primitive: widening
+<span class="nc" id="L281">                Wrapper wto = forPrimitiveType(toType);</span>
+<span class="nc" id="L282">                return wto.isConvertibleFrom(wfrom);</span>
+            } else {
+                // from primitive to reference: boxing
+<span class="fc" id="L285">                return toType.isAssignableFrom(wfrom.wrapperType());</span>
+            }
+        } else {
+<span class="fc bfc" id="L288" title="All 2 branches covered.">            if (toType.isPrimitive()) {</span>
+                // from reference to primitive: unboxing
+                Wrapper wfrom;
+<span class="pc bpc" id="L291" title="2 of 4 branches missed.">                if (isWrapperType(fromType) &amp;&amp; (wfrom = forWrapperType(fromType)).primitiveType().isPrimitive()) {</span>
+                    // fromType is a primitive wrapper; unbox+widen
+<span class="fc" id="L293">                    Wrapper wto = forPrimitiveType(toType);</span>
+<span class="fc" id="L294">                    return wto.isConvertibleFrom(wfrom);</span>
+                } else {
+                    // must be convertible to primitive
+<span class="nc bnc" id="L297" title="All 2 branches missed.">                    return !strict;</span>
+                }
+            } else {
+                // both are reference types: fromType should be a superclass of toType.
+<span class="pc bpc" id="L301" title="1 of 4 branches missed.">                return !strict || toType.isAssignableFrom(fromType);</span>
+            }
+        }
+    }
+
+    /**
+     * Check type adaptability for return types --
+     * special handling of void type) and parameterized fromType
+     * @return True if 'fromType' can be converted to 'toType'
+     */
+    private boolean isAdaptableToAsReturn(Class&lt;?&gt; fromType, Class&lt;?&gt; toType) {
+<span class="fc bfc" id="L312" title="All 2 branches covered.">        return toType.equals(void.class)</span>
+<span class="pc bpc" id="L313" title="2 of 4 branches missed.">               || !fromType.equals(void.class) &amp;&amp; isAdaptableTo(fromType, toType, false);</span>
+    }
+
+
+    /*********** Logging support -- for debugging only, uncomment as needed
+    static final Executor logPool = Executors.newSingleThreadExecutor();
+    protected static void log(final String s) {
+        MethodHandleProxyLambdaMetafactory.logPool.execute(new Runnable() {
+            @Override
+            public void run() {
+                System.out.println(s);
+            }
+        });
+    }
+
+    protected static void log(final String s, final Throwable e) {
+        MethodHandleProxyLambdaMetafactory.logPool.execute(new Runnable() {
+            @Override
+            public void run() {
+                System.out.println(s);
+                e.printStackTrace(System.out);
+            }
+        });
+    }
+    ***********************/
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

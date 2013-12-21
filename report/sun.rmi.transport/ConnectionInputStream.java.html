@@ -1,0 +1,159 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ConnectionInputStream.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.rmi.transport</a> &gt; <span class="el_source">ConnectionInputStream.java</span></div><h1>ConnectionInputStream.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1996, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package sun.rmi.transport;
+
+import java.io.*;
+import java.util.*;
+import java.rmi.RemoteException;
+import java.rmi.server.UID;
+import sun.rmi.server.MarshalInputStream;
+import sun.rmi.runtime.Log;
+
+/**
+ * Special stream to keep track of refs being unmarshaled so that
+ * refs can be ref-counted locally.
+ *
+ * @author Ann Wollrath
+ */
+class ConnectionInputStream extends MarshalInputStream {
+
+    /** indicates whether ack is required for DGC */
+<span class="fc" id="L43">    private boolean dgcAckNeeded = false;</span>
+
+    /** Hashtable mapping Endpoints to lists of LiveRefs to register */
+<span class="fc" id="L46">    private Map&lt;Endpoint, List&lt;LiveRef&gt;&gt; incomingRefTable = new HashMap&lt;&gt;(5);</span>
+
+    /** identifier for gc ack*/
+    private UID ackID;
+
+    /**
+     * Constructs a marshal input stream using the underlying
+     * stream &quot;in&quot;.
+     */
+    ConnectionInputStream(InputStream in) throws IOException {
+<span class="fc" id="L56">        super(in);</span>
+<span class="fc" id="L57">    }</span>
+
+    void readID() throws IOException {
+<span class="fc" id="L60">        ackID = UID.read((DataInput) this);</span>
+<span class="fc" id="L61">    }</span>
+
+    /**
+     * Save reference in order to send &quot;dirty&quot; call after all args/returns
+     * have been unmarshaled.  Save in hashtable incomingRefTable.  This
+     * table is keyed on endpoints, and holds objects of type
+     * IncomingRefTableEntry.
+     */
+    void saveRef(LiveRef ref) {
+<span class="fc" id="L70">        Endpoint ep = ref.getEndpoint();</span>
+
+        // check whether endpoint is already in the hashtable
+<span class="fc" id="L73">        List&lt;LiveRef&gt; refList = incomingRefTable.get(ep);</span>
+
+<span class="fc bfc" id="L75" title="All 2 branches covered.">        if (refList == null) {</span>
+<span class="fc" id="L76">            refList = new ArrayList&lt;LiveRef&gt;();</span>
+<span class="fc" id="L77">            incomingRefTable.put(ep, refList);</span>
+        }
+
+        // add ref to list of refs for endpoint ep
+<span class="fc" id="L81">        refList.add(ref);</span>
+<span class="fc" id="L82">    }</span>
+
+    /**
+     * Add references to DGC table (and possibly send dirty call).
+     * RegisterRefs now calls DGCClient.referenced on all
+     * refs with the same endpoint at once to achieve batching of
+     * calls to the DGC
+     */
+    void registerRefs() throws IOException {
+<span class="fc bfc" id="L91" title="All 2 branches covered.">        if (!incomingRefTable.isEmpty()) {</span>
+            for (Map.Entry&lt;Endpoint, List&lt;LiveRef&gt;&gt; entry :
+<span class="fc bfc" id="L93" title="All 2 branches covered.">                     incomingRefTable.entrySet()) {</span>
+<span class="fc" id="L94">                DGCClient.registerRefs(entry.getKey(), entry.getValue());</span>
+<span class="fc" id="L95">            }</span>
+        }
+<span class="fc" id="L97">    }</span>
+
+    /**
+     * Indicate that an ack is required to the distributed
+     * collector.
+     */
+    void setAckNeeded() {
+<span class="fc" id="L104">        dgcAckNeeded = true;</span>
+<span class="fc" id="L105">    }</span>
+
+    /**
+     * Done with input stream for remote call. Send DGC ack if necessary.
+     * Allow sending of ack to fail without flagging an error.
+     */
+    void done(Connection c) {
+        /*
+         * WARNING: The connection c may have already been freed.  It
+         * is only be safe to use c to obtain c's channel.
+         */
+
+<span class="fc bfc" id="L117" title="All 2 branches covered.">        if (dgcAckNeeded) {</span>
+<span class="fc" id="L118">            Connection conn = null;</span>
+<span class="fc" id="L119">            Channel ch = null;</span>
+<span class="fc" id="L120">            boolean reuse = true;</span>
+
+<span class="fc" id="L122">            DGCImpl.dgcLog.log(Log.VERBOSE, &quot;send ack&quot;);</span>
+
+            try {
+<span class="fc" id="L125">                ch = c.getChannel();</span>
+<span class="fc" id="L126">                conn = ch.newConnection();</span>
+<span class="fc" id="L127">                DataOutputStream out =</span>
+<span class="fc" id="L128">                    new DataOutputStream(conn.getOutputStream());</span>
+<span class="fc" id="L129">                out.writeByte(TransportConstants.DGCAck);</span>
+<span class="pc bpc" id="L130" title="1 of 2 branches missed.">                if (ackID == null) {</span>
+<span class="nc" id="L131">                    ackID = new UID();</span>
+                }
+<span class="fc" id="L133">                ackID.write((DataOutput) out);</span>
+<span class="fc" id="L134">                conn.releaseOutputStream();</span>
+
+                /*
+                 * Fix for 4221173: if this connection is on top of an
+                 * HttpSendSocket, the DGCAck won't actually get sent until a
+                 * read operation is attempted on the socket.  Calling
+                 * available() is the most innocuous way of triggering the
+                 * write.
+                 */
+<span class="fc" id="L143">                conn.getInputStream().available();</span>
+<span class="fc" id="L144">                conn.releaseInputStream();</span>
+<span class="fc" id="L145">            } catch (RemoteException e) {</span>
+<span class="fc" id="L146">                reuse = false;</span>
+<span class="nc" id="L147">            } catch (IOException e) {</span>
+<span class="nc" id="L148">                reuse = false;</span>
+<span class="fc" id="L149">            }</span>
+            try {
+<span class="fc bfc" id="L151" title="All 2 branches covered.">                if (conn != null)</span>
+<span class="fc" id="L152">                    ch.free(conn, reuse);</span>
+<span class="nc" id="L153">            } catch (RemoteException e){</span>
+                // eat exception
+<span class="fc" id="L155">            }</span>
+        }
+<span class="fc" id="L157">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

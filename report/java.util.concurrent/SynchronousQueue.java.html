@@ -1,0 +1,1213 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>SynchronousQueue.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">java.util.concurrent</a> &gt; <span class="el_source">SynchronousQueue.java</span></div><h1>SynchronousQueue.java</h1><pre class="source lang-java linenums">/*
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+/*
+ * This file is available under and governed by the GNU General Public
+ * License version 2 only, as published by the Free Software Foundation.
+ * However, the following notice accompanied the original version of this
+ * file:
+ *
+ * Written by Doug Lea, Bill Scherer, and Michael Scott with
+ * assistance from members of JCP JSR-166 Expert Group and released to
+ * the public domain, as explained at
+ * http://creativecommons.org/publicdomain/zero/1.0/
+ */
+
+package java.util.concurrent;
+import java.util.concurrent.locks.LockSupport;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.*;
+import java.util.Spliterator;
+import java.util.Spliterators;
+
+/**
+ * A {@linkplain BlockingQueue blocking queue} in which each insert
+ * operation must wait for a corresponding remove operation by another
+ * thread, and vice versa.  A synchronous queue does not have any
+ * internal capacity, not even a capacity of one.  You cannot
+ * {@code peek} at a synchronous queue because an element is only
+ * present when you try to remove it; you cannot insert an element
+ * (using any method) unless another thread is trying to remove it;
+ * you cannot iterate as there is nothing to iterate.  The
+ * &lt;em&gt;head&lt;/em&gt; of the queue is the element that the first queued
+ * inserting thread is trying to add to the queue; if there is no such
+ * queued thread then no element is available for removal and
+ * {@code poll()} will return {@code null}.  For purposes of other
+ * {@code Collection} methods (for example {@code contains}), a
+ * {@code SynchronousQueue} acts as an empty collection.  This queue
+ * does not permit {@code null} elements.
+ *
+ * &lt;p&gt;Synchronous queues are similar to rendezvous channels used in
+ * CSP and Ada. They are well suited for handoff designs, in which an
+ * object running in one thread must sync up with an object running
+ * in another thread in order to hand it some information, event, or
+ * task.
+ *
+ * &lt;p&gt;This class supports an optional fairness policy for ordering
+ * waiting producer and consumer threads.  By default, this ordering
+ * is not guaranteed. However, a queue constructed with fairness set
+ * to {@code true} grants threads access in FIFO order.
+ *
+ * &lt;p&gt;This class and its iterator implement all of the
+ * &lt;em&gt;optional&lt;/em&gt; methods of the {@link Collection} and {@link
+ * Iterator} interfaces.
+ *
+ * &lt;p&gt;This class is a member of the
+ * &lt;a href=&quot;{@docRoot}/../technotes/guides/collections/index.html&quot;&gt;
+ * Java Collections Framework&lt;/a&gt;.
+ *
+ * @since 1.5
+ * @author Doug Lea and Bill Scherer and Michael Scott
+ * @param &lt;E&gt; the type of elements held in this collection
+ */
+public class SynchronousQueue&lt;E&gt; extends AbstractQueue&lt;E&gt;
+    implements BlockingQueue&lt;E&gt;, java.io.Serializable {
+    private static final long serialVersionUID = -3223113410248163686L;
+
+    /*
+     * This class implements extensions of the dual stack and dual
+     * queue algorithms described in &quot;Nonblocking Concurrent Objects
+     * with Condition Synchronization&quot;, by W. N. Scherer III and
+     * M. L. Scott.  18th Annual Conf. on Distributed Computing,
+     * Oct. 2004 (see also
+     * http://www.cs.rochester.edu/u/scott/synchronization/pseudocode/duals.html).
+     * The (Lifo) stack is used for non-fair mode, and the (Fifo)
+     * queue for fair mode. The performance of the two is generally
+     * similar. Fifo usually supports higher throughput under
+     * contention but Lifo maintains higher thread locality in common
+     * applications.
+     *
+     * A dual queue (and similarly stack) is one that at any given
+     * time either holds &quot;data&quot; -- items provided by put operations,
+     * or &quot;requests&quot; -- slots representing take operations, or is
+     * empty. A call to &quot;fulfill&quot; (i.e., a call requesting an item
+     * from a queue holding data or vice versa) dequeues a
+     * complementary node.  The most interesting feature of these
+     * queues is that any operation can figure out which mode the
+     * queue is in, and act accordingly without needing locks.
+     *
+     * Both the queue and stack extend abstract class Transferer
+     * defining the single method transfer that does a put or a
+     * take. These are unified into a single method because in dual
+     * data structures, the put and take operations are symmetrical,
+     * so nearly all code can be combined. The resulting transfer
+     * methods are on the long side, but are easier to follow than
+     * they would be if broken up into nearly-duplicated parts.
+     *
+     * The queue and stack data structures share many conceptual
+     * similarities but very few concrete details. For simplicity,
+     * they are kept distinct so that they can later evolve
+     * separately.
+     *
+     * The algorithms here differ from the versions in the above paper
+     * in extending them for use in synchronous queues, as well as
+     * dealing with cancellation. The main differences include:
+     *
+     *  1. The original algorithms used bit-marked pointers, but
+     *     the ones here use mode bits in nodes, leading to a number
+     *     of further adaptations.
+     *  2. SynchronousQueues must block threads waiting to become
+     *     fulfilled.
+     *  3. Support for cancellation via timeout and interrupts,
+     *     including cleaning out cancelled nodes/threads
+     *     from lists to avoid garbage retention and memory depletion.
+     *
+     * Blocking is mainly accomplished using LockSupport park/unpark,
+     * except that nodes that appear to be the next ones to become
+     * fulfilled first spin a bit (on multiprocessors only). On very
+     * busy synchronous queues, spinning can dramatically improve
+     * throughput. And on less busy ones, the amount of spinning is
+     * small enough not to be noticeable.
+     *
+     * Cleaning is done in different ways in queues vs stacks.  For
+     * queues, we can almost always remove a node immediately in O(1)
+     * time (modulo retries for consistency checks) when it is
+     * cancelled. But if it may be pinned as the current tail, it must
+     * wait until some subsequent cancellation. For stacks, we need a
+     * potentially O(n) traversal to be sure that we can remove the
+     * node, but this can run concurrently with other threads
+     * accessing the stack.
+     *
+     * While garbage collection takes care of most node reclamation
+     * issues that otherwise complicate nonblocking algorithms, care
+     * is taken to &quot;forget&quot; references to data, other nodes, and
+     * threads that might be held on to long-term by blocked
+     * threads. In cases where setting to null would otherwise
+     * conflict with main algorithms, this is done by changing a
+     * node's link to now point to the node itself. This doesn't arise
+     * much for Stack nodes (because blocked threads do not hang on to
+     * old head pointers), but references in Queue nodes must be
+     * aggressively forgotten to avoid reachability of everything any
+     * node has ever referred to since arrival.
+     */
+
+    /**
+     * Shared internal API for dual stacks and queues.
+     */
+<span class="fc" id="L168">    abstract static class Transferer&lt;E&gt; {</span>
+        /**
+         * Performs a put or take.
+         *
+         * @param e if non-null, the item to be handed to a consumer;
+         *          if null, requests that transfer return an item
+         *          offered by producer.
+         * @param timed if this operation should timeout
+         * @param nanos the timeout, in nanoseconds
+         * @return if non-null, the item provided or received; if null,
+         *         the operation failed due to timeout or interrupt --
+         *         the caller can distinguish which of these occurred
+         *         by checking Thread.interrupted.
+         */
+        abstract E transfer(E e, boolean timed, long nanos);
+    }
+
+    /** The number of CPUs, for spin control */
+<span class="fc" id="L186">    static final int NCPUS = Runtime.getRuntime().availableProcessors();</span>
+
+    /**
+     * The number of times to spin before blocking in timed waits.
+     * The value is empirically derived -- it works well across a
+     * variety of processors and OSes. Empirically, the best value
+     * seems not to vary with number of CPUs (beyond 2) so is just
+     * a constant.
+     */
+<span class="pc bpc" id="L195" title="1 of 2 branches missed.">    static final int maxTimedSpins = (NCPUS &lt; 2) ? 0 : 32;</span>
+
+    /**
+     * The number of times to spin before blocking in untimed waits.
+     * This is greater than timed value because untimed waits spin
+     * faster since they don't need to check times on each spin.
+     */
+<span class="fc" id="L202">    static final int maxUntimedSpins = maxTimedSpins * 16;</span>
+
+    /**
+     * The number of nanoseconds for which it is faster to spin
+     * rather than to use timed park. A rough estimate suffices.
+     */
+    static final long spinForTimeoutThreshold = 1000L;
+
+    /** Dual stack */
+<span class="fc" id="L211">    static final class TransferStack&lt;E&gt; extends Transferer&lt;E&gt; {</span>
+        /*
+         * This extends Scherer-Scott dual stack algorithm, differing,
+         * among other ways, by using &quot;covering&quot; nodes rather than
+         * bit-marked pointers: Fulfilling operations push on marker
+         * nodes (with FULFILLING bit set in mode) to reserve a spot
+         * to match a waiting node.
+         */
+
+        /* Modes for SNodes, ORed together in node fields */
+        /** Node represents an unfulfilled consumer */
+        static final int REQUEST    = 0;
+        /** Node represents an unfulfilled producer */
+        static final int DATA       = 1;
+        /** Node is fulfilling another unfulfilled DATA or REQUEST */
+        static final int FULFILLING = 2;
+
+        /** Returns true if m has fulfilling bit set. */
+<span class="fc bfc" id="L229" title="All 2 branches covered.">        static boolean isFulfilling(int m) { return (m &amp; FULFILLING) != 0; }</span>
+
+        /** Node class for TransferStacks. */
+<span class="fc" id="L232">        static final class SNode {</span>
+            volatile SNode next;        // next node in stack
+            volatile SNode match;       // the node matched to this
+            volatile Thread waiter;     // to control park/unpark
+            Object item;                // data; or null for REQUESTs
+            int mode;
+            // Note: item and mode fields don't need to be volatile
+            // since they are always written before, and read after,
+            // other volatile/atomic operations.
+
+<span class="fc" id="L242">            SNode(Object item) {</span>
+<span class="fc" id="L243">                this.item = item;</span>
+<span class="fc" id="L244">            }</span>
+
+            boolean casNext(SNode cmp, SNode val) {
+<span class="fc bfc" id="L247" title="All 2 branches covered.">                return cmp == next &amp;&amp;</span>
+<span class="fc bfc" id="L248" title="All 2 branches covered.">                    UNSAFE.compareAndSwapObject(this, nextOffset, cmp, val);</span>
+            }
+
+            /**
+             * Tries to match node s to this node, if so, waking up thread.
+             * Fulfillers call tryMatch to identify their waiters.
+             * Waiters block until they have been matched.
+             *
+             * @param s the node to match
+             * @return true if successfully matched to s
+             */
+            boolean tryMatch(SNode s) {
+<span class="fc bfc" id="L260" title="All 2 branches covered.">                if (match == null &amp;&amp;</span>
+<span class="fc bfc" id="L261" title="All 2 branches covered.">                    UNSAFE.compareAndSwapObject(this, matchOffset, null, s)) {</span>
+<span class="fc" id="L262">                    Thread w = waiter;</span>
+<span class="fc bfc" id="L263" title="All 2 branches covered.">                    if (w != null) {    // waiters need at most one unpark</span>
+<span class="fc" id="L264">                        waiter = null;</span>
+<span class="fc" id="L265">                        LockSupport.unpark(w);</span>
+                    }
+<span class="fc" id="L267">                    return true;</span>
+                }
+<span class="pc bpc" id="L269" title="1 of 2 branches missed.">                return match == s;</span>
+            }
+
+            /**
+             * Tries to cancel a wait by matching node to itself.
+             */
+            void tryCancel() {
+<span class="fc" id="L276">                UNSAFE.compareAndSwapObject(this, matchOffset, null, this);</span>
+<span class="fc" id="L277">            }</span>
+
+            boolean isCancelled() {
+<span class="fc bfc" id="L280" title="All 2 branches covered.">                return match == this;</span>
+            }
+
+            // Unsafe mechanics
+            private static final sun.misc.Unsafe UNSAFE;
+            private static final long matchOffset;
+            private static final long nextOffset;
+
+            static {
+                try {
+<span class="fc" id="L290">                    UNSAFE = sun.misc.Unsafe.getUnsafe();</span>
+<span class="fc" id="L291">                    Class&lt;?&gt; k = SNode.class;</span>
+<span class="fc" id="L292">                    matchOffset = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L293">                        (k.getDeclaredField(&quot;match&quot;));</span>
+<span class="fc" id="L294">                    nextOffset = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L295">                        (k.getDeclaredField(&quot;next&quot;));</span>
+<span class="nc" id="L296">                } catch (Exception e) {</span>
+<span class="nc" id="L297">                    throw new Error(e);</span>
+<span class="fc" id="L298">                }</span>
+<span class="fc" id="L299">            }</span>
+        }
+
+        /** The head (top) of the stack */
+        volatile SNode head;
+
+        boolean casHead(SNode h, SNode nh) {
+<span class="fc bfc" id="L306" title="All 2 branches covered.">            return h == head &amp;&amp;</span>
+<span class="fc bfc" id="L307" title="All 2 branches covered.">                UNSAFE.compareAndSwapObject(this, headOffset, h, nh);</span>
+        }
+
+        /**
+         * Creates or resets fields of a node. Called only from transfer
+         * where the node to push on stack is lazily created and
+         * reused when possible to help reduce intervals between reads
+         * and CASes of head and to avoid surges of garbage when CASes
+         * to push nodes fail due to contention.
+         */
+        static SNode snode(SNode s, Object e, SNode next, int mode) {
+<span class="fc bfc" id="L318" title="All 2 branches covered.">            if (s == null) s = new SNode(e);</span>
+<span class="fc" id="L319">            s.mode = mode;</span>
+<span class="fc" id="L320">            s.next = next;</span>
+<span class="fc" id="L321">            return s;</span>
+        }
+
+        /**
+         * Puts or takes an item.
+         */
+        @SuppressWarnings(&quot;unchecked&quot;)
+        E transfer(E e, boolean timed, long nanos) {
+            /*
+             * Basic algorithm is to loop trying one of three actions:
+             *
+             * 1. If apparently empty or already containing nodes of same
+             *    mode, try to push node on stack and wait for a match,
+             *    returning it, or null if cancelled.
+             *
+             * 2. If apparently containing node of complementary mode,
+             *    try to push a fulfilling node on to stack, match
+             *    with corresponding waiting node, pop both from
+             *    stack, and return matched item. The matching or
+             *    unlinking might not actually be necessary because of
+             *    other threads performing action 3:
+             *
+             * 3. If top of stack already holds another fulfilling node,
+             *    help it out by doing its match and/or pop
+             *    operations, and then continue. The code for helping
+             *    is essentially the same as for fulfilling, except
+             *    that it doesn't return the item.
+             */
+
+<span class="fc" id="L350">            SNode s = null; // constructed/reused as needed</span>
+<span class="fc bfc" id="L351" title="All 2 branches covered.">            int mode = (e == null) ? REQUEST : DATA;</span>
+
+            for (;;) {
+<span class="fc" id="L354">                SNode h = head;</span>
+<span class="fc bfc" id="L355" title="All 4 branches covered.">                if (h == null || h.mode == mode) {  // empty or same-mode</span>
+<span class="fc bfc" id="L356" title="All 4 branches covered.">                    if (timed &amp;&amp; nanos &lt;= 0) {      // can't wait</span>
+<span class="pc bpc" id="L357" title="3 of 4 branches missed.">                        if (h != null &amp;&amp; h.isCancelled())</span>
+<span class="nc" id="L358">                            casHead(h, h.next);     // pop cancelled node</span>
+                        else
+<span class="fc" id="L360">                            return null;</span>
+<span class="fc bfc" id="L361" title="All 2 branches covered.">                    } else if (casHead(h, s = snode(s, e, h, mode))) {</span>
+<span class="fc" id="L362">                        SNode m = awaitFulfill(s, timed, nanos);</span>
+<span class="fc bfc" id="L363" title="All 2 branches covered.">                        if (m == s) {               // wait was cancelled</span>
+<span class="fc" id="L364">                            clean(s);</span>
+<span class="fc" id="L365">                            return null;</span>
+                        }
+<span class="fc bfc" id="L367" title="All 4 branches covered.">                        if ((h = head) != null &amp;&amp; h.next == s)</span>
+<span class="fc" id="L368">                            casHead(h, s.next);     // help s's fulfiller</span>
+<span class="fc bfc" id="L369" title="All 2 branches covered.">                        return (E) ((mode == REQUEST) ? m.item : s.item);</span>
+                    }
+<span class="fc bfc" id="L371" title="All 2 branches covered.">                } else if (!isFulfilling(h.mode)) { // try to fulfill</span>
+<span class="pc bpc" id="L372" title="1 of 2 branches missed.">                    if (h.isCancelled())            // already cancelled</span>
+<span class="nc" id="L373">                        casHead(h, h.next);         // pop and retry</span>
+<span class="fc bfc" id="L374" title="All 2 branches covered.">                    else if (casHead(h, s=snode(s, e, h, FULFILLING|mode))) {</span>
+                        for (;;) { // loop until matched or waiters disappear
+<span class="fc" id="L376">                            SNode m = s.next;       // m is s's match</span>
+<span class="pc bpc" id="L377" title="1 of 2 branches missed.">                            if (m == null) {        // all waiters are gone</span>
+<span class="nc" id="L378">                                casHead(s, null);   // pop fulfill node</span>
+<span class="nc" id="L379">                                s = null;           // use new node next time</span>
+<span class="nc" id="L380">                                break;              // restart main loop</span>
+                            }
+<span class="fc" id="L382">                            SNode mn = m.next;</span>
+<span class="pc bpc" id="L383" title="1 of 2 branches missed.">                            if (m.tryMatch(s)) {</span>
+<span class="fc" id="L384">                                casHead(s, mn);     // pop both s and m</span>
+<span class="fc bfc" id="L385" title="All 2 branches covered.">                                return (E) ((mode == REQUEST) ? m.item : s.item);</span>
+                            } else                  // lost match
+<span class="nc" id="L387">                                s.casNext(m, mn);   // help unlink</span>
+<span class="nc" id="L388">                        }</span>
+                    }
+                } else {                            // help a fulfiller
+<span class="fc" id="L391">                    SNode m = h.next;               // m is h's match</span>
+<span class="pc bpc" id="L392" title="1 of 2 branches missed.">                    if (m == null)                  // waiter is gone</span>
+<span class="nc" id="L393">                        casHead(h, null);           // pop fulfilling node</span>
+                    else {
+<span class="fc" id="L395">                        SNode mn = m.next;</span>
+<span class="pc bpc" id="L396" title="1 of 2 branches missed.">                        if (m.tryMatch(h))          // help match</span>
+<span class="fc" id="L397">                            casHead(h, mn);         // pop both h and m</span>
+                        else                        // lost match
+<span class="nc" id="L399">                            h.casNext(m, mn);       // help unlink</span>
+                    }
+                }
+<span class="fc" id="L402">            }</span>
+        }
+
+        /**
+         * Spins/blocks until node s is matched by a fulfill operation.
+         *
+         * @param s the waiting node
+         * @param timed true if timed wait
+         * @param nanos timeout value
+         * @return matched node, or s if cancelled
+         */
+        SNode awaitFulfill(SNode s, boolean timed, long nanos) {
+            /*
+             * When a node/thread is about to block, it sets its waiter
+             * field and then rechecks state at least one more time
+             * before actually parking, thus covering race vs
+             * fulfiller noticing that waiter is non-null so should be
+             * woken.
+             *
+             * When invoked by nodes that appear at the point of call
+             * to be at the head of the stack, calls to park are
+             * preceded by spins to avoid blocking when producers and
+             * consumers are arriving very close in time.  This can
+             * happen enough to bother only on multiprocessors.
+             *
+             * The order of checks for returning out of main loop
+             * reflects fact that interrupts have precedence over
+             * normal returns, which have precedence over
+             * timeouts. (So, on timeout, one last check for match is
+             * done before giving up.) Except that calls from untimed
+             * SynchronousQueue.{poll/offer} don't check interrupts
+             * and don't wait at all, so are trapped in transfer
+             * method rather than calling awaitFulfill.
+             */
+<span class="fc bfc" id="L436" title="All 2 branches covered.">            final long deadline = timed ? System.nanoTime() + nanos : 0L;</span>
+<span class="fc" id="L437">            Thread w = Thread.currentThread();</span>
+<span class="fc bfc" id="L438" title="All 4 branches covered.">            int spins = (shouldSpin(s) ?</span>
+                         (timed ? maxTimedSpins : maxUntimedSpins) : 0);
+            for (;;) {
+<span class="fc bfc" id="L441" title="All 2 branches covered.">                if (w.isInterrupted())</span>
+<span class="fc" id="L442">                    s.tryCancel();</span>
+<span class="fc" id="L443">                SNode m = s.match;</span>
+<span class="fc bfc" id="L444" title="All 2 branches covered.">                if (m != null)</span>
+<span class="fc" id="L445">                    return m;</span>
+<span class="fc bfc" id="L446" title="All 2 branches covered.">                if (timed) {</span>
+<span class="fc" id="L447">                    nanos = deadline - System.nanoTime();</span>
+<span class="fc bfc" id="L448" title="All 2 branches covered.">                    if (nanos &lt;= 0L) {</span>
+<span class="fc" id="L449">                        s.tryCancel();</span>
+<span class="fc" id="L450">                        continue;</span>
+                    }
+                }
+<span class="fc bfc" id="L453" title="All 2 branches covered.">                if (spins &gt; 0)</span>
+<span class="fc bfc" id="L454" title="All 2 branches covered.">                    spins = shouldSpin(s) ? (spins-1) : 0;</span>
+<span class="fc bfc" id="L455" title="All 2 branches covered.">                else if (s.waiter == null)</span>
+<span class="fc" id="L456">                    s.waiter = w; // establish waiter so can park next iter</span>
+<span class="fc bfc" id="L457" title="All 2 branches covered.">                else if (!timed)</span>
+<span class="fc" id="L458">                    LockSupport.park(this);</span>
+<span class="pc bpc" id="L459" title="1 of 2 branches missed.">                else if (nanos &gt; spinForTimeoutThreshold)</span>
+<span class="fc" id="L460">                    LockSupport.parkNanos(this, nanos);</span>
+<span class="fc" id="L461">            }</span>
+        }
+
+        /**
+         * Returns true if node s is at head or there is an active
+         * fulfiller.
+         */
+        boolean shouldSpin(SNode s) {
+<span class="fc" id="L469">            SNode h = head;</span>
+<span class="fc bfc" id="L470" title="All 6 branches covered.">            return (h == s || h == null || isFulfilling(h.mode));</span>
+        }
+
+        /**
+         * Unlinks s from the stack.
+         */
+        void clean(SNode s) {
+<span class="fc" id="L477">            s.item = null;   // forget item</span>
+<span class="fc" id="L478">            s.waiter = null; // forget thread</span>
+
+            /*
+             * At worst we may need to traverse entire stack to unlink
+             * s. If there are multiple concurrent calls to clean, we
+             * might not see s if another thread has already removed
+             * it. But we can stop when we see any node known to
+             * follow s. We use s.next unless it too is cancelled, in
+             * which case we try the node one past. We don't check any
+             * further because we don't want to doubly traverse just to
+             * find sentinel.
+             */
+
+<span class="fc" id="L491">            SNode past = s.next;</span>
+<span class="fc bfc" id="L492" title="All 4 branches covered.">            if (past != null &amp;&amp; past.isCancelled())</span>
+<span class="fc" id="L493">                past = past.next;</span>
+
+            // Absorb cancelled nodes at head
+            SNode p;
+<span class="fc bfc" id="L497" title="All 6 branches covered.">            while ((p = head) != null &amp;&amp; p != past &amp;&amp; p.isCancelled())</span>
+<span class="fc" id="L498">                casHead(p, p.next);</span>
+
+            // Unsplice embedded nodes
+<span class="fc bfc" id="L501" title="All 4 branches covered.">            while (p != null &amp;&amp; p != past) {</span>
+<span class="fc" id="L502">                SNode n = p.next;</span>
+<span class="fc bfc" id="L503" title="All 4 branches covered.">                if (n != null &amp;&amp; n.isCancelled())</span>
+<span class="fc" id="L504">                    p.casNext(n, n.next);</span>
+                else
+<span class="fc" id="L506">                    p = n;</span>
+<span class="fc" id="L507">            }</span>
+<span class="fc" id="L508">        }</span>
+
+        // Unsafe mechanics
+        private static final sun.misc.Unsafe UNSAFE;
+        private static final long headOffset;
+        static {
+            try {
+<span class="fc" id="L515">                UNSAFE = sun.misc.Unsafe.getUnsafe();</span>
+<span class="fc" id="L516">                Class&lt;?&gt; k = TransferStack.class;</span>
+<span class="fc" id="L517">                headOffset = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L518">                    (k.getDeclaredField(&quot;head&quot;));</span>
+<span class="nc" id="L519">            } catch (Exception e) {</span>
+<span class="nc" id="L520">                throw new Error(e);</span>
+<span class="fc" id="L521">            }</span>
+<span class="fc" id="L522">        }</span>
+    }
+
+    /** Dual Queue */
+    static final class TransferQueue&lt;E&gt; extends Transferer&lt;E&gt; {
+        /*
+         * This extends Scherer-Scott dual queue algorithm, differing,
+         * among other ways, by using modes within nodes rather than
+         * marked pointers. The algorithm is a little simpler than
+         * that for stacks because fulfillers do not need explicit
+         * nodes, and matching is done by CAS'ing QNode.item field
+         * from non-null to null (for put) or vice versa (for take).
+         */
+
+        /** Node class for TransferQueue. */
+        static final class QNode {
+            volatile QNode next;          // next node in queue
+            volatile Object item;         // CAS'ed to or from null
+            volatile Thread waiter;       // to control park/unpark
+            final boolean isData;
+
+<span class="fc" id="L543">            QNode(Object item, boolean isData) {</span>
+<span class="fc" id="L544">                this.item = item;</span>
+<span class="fc" id="L545">                this.isData = isData;</span>
+<span class="fc" id="L546">            }</span>
+
+            boolean casNext(QNode cmp, QNode val) {
+<span class="fc bfc" id="L549" title="All 2 branches covered.">                return next == cmp &amp;&amp;</span>
+<span class="fc bfc" id="L550" title="All 2 branches covered.">                    UNSAFE.compareAndSwapObject(this, nextOffset, cmp, val);</span>
+            }
+
+            boolean casItem(Object cmp, Object val) {
+<span class="fc bfc" id="L554" title="All 2 branches covered.">                return item == cmp &amp;&amp;</span>
+<span class="fc bfc" id="L555" title="All 2 branches covered.">                    UNSAFE.compareAndSwapObject(this, itemOffset, cmp, val);</span>
+            }
+
+            /**
+             * Tries to cancel by CAS'ing ref to this as item.
+             */
+            void tryCancel(Object cmp) {
+<span class="nc" id="L562">                UNSAFE.compareAndSwapObject(this, itemOffset, cmp, this);</span>
+<span class="nc" id="L563">            }</span>
+
+            boolean isCancelled() {
+<span class="nc bnc" id="L566" title="All 2 branches missed.">                return item == this;</span>
+            }
+
+            /**
+             * Returns true if this node is known to be off the queue
+             * because its next pointer has been forgotten due to
+             * an advanceHead operation.
+             */
+            boolean isOffList() {
+<span class="fc bfc" id="L575" title="All 2 branches covered.">                return next == this;</span>
+            }
+
+            // Unsafe mechanics
+            private static final sun.misc.Unsafe UNSAFE;
+            private static final long itemOffset;
+            private static final long nextOffset;
+
+            static {
+                try {
+<span class="fc" id="L585">                    UNSAFE = sun.misc.Unsafe.getUnsafe();</span>
+<span class="fc" id="L586">                    Class&lt;?&gt; k = QNode.class;</span>
+<span class="fc" id="L587">                    itemOffset = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L588">                        (k.getDeclaredField(&quot;item&quot;));</span>
+<span class="fc" id="L589">                    nextOffset = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L590">                        (k.getDeclaredField(&quot;next&quot;));</span>
+<span class="nc" id="L591">                } catch (Exception e) {</span>
+<span class="nc" id="L592">                    throw new Error(e);</span>
+<span class="fc" id="L593">                }</span>
+<span class="fc" id="L594">            }</span>
+        }
+
+        /** Head of queue */
+        transient volatile QNode head;
+        /** Tail of queue */
+        transient volatile QNode tail;
+        /**
+         * Reference to a cancelled node that might not yet have been
+         * unlinked from queue because it was the last inserted node
+         * when it was cancelled.
+         */
+        transient volatile QNode cleanMe;
+
+<span class="fc" id="L608">        TransferQueue() {</span>
+<span class="fc" id="L609">            QNode h = new QNode(null, false); // initialize to dummy node.</span>
+<span class="fc" id="L610">            head = h;</span>
+<span class="fc" id="L611">            tail = h;</span>
+<span class="fc" id="L612">        }</span>
+
+        /**
+         * Tries to cas nh as new head; if successful, unlink
+         * old head's next node to avoid garbage retention.
+         */
+        void advanceHead(QNode h, QNode nh) {
+<span class="fc bfc" id="L619" title="All 2 branches covered.">            if (h == head &amp;&amp;</span>
+<span class="fc bfc" id="L620" title="All 2 branches covered.">                UNSAFE.compareAndSwapObject(this, headOffset, h, nh))</span>
+<span class="fc" id="L621">                h.next = h; // forget old next</span>
+<span class="fc" id="L622">        }</span>
+
+        /**
+         * Tries to cas nt as new tail.
+         */
+        void advanceTail(QNode t, QNode nt) {
+<span class="fc bfc" id="L628" title="All 2 branches covered.">            if (tail == t)</span>
+<span class="fc" id="L629">                UNSAFE.compareAndSwapObject(this, tailOffset, t, nt);</span>
+<span class="fc" id="L630">        }</span>
+
+        /**
+         * Tries to CAS cleanMe slot.
+         */
+        boolean casCleanMe(QNode cmp, QNode val) {
+<span class="nc bnc" id="L636" title="All 2 branches missed.">            return cleanMe == cmp &amp;&amp;</span>
+<span class="nc bnc" id="L637" title="All 2 branches missed.">                UNSAFE.compareAndSwapObject(this, cleanMeOffset, cmp, val);</span>
+        }
+
+        /**
+         * Puts or takes an item.
+         */
+        @SuppressWarnings(&quot;unchecked&quot;)
+        E transfer(E e, boolean timed, long nanos) {
+            /* Basic algorithm is to loop trying to take either of
+             * two actions:
+             *
+             * 1. If queue apparently empty or holding same-mode nodes,
+             *    try to add node to queue of waiters, wait to be
+             *    fulfilled (or cancelled) and return matching item.
+             *
+             * 2. If queue apparently contains waiting items, and this
+             *    call is of complementary mode, try to fulfill by CAS'ing
+             *    item field of waiting node and dequeuing it, and then
+             *    returning matching item.
+             *
+             * In each case, along the way, check for and try to help
+             * advance head and tail on behalf of other stalled/slow
+             * threads.
+             *
+             * The loop starts off with a null check guarding against
+             * seeing uninitialized head or tail values. This never
+             * happens in current SynchronousQueue, but could if
+             * callers held non-volatile/final ref to the
+             * transferer. The check is here anyway because it places
+             * null checks at top of loop, which is usually faster
+             * than having them implicitly interspersed.
+             */
+
+<span class="fc" id="L670">            QNode s = null; // constructed/reused as needed</span>
+<span class="fc bfc" id="L671" title="All 2 branches covered.">            boolean isData = (e != null);</span>
+
+            for (;;) {
+<span class="fc" id="L674">                QNode t = tail;</span>
+<span class="fc" id="L675">                QNode h = head;</span>
+<span class="pc bpc" id="L676" title="2 of 4 branches missed.">                if (t == null || h == null)         // saw uninitialized value</span>
+<span class="nc" id="L677">                    continue;                       // spin</span>
+
+<span class="fc bfc" id="L679" title="All 4 branches covered.">                if (h == t || t.isData == isData) { // empty or same-mode</span>
+<span class="fc" id="L680">                    QNode tn = t.next;</span>
+<span class="fc bfc" id="L681" title="All 2 branches covered.">                    if (t != tail)                  // inconsistent read</span>
+<span class="fc" id="L682">                        continue;</span>
+<span class="fc bfc" id="L683" title="All 2 branches covered.">                    if (tn != null) {               // lagging tail</span>
+<span class="fc" id="L684">                        advanceTail(t, tn);</span>
+<span class="fc" id="L685">                        continue;</span>
+                    }
+<span class="pc bpc" id="L687" title="3 of 4 branches missed.">                    if (timed &amp;&amp; nanos &lt;= 0)        // can't wait</span>
+<span class="nc" id="L688">                        return null;</span>
+<span class="fc bfc" id="L689" title="All 2 branches covered.">                    if (s == null)</span>
+<span class="fc" id="L690">                        s = new QNode(e, isData);</span>
+<span class="fc bfc" id="L691" title="All 2 branches covered.">                    if (!t.casNext(null, s))        // failed to link in</span>
+<span class="fc" id="L692">                        continue;</span>
+
+<span class="fc" id="L694">                    advanceTail(t, s);              // swing tail and wait</span>
+<span class="fc" id="L695">                    Object x = awaitFulfill(s, e, timed, nanos);</span>
+<span class="pc bpc" id="L696" title="1 of 2 branches missed.">                    if (x == s) {                   // wait was cancelled</span>
+<span class="nc" id="L697">                        clean(t, s);</span>
+<span class="nc" id="L698">                        return null;</span>
+                    }
+
+<span class="fc bfc" id="L701" title="All 2 branches covered.">                    if (!s.isOffList()) {           // not already unlinked</span>
+<span class="fc" id="L702">                        advanceHead(t, s);          // unlink if head</span>
+<span class="fc bfc" id="L703" title="All 2 branches covered.">                        if (x != null)              // and forget fields</span>
+<span class="fc" id="L704">                            s.item = s;</span>
+<span class="fc" id="L705">                        s.waiter = null;</span>
+                    }
+<span class="fc bfc" id="L707" title="All 2 branches covered.">                    return (x != null) ? (E)x : e;</span>
+
+                } else {                            // complementary-mode
+<span class="fc" id="L710">                    QNode m = h.next;               // node to fulfill</span>
+<span class="pc bpc" id="L711" title="1 of 6 branches missed.">                    if (t != tail || m == null || h != head)</span>
+<span class="fc" id="L712">                        continue;                   // inconsistent read</span>
+
+<span class="fc" id="L714">                    Object x = m.item;</span>
+<span class="pc bpc" id="L715" title="1 of 6 branches missed.">                    if (isData == (x != null) ||    // m already fulfilled</span>
+                        x == m ||                   // m cancelled
+<span class="fc bfc" id="L717" title="All 2 branches covered.">                        !m.casItem(x, e)) {         // lost CAS</span>
+<span class="fc" id="L718">                        advanceHead(h, m);          // dequeue and retry</span>
+<span class="fc" id="L719">                        continue;</span>
+                    }
+
+<span class="fc" id="L722">                    advanceHead(h, m);              // successfully fulfilled</span>
+<span class="fc" id="L723">                    LockSupport.unpark(m.waiter);</span>
+<span class="fc bfc" id="L724" title="All 2 branches covered.">                    return (x != null) ? (E)x : e;</span>
+                }
+            }
+        }
+
+        /**
+         * Spins/blocks until node s is fulfilled.
+         *
+         * @param s the waiting node
+         * @param e the comparison value for checking match
+         * @param timed true if timed wait
+         * @param nanos timeout value
+         * @return matched item, or s if cancelled
+         */
+        Object awaitFulfill(QNode s, E e, boolean timed, long nanos) {
+            /* Same idea as TransferStack.awaitFulfill */
+<span class="pc bpc" id="L740" title="1 of 2 branches missed.">            final long deadline = timed ? System.nanoTime() + nanos : 0L;</span>
+<span class="fc" id="L741">            Thread w = Thread.currentThread();</span>
+<span class="pc bpc" id="L742" title="1 of 4 branches missed.">            int spins = ((head.next == s) ?</span>
+                         (timed ? maxTimedSpins : maxUntimedSpins) : 0);
+            for (;;) {
+<span class="pc bpc" id="L745" title="1 of 2 branches missed.">                if (w.isInterrupted())</span>
+<span class="nc" id="L746">                    s.tryCancel(e);</span>
+<span class="fc" id="L747">                Object x = s.item;</span>
+<span class="fc bfc" id="L748" title="All 2 branches covered.">                if (x != e)</span>
+<span class="fc" id="L749">                    return x;</span>
+<span class="pc bpc" id="L750" title="1 of 2 branches missed.">                if (timed) {</span>
+<span class="nc" id="L751">                    nanos = deadline - System.nanoTime();</span>
+<span class="nc bnc" id="L752" title="All 2 branches missed.">                    if (nanos &lt;= 0L) {</span>
+<span class="nc" id="L753">                        s.tryCancel(e);</span>
+<span class="nc" id="L754">                        continue;</span>
+                    }
+                }
+<span class="fc bfc" id="L757" title="All 2 branches covered.">                if (spins &gt; 0)</span>
+<span class="fc" id="L758">                    --spins;</span>
+<span class="fc bfc" id="L759" title="All 2 branches covered.">                else if (s.waiter == null)</span>
+<span class="fc" id="L760">                    s.waiter = w;</span>
+<span class="pc bpc" id="L761" title="1 of 2 branches missed.">                else if (!timed)</span>
+<span class="fc" id="L762">                    LockSupport.park(this);</span>
+<span class="nc bnc" id="L763" title="All 2 branches missed.">                else if (nanos &gt; spinForTimeoutThreshold)</span>
+<span class="nc" id="L764">                    LockSupport.parkNanos(this, nanos);</span>
+<span class="fc" id="L765">            }</span>
+        }
+
+        /**
+         * Gets rid of cancelled node s with original predecessor pred.
+         */
+        void clean(QNode pred, QNode s) {
+<span class="nc" id="L772">            s.waiter = null; // forget thread</span>
+            /*
+             * At any given time, exactly one node on list cannot be
+             * deleted -- the last inserted node. To accommodate this,
+             * if we cannot delete s, we save its predecessor as
+             * &quot;cleanMe&quot;, deleting the previously saved version
+             * first. At least one of node s or the node previously
+             * saved can always be deleted, so this always terminates.
+             */
+<span class="nc bnc" id="L781" title="All 2 branches missed.">            while (pred.next == s) { // Return early if already unlinked</span>
+<span class="nc" id="L782">                QNode h = head;</span>
+<span class="nc" id="L783">                QNode hn = h.next;   // Absorb cancelled first node as head</span>
+<span class="nc bnc" id="L784" title="All 4 branches missed.">                if (hn != null &amp;&amp; hn.isCancelled()) {</span>
+<span class="nc" id="L785">                    advanceHead(h, hn);</span>
+<span class="nc" id="L786">                    continue;</span>
+                }
+<span class="nc" id="L788">                QNode t = tail;      // Ensure consistent read for tail</span>
+<span class="nc bnc" id="L789" title="All 2 branches missed.">                if (t == h)</span>
+<span class="nc" id="L790">                    return;</span>
+<span class="nc" id="L791">                QNode tn = t.next;</span>
+<span class="nc bnc" id="L792" title="All 2 branches missed.">                if (t != tail)</span>
+<span class="nc" id="L793">                    continue;</span>
+<span class="nc bnc" id="L794" title="All 2 branches missed.">                if (tn != null) {</span>
+<span class="nc" id="L795">                    advanceTail(t, tn);</span>
+<span class="nc" id="L796">                    continue;</span>
+                }
+<span class="nc bnc" id="L798" title="All 2 branches missed.">                if (s != t) {        // If not tail, try to unsplice</span>
+<span class="nc" id="L799">                    QNode sn = s.next;</span>
+<span class="nc bnc" id="L800" title="All 4 branches missed.">                    if (sn == s || pred.casNext(s, sn))</span>
+<span class="nc" id="L801">                        return;</span>
+                }
+<span class="nc" id="L803">                QNode dp = cleanMe;</span>
+<span class="nc bnc" id="L804" title="All 2 branches missed.">                if (dp != null) {    // Try unlinking previous cancelled node</span>
+<span class="nc" id="L805">                    QNode d = dp.next;</span>
+                    QNode dn;
+<span class="nc bnc" id="L807" title="All 4 branches missed.">                    if (d == null ||               // d is gone or</span>
+                        d == dp ||                 // d is off list or
+<span class="nc bnc" id="L809" title="All 8 branches missed.">                        !d.isCancelled() ||        // d not cancelled or</span>
+                        (d != t &amp;&amp;                 // d not tail and
+                         (dn = d.next) != null &amp;&amp;  //   has successor
+                         dn != d &amp;&amp;                //   that is on list
+<span class="nc bnc" id="L813" title="All 2 branches missed.">                         dp.casNext(d, dn)))       // d unspliced</span>
+<span class="nc" id="L814">                        casCleanMe(dp, null);</span>
+<span class="nc bnc" id="L815" title="All 2 branches missed.">                    if (dp == pred)</span>
+<span class="nc" id="L816">                        return;      // s is already saved node</span>
+<span class="nc bnc" id="L817" title="All 2 branches missed.">                } else if (casCleanMe(null, pred))</span>
+<span class="nc" id="L818">                    return;          // Postpone cleaning s</span>
+<span class="nc" id="L819">            }</span>
+<span class="nc" id="L820">        }</span>
+
+        private static final sun.misc.Unsafe UNSAFE;
+        private static final long headOffset;
+        private static final long tailOffset;
+        private static final long cleanMeOffset;
+        static {
+            try {
+<span class="fc" id="L828">                UNSAFE = sun.misc.Unsafe.getUnsafe();</span>
+<span class="fc" id="L829">                Class&lt;?&gt; k = TransferQueue.class;</span>
+<span class="fc" id="L830">                headOffset = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L831">                    (k.getDeclaredField(&quot;head&quot;));</span>
+<span class="fc" id="L832">                tailOffset = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L833">                    (k.getDeclaredField(&quot;tail&quot;));</span>
+<span class="fc" id="L834">                cleanMeOffset = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L835">                    (k.getDeclaredField(&quot;cleanMe&quot;));</span>
+<span class="nc" id="L836">            } catch (Exception e) {</span>
+<span class="nc" id="L837">                throw new Error(e);</span>
+<span class="fc" id="L838">            }</span>
+<span class="fc" id="L839">        }</span>
+    }
+
+    /**
+     * The transferer. Set only in constructor, but cannot be declared
+     * as final without further complicating serialization.  Since
+     * this is accessed only at most once per public method, there
+     * isn't a noticeable performance penalty for using volatile
+     * instead of final here.
+     */
+    private transient volatile Transferer&lt;E&gt; transferer;
+
+    /**
+     * Creates a {@code SynchronousQueue} with nonfair access policy.
+     */
+    public SynchronousQueue() {
+<span class="fc" id="L855">        this(false);</span>
+<span class="fc" id="L856">    }</span>
+
+    /**
+     * Creates a {@code SynchronousQueue} with the specified fairness policy.
+     *
+     * @param fair if true, waiting threads contend in FIFO order for
+     *        access; otherwise the order is unspecified.
+     */
+<span class="fc" id="L864">    public SynchronousQueue(boolean fair) {</span>
+<span class="fc bfc" id="L865" title="All 2 branches covered.">        transferer = fair ? new TransferQueue&lt;E&gt;() : new TransferStack&lt;E&gt;();</span>
+<span class="fc" id="L866">    }</span>
+
+    /**
+     * Adds the specified element to this queue, waiting if necessary for
+     * another thread to receive it.
+     *
+     * @throws InterruptedException {@inheritDoc}
+     * @throws NullPointerException {@inheritDoc}
+     */
+    public void put(E e) throws InterruptedException {
+<span class="pc bpc" id="L876" title="1 of 2 branches missed.">        if (e == null) throw new NullPointerException();</span>
+<span class="fc bfc" id="L877" title="All 2 branches covered.">        if (transferer.transfer(e, false, 0) == null) {</span>
+<span class="fc" id="L878">            Thread.interrupted();</span>
+<span class="fc" id="L879">            throw new InterruptedException();</span>
+        }
+<span class="fc" id="L881">    }</span>
+
+    /**
+     * Inserts the specified element into this queue, waiting if necessary
+     * up to the specified wait time for another thread to receive it.
+     *
+     * @return {@code true} if successful, or {@code false} if the
+     *         specified waiting time elapses before a consumer appears
+     * @throws InterruptedException {@inheritDoc}
+     * @throws NullPointerException {@inheritDoc}
+     */
+    public boolean offer(E e, long timeout, TimeUnit unit)
+        throws InterruptedException {
+<span class="pc bpc" id="L894" title="1 of 2 branches missed.">        if (e == null) throw new NullPointerException();</span>
+<span class="pc bpc" id="L895" title="1 of 2 branches missed.">        if (transferer.transfer(e, true, unit.toNanos(timeout)) != null)</span>
+<span class="nc" id="L896">            return true;</span>
+<span class="pc bpc" id="L897" title="1 of 2 branches missed.">        if (!Thread.interrupted())</span>
+<span class="nc" id="L898">            return false;</span>
+<span class="fc" id="L899">        throw new InterruptedException();</span>
+    }
+
+    /**
+     * Inserts the specified element into this queue, if another thread is
+     * waiting to receive it.
+     *
+     * @param e the element to add
+     * @return {@code true} if the element was added to this queue, else
+     *         {@code false}
+     * @throws NullPointerException if the specified element is null
+     */
+    public boolean offer(E e) {
+<span class="pc bpc" id="L912" title="1 of 2 branches missed.">        if (e == null) throw new NullPointerException();</span>
+<span class="fc bfc" id="L913" title="All 2 branches covered.">        return transferer.transfer(e, true, 0) != null;</span>
+    }
+
+    /**
+     * Retrieves and removes the head of this queue, waiting if necessary
+     * for another thread to insert it.
+     *
+     * @return the head of this queue
+     * @throws InterruptedException {@inheritDoc}
+     */
+    public E take() throws InterruptedException {
+<span class="fc" id="L924">        E e = transferer.transfer(null, false, 0);</span>
+<span class="fc bfc" id="L925" title="All 2 branches covered.">        if (e != null)</span>
+<span class="fc" id="L926">            return e;</span>
+<span class="fc" id="L927">        Thread.interrupted();</span>
+<span class="fc" id="L928">        throw new InterruptedException();</span>
+    }
+
+    /**
+     * Retrieves and removes the head of this queue, waiting
+     * if necessary up to the specified wait time, for another thread
+     * to insert it.
+     *
+     * @return the head of this queue, or {@code null} if the
+     *         specified waiting time elapses before an element is present
+     * @throws InterruptedException {@inheritDoc}
+     */
+    public E poll(long timeout, TimeUnit unit) throws InterruptedException {
+<span class="fc" id="L941">        E e = transferer.transfer(null, true, unit.toNanos(timeout));</span>
+<span class="fc bfc" id="L942" title="All 4 branches covered.">        if (e != null || !Thread.interrupted())</span>
+<span class="fc" id="L943">            return e;</span>
+<span class="fc" id="L944">        throw new InterruptedException();</span>
+    }
+
+    /**
+     * Retrieves and removes the head of this queue, if another thread
+     * is currently making an element available.
+     *
+     * @return the head of this queue, or {@code null} if no
+     *         element is available
+     */
+    public E poll() {
+<span class="fc" id="L955">        return transferer.transfer(null, true, 0);</span>
+    }
+
+    /**
+     * Always returns {@code true}.
+     * A {@code SynchronousQueue} has no internal capacity.
+     *
+     * @return {@code true}
+     */
+    public boolean isEmpty() {
+<span class="fc" id="L965">        return true;</span>
+    }
+
+    /**
+     * Always returns zero.
+     * A {@code SynchronousQueue} has no internal capacity.
+     *
+     * @return zero
+     */
+    public int size() {
+<span class="nc" id="L975">        return 0;</span>
+    }
+
+    /**
+     * Always returns zero.
+     * A {@code SynchronousQueue} has no internal capacity.
+     *
+     * @return zero
+     */
+    public int remainingCapacity() {
+<span class="fc" id="L985">        return 0;</span>
+    }
+
+    /**
+     * Does nothing.
+     * A {@code SynchronousQueue} has no internal capacity.
+     */
+    public void clear() {
+<span class="fc" id="L993">    }</span>
+
+    /**
+     * Always returns {@code false}.
+     * A {@code SynchronousQueue} has no internal capacity.
+     *
+     * @param o the element
+     * @return {@code false}
+     */
+    public boolean contains(Object o) {
+<span class="nc" id="L1003">        return false;</span>
+    }
+
+    /**
+     * Always returns {@code false}.
+     * A {@code SynchronousQueue} has no internal capacity.
+     *
+     * @param o the element to remove
+     * @return {@code false}
+     */
+    public boolean remove(Object o) {
+<span class="nc" id="L1014">        return false;</span>
+    }
+
+    /**
+     * Returns {@code false} unless the given collection is empty.
+     * A {@code SynchronousQueue} has no internal capacity.
+     *
+     * @param c the collection
+     * @return {@code false} unless given collection is empty
+     */
+    public boolean containsAll(Collection&lt;?&gt; c) {
+<span class="nc" id="L1025">        return c.isEmpty();</span>
+    }
+
+    /**
+     * Always returns {@code false}.
+     * A {@code SynchronousQueue} has no internal capacity.
+     *
+     * @param c the collection
+     * @return {@code false}
+     */
+    public boolean removeAll(Collection&lt;?&gt; c) {
+<span class="nc" id="L1036">        return false;</span>
+    }
+
+    /**
+     * Always returns {@code false}.
+     * A {@code SynchronousQueue} has no internal capacity.
+     *
+     * @param c the collection
+     * @return {@code false}
+     */
+    public boolean retainAll(Collection&lt;?&gt; c) {
+<span class="nc" id="L1047">        return false;</span>
+    }
+
+    /**
+     * Always returns {@code null}.
+     * A {@code SynchronousQueue} does not return elements
+     * unless actively waited on.
+     *
+     * @return {@code null}
+     */
+    public E peek() {
+<span class="nc" id="L1058">        return null;</span>
+    }
+
+    /**
+     * Returns an empty iterator in which {@code hasNext} always returns
+     * {@code false}.
+     *
+     * @return an empty iterator
+     */
+    public Iterator&lt;E&gt; iterator() {
+<span class="nc" id="L1068">        return Collections.emptyIterator();</span>
+    }
+
+    /**
+     * Returns an empty spliterator in which calls to
+     * {@link java.util.Spliterator#trySplit()} always return {@code null}.
+     *
+     * @return an empty spliterator
+     * @since 1.8
+     */
+    public Spliterator&lt;E&gt; spliterator() {
+<span class="nc" id="L1079">        return Spliterators.emptySpliterator();</span>
+    }
+
+    /**
+     * Returns a zero-length array.
+     * @return a zero-length array
+     */
+    public Object[] toArray() {
+<span class="nc" id="L1087">        return new Object[0];</span>
+    }
+
+    /**
+     * Sets the zeroeth element of the specified array to {@code null}
+     * (if the array has non-zero length) and returns it.
+     *
+     * @param a the array
+     * @return the specified array
+     * @throws NullPointerException if the specified array is null
+     */
+    public &lt;T&gt; T[] toArray(T[] a) {
+<span class="nc bnc" id="L1099" title="All 2 branches missed.">        if (a.length &gt; 0)</span>
+<span class="nc" id="L1100">            a[0] = null;</span>
+<span class="nc" id="L1101">        return a;</span>
+    }
+
+    /**
+     * @throws UnsupportedOperationException {@inheritDoc}
+     * @throws ClassCastException            {@inheritDoc}
+     * @throws NullPointerException          {@inheritDoc}
+     * @throws IllegalArgumentException      {@inheritDoc}
+     */
+    public int drainTo(Collection&lt;? super E&gt; c) {
+<span class="pc bpc" id="L1111" title="1 of 2 branches missed.">        if (c == null)</span>
+<span class="nc" id="L1112">            throw new NullPointerException();</span>
+<span class="pc bpc" id="L1113" title="1 of 2 branches missed.">        if (c == this)</span>
+<span class="nc" id="L1114">            throw new IllegalArgumentException();</span>
+<span class="fc" id="L1115">        int n = 0;</span>
+<span class="pc bpc" id="L1116" title="1 of 2 branches missed.">        for (E e; (e = poll()) != null;) {</span>
+<span class="nc" id="L1117">            c.add(e);</span>
+<span class="nc" id="L1118">            ++n;</span>
+        }
+<span class="fc" id="L1120">        return n;</span>
+    }
+
+    /**
+     * @throws UnsupportedOperationException {@inheritDoc}
+     * @throws ClassCastException            {@inheritDoc}
+     * @throws NullPointerException          {@inheritDoc}
+     * @throws IllegalArgumentException      {@inheritDoc}
+     */
+    public int drainTo(Collection&lt;? super E&gt; c, int maxElements) {
+<span class="nc bnc" id="L1130" title="All 2 branches missed.">        if (c == null)</span>
+<span class="nc" id="L1131">            throw new NullPointerException();</span>
+<span class="nc bnc" id="L1132" title="All 2 branches missed.">        if (c == this)</span>
+<span class="nc" id="L1133">            throw new IllegalArgumentException();</span>
+<span class="nc" id="L1134">        int n = 0;</span>
+<span class="nc bnc" id="L1135" title="All 4 branches missed.">        for (E e; n &lt; maxElements &amp;&amp; (e = poll()) != null;) {</span>
+<span class="nc" id="L1136">            c.add(e);</span>
+<span class="nc" id="L1137">            ++n;</span>
+        }
+<span class="nc" id="L1139">        return n;</span>
+    }
+
+    /*
+     * To cope with serialization strategy in the 1.5 version of
+     * SynchronousQueue, we declare some unused classes and fields
+     * that exist solely to enable serializability across versions.
+     * These fields are never used, so are initialized only if this
+     * object is ever serialized or deserialized.
+     */
+
+    @SuppressWarnings(&quot;serial&quot;)
+<span class="nc" id="L1151">    static class WaitQueue implements java.io.Serializable { }</span>
+<span class="nc" id="L1152">    static class LifoWaitQueue extends WaitQueue {</span>
+        private static final long serialVersionUID = -3633113410248163686L;
+    }
+<span class="nc" id="L1155">    static class FifoWaitQueue extends WaitQueue {</span>
+        private static final long serialVersionUID = -3623113410248163686L;
+    }
+    private ReentrantLock qlock;
+    private WaitQueue waitingProducers;
+    private WaitQueue waitingConsumers;
+
+    /**
+     * Saves this queue to a stream (that is, serializes it).
+     * @param s the stream
+     * @throws java.io.IOException if an I/O error occurs
+     */
+    private void writeObject(java.io.ObjectOutputStream s)
+        throws java.io.IOException {
+<span class="nc" id="L1169">        boolean fair = transferer instanceof TransferQueue;</span>
+<span class="nc bnc" id="L1170" title="All 2 branches missed.">        if (fair) {</span>
+<span class="nc" id="L1171">            qlock = new ReentrantLock(true);</span>
+<span class="nc" id="L1172">            waitingProducers = new FifoWaitQueue();</span>
+<span class="nc" id="L1173">            waitingConsumers = new FifoWaitQueue();</span>
+        }
+        else {
+<span class="nc" id="L1176">            qlock = new ReentrantLock();</span>
+<span class="nc" id="L1177">            waitingProducers = new LifoWaitQueue();</span>
+<span class="nc" id="L1178">            waitingConsumers = new LifoWaitQueue();</span>
+        }
+<span class="nc" id="L1180">        s.defaultWriteObject();</span>
+<span class="nc" id="L1181">    }</span>
+
+    /**
+     * Reconstitutes this queue from a stream (that is, deserializes it).
+     * @param s the stream
+     * @throws ClassNotFoundException if the class of a serialized object
+     *         could not be found
+     * @throws java.io.IOException if an I/O error occurs
+     */
+    private void readObject(java.io.ObjectInputStream s)
+        throws java.io.IOException, ClassNotFoundException {
+<span class="nc" id="L1192">        s.defaultReadObject();</span>
+<span class="nc bnc" id="L1193" title="All 2 branches missed.">        if (waitingProducers instanceof FifoWaitQueue)</span>
+<span class="nc" id="L1194">            transferer = new TransferQueue&lt;E&gt;();</span>
+        else
+<span class="nc" id="L1196">            transferer = new TransferStack&lt;E&gt;();</span>
+<span class="nc" id="L1197">    }</span>
+
+    // Unsafe mechanics
+    static long objectFieldOffset(sun.misc.Unsafe UNSAFE,
+                                  String field, Class&lt;?&gt; klazz) {
+        try {
+<span class="nc" id="L1203">            return UNSAFE.objectFieldOffset(klazz.getDeclaredField(field));</span>
+<span class="nc" id="L1204">        } catch (NoSuchFieldException e) {</span>
+            // Convert Exception to corresponding Error
+<span class="nc" id="L1206">            NoSuchFieldError error = new NoSuchFieldError(field);</span>
+<span class="nc" id="L1207">            error.initCause(e);</span>
+<span class="nc" id="L1208">            throw error;</span>
+        }
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

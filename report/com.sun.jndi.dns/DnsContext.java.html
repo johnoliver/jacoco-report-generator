@@ -1,0 +1,1090 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>DnsContext.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">com.sun.jndi.dns</a> &gt; <span class="el_source">DnsContext.java</span></div><h1>DnsContext.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package com.sun.jndi.dns;
+
+
+import java.util.Enumeration;
+import java.util.Hashtable;
+
+import javax.naming.*;
+import javax.naming.directory.*;
+import javax.naming.spi.DirectoryManager;
+
+import com.sun.jndi.toolkit.ctx.*;
+
+
+/**
+ * A DnsContext is a directory context representing a DNS node.
+ *
+ * @author Scott Seligman
+ */
+
+
+public class DnsContext extends ComponentDirContext {
+
+    DnsName domain;             // fully-qualified domain name of this context,
+                                // with a root (empty) label at position 0
+    Hashtable&lt;Object,Object&gt; environment;
+    private boolean envShared;  // true if environment is possibly shared
+                                // and so must be copied on write
+    private boolean parentIsDns;        // was this DnsContext created by
+                                        // another?  see composeName()
+    private String[] servers;
+    private Resolver resolver;
+
+    private boolean authoritative;      // must all responses be authoritative?
+    private boolean recursion;          // request recursion on queries?
+    private int timeout;                // initial timeout on UDP queries in ms
+    private int retries;                // number of UDP retries
+
+<span class="fc" id="L63">    static final NameParser nameParser = new DnsNameParser();</span>
+
+    // Timeouts for UDP queries use exponential backoff:  each retry
+    // is for twice as long as the last.  The following constants set
+    // the defaults for the initial timeout (in ms) and the number of
+    // retries, and name the environment properties used to override
+    // these defaults.
+    private static final int DEFAULT_INIT_TIMEOUT = 1000;
+    private static final int DEFAULT_RETRIES = 4;
+    private static final String INIT_TIMEOUT =
+                                          &quot;com.sun.jndi.dns.timeout.initial&quot;;
+    private static final String RETRIES = &quot;com.sun.jndi.dns.timeout.retries&quot;;
+
+    // The resource record type and class to use for lookups, and the
+    // property used to modify them
+    private CT lookupCT;
+    private static final String LOOKUP_ATTR = &quot;com.sun.jndi.dns.lookup.attr&quot;;
+
+    // Property used to disallow recursion on queries
+    private static final String RECURSION = &quot;com.sun.jndi.dns.recursion&quot;;
+
+    // ANY == ResourceRecord.QCLASS_STAR == ResourceRecord.QTYPE_STAR
+    private static final int ANY = ResourceRecord.QTYPE_STAR;
+
+    // The zone tree used for list operations
+<span class="fc" id="L88">    private static final ZoneNode zoneTree = new ZoneNode(null);</span>
+
+
+    /**
+     * Returns a DNS context for a given domain and servers.
+     * Each server is of the form &quot;server[:port]&quot;.
+     * IPv6 literal host names include delimiting brackets.
+     * There must be at least one server.
+     * The environment must not be null; it is cloned before being stored.
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public DnsContext(String domain, String[] servers, Hashtable&lt;?,?&gt; environment)
+<span class="fc" id="L100">            throws NamingException {</span>
+
+<span class="fc bfc" id="L102" title="All 2 branches covered.">        this.domain = new DnsName(domain.endsWith(&quot;.&quot;)</span>
+                                  ? domain
+                                  : domain + &quot;.&quot;);
+<span class="fc bfc" id="L105" title="All 2 branches covered.">        this.servers = (servers == null) ? null : servers.clone();</span>
+<span class="fc" id="L106">        this.environment = (Hashtable&lt;Object,Object&gt;) environment.clone();</span>
+<span class="fc" id="L107">        envShared = false;</span>
+<span class="fc" id="L108">        parentIsDns = false;</span>
+<span class="fc" id="L109">        resolver = null;</span>
+
+<span class="fc" id="L111">        initFromEnvironment();</span>
+<span class="fc" id="L112">    }</span>
+
+    /*
+     * Returns a clone of a DNS context, just like DnsContext(DnsContext)
+     * but with a different domain name and with parentIsDns set to true.
+     */
+    DnsContext(DnsContext ctx, DnsName domain) {
+<span class="nc" id="L119">        this(ctx);</span>
+<span class="nc" id="L120">        this.domain = domain;</span>
+<span class="nc" id="L121">        parentIsDns = true;</span>
+<span class="nc" id="L122">    }</span>
+
+    /*
+     * Returns a clone of a DNS context.  The context's modifiable
+     * private state is independent of the original's (so closing one
+     * context, for example, won't close the other).  The two contexts
+     * share &lt;tt&gt;environment&lt;/tt&gt;, but it's copy-on-write so there's
+     * no conflict.
+     */
+<span class="nc" id="L131">    private DnsContext(DnsContext ctx) {</span>
+<span class="nc" id="L132">        environment = ctx.environment;  // shared environment, copy-on-write</span>
+<span class="nc" id="L133">        envShared = ctx.envShared = true;</span>
+<span class="nc" id="L134">        parentIsDns = ctx.parentIsDns;</span>
+<span class="nc" id="L135">        domain = ctx.domain;</span>
+<span class="nc" id="L136">        servers = ctx.servers;          // shared servers, no write operation</span>
+<span class="nc" id="L137">        resolver = ctx.resolver;</span>
+<span class="nc" id="L138">        authoritative = ctx.authoritative;</span>
+<span class="nc" id="L139">        recursion = ctx.recursion;</span>
+<span class="nc" id="L140">        timeout = ctx.timeout;</span>
+<span class="nc" id="L141">        retries = ctx.retries;</span>
+<span class="nc" id="L142">        lookupCT = ctx.lookupCT;</span>
+<span class="nc" id="L143">    }</span>
+
+    public void close() {
+<span class="pc bpc" id="L146" title="1 of 2 branches missed.">        if (resolver != null) {</span>
+<span class="fc" id="L147">            resolver.close();</span>
+<span class="fc" id="L148">            resolver = null;</span>
+        }
+<span class="fc" id="L150">    }</span>
+
+
+    //---------- Environment operations
+
+    /*
+     * Override default with a noncloning version.
+     */
+    protected Hashtable&lt;?,?&gt; p_getEnvironment() {
+<span class="fc" id="L159">        return environment;</span>
+    }
+
+    public Hashtable&lt;?,?&gt; getEnvironment() throws NamingException {
+<span class="nc" id="L163">        return (Hashtable&lt;?,?&gt;) environment.clone();</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public Object addToEnvironment(String propName, Object propVal)
+            throws NamingException {
+
+<span class="nc bnc" id="L170" title="All 2 branches missed.">        if (propName.equals(LOOKUP_ATTR)) {</span>
+<span class="nc" id="L171">            lookupCT = getLookupCT((String) propVal);</span>
+<span class="nc bnc" id="L172" title="All 2 branches missed.">        } else if (propName.equals(Context.AUTHORITATIVE)) {</span>
+<span class="nc" id="L173">            authoritative = &quot;true&quot;.equalsIgnoreCase((String) propVal);</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">        } else if (propName.equals(RECURSION)) {</span>
+<span class="nc" id="L175">            recursion = &quot;true&quot;.equalsIgnoreCase((String) propVal);</span>
+<span class="nc bnc" id="L176" title="All 2 branches missed.">        } else if (propName.equals(INIT_TIMEOUT)) {</span>
+<span class="nc" id="L177">            int val = Integer.parseInt((String) propVal);</span>
+<span class="nc bnc" id="L178" title="All 2 branches missed.">            if (timeout != val) {</span>
+<span class="nc" id="L179">                timeout = val;</span>
+<span class="nc" id="L180">                resolver = null;</span>
+            }
+<span class="nc bnc" id="L182" title="All 2 branches missed.">        } else if (propName.equals(RETRIES)) {</span>
+<span class="nc" id="L183">            int val = Integer.parseInt((String) propVal);</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">            if (retries != val) {</span>
+<span class="nc" id="L185">                retries = val;</span>
+<span class="nc" id="L186">                resolver = null;</span>
+            }
+        }
+
+<span class="nc bnc" id="L190" title="All 2 branches missed.">        if (!envShared) {</span>
+<span class="nc" id="L191">            return environment.put(propName, propVal);</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">        } else if (environment.get(propName) != propVal) {</span>
+            // copy on write
+<span class="nc" id="L194">            environment = (Hashtable&lt;Object,Object&gt;) environment.clone();</span>
+<span class="nc" id="L195">            envShared = false;</span>
+<span class="nc" id="L196">            return environment.put(propName, propVal);</span>
+        } else {
+<span class="nc" id="L198">            return propVal;</span>
+        }
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public Object removeFromEnvironment(String propName)
+            throws NamingException {
+
+<span class="nc bnc" id="L206" title="All 2 branches missed.">        if (propName.equals(LOOKUP_ATTR)) {</span>
+<span class="nc" id="L207">            lookupCT = getLookupCT(null);</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">        } else if (propName.equals(Context.AUTHORITATIVE)) {</span>
+<span class="nc" id="L209">            authoritative = false;</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">        } else if (propName.equals(RECURSION)) {</span>
+<span class="nc" id="L211">            recursion = true;</span>
+<span class="nc bnc" id="L212" title="All 2 branches missed.">        } else if (propName.equals(INIT_TIMEOUT)) {</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">            if (timeout != DEFAULT_INIT_TIMEOUT) {</span>
+<span class="nc" id="L214">                timeout = DEFAULT_INIT_TIMEOUT;</span>
+<span class="nc" id="L215">                resolver = null;</span>
+            }
+<span class="nc bnc" id="L217" title="All 2 branches missed.">        } else if (propName.equals(RETRIES)) {</span>
+<span class="nc bnc" id="L218" title="All 2 branches missed.">            if (retries != DEFAULT_RETRIES) {</span>
+<span class="nc" id="L219">                retries = DEFAULT_RETRIES;</span>
+<span class="nc" id="L220">                resolver = null;</span>
+            }
+        }
+
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        if (!envShared) {</span>
+<span class="nc" id="L225">            return environment.remove(propName);</span>
+<span class="nc bnc" id="L226" title="All 2 branches missed.">        } else if (environment.get(propName) != null) {</span>
+            // copy-on-write
+<span class="nc" id="L228">            environment = (Hashtable&lt;Object,Object&gt;) environment.clone();</span>
+<span class="nc" id="L229">            envShared = false;</span>
+<span class="nc" id="L230">            return environment.remove(propName);</span>
+        } else {
+<span class="nc" id="L232">            return null;</span>
+        }
+    }
+
+    /*
+     * Update PROVIDER_URL property.  Call this only when environment
+     * is not being shared.
+     */
+    void setProviderUrl(String url) {
+        // assert !envShared;
+<span class="fc" id="L242">        environment.put(Context.PROVIDER_URL, url);</span>
+<span class="fc" id="L243">    }</span>
+
+    /*
+     * Read environment properties and set parameters.
+     */
+    private void initFromEnvironment()
+            throws InvalidAttributeIdentifierException {
+
+<span class="fc" id="L251">        lookupCT = getLookupCT((String) environment.get(LOOKUP_ATTR));</span>
+<span class="fc" id="L252">        authoritative = &quot;true&quot;.equalsIgnoreCase((String)</span>
+<span class="fc" id="L253">                                       environment.get(Context.AUTHORITATIVE));</span>
+<span class="fc" id="L254">        String val = (String) environment.get(RECURSION);</span>
+<span class="pc bpc" id="L255" title="1 of 2 branches missed.">        recursion = ((val == null) ||</span>
+<span class="pc bnc" id="L256" title="All 2 branches missed.">                     &quot;true&quot;.equalsIgnoreCase(val));</span>
+<span class="fc" id="L257">        val = (String) environment.get(INIT_TIMEOUT);</span>
+<span class="pc bpc" id="L258" title="1 of 2 branches missed.">        timeout = (val == null)</span>
+            ? DEFAULT_INIT_TIMEOUT
+<span class="pc" id="L260">            : Integer.parseInt(val);</span>
+<span class="fc" id="L261">        val = (String) environment.get(RETRIES);</span>
+<span class="pc bpc" id="L262" title="1 of 2 branches missed.">        retries = (val == null)</span>
+            ? DEFAULT_RETRIES
+<span class="pc" id="L264">            : Integer.parseInt(val);</span>
+<span class="fc" id="L265">    }</span>
+
+    private CT getLookupCT(String attrId)
+            throws InvalidAttributeIdentifierException {
+<span class="pc bpc" id="L269" title="1 of 2 branches missed.">        return (attrId == null)</span>
+            ? new CT(ResourceRecord.CLASS_INTERNET, ResourceRecord.TYPE_TXT)
+<span class="pc" id="L271">            : fromAttrId(attrId);</span>
+    }
+
+
+    //---------- Naming operations
+
+    public Object c_lookup(Name name, Continuation cont)
+            throws NamingException {
+
+<span class="nc" id="L280">        cont.setSuccess();</span>
+<span class="nc bnc" id="L281" title="All 2 branches missed.">        if (name.isEmpty()) {</span>
+<span class="nc" id="L282">            DnsContext ctx = new DnsContext(this);</span>
+<span class="nc" id="L283">            ctx.resolver = new Resolver(servers, timeout, retries);</span>
+                                                // clone for parallelism
+<span class="nc" id="L285">            return ctx;</span>
+        }
+        try {
+<span class="nc" id="L288">            DnsName fqdn = fullyQualify(name);</span>
+<span class="nc" id="L289">            ResourceRecords rrs =</span>
+<span class="nc" id="L290">                getResolver().query(fqdn, lookupCT.rrclass, lookupCT.rrtype,</span>
+                                    recursion, authoritative);
+<span class="nc" id="L292">            Attributes attrs = rrsToAttrs(rrs, null);</span>
+<span class="nc" id="L293">            DnsContext ctx = new DnsContext(this, fqdn);</span>
+<span class="nc" id="L294">            return DirectoryManager.getObjectInstance(ctx, name, this,</span>
+                                                      environment, attrs);
+<span class="nc" id="L296">        } catch (NamingException e) {</span>
+<span class="nc" id="L297">            cont.setError(this, name);</span>
+<span class="nc" id="L298">            throw cont.fillInException(e);</span>
+<span class="nc" id="L299">        } catch (Exception e) {</span>
+<span class="nc" id="L300">            cont.setError(this, name);</span>
+<span class="nc" id="L301">            NamingException ne = new NamingException(</span>
+                    &quot;Problem generating object using object factory&quot;);
+<span class="nc" id="L303">            ne.setRootCause(e);</span>
+<span class="nc" id="L304">            throw cont.fillInException(ne);</span>
+        }
+    }
+
+    public Object c_lookupLink(Name name, Continuation cont)
+            throws NamingException {
+<span class="nc" id="L310">        return c_lookup(name, cont);</span>
+    }
+
+    public NamingEnumeration&lt;NameClassPair&gt; c_list(Name name, Continuation cont)
+            throws NamingException {
+<span class="nc" id="L315">        cont.setSuccess();</span>
+        try {
+<span class="nc" id="L317">            DnsName fqdn = fullyQualify(name);</span>
+<span class="nc" id="L318">            NameNode nnode = getNameNode(fqdn);</span>
+<span class="nc" id="L319">            DnsContext ctx = new DnsContext(this, fqdn);</span>
+<span class="nc" id="L320">            return new NameClassPairEnumeration(ctx, nnode.getChildren());</span>
+
+<span class="nc" id="L322">        } catch (NamingException e) {</span>
+<span class="nc" id="L323">            cont.setError(this, name);</span>
+<span class="nc" id="L324">            throw cont.fillInException(e);</span>
+        }
+    }
+
+    public NamingEnumeration&lt;Binding&gt; c_listBindings(Name name, Continuation cont)
+            throws NamingException {
+<span class="nc" id="L330">        cont.setSuccess();</span>
+        try {
+<span class="nc" id="L332">            DnsName fqdn = fullyQualify(name);</span>
+<span class="nc" id="L333">            NameNode nnode = getNameNode(fqdn);</span>
+<span class="nc" id="L334">            DnsContext ctx = new DnsContext(this, fqdn);</span>
+<span class="nc" id="L335">            return new BindingEnumeration(ctx, nnode.getChildren());</span>
+
+<span class="nc" id="L337">        } catch (NamingException e) {</span>
+<span class="nc" id="L338">            cont.setError(this, name);</span>
+<span class="nc" id="L339">            throw cont.fillInException(e);</span>
+        }
+    }
+
+    public void c_bind(Name name, Object obj, Continuation cont)
+            throws NamingException {
+<span class="nc" id="L345">        cont.setError(this, name);</span>
+<span class="nc" id="L346">        throw cont.fillInException(</span>
+                new OperationNotSupportedException());
+    }
+
+    public void c_rebind(Name name, Object obj, Continuation cont)
+            throws NamingException {
+<span class="nc" id="L352">        cont.setError(this, name);</span>
+<span class="nc" id="L353">        throw cont.fillInException(</span>
+                new OperationNotSupportedException());
+    }
+
+    public void c_unbind(Name name, Continuation cont)
+            throws NamingException {
+<span class="nc" id="L359">        cont.setError(this, name);</span>
+<span class="nc" id="L360">        throw cont.fillInException(</span>
+                new OperationNotSupportedException());
+    }
+
+    public void c_rename(Name oldname, Name newname, Continuation cont)
+            throws NamingException {
+<span class="nc" id="L366">        cont.setError(this, oldname);</span>
+<span class="nc" id="L367">        throw cont.fillInException(</span>
+                new OperationNotSupportedException());
+    }
+
+    public Context c_createSubcontext(Name name, Continuation cont)
+            throws NamingException {
+<span class="nc" id="L373">        cont.setError(this, name);</span>
+<span class="nc" id="L374">        throw cont.fillInException(</span>
+                new OperationNotSupportedException());
+    }
+
+    public void c_destroySubcontext(Name name, Continuation cont)
+            throws NamingException {
+<span class="nc" id="L380">        cont.setError(this, name);</span>
+<span class="nc" id="L381">        throw cont.fillInException(</span>
+                new OperationNotSupportedException());
+    }
+
+    public NameParser c_getNameParser(Name name, Continuation cont)
+            throws NamingException {
+<span class="nc" id="L387">        cont.setSuccess();</span>
+<span class="nc" id="L388">        return nameParser;</span>
+    }
+
+
+    //---------- Directory operations
+
+    public void c_bind(Name name,
+                       Object obj,
+                       Attributes attrs,
+                       Continuation cont)
+            throws NamingException {
+<span class="nc" id="L399">        cont.setError(this, name);</span>
+<span class="nc" id="L400">        throw cont.fillInException(</span>
+                new OperationNotSupportedException());
+    }
+
+    public void c_rebind(Name name,
+                         Object obj,
+                         Attributes attrs,
+                         Continuation cont)
+            throws NamingException {
+<span class="nc" id="L409">        cont.setError(this, name);</span>
+<span class="nc" id="L410">        throw cont.fillInException(</span>
+                new OperationNotSupportedException());
+    }
+
+    public DirContext c_createSubcontext(Name name,
+                                         Attributes attrs,
+                                         Continuation cont)
+            throws NamingException {
+<span class="nc" id="L418">        cont.setError(this, name);</span>
+<span class="nc" id="L419">        throw cont.fillInException(</span>
+                new OperationNotSupportedException());
+    }
+
+    public Attributes c_getAttributes(Name name,
+                                      String[] attrIds,
+                                      Continuation cont)
+            throws NamingException {
+
+<span class="fc" id="L428">        cont.setSuccess();</span>
+        try {
+<span class="nc" id="L430">            DnsName fqdn = fullyQualify(name);</span>
+<span class="nc" id="L431">            CT[] cts = attrIdsToClassesAndTypes(attrIds);</span>
+<span class="nc" id="L432">            CT ct = getClassAndTypeToQuery(cts);</span>
+<span class="nc" id="L433">            ResourceRecords rrs =</span>
+<span class="nc" id="L434">                getResolver().query(fqdn, ct.rrclass, ct.rrtype,</span>
+                                    recursion, authoritative);
+<span class="nc" id="L436">            return rrsToAttrs(rrs, cts);</span>
+
+<span class="fc" id="L438">        } catch (NamingException e) {</span>
+<span class="fc" id="L439">            cont.setError(this, name);</span>
+<span class="fc" id="L440">            throw cont.fillInException(e);</span>
+        }
+    }
+
+    public void c_modifyAttributes(Name name,
+                                   int mod_op,
+                                   Attributes attrs,
+                                   Continuation cont)
+            throws NamingException {
+<span class="nc" id="L449">        cont.setError(this, name);</span>
+<span class="nc" id="L450">        throw cont.fillInException(</span>
+                new OperationNotSupportedException());
+    }
+
+    public void c_modifyAttributes(Name name,
+                                   ModificationItem[] mods,
+                                   Continuation cont)
+            throws NamingException {
+<span class="nc" id="L458">        cont.setError(this, name);</span>
+<span class="nc" id="L459">        throw cont.fillInException(</span>
+                new OperationNotSupportedException());
+    }
+
+    public NamingEnumeration&lt;SearchResult&gt; c_search(Name name,
+                                      Attributes matchingAttributes,
+                                      String[] attributesToReturn,
+                                      Continuation cont)
+            throws NamingException {
+<span class="nc" id="L468">        throw new OperationNotSupportedException();</span>
+    }
+
+    public NamingEnumeration&lt;SearchResult&gt; c_search(Name name,
+                                      String filter,
+                                      SearchControls cons,
+                                      Continuation cont)
+            throws NamingException {
+<span class="nc" id="L476">        throw new OperationNotSupportedException();</span>
+    }
+
+    public NamingEnumeration&lt;SearchResult&gt; c_search(Name name,
+                                      String filterExpr,
+                                      Object[] filterArgs,
+                                      SearchControls cons,
+                                      Continuation cont)
+            throws NamingException {
+<span class="nc" id="L485">        throw new OperationNotSupportedException();</span>
+    }
+
+    public DirContext c_getSchema(Name name, Continuation cont)
+            throws NamingException {
+<span class="nc" id="L490">        cont.setError(this, name);</span>
+<span class="nc" id="L491">        throw cont.fillInException(</span>
+                new OperationNotSupportedException());
+    }
+
+    public DirContext c_getSchemaClassDefinition(Name name, Continuation cont)
+            throws NamingException {
+<span class="nc" id="L497">        cont.setError(this, name);</span>
+<span class="nc" id="L498">        throw cont.fillInException(</span>
+                new OperationNotSupportedException());
+    }
+
+
+    //---------- Name-related operations
+
+    public String getNameInNamespace() {
+<span class="nc" id="L506">        return domain.toString();</span>
+    }
+
+    public Name composeName(Name name, Name prefix) throws NamingException {
+        Name result;
+
+        // Any name that's not a CompositeName is assumed to be a DNS
+        // compound name.  Convert each to a DnsName for syntax checking.
+<span class="nc bnc" id="L514" title="All 4 branches missed.">        if (!(prefix instanceof DnsName || prefix instanceof CompositeName)) {</span>
+<span class="nc" id="L515">            prefix = (new DnsName()).addAll(prefix);</span>
+        }
+<span class="nc bnc" id="L517" title="All 4 branches missed.">        if (!(name instanceof DnsName || name instanceof CompositeName)) {</span>
+<span class="nc" id="L518">            name = (new DnsName()).addAll(name);</span>
+        }
+
+        // Each of prefix and name is now either a DnsName or a CompositeName.
+
+        // If we have two DnsNames, simply join them together.
+<span class="nc bnc" id="L524" title="All 4 branches missed.">        if ((prefix instanceof DnsName) &amp;&amp; (name instanceof DnsName)) {</span>
+<span class="nc" id="L525">            result = (DnsName) (prefix.clone());</span>
+<span class="nc" id="L526">            result.addAll(name);</span>
+<span class="nc" id="L527">            return new CompositeName().add(result.toString());</span>
+        }
+
+        // Wrap compound names in composite names.
+<span class="nc bnc" id="L531" title="All 2 branches missed.">        Name prefixC = (prefix instanceof CompositeName)</span>
+            ? prefix
+<span class="nc" id="L533">            : new CompositeName().add(prefix.toString());</span>
+<span class="nc bnc" id="L534" title="All 2 branches missed.">        Name nameC = (name instanceof CompositeName)</span>
+            ? name
+<span class="nc" id="L536">            : new CompositeName().add(name.toString());</span>
+<span class="nc" id="L537">        int prefixLast = prefixC.size() - 1;</span>
+
+        // Let toolkit do the work at namespace boundaries.
+<span class="nc bnc" id="L540" title="All 4 branches missed.">        if (nameC.isEmpty() || nameC.get(0).equals(&quot;&quot;) ||</span>
+<span class="nc bnc" id="L541" title="All 4 branches missed.">                prefixC.isEmpty() || prefixC.get(prefixLast).equals(&quot;&quot;)) {</span>
+<span class="nc" id="L542">            return super.composeName(nameC, prefixC);</span>
+        }
+
+<span class="nc bnc" id="L545" title="All 2 branches missed.">        result = (prefix == prefixC)</span>
+<span class="nc" id="L546">            ? (CompositeName) prefixC.clone()</span>
+            : prefixC;                  // prefixC is already a clone
+<span class="nc" id="L548">        result.addAll(nameC);</span>
+
+<span class="nc bnc" id="L550" title="All 2 branches missed.">        if (parentIsDns) {</span>
+<span class="nc bnc" id="L551" title="All 2 branches missed.">            DnsName dnsComp = (prefix instanceof DnsName)</span>
+<span class="nc" id="L552">                           ? (DnsName) prefix.clone()</span>
+<span class="nc" id="L553">                           : new DnsName(prefixC.get(prefixLast));</span>
+<span class="nc bnc" id="L554" title="All 2 branches missed.">            dnsComp.addAll((name instanceof DnsName)</span>
+                           ? name
+<span class="nc" id="L556">                           : new DnsName(nameC.get(0)));</span>
+<span class="nc" id="L557">            result.remove(prefixLast + 1);</span>
+<span class="nc" id="L558">            result.remove(prefixLast);</span>
+<span class="nc" id="L559">            result.add(prefixLast, dnsComp.toString());</span>
+        }
+<span class="nc" id="L561">        return result;</span>
+    }
+
+
+    //---------- Helper methods
+
+    /*
+     * Resolver is not created until needed, to allow time for updates
+     * to the environment.
+     */
+    private synchronized Resolver getResolver() throws NamingException {
+<span class="pc bpc" id="L572" title="1 of 2 branches missed.">        if (resolver == null) {</span>
+<span class="fc" id="L573">            resolver = new Resolver(servers, timeout, retries);</span>
+        }
+<span class="fc" id="L575">        return resolver;</span>
+    }
+
+    /*
+     * Returns the fully-qualified domain name of a name given
+     * relative to this context.  Result includes a root label (an
+     * empty component at position 0).
+     */
+    DnsName fullyQualify(Name name) throws NamingException {
+<span class="pc bpc" id="L584" title="1 of 2 branches missed.">        if (name.isEmpty()) {</span>
+<span class="nc" id="L585">            return domain;</span>
+        }
+<span class="pc bpc" id="L587" title="1 of 2 branches missed.">        DnsName dnsName = (name instanceof CompositeName)</span>
+<span class="pc" id="L588">            ? new DnsName(name.get(0))                  // parse name</span>
+<span class="pc" id="L589">            : (DnsName) (new DnsName()).addAll(name);   // clone &amp; check syntax</span>
+
+<span class="pc bpc" id="L591" title="1 of 2 branches missed.">        if (dnsName.hasRootLabel()) {</span>
+            // Be overly generous and allow root label if we're in root domain.
+<span class="nc bnc" id="L593" title="All 2 branches missed.">            if (domain.size() == 1) {</span>
+<span class="nc" id="L594">                return dnsName;</span>
+            } else {
+<span class="nc" id="L596">                throw new InvalidNameException(</span>
+                       &quot;DNS name &quot; + dnsName + &quot; not relative to &quot; + domain);
+            }
+        }
+<span class="fc" id="L600">        return (DnsName) dnsName.addAll(0, domain);</span>
+    }
+
+    /*
+     * Converts resource records to an attribute set.  Only resource
+     * records in the answer section are used, and only those that
+     * match the classes and types in cts (see classAndTypeMatch()
+     * for matching rules).
+     */
+    private static Attributes rrsToAttrs(ResourceRecords rrs, CT[] cts) {
+
+<span class="nc" id="L611">        BasicAttributes attrs = new BasicAttributes(true);</span>
+
+<span class="nc bnc" id="L613" title="All 2 branches missed.">        for (int i = 0; i &lt; rrs.answer.size(); i++) {</span>
+<span class="nc" id="L614">            ResourceRecord rr = rrs.answer.elementAt(i);</span>
+<span class="nc" id="L615">            int rrtype  = rr.getType();</span>
+<span class="nc" id="L616">            int rrclass = rr.getRrclass();</span>
+
+<span class="nc bnc" id="L618" title="All 2 branches missed.">            if (!classAndTypeMatch(rrclass, rrtype, cts)) {</span>
+<span class="nc" id="L619">                continue;</span>
+            }
+
+<span class="nc" id="L622">            String attrId = toAttrId(rrclass, rrtype);</span>
+<span class="nc" id="L623">            Attribute attr = attrs.get(attrId);</span>
+<span class="nc bnc" id="L624" title="All 2 branches missed.">            if (attr == null) {</span>
+<span class="nc" id="L625">                attr = new BasicAttribute(attrId);</span>
+<span class="nc" id="L626">                attrs.put(attr);</span>
+            }
+<span class="nc" id="L628">            attr.add(rr.getRdata());</span>
+        }
+<span class="nc" id="L630">        return attrs;</span>
+    }
+
+    /*
+     * Returns true if rrclass and rrtype match some element of cts.
+     * A match occurs if corresponding classes and types are equal,
+     * or if the array value is ANY.  If cts is null, then any class
+     * and type match.
+     */
+    private static boolean classAndTypeMatch(int rrclass, int rrtype,
+                                             CT[] cts) {
+<span class="nc bnc" id="L641" title="All 2 branches missed.">        if (cts == null) {</span>
+<span class="nc" id="L642">            return true;</span>
+        }
+<span class="nc bnc" id="L644" title="All 2 branches missed.">        for (int i = 0; i &lt; cts.length; i++) {</span>
+<span class="nc" id="L645">            CT ct = cts[i];</span>
+<span class="nc bnc" id="L646" title="All 4 branches missed.">            boolean classMatch = (ct.rrclass == ANY) ||</span>
+                                 (ct.rrclass == rrclass);
+<span class="nc bnc" id="L648" title="All 4 branches missed.">            boolean typeMatch  = (ct.rrtype == ANY) ||</span>
+                                 (ct.rrtype == rrtype);
+<span class="nc bnc" id="L650" title="All 4 branches missed.">            if (classMatch &amp;&amp; typeMatch) {</span>
+<span class="nc" id="L651">                return true;</span>
+            }
+        }
+<span class="nc" id="L654">        return false;</span>
+    }
+
+    /*
+     * Returns the attribute ID for a resource record given its class
+     * and type.  If the record is in the internet class, the
+     * corresponding attribute ID is the record's type name (or the
+     * integer type value if the name is not known).  If the record is
+     * not in the internet class, the class name (or integer class
+     * value) is prepended to the attribute ID, separated by a space.
+     *
+     * A class or type value of ANY represents an indeterminate class
+     * or type, and is represented within the attribute ID by &quot;*&quot;.
+     * For example, the attribute ID &quot;IN *&quot; represents
+     * any type in the internet class, and &quot;* NS&quot; represents an NS
+     * record of any class.
+     */
+    private static String toAttrId(int rrclass, int rrtype) {
+<span class="nc" id="L672">        String attrId = ResourceRecord.getTypeName(rrtype);</span>
+<span class="nc bnc" id="L673" title="All 2 branches missed.">        if (rrclass != ResourceRecord.CLASS_INTERNET) {</span>
+<span class="nc" id="L674">            attrId = ResourceRecord.getRrclassName(rrclass) + &quot; &quot; + attrId;</span>
+        }
+<span class="nc" id="L676">        return attrId;</span>
+    }
+
+    /*
+     * Returns the class and type values corresponding to an attribute
+     * ID.  An indeterminate class or type is represented by ANY.  See
+     * toAttrId() for the format of attribute IDs.
+     *
+     * @throws InvalidAttributeIdentifierException
+     *          if class or type is unknown
+     */
+    private static CT fromAttrId(String attrId)
+            throws InvalidAttributeIdentifierException {
+
+<span class="pc bpc" id="L690" title="1 of 2 branches missed.">        if (attrId.equals(&quot;&quot;)) {</span>
+<span class="nc" id="L691">            throw new InvalidAttributeIdentifierException(</span>
+                    &quot;Attribute ID cannot be empty&quot;);
+        }
+        int rrclass;
+        int rrtype;
+<span class="fc" id="L696">        int space = attrId.indexOf(' ');</span>
+
+        // class
+<span class="pc bpc" id="L699" title="1 of 2 branches missed.">        if (space &lt; 0) {</span>
+<span class="fc" id="L700">            rrclass = ResourceRecord.CLASS_INTERNET;</span>
+        } else {
+<span class="nc" id="L702">            String className = attrId.substring(0, space);</span>
+<span class="nc" id="L703">            rrclass = ResourceRecord.getRrclass(className);</span>
+<span class="nc bnc" id="L704" title="All 2 branches missed.">            if (rrclass &lt; 0) {</span>
+<span class="nc" id="L705">                throw new InvalidAttributeIdentifierException(</span>
+                        &quot;Unknown resource record class '&quot; + className + '\'');
+            }
+        }
+
+        // type
+<span class="fc" id="L711">        String typeName = attrId.substring(space + 1);</span>
+<span class="fc" id="L712">        rrtype = ResourceRecord.getType(typeName);</span>
+<span class="pc bpc" id="L713" title="1 of 2 branches missed.">        if (rrtype &lt; 0) {</span>
+<span class="nc" id="L714">            throw new InvalidAttributeIdentifierException(</span>
+                    &quot;Unknown resource record type '&quot; + typeName + '\'');
+        }
+
+<span class="fc" id="L718">        return new CT(rrclass, rrtype);</span>
+    }
+
+    /*
+     * Returns an array of the classes and types corresponding to a
+     * set of attribute IDs.  See toAttrId() for the format of
+     * attribute IDs, and classAndTypeMatch() for the format of the
+     * array returned.
+     */
+    private static CT[] attrIdsToClassesAndTypes(String[] attrIds)
+            throws InvalidAttributeIdentifierException {
+<span class="pc bpc" id="L729" title="1 of 2 branches missed.">        if (attrIds == null) {</span>
+<span class="nc" id="L730">            return null;</span>
+        }
+<span class="fc" id="L732">        CT[] cts = new CT[attrIds.length];</span>
+
+<span class="fc bfc" id="L734" title="All 2 branches covered.">        for (int i = 0; i &lt; attrIds.length; i++) {</span>
+<span class="fc" id="L735">            cts[i] = fromAttrId(attrIds[i]);</span>
+        }
+<span class="fc" id="L737">        return cts;</span>
+    }
+
+    /*
+     * Returns the most restrictive resource record class and type
+     * that may be used to query for records matching cts.
+     * See classAndTypeMatch() for matching rules.
+     */
+    private static CT getClassAndTypeToQuery(CT[] cts) {
+        int rrclass;
+        int rrtype;
+
+<span class="pc bpc" id="L749" title="1 of 2 branches missed.">        if (cts == null) {</span>
+            // Query all records.
+<span class="nc" id="L751">            rrclass = ANY;</span>
+<span class="nc" id="L752">            rrtype  = ANY;</span>
+<span class="pc bpc" id="L753" title="1 of 2 branches missed.">        } else if (cts.length == 0) {</span>
+            // No records are requested, but we need to ask for something.
+<span class="nc" id="L755">            rrclass = ResourceRecord.CLASS_INTERNET;</span>
+<span class="nc" id="L756">            rrtype  = ANY;</span>
+        } else {
+<span class="fc" id="L758">            rrclass = cts[0].rrclass;</span>
+<span class="fc" id="L759">            rrtype  = cts[0].rrtype;</span>
+<span class="pc bpc" id="L760" title="1 of 2 branches missed.">            for (int i = 1; i &lt; cts.length; i++) {</span>
+<span class="nc bnc" id="L761" title="All 2 branches missed.">                if (rrclass != cts[i].rrclass) {</span>
+<span class="nc" id="L762">                    rrclass = ANY;</span>
+                }
+<span class="nc bnc" id="L764" title="All 2 branches missed.">                if (rrtype != cts[i].rrtype) {</span>
+<span class="nc" id="L765">                    rrtype = ANY;</span>
+                }
+            }
+        }
+<span class="fc" id="L769">        return new CT(rrclass, rrtype);</span>
+    }
+
+
+    //---------- Support for list operations
+
+    /*
+     * Synchronization notes:
+     *
+     * Any access to zoneTree that walks the tree, whether it modifies
+     * the tree or not, is synchronized on zoneTree.
+     * [%%% Note:  a read/write lock would allow increased concurrency.]
+     * The depth of a ZoneNode can thereafter be accessed without
+     * further synchronization.  Access to other fields and methods
+     * should be synchronized on the node itself.
+     *
+     * A zone's contents is a NameNode tree that, once created, is never
+     * modified.  The only synchronization needed is to ensure that it
+     * gets flushed into shared memory after being created, which is
+     * accomplished by ZoneNode.populate().  The contents are accessed
+     * via a soft reference, so a ZoneNode may be seen to be populated
+     * one moment and unpopulated the next.
+     */
+
+    /*
+     * Returns the node in the zone tree corresponding to a
+     * fully-qualified domain name.  If the desired portion of the
+     * tree has not yet been populated or has been outdated, a zone
+     * transfer is done to populate the tree.
+     */
+    private NameNode getNameNode(DnsName fqdn) throws NamingException {
+<span class="nc" id="L800">        dprint(&quot;getNameNode(&quot; + fqdn + &quot;)&quot;);</span>
+
+        // Find deepest related zone in zone tree.
+        ZoneNode znode;
+        DnsName zone;
+<span class="nc" id="L805">        synchronized (zoneTree) {</span>
+<span class="nc" id="L806">            znode = zoneTree.getDeepestPopulated(fqdn);</span>
+<span class="nc" id="L807">        }</span>
+<span class="nc bnc" id="L808" title="All 2 branches missed.">        dprint(&quot;Deepest related zone in zone tree: &quot; +</span>
+<span class="nc" id="L809">               ((znode != null) ? znode.getLabel() : &quot;[none]&quot;));</span>
+
+        NameNode topOfZone;
+        NameNode nnode;
+
+<span class="nc bnc" id="L814" title="All 2 branches missed.">        if (znode != null) {</span>
+<span class="nc" id="L815">            synchronized (znode) {</span>
+<span class="nc" id="L816">                topOfZone = znode.getContents();</span>
+<span class="nc" id="L817">            }</span>
+            // If fqdn is in znode's zone, is not at a zone cut, and
+            // is current, we're done.
+<span class="nc bnc" id="L820" title="All 2 branches missed.">            if (topOfZone != null) {</span>
+<span class="nc" id="L821">                nnode = topOfZone.get(fqdn, znode.depth() + 1); // +1 for root</span>
+
+<span class="nc bnc" id="L823" title="All 4 branches missed.">                if ((nnode != null) &amp;&amp; !nnode.isZoneCut()) {</span>
+<span class="nc" id="L824">                    dprint(&quot;Found node &quot; + fqdn + &quot; in zone tree&quot;);</span>
+<span class="nc" id="L825">                    zone = (DnsName)</span>
+<span class="nc" id="L826">                        fqdn.getPrefix(znode.depth() + 1);      // +1 for root</span>
+<span class="nc" id="L827">                    boolean current = isZoneCurrent(znode, zone);</span>
+<span class="nc" id="L828">                    boolean restart = false;</span>
+
+<span class="nc" id="L830">                    synchronized (znode) {</span>
+<span class="nc bnc" id="L831" title="All 2 branches missed.">                        if (topOfZone != znode.getContents()) {</span>
+                            // Zone was modified while we were examining it.
+                            // All bets are off.
+<span class="nc" id="L834">                            restart = true;</span>
+<span class="nc bnc" id="L835" title="All 2 branches missed.">                        } else if (!current) {</span>
+<span class="nc" id="L836">                            znode.depopulate();</span>
+                        } else {
+<span class="nc" id="L838">                            return nnode;                       // cache hit!</span>
+                        }
+<span class="nc" id="L840">                    }</span>
+<span class="nc" id="L841">                    dprint(&quot;Zone not current; discarding node&quot;);</span>
+<span class="nc bnc" id="L842" title="All 2 branches missed.">                    if (restart) {</span>
+<span class="nc" id="L843">                        return getNameNode(fqdn);</span>
+                    }
+                }
+            }
+        }
+
+        // Cache miss...  do it the expensive way.
+<span class="nc" id="L850">        dprint(&quot;Adding node &quot; + fqdn + &quot; to zone tree&quot;);</span>
+
+        // Find fqdn's zone and add it to the tree.
+<span class="nc" id="L853">        zone = getResolver().findZoneName(fqdn, ResourceRecord.CLASS_INTERNET,</span>
+                                          recursion);
+<span class="nc" id="L855">        dprint(&quot;Node's zone is &quot; + zone);</span>
+<span class="nc" id="L856">        synchronized (zoneTree) {</span>
+<span class="nc" id="L857">            znode = (ZoneNode) zoneTree.add(zone, 1);   // &quot;1&quot; to skip root</span>
+<span class="nc" id="L858">        }</span>
+
+        // If znode is now populated we know -- because the first half of
+        // getNodeName() didn't find it -- that it was populated by another
+        // thread during this method call.  Assume then that it's current.
+
+<span class="nc" id="L864">        synchronized (znode) {</span>
+<span class="nc bnc" id="L865" title="All 2 branches missed.">            topOfZone = znode.isPopulated()</span>
+<span class="nc" id="L866">                ? znode.getContents()</span>
+<span class="nc" id="L867">                : populateZone(znode, zone);</span>
+<span class="nc" id="L868">        }</span>
+        // Desired node should now be in znode's populated zone.  Find it.
+<span class="nc" id="L870">        nnode = topOfZone.get(fqdn, zone.size());</span>
+<span class="nc bnc" id="L871" title="All 2 branches missed.">        if (nnode == null) {</span>
+<span class="nc" id="L872">            throw new ConfigurationException(</span>
+                    &quot;DNS error: node not found in its own zone&quot;);
+        }
+<span class="nc" id="L875">        dprint(&quot;Found node in newly-populated zone&quot;);</span>
+<span class="nc" id="L876">        return nnode;</span>
+    }
+
+    /*
+     * Does a zone transfer to [re]populate a zone in the zone tree.
+     * Returns the zone's new contents.
+     */
+    private NameNode populateZone(ZoneNode znode, DnsName zone)
+            throws NamingException {
+<span class="nc" id="L885">        dprint(&quot;Populating zone &quot; + zone);</span>
+        // assert Thread.holdsLock(znode);
+<span class="nc" id="L887">        ResourceRecords rrs =</span>
+<span class="nc" id="L888">            getResolver().queryZone(zone,</span>
+                                    ResourceRecord.CLASS_INTERNET, recursion);
+<span class="nc" id="L890">        dprint(&quot;zone xfer complete: &quot; + rrs.answer.size() + &quot; records&quot;);</span>
+<span class="nc" id="L891">        return znode.populate(zone, rrs);</span>
+    }
+
+    /*
+     * Determine if a ZoneNode's data is current.
+     * We base this on a comparison between the cached serial
+     * number and the latest SOA record.
+     *
+     * If there is no SOA record, znode is not (or is no longer) a zone:
+     * depopulate znode and return false.
+     *
+     * Since this method may perform a network operation, it is best
+     * to call it with znode unlocked.  Caller must then note that the
+     * result may be outdated by the time this method returns.
+     */
+    private boolean isZoneCurrent(ZoneNode znode, DnsName zone)
+            throws NamingException {
+        // former version:  return !znode.isExpired();
+
+<span class="nc bnc" id="L910" title="All 2 branches missed.">        if (!znode.isPopulated()) {</span>
+<span class="nc" id="L911">            return false;</span>
+        }
+<span class="nc" id="L913">        ResourceRecord soa =</span>
+<span class="nc" id="L914">            getResolver().findSoa(zone, ResourceRecord.CLASS_INTERNET,</span>
+                                  recursion);
+<span class="nc" id="L916">        synchronized (znode) {</span>
+<span class="nc bnc" id="L917" title="All 2 branches missed.">            if (soa == null) {</span>
+<span class="nc" id="L918">                znode.depopulate();</span>
+            }
+<span class="nc bnc" id="L920" title="All 2 branches missed.">            return (znode.isPopulated() &amp;&amp;</span>
+<span class="nc bnc" id="L921" title="All 2 branches missed.">                    znode.compareSerialNumberTo(soa) &gt;= 0);</span>
+<span class="nc" id="L922">        }</span>
+    }
+
+
+    //---------- Debugging
+
+    private static final boolean debug = false;
+
+    private static final void dprint(String msg) {
+        if (debug) {
+            System.err.println(&quot;** &quot; + msg);
+        }
+<span class="nc" id="L934">    }</span>
+}
+
+
+//----------
+
+/*
+ * A pairing of a resource record class and a resource record type.
+ * A value of ANY in either field represents an indeterminate value.
+ */
+class CT {
+    int rrclass;
+    int rrtype;
+
+<span class="fc" id="L948">    CT(int rrclass, int rrtype) {</span>
+<span class="fc" id="L949">        this.rrclass = rrclass;</span>
+<span class="fc" id="L950">        this.rrtype = rrtype;</span>
+<span class="fc" id="L951">    }</span>
+}
+
+
+//----------
+
+/*
+ * Common base class for NameClassPairEnumeration and BindingEnumeration.
+ */
+abstract class BaseNameClassPairEnumeration&lt;T&gt; implements NamingEnumeration&lt;T&gt; {
+
+    protected Enumeration&lt;NameNode&gt; nodes;    // nodes to be enumerated, or null if none
+    protected DnsContext ctx;       // context being enumerated
+
+<span class="nc" id="L965">    BaseNameClassPairEnumeration(DnsContext ctx, Hashtable&lt;String,NameNode&gt; nodes) {</span>
+<span class="nc" id="L966">        this.ctx = ctx;</span>
+<span class="nc bnc" id="L967" title="All 2 branches missed.">        this.nodes = (nodes != null)</span>
+<span class="nc" id="L968">            ? nodes.elements()</span>
+            : null;
+<span class="nc" id="L970">    }</span>
+
+    /*
+     * ctx will be set to null when no longer needed by the enumeration.
+     */
+    public final void close() {
+<span class="nc" id="L976">        nodes = null;</span>
+<span class="nc" id="L977">        ctx = null;</span>
+<span class="nc" id="L978">    }</span>
+
+    public final boolean hasMore() {
+<span class="nc bnc" id="L981" title="All 4 branches missed.">        boolean more = ((nodes != null) &amp;&amp; nodes.hasMoreElements());</span>
+<span class="nc bnc" id="L982" title="All 2 branches missed.">        if (!more) {</span>
+<span class="nc" id="L983">            close();</span>
+        }
+<span class="nc" id="L985">        return more;</span>
+    }
+
+    public final boolean hasMoreElements() {
+<span class="nc" id="L989">        return hasMore();</span>
+    }
+
+    abstract public T next() throws NamingException;
+
+    public final T nextElement() {
+        try {
+<span class="nc" id="L996">            return next();</span>
+<span class="nc" id="L997">        } catch (NamingException e) {</span>
+<span class="nc" id="L998">            java.util.NoSuchElementException nsee =</span>
+                    new java.util.NoSuchElementException();
+<span class="nc" id="L1000">            nsee.initCause(e);</span>
+<span class="nc" id="L1001">            throw nsee;</span>
+        }
+    }
+}
+
+/*
+ * An enumeration of name/classname pairs.
+ *
+ * Nodes that have children or that are zone cuts are returned with
+ * classname DirContext.  Other nodes are returned with classname
+ * Object even though they are DirContexts as well, since this might
+ * make the namespace easier to browse.
+ */
+final class NameClassPairEnumeration
+        extends BaseNameClassPairEnumeration&lt;NameClassPair&gt;
+        implements NamingEnumeration&lt;NameClassPair&gt; {
+
+    NameClassPairEnumeration(DnsContext ctx, Hashtable&lt;String,NameNode&gt; nodes) {
+<span class="nc" id="L1019">        super(ctx, nodes);</span>
+<span class="nc" id="L1020">    }</span>
+
+    @Override
+    public NameClassPair next() throws NamingException {
+<span class="nc bnc" id="L1024" title="All 2 branches missed.">        if (!hasMore()) {</span>
+<span class="nc" id="L1025">            throw new java.util.NoSuchElementException();</span>
+        }
+<span class="nc" id="L1027">        NameNode nnode = nodes.nextElement();</span>
+<span class="nc bnc" id="L1028" title="All 2 branches missed.">        String className = (nnode.isZoneCut() ||</span>
+<span class="nc bnc" id="L1029" title="All 2 branches missed.">                            (nnode.getChildren() != null))</span>
+            ? &quot;javax.naming.directory.DirContext&quot;
+            : &quot;java.lang.Object&quot;;
+
+<span class="nc" id="L1033">        String label = nnode.getLabel();</span>
+<span class="nc" id="L1034">        Name compName = (new DnsName()).add(label);</span>
+<span class="nc" id="L1035">        Name cname = (new CompositeName()).add(compName.toString());</span>
+
+<span class="nc" id="L1037">        NameClassPair ncp = new NameClassPair(cname.toString(), className);</span>
+<span class="nc" id="L1038">        ncp.setNameInNamespace(ctx.fullyQualify(cname).toString());</span>
+<span class="nc" id="L1039">        return ncp;</span>
+    }
+}
+
+/*
+ * An enumeration of Bindings.
+ */
+final class BindingEnumeration extends BaseNameClassPairEnumeration&lt;Binding&gt;
+                         implements NamingEnumeration&lt;Binding&gt; {
+
+    BindingEnumeration(DnsContext ctx, Hashtable&lt;String,NameNode&gt; nodes) {
+<span class="nc" id="L1050">        super(ctx, nodes);</span>
+<span class="nc" id="L1051">    }</span>
+
+    // Finalizer not needed since it's safe to leave ctx unclosed.
+//  protected void finalize() {
+//      close();
+//  }
+
+    @Override
+    public Binding next() throws NamingException {
+<span class="nc bnc" id="L1060" title="All 2 branches missed.">        if (!hasMore()) {</span>
+<span class="nc" id="L1061">            throw (new java.util.NoSuchElementException());</span>
+        }
+<span class="nc" id="L1063">        NameNode nnode = nodes.nextElement();</span>
+
+<span class="nc" id="L1065">        String label = nnode.getLabel();</span>
+<span class="nc" id="L1066">        Name compName = (new DnsName()).add(label);</span>
+<span class="nc" id="L1067">        String compNameStr = compName.toString();</span>
+<span class="nc" id="L1068">        Name cname = (new CompositeName()).add(compNameStr);</span>
+<span class="nc" id="L1069">        String cnameStr = cname.toString();</span>
+
+<span class="nc" id="L1071">        DnsName fqdn = ctx.fullyQualify(compName);</span>
+
+        // Clone ctx to create the child context.
+<span class="nc" id="L1074">        DnsContext child = new DnsContext(ctx, fqdn);</span>
+
+        try {
+<span class="nc" id="L1077">            Object obj = DirectoryManager.getObjectInstance(</span>
+                    child, cname, ctx, child.environment, null);
+<span class="nc" id="L1079">            Binding binding = new Binding(cnameStr, obj);</span>
+<span class="nc" id="L1080">            binding.setNameInNamespace(ctx.fullyQualify(cname).toString());</span>
+<span class="nc" id="L1081">            return binding;</span>
+<span class="nc" id="L1082">        } catch (Exception e) {</span>
+<span class="nc" id="L1083">            NamingException ne = new NamingException(</span>
+                    &quot;Problem generating object using object factory&quot;);
+<span class="nc" id="L1085">            ne.setRootCause(e);</span>
+<span class="nc" id="L1086">            throw ne;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

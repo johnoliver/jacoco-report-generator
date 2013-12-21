@@ -1,0 +1,725 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>DigestMD5Server.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">com.sun.security.sasl.digest</a> &gt; <span class="el_source">DigestMD5Server.java</span></div><h1>DigestMD5Server.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2003, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package com.sun.security.sasl.digest;
+
+import java.security.NoSuchAlgorithmException;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.UnsupportedEncodingException;
+import java.util.StringTokenizer;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Arrays;
+
+import java.util.logging.Level;
+
+import javax.security.sasl.*;
+import javax.security.auth.callback.*;
+
+/**
+  * An implementation of the DIGEST-MD5 server SASL mechanism.
+  * (&lt;a href=&quot;http://www.ietf.org/rfc/rfc2831.txt&quot;&gt;RFC 2831&lt;/a&gt;)
+  * &lt;p&gt;
+  * The DIGEST-MD5 SASL mechanism specifies two modes of authentication.
+  * &lt;ul&gt;&lt;li&gt;Initial Authentication
+  * &lt;li&gt;Subsequent Authentication - optional, (currently not supported)
+  * &lt;/ul&gt;
+  *
+  * Required callbacks:
+  * - RealmCallback
+  *      used as key by handler to fetch password
+  * - NameCallback
+  *      used as key by handler to fetch password
+  * - PasswordCallback
+  *      handler must enter password for username/realm supplied
+  * - AuthorizeCallback
+  *      handler must verify that authid/authzids are allowed and set
+  *      authorized ID to be the canonicalized authzid (if applicable).
+  *
+  * Environment properties that affect the implementation:
+  * javax.security.sasl.qop:
+  *    specifies list of qops; default is &quot;auth&quot;; typically, caller should set
+  *    this to &quot;auth, auth-int, auth-conf&quot;.
+  * javax.security.sasl.strength
+  *    specifies low/medium/high strength of encryption; default is all available
+  *    ciphers [high,medium,low]; high means des3 or rc4 (128); medium des or
+  *    rc4-56; low is rc4-40.
+  * javax.security.sasl.maxbuf
+  *    specifies max receive buf size; default is 65536
+  * javax.security.sasl.sendmaxbuffer
+  *    specifies max send buf size; default is 65536 (min of this and client's max
+  *    recv size)
+  *
+  * com.sun.security.sasl.digest.utf8:
+  *    &quot;true&quot; means to use UTF-8 charset; &quot;false&quot; to use ISO-8859-1 encoding;
+  *    default is &quot;true&quot;.
+  * com.sun.security.sasl.digest.realm:
+  *    space-separated list of realms; default is server name (fqdn parameter)
+  *
+  * @author Rosanna Lee
+  */
+
+final class DigestMD5Server extends DigestMD5Base implements SaslServer {
+<span class="fc" id="L87">    private static final String MY_CLASS_NAME = DigestMD5Server.class.getName();</span>
+
+    private static final String UTF8_DIRECTIVE = &quot;charset=utf-8,&quot;;
+    private static final String ALGORITHM_DIRECTIVE = &quot;algorithm=md5-sess&quot;;
+
+    /*
+     * Always expect nonce count value to be 1 because we support only
+     * initial authentication.
+     */
+    private static final int NONCE_COUNT_VALUE = 1;
+
+    /* &quot;true&quot; means use UTF8; &quot;false&quot; ISO 8859-1; default is &quot;true&quot; */
+    private static final String UTF8_PROPERTY =
+        &quot;com.sun.security.sasl.digest.utf8&quot;;
+
+    /* List of space-separated realms used for authentication */
+    private static final String REALM_PROPERTY =
+        &quot;com.sun.security.sasl.digest.realm&quot;;
+
+    /* Directives encountered in responses sent by the client. */
+<span class="fc" id="L107">    private static final String[] DIRECTIVE_KEY = {</span>
+        &quot;username&quot;,    // exactly once
+        &quot;realm&quot;,       // exactly once if sent by server
+        &quot;nonce&quot;,       // exactly once
+        &quot;cnonce&quot;,      // exactly once
+        &quot;nonce-count&quot;, // atmost once; default is 00000001
+        &quot;qop&quot;,         // atmost once; default is &quot;auth&quot;
+        &quot;digest-uri&quot;,  // atmost once; (default?)
+        &quot;response&quot;,    // exactly once
+        &quot;maxbuf&quot;,      // atmost once; default is 65536
+        &quot;charset&quot;,     // atmost once; default is ISO-8859-1
+        &quot;cipher&quot;,      // exactly once if qop is &quot;auth-conf&quot;
+        &quot;authzid&quot;,     // atmost once; default is none
+        &quot;auth-param&quot;,  // &gt;= 0 times (ignored)
+    };
+
+    /* Indices into DIRECTIVE_KEY */
+    private static final int USERNAME = 0;
+    private static final int REALM = 1;
+    private static final int NONCE = 2;
+    private static final int CNONCE = 3;
+    private static final int NONCE_COUNT = 4;
+    private static final int QOP = 5;
+    private static final int DIGEST_URI = 6;
+    private static final int RESPONSE = 7;
+    private static final int MAXBUF = 8;
+    private static final int CHARSET = 9;
+    private static final int CIPHER = 10;
+    private static final int AUTHZID = 11;
+    private static final int AUTH_PARAM = 12;
+
+    /* Server-generated/supplied information */
+    private String specifiedQops;
+    private byte[] myCiphers;
+    private List&lt;String&gt; serverRealms;
+
+    DigestMD5Server(String protocol, String serverName, Map&lt;String, ?&gt; props,
+            CallbackHandler cbh) throws SaslException {
+<span class="pc bpc" id="L145" title="1 of 2 branches missed.">        super(props, MY_CLASS_NAME, 1,</span>
+                protocol + &quot;/&quot; + (serverName==null?&quot;*&quot;:serverName),
+                cbh);
+
+<span class="fc" id="L149">        serverRealms = new ArrayList&lt;String&gt;();</span>
+
+<span class="fc" id="L151">        useUTF8 = true;  // default</span>
+
+<span class="pc bpc" id="L153" title="1 of 2 branches missed.">        if (props != null) {</span>
+<span class="fc" id="L154">            specifiedQops = (String) props.get(Sasl.QOP);</span>
+<span class="fc bfc" id="L155" title="All 2 branches covered.">            if (&quot;false&quot;.equals((String) props.get(UTF8_PROPERTY))) {</span>
+<span class="fc" id="L156">                useUTF8 = false;</span>
+<span class="fc" id="L157">                logger.log(Level.FINE, &quot;DIGEST80:Server supports ISO-Latin-1&quot;);</span>
+            }
+
+<span class="fc" id="L160">            String realms = (String) props.get(REALM_PROPERTY);</span>
+<span class="fc bfc" id="L161" title="All 2 branches covered.">            if (realms != null) {</span>
+<span class="fc" id="L162">                StringTokenizer parser = new StringTokenizer(realms, &quot;, \t\n&quot;);</span>
+<span class="fc" id="L163">                int tokenCount = parser.countTokens();</span>
+<span class="fc" id="L164">                String token = null;</span>
+<span class="fc bfc" id="L165" title="All 2 branches covered.">                for (int i = 0; i &lt; tokenCount; i++) {</span>
+<span class="fc" id="L166">                    token = parser.nextToken();</span>
+<span class="fc" id="L167">                    logger.log(Level.FINE, &quot;DIGEST81:Server supports realm {0}&quot;,</span>
+                        token);
+<span class="fc" id="L169">                    serverRealms.add(token);</span>
+                }
+            }
+        }
+
+<span class="fc bfc" id="L174" title="All 2 branches covered.">        encoding = (useUTF8 ? &quot;UTF8&quot; : &quot;8859_1&quot;);</span>
+
+        // By default, use server name as realm
+<span class="fc bfc" id="L177" title="All 2 branches covered.">        if (serverRealms.isEmpty()) {</span>
+<span class="pc bpc" id="L178" title="1 of 2 branches missed.">            if (serverName == null) {</span>
+<span class="nc" id="L179">                throw new SaslException(</span>
+                        &quot;A realm must be provided in props or serverName&quot;);
+            } else {
+<span class="fc" id="L182">                serverRealms.add(serverName);</span>
+            }
+        }
+<span class="fc" id="L185">    }</span>
+
+    public  byte[] evaluateResponse(byte[] response) throws SaslException {
+<span class="pc bpc" id="L188" title="1 of 2 branches missed.">        if (response.length &gt; MAX_RESPONSE_LENGTH) {</span>
+<span class="nc" id="L189">            throw new SaslException(</span>
+                &quot;DIGEST-MD5: Invalid digest response length. Got:  &quot; +
+                response.length + &quot; Expected &lt; &quot; + MAX_RESPONSE_LENGTH);
+        }
+
+        byte[] challenge;
+<span class="pc bpc" id="L195" title="1 of 3 branches missed.">        switch (step) {</span>
+        case 1:
+<span class="pc bpc" id="L197" title="1 of 2 branches missed.">            if (response.length != 0) {</span>
+<span class="nc" id="L198">                throw new SaslException(</span>
+                    &quot;DIGEST-MD5 must not have an initial response&quot;);
+            }
+
+            /* Generate first challenge */
+<span class="fc" id="L203">            String supportedCiphers = null;</span>
+<span class="pc bpc" id="L204" title="1 of 2 branches missed.">            if ((allQop&amp;PRIVACY_PROTECTION) != 0) {</span>
+<span class="nc" id="L205">                myCiphers = getPlatformCiphers();</span>
+<span class="nc" id="L206">                StringBuffer buf = new StringBuffer();</span>
+
+                // myCipher[i] is a byte that indicates whether CIPHER_TOKENS[i]
+                // is supported
+<span class="nc bnc" id="L210" title="All 2 branches missed.">                for (int i = 0; i &lt; CIPHER_TOKENS.length; i++) {</span>
+<span class="nc bnc" id="L211" title="All 2 branches missed.">                    if (myCiphers[i] != 0) {</span>
+<span class="nc bnc" id="L212" title="All 2 branches missed.">                        if (buf.length() &gt; 0) {</span>
+<span class="nc" id="L213">                            buf.append(',');</span>
+                        }
+<span class="nc" id="L215">                        buf.append(CIPHER_TOKENS[i]);</span>
+                    }
+                }
+<span class="nc" id="L218">                supportedCiphers = buf.toString();</span>
+            }
+
+            try {
+<span class="fc" id="L222">                challenge = generateChallenge(serverRealms, specifiedQops,</span>
+                    supportedCiphers);
+
+<span class="fc" id="L225">                step = 3;</span>
+<span class="fc" id="L226">                return challenge;</span>
+<span class="nc" id="L227">            } catch (UnsupportedEncodingException e) {</span>
+<span class="nc" id="L228">                throw new SaslException(</span>
+                    &quot;DIGEST-MD5: Error encoding challenge&quot;, e);
+<span class="nc" id="L230">            } catch (IOException e) {</span>
+<span class="nc" id="L231">                throw new SaslException(</span>
+                    &quot;DIGEST-MD5: Error generating challenge&quot;, e);
+            }
+
+            // Step 2 is performed by client
+
+        case 3:
+            /* Validates client's response and generate challenge:
+             *    response-auth = &quot;rspauth&quot; &quot;=&quot; response-value
+             */
+            try {
+<span class="fc" id="L242">                byte[][] responseVal = parseDirectives(response, DIRECTIVE_KEY,</span>
+                    null, REALM);
+<span class="fc" id="L244">                challenge = validateClientResponse(responseVal);</span>
+<span class="nc" id="L245">            } catch (SaslException e) {</span>
+<span class="nc" id="L246">                throw e;</span>
+<span class="nc" id="L247">            } catch (UnsupportedEncodingException e) {</span>
+<span class="nc" id="L248">                throw new SaslException(</span>
+                    &quot;DIGEST-MD5: Error validating client response&quot;, e);
+            } finally {
+<span class="pc" id="L251">                step = 0;  // Set to invalid state</span>
+<span class="fc" id="L252">            }</span>
+
+<span class="fc" id="L254">            completed = true;</span>
+
+            /* Initialize SecurityCtx implementation */
+<span class="pc bpc" id="L257" title="3 of 4 branches missed.">            if (integrity &amp;&amp; privacy) {</span>
+<span class="nc" id="L258">                secCtx = new DigestPrivacy(false /* not client */);</span>
+<span class="pc bpc" id="L259" title="1 of 2 branches missed.">            } else if (integrity) {</span>
+<span class="nc" id="L260">                secCtx = new DigestIntegrity(false /* not client */);</span>
+            }
+
+<span class="fc" id="L263">            return challenge;</span>
+
+        default:
+            // No other possible state
+<span class="nc" id="L267">            throw new SaslException(&quot;DIGEST-MD5: Server at illegal state&quot;);</span>
+        }
+    }
+
+    /**
+     * Generates challenge to be sent to client.
+     *  digest-challenge  =
+     *    1#( realm | nonce | qop-options | stale | maxbuf | charset
+     *               algorithm | cipher-opts | auth-param )
+     *
+     *        realm             = &quot;realm&quot; &quot;=&quot; &lt;&quot;&gt; realm-value &lt;&quot;&gt;
+     *        realm-value       = qdstr-val
+     *        nonce             = &quot;nonce&quot; &quot;=&quot; &lt;&quot;&gt; nonce-value &lt;&quot;&gt;
+     *        nonce-value       = qdstr-val
+     *        qop-options       = &quot;qop&quot; &quot;=&quot; &lt;&quot;&gt; qop-list &lt;&quot;&gt;
+     *        qop-list          = 1#qop-value
+     *        qop-value         = &quot;auth&quot; | &quot;auth-int&quot; | &quot;auth-conf&quot; |
+     *                             token
+     *        stale             = &quot;stale&quot; &quot;=&quot; &quot;true&quot;
+     *        maxbuf            = &quot;maxbuf&quot; &quot;=&quot; maxbuf-value
+     *        maxbuf-value      = 1*DIGIT
+     *        charset           = &quot;charset&quot; &quot;=&quot; &quot;utf-8&quot;
+     *        algorithm         = &quot;algorithm&quot; &quot;=&quot; &quot;md5-sess&quot;
+     *        cipher-opts       = &quot;cipher&quot; &quot;=&quot; &lt;&quot;&gt; 1#cipher-value &lt;&quot;&gt;
+     *        cipher-value      = &quot;3des&quot; | &quot;des&quot; | &quot;rc4-40&quot; | &quot;rc4&quot; |
+     *                            &quot;rc4-56&quot; | token
+     *        auth-param        = token &quot;=&quot; ( token | quoted-string )
+     */
+    private byte[] generateChallenge(List&lt;String&gt; realms, String qopStr,
+        String cipherStr) throws UnsupportedEncodingException, IOException {
+<span class="fc" id="L297">        ByteArrayOutputStream out = new ByteArrayOutputStream();</span>
+
+        // Realms (&gt;= 0)
+<span class="pc bpc" id="L300" title="1 of 4 branches missed.">        for (int i = 0; realms != null &amp;&amp; i &lt; realms.size(); i++) {</span>
+<span class="fc" id="L301">            out.write(&quot;realm=\&quot;&quot;.getBytes(encoding));</span>
+<span class="fc" id="L302">            writeQuotedStringValue(out, realms.get(i).getBytes(encoding));</span>
+<span class="fc" id="L303">            out.write('&quot;');</span>
+<span class="fc" id="L304">            out.write(',');</span>
+        }
+
+        // Nonce - required (1)
+<span class="fc" id="L308">        out.write((&quot;nonce=\&quot;&quot;).getBytes(encoding));</span>
+<span class="fc" id="L309">        nonce = generateNonce();</span>
+<span class="fc" id="L310">        writeQuotedStringValue(out, nonce);</span>
+<span class="fc" id="L311">        out.write('&quot;');</span>
+<span class="fc" id="L312">        out.write(',');</span>
+
+        // QOP - optional (1) [default: auth]
+        // qop=&quot;auth,auth-conf,auth-int&quot;
+<span class="fc bfc" id="L316" title="All 2 branches covered.">        if (qopStr != null) {</span>
+<span class="fc" id="L317">            out.write((&quot;qop=\&quot;&quot;).getBytes(encoding));</span>
+            // Check for quotes in case of non-standard qop options
+<span class="fc" id="L319">            writeQuotedStringValue(out, qopStr.getBytes(encoding));</span>
+<span class="fc" id="L320">            out.write('&quot;');</span>
+<span class="fc" id="L321">            out.write(',');</span>
+        }
+
+        // maxbuf - optional (1) [default: 65536]
+<span class="pc bpc" id="L325" title="1 of 2 branches missed.">        if (recvMaxBufSize != DEFAULT_MAXBUF) {</span>
+<span class="nc" id="L326">            out.write((&quot;maxbuf=\&quot;&quot; + recvMaxBufSize + &quot;\&quot;,&quot;).getBytes(encoding));</span>
+        }
+
+        // charset - optional (1) [default: ISO 8859_1]
+<span class="fc bfc" id="L330" title="All 2 branches covered.">        if (useUTF8) {</span>
+<span class="fc" id="L331">            out.write(UTF8_DIRECTIVE.getBytes(encoding));</span>
+        }
+
+<span class="pc bpc" id="L334" title="1 of 2 branches missed.">        if (cipherStr != null) {</span>
+<span class="nc" id="L335">            out.write(&quot;cipher=\&quot;&quot;.getBytes(encoding));</span>
+            // Check for quotes in case of custom ciphers
+<span class="nc" id="L337">            writeQuotedStringValue(out, cipherStr.getBytes(encoding));</span>
+<span class="nc" id="L338">            out.write('&quot;');</span>
+<span class="nc" id="L339">            out.write(',');</span>
+        }
+
+        // algorithm - required (1)
+<span class="fc" id="L343">        out.write(ALGORITHM_DIRECTIVE.getBytes(encoding));</span>
+
+<span class="fc" id="L345">        return out.toByteArray();</span>
+    }
+
+    /**
+     * Validates client's response.
+     *   digest-response  = 1#( username | realm | nonce | cnonce |
+     *                          nonce-count | qop | digest-uri | response |
+     *                          maxbuf | charset | cipher | authzid |
+     *                          auth-param )
+     *
+     *       username         = &quot;username&quot; &quot;=&quot; &lt;&quot;&gt; username-value &lt;&quot;&gt;
+     *       username-value   = qdstr-val
+     *       cnonce           = &quot;cnonce&quot; &quot;=&quot; &lt;&quot;&gt; cnonce-value &lt;&quot;&gt;
+     *       cnonce-value     = qdstr-val
+     *       nonce-count      = &quot;nc&quot; &quot;=&quot; nc-value
+     *       nc-value         = 8LHEX
+     *       qop              = &quot;qop&quot; &quot;=&quot; qop-value
+     *       digest-uri       = &quot;digest-uri&quot; &quot;=&quot; &lt;&quot;&gt; digest-uri-value &lt;&quot;&gt;
+     *       digest-uri-value  = serv-type &quot;/&quot; host [ &quot;/&quot; serv-name ]
+     *       serv-type        = 1*ALPHA
+     *       host             = 1*( ALPHA | DIGIT | &quot;-&quot; | &quot;.&quot; )
+     *       serv-name        = host
+     *       response         = &quot;response&quot; &quot;=&quot; response-value
+     *       response-value   = 32LHEX
+     *       LHEX             = &quot;0&quot; | &quot;1&quot; | &quot;2&quot; | &quot;3&quot; |
+     *                          &quot;4&quot; | &quot;5&quot; | &quot;6&quot; | &quot;7&quot; |
+     *                          &quot;8&quot; | &quot;9&quot; | &quot;a&quot; | &quot;b&quot; |
+     *                          &quot;c&quot; | &quot;d&quot; | &quot;e&quot; | &quot;f&quot;
+     *       cipher           = &quot;cipher&quot; &quot;=&quot; cipher-value
+     *       authzid          = &quot;authzid&quot; &quot;=&quot; &lt;&quot;&gt; authzid-value &lt;&quot;&gt;
+     *       authzid-value    = qdstr-val
+     * sets:
+     *   negotiatedQop
+     *   negotiatedCipher
+     *   negotiatedRealm
+     *   negotiatedStrength
+     *   digestUri (checked and set to clients to account for case diffs)
+     *   sendMaxBufSize
+     *   authzid (gotten from callback)
+     * @return response-value ('rspauth') for client to validate
+     */
+    private byte[] validateClientResponse(byte[][] responseVal)
+        throws SaslException, UnsupportedEncodingException {
+
+        /* CHARSET: optional atmost once */
+<span class="fc bfc" id="L390" title="All 2 branches covered.">        if (responseVal[CHARSET] != null) {</span>
+            // The client should send this directive only if the server has
+            // indicated it supports UTF-8.
+<span class="pc bpc" id="L393" title="1 of 2 branches missed.">            if (!useUTF8 ||</span>
+<span class="pc bpc" id="L394" title="1 of 2 branches missed.">                !&quot;utf-8&quot;.equals(new String(responseVal[CHARSET], encoding))) {</span>
+<span class="nc" id="L395">                throw new SaslException(&quot;DIGEST-MD5: digest response format &quot; +</span>
+                    &quot;violation. Incompatible charset value: &quot; +
+                    new String(responseVal[CHARSET]));
+            }
+        }
+
+        // maxbuf: atmost once
+<span class="pc bpc" id="L402" title="1 of 2 branches missed.">        int clntMaxBufSize =</span>
+            (responseVal[MAXBUF] == null) ? DEFAULT_MAXBUF
+<span class="fc" id="L404">            : Integer.parseInt(new String(responseVal[MAXBUF], encoding));</span>
+
+        // Max send buf size is min of client's max recv buf size and
+        // server's max send buf size
+<span class="pc bpc" id="L408" title="1 of 2 branches missed.">        sendMaxBufSize = ((sendMaxBufSize == 0) ? clntMaxBufSize :</span>
+<span class="pc" id="L409">            Math.min(sendMaxBufSize, clntMaxBufSize));</span>
+
+        /* username: exactly once */
+        String username;
+<span class="pc bpc" id="L413" title="1 of 2 branches missed.">        if (responseVal[USERNAME] != null) {</span>
+<span class="fc" id="L414">            username = new String(responseVal[USERNAME], encoding);</span>
+<span class="fc" id="L415">            logger.log(Level.FINE, &quot;DIGEST82:Username: {0}&quot;, username);</span>
+        } else {
+<span class="nc" id="L417">            throw new SaslException(&quot;DIGEST-MD5: digest response format &quot; +</span>
+                &quot;violation. Missing username.&quot;);
+        }
+
+        /* realm: exactly once if sent by server */
+<span class="pc bpc" id="L422" title="1 of 2 branches missed.">        negotiatedRealm = ((responseVal[REALM] != null) ?</span>
+            new String(responseVal[REALM], encoding) : &quot;&quot;);
+<span class="fc" id="L424">        logger.log(Level.FINE, &quot;DIGEST83:Client negotiated realm: {0}&quot;,</span>
+            negotiatedRealm);
+
+<span class="pc bpc" id="L427" title="1 of 2 branches missed.">        if (!serverRealms.contains(negotiatedRealm)) {</span>
+            // Server had sent at least one realm
+            // Check that response is one of these
+<span class="nc" id="L430">            throw new SaslException(&quot;DIGEST-MD5: digest response format &quot; +</span>
+                &quot;violation. Nonexistent realm: &quot; + negotiatedRealm);
+        }
+        // Else, client specified realm was one of server's or server had none
+
+        /* nonce: exactly once */
+<span class="pc bpc" id="L436" title="1 of 2 branches missed.">        if (responseVal[NONCE] == null) {</span>
+<span class="nc" id="L437">            throw new SaslException(&quot;DIGEST-MD5: digest response format &quot; +</span>
+                &quot;violation. Missing nonce.&quot;);
+        }
+<span class="fc" id="L440">        byte[] nonceFromClient = responseVal[NONCE];</span>
+<span class="pc bpc" id="L441" title="1 of 2 branches missed.">        if (!Arrays.equals(nonceFromClient, nonce)) {</span>
+<span class="nc" id="L442">            throw new SaslException(&quot;DIGEST-MD5: digest response format &quot; +</span>
+                &quot;violation. Mismatched nonce.&quot;);
+        }
+
+        /* cnonce: exactly once */
+<span class="pc bpc" id="L447" title="1 of 2 branches missed.">        if (responseVal[CNONCE] == null) {</span>
+<span class="nc" id="L448">            throw new SaslException(&quot;DIGEST-MD5: digest response format &quot; +</span>
+                &quot;violation. Missing cnonce.&quot;);
+        }
+<span class="fc" id="L451">        byte[] cnonce = responseVal[CNONCE];</span>
+
+        /* nonce-count: atmost once */
+<span class="pc bpc" id="L454" title="1 of 2 branches missed.">        if (responseVal[NONCE_COUNT] != null &amp;&amp;</span>
+<span class="nc bnc" id="L455" title="All 2 branches missed.">            NONCE_COUNT_VALUE != Integer.parseInt(</span>
+                new String(responseVal[NONCE_COUNT], encoding), 16)) {
+<span class="nc" id="L457">            throw new SaslException(&quot;DIGEST-MD5: digest response format &quot; +</span>
+                &quot;violation. Nonce count does not match: &quot; +
+                new String(responseVal[NONCE_COUNT]));
+        }
+
+        /* qop: atmost once; default is &quot;auth&quot; */
+<span class="pc bpc" id="L463" title="1 of 2 branches missed.">        negotiatedQop = ((responseVal[QOP] != null) ?</span>
+            new String(responseVal[QOP], encoding) : &quot;auth&quot;);
+
+<span class="fc" id="L466">        logger.log(Level.FINE, &quot;DIGEST84:Client negotiated qop: {0}&quot;,</span>
+            negotiatedQop);
+
+        // Check that QOP is one sent by server
+        byte cQop;
+<span class="pc bpc" id="L471" title="11 of 14 branches missed.">        switch (negotiatedQop) {</span>
+            case &quot;auth&quot;:
+<span class="fc" id="L473">                cQop = NO_PROTECTION;</span>
+<span class="fc" id="L474">                break;</span>
+            case &quot;auth-int&quot;:
+<span class="nc" id="L476">                cQop = INTEGRITY_ONLY_PROTECTION;</span>
+<span class="nc" id="L477">                integrity = true;</span>
+<span class="nc" id="L478">                rawSendSize = sendMaxBufSize - 16;</span>
+<span class="nc" id="L479">                break;</span>
+            case &quot;auth-conf&quot;:
+<span class="nc" id="L481">                cQop = PRIVACY_PROTECTION;</span>
+<span class="nc" id="L482">                integrity = privacy = true;</span>
+<span class="nc" id="L483">                rawSendSize = sendMaxBufSize - 26;</span>
+<span class="nc" id="L484">                break;</span>
+            default:
+<span class="nc" id="L486">                throw new SaslException(&quot;DIGEST-MD5: digest response format &quot; +</span>
+                    &quot;violation. Invalid QOP: &quot; + negotiatedQop);
+        }
+<span class="pc bpc" id="L489" title="1 of 2 branches missed.">        if ((cQop&amp;allQop) == 0) {</span>
+<span class="nc" id="L490">            throw new SaslException(&quot;DIGEST-MD5: server does not support &quot; +</span>
+                &quot; qop: &quot; + negotiatedQop);
+        }
+
+<span class="pc bpc" id="L494" title="1 of 2 branches missed.">        if (privacy) {</span>
+<span class="nc bnc" id="L495" title="All 2 branches missed.">            negotiatedCipher = ((responseVal[CIPHER] != null) ?</span>
+                new String(responseVal[CIPHER], encoding) : null);
+<span class="nc bnc" id="L497" title="All 2 branches missed.">            if (negotiatedCipher == null) {</span>
+<span class="nc" id="L498">                throw new SaslException(&quot;DIGEST-MD5: digest response format &quot; +</span>
+                    &quot;violation. No cipher specified.&quot;);
+            }
+
+<span class="nc" id="L502">            int foundCipher = -1;</span>
+<span class="nc" id="L503">            logger.log(Level.FINE, &quot;DIGEST85:Client negotiated cipher: {0}&quot;,</span>
+                negotiatedCipher);
+
+            // Check that cipher is one that we offered
+<span class="nc bnc" id="L507" title="All 2 branches missed.">            for (int j = 0; j &lt; CIPHER_TOKENS.length; j++) {</span>
+<span class="nc bnc" id="L508" title="All 4 branches missed.">                if (negotiatedCipher.equals(CIPHER_TOKENS[j]) &amp;&amp;</span>
+                    myCiphers[j] != 0) {
+<span class="nc" id="L510">                    foundCipher = j;</span>
+<span class="nc" id="L511">                    break;</span>
+                }
+            }
+<span class="nc bnc" id="L514" title="All 2 branches missed.">            if (foundCipher == -1) {</span>
+<span class="nc" id="L515">                throw new SaslException(&quot;DIGEST-MD5: server does not &quot; +</span>
+                    &quot;support cipher: &quot; + negotiatedCipher);
+            }
+            // Set negotiatedStrength
+<span class="nc bnc" id="L519" title="All 2 branches missed.">            if ((CIPHER_MASKS[foundCipher]&amp;HIGH_STRENGTH) != 0) {</span>
+<span class="nc" id="L520">                negotiatedStrength = &quot;high&quot;;</span>
+<span class="nc bnc" id="L521" title="All 2 branches missed.">            } else if ((CIPHER_MASKS[foundCipher]&amp;MEDIUM_STRENGTH) != 0) {</span>
+<span class="nc" id="L522">                negotiatedStrength = &quot;medium&quot;;</span>
+            } else {
+                // assume default low
+<span class="nc" id="L525">                negotiatedStrength = &quot;low&quot;;</span>
+            }
+
+<span class="nc" id="L528">            logger.log(Level.FINE, &quot;DIGEST86:Negotiated strength: {0}&quot;,</span>
+                negotiatedStrength);
+        }
+
+        // atmost once
+<span class="pc bpc" id="L533" title="1 of 2 branches missed.">        String digestUriFromResponse = ((responseVal[DIGEST_URI]) != null ?</span>
+            new String(responseVal[DIGEST_URI], encoding) : null);
+
+<span class="pc bpc" id="L536" title="1 of 2 branches missed.">        if (digestUriFromResponse != null) {</span>
+<span class="fc" id="L537">            logger.log(Level.FINE, &quot;DIGEST87:digest URI: {0}&quot;,</span>
+                digestUriFromResponse);
+        }
+
+        // serv-type &quot;/&quot; host [ &quot;/&quot; serv-name ]
+        // e.g.: smtp/mail3.example.com/example.com
+        // e.g.: ftp/ftp.example.com
+        // e.g.: ldap/ldapserver.example.com
+
+        // host should match one of service's configured service names
+        // Check against digest URI that mech was created with
+
+<span class="pc bpc" id="L549" title="1 of 2 branches missed.">        if (uriMatches(digestUri, digestUriFromResponse)) {</span>
+<span class="fc" id="L550">            digestUri = digestUriFromResponse; // account for case-sensitive diffs</span>
+        } else {
+<span class="nc" id="L552">            throw new SaslException(&quot;DIGEST-MD5: digest response format &quot; +</span>
+                &quot;violation. Mismatched URI: &quot; + digestUriFromResponse +
+                &quot;; expecting: &quot; + digestUri);
+        }
+
+        // response: exactly once
+<span class="fc" id="L558">        byte[] responseFromClient = responseVal[RESPONSE];</span>
+<span class="pc bpc" id="L559" title="1 of 2 branches missed.">        if (responseFromClient == null) {</span>
+<span class="nc" id="L560">            throw new SaslException(&quot;DIGEST-MD5: digest response format &quot; +</span>
+                &quot; violation. Missing response.&quot;);
+        }
+
+        // authzid: atmost once
+        byte[] authzidBytes;
+<span class="pc bpc" id="L566" title="1 of 2 branches missed.">        String authzidFromClient = ((authzidBytes=responseVal[AUTHZID]) != null?</span>
+            new String(authzidBytes, encoding) : username);
+
+<span class="pc bpc" id="L569" title="1 of 2 branches missed.">        if (authzidBytes != null) {</span>
+<span class="nc" id="L570">            logger.log(Level.FINE, &quot;DIGEST88:Authzid: {0}&quot;,</span>
+                new String(authzidBytes));
+        }
+
+        // Ignore auth-param
+
+        // Get password need to generate verifying response
+        char[] passwd;
+        try {
+            // Realm and Name callbacks are used to provide info
+<span class="fc" id="L580">            RealmCallback rcb = new RealmCallback(&quot;DIGEST-MD5 realm: &quot;,</span>
+                negotiatedRealm);
+<span class="fc" id="L582">            NameCallback ncb = new NameCallback(&quot;DIGEST-MD5 authentication ID: &quot;,</span>
+                username);
+
+            // PasswordCallback is used to collect info
+<span class="fc" id="L586">            PasswordCallback pcb =</span>
+                new PasswordCallback(&quot;DIGEST-MD5 password: &quot;, false);
+
+<span class="fc" id="L589">            cbh.handle(new Callback[] {rcb, ncb, pcb});</span>
+<span class="fc" id="L590">            passwd = pcb.getPassword();</span>
+<span class="fc" id="L591">            pcb.clearPassword();</span>
+
+<span class="nc" id="L593">        } catch (UnsupportedCallbackException e) {</span>
+<span class="nc" id="L594">            throw new SaslException(</span>
+                &quot;DIGEST-MD5: Cannot perform callback to acquire password&quot;, e);
+
+<span class="nc" id="L597">        } catch (IOException e) {</span>
+<span class="nc" id="L598">            throw new SaslException(</span>
+                &quot;DIGEST-MD5: IO error acquiring password&quot;, e);
+<span class="fc" id="L600">        }</span>
+
+<span class="pc bpc" id="L602" title="1 of 2 branches missed.">        if (passwd == null) {</span>
+<span class="nc" id="L603">            throw new SaslException(</span>
+                &quot;DIGEST-MD5: cannot acquire password for &quot; + username +
+                &quot; in realm : &quot; + negotiatedRealm);
+        }
+
+        try {
+            // Validate response value sent by client
+            byte[] expectedResponse;
+
+            try {
+<span class="fc" id="L613">                expectedResponse = generateResponseValue(&quot;AUTHENTICATE&quot;,</span>
+                    digestUri, negotiatedQop, username, negotiatedRealm,
+                    passwd, nonce /* use own nonce */,
+                    cnonce, NONCE_COUNT_VALUE, authzidBytes);
+
+<span class="nc" id="L618">            } catch (NoSuchAlgorithmException e) {</span>
+<span class="nc" id="L619">                throw new SaslException(</span>
+                    &quot;DIGEST-MD5: problem duplicating client response&quot;, e);
+<span class="nc" id="L621">            } catch (IOException e) {</span>
+<span class="nc" id="L622">                throw new SaslException(</span>
+                    &quot;DIGEST-MD5: problem duplicating client response&quot;, e);
+<span class="fc" id="L624">            }</span>
+
+<span class="pc bpc" id="L626" title="1 of 2 branches missed.">            if (!Arrays.equals(responseFromClient, expectedResponse)) {</span>
+<span class="nc" id="L627">                throw new SaslException(&quot;DIGEST-MD5: digest response format &quot; +</span>
+                    &quot;violation. Mismatched response.&quot;);
+            }
+
+            // Ensure that authzid mapping is OK
+            try {
+<span class="fc" id="L633">                AuthorizeCallback acb =</span>
+                    new AuthorizeCallback(username, authzidFromClient);
+<span class="fc" id="L635">                cbh.handle(new Callback[]{acb});</span>
+
+<span class="pc bpc" id="L637" title="1 of 2 branches missed.">                if (acb.isAuthorized()) {</span>
+<span class="fc" id="L638">                    authzid = acb.getAuthorizedID();</span>
+                } else {
+<span class="nc" id="L640">                    throw new SaslException(&quot;DIGEST-MD5: &quot; + username +</span>
+                        &quot; is not authorized to act as &quot; + authzidFromClient);
+                }
+<span class="nc" id="L643">            } catch (SaslException e) {</span>
+<span class="nc" id="L644">                throw e;</span>
+<span class="nc" id="L645">            } catch (UnsupportedCallbackException e) {</span>
+<span class="nc" id="L646">                throw new SaslException(</span>
+                    &quot;DIGEST-MD5: Cannot perform callback to check authzid&quot;, e);
+<span class="nc" id="L648">            } catch (IOException e) {</span>
+<span class="nc" id="L649">                throw new SaslException(</span>
+                    &quot;DIGEST-MD5: IO error checking authzid&quot;, e);
+<span class="fc" id="L651">            }</span>
+
+<span class="fc" id="L653">            return generateResponseAuth(username, passwd, cnonce,</span>
+                NONCE_COUNT_VALUE, authzidBytes);
+        } finally {
+            // Clear password
+<span class="pc bpc" id="L657" title="2 of 4 branches missed.">            for (int i = 0; i &lt; passwd.length; i++) {</span>
+<span class="pc" id="L658">                passwd[i] = 0;</span>
+            }
+        }
+    }
+
+    private static boolean uriMatches(String thisUri, String incomingUri) {
+        // Full match
+<span class="pc bpc" id="L665" title="1 of 2 branches missed.">        if (thisUri.equalsIgnoreCase(incomingUri)) {</span>
+<span class="fc" id="L666">            return true;</span>
+        }
+        // Unbound match
+<span class="nc bnc" id="L669" title="All 2 branches missed.">        if (thisUri.endsWith(&quot;/*&quot;)) {</span>
+<span class="nc" id="L670">            int protoAndSlash = thisUri.length() - 1;</span>
+<span class="nc" id="L671">            String thisProtoAndSlash = thisUri.substring(0, protoAndSlash);</span>
+<span class="nc" id="L672">            String incomingProtoAndSlash = incomingUri.substring(0, protoAndSlash);</span>
+<span class="nc" id="L673">            return thisProtoAndSlash.equalsIgnoreCase(incomingProtoAndSlash);</span>
+        }
+<span class="nc" id="L675">        return false;</span>
+    }
+
+    /**
+     * Server sends a message formatted as follows:
+     *    response-auth = &quot;rspauth&quot; &quot;=&quot; response-value
+     *   where response-value is calculated as above, using the values sent in
+     *   step two, except that if qop is &quot;auth&quot;, then A2 is
+     *
+     *       A2 = { &quot;:&quot;, digest-uri-value }
+     *
+     *   And if qop is &quot;auth-int&quot; or &quot;auth-conf&quot; then A2 is
+     *
+     *       A2 = { &quot;:&quot;, digest-uri-value, &quot;:00000000000000000000000000000000&quot; }
+     *
+     * Clears password afterwards.
+     */
+    private byte[] generateResponseAuth(String username, char[] passwd,
+        byte[] cnonce, int nonceCount, byte[] authzidBytes) throws SaslException {
+
+        // Construct response value
+
+        try {
+<span class="fc" id="L698">            byte[] responseValue = generateResponseValue(&quot;&quot;,</span>
+                digestUri, negotiatedQop, username, negotiatedRealm,
+                passwd, nonce, cnonce, nonceCount, authzidBytes);
+
+<span class="fc" id="L702">            byte[] challenge = new byte[responseValue.length + 8];</span>
+<span class="fc" id="L703">            System.arraycopy(&quot;rspauth=&quot;.getBytes(encoding), 0, challenge, 0, 8);</span>
+<span class="fc" id="L704">            System.arraycopy(responseValue, 0, challenge, 8,</span>
+                responseValue.length );
+
+<span class="fc" id="L707">            return challenge;</span>
+
+<span class="nc" id="L709">        } catch (NoSuchAlgorithmException e) {</span>
+<span class="nc" id="L710">            throw new SaslException(&quot;DIGEST-MD5: problem generating response&quot;, e);</span>
+<span class="nc" id="L711">        } catch (IOException e) {</span>
+<span class="nc" id="L712">            throw new SaslException(&quot;DIGEST-MD5: problem generating response&quot;, e);</span>
+        }
+    }
+
+    public String getAuthorizationID() {
+<span class="nc bnc" id="L717" title="All 2 branches missed.">        if (completed) {</span>
+<span class="nc" id="L718">            return authzid;</span>
+        } else {
+<span class="nc" id="L720">            throw new IllegalStateException(</span>
+                &quot;DIGEST-MD5 server negotiation not complete&quot;);
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

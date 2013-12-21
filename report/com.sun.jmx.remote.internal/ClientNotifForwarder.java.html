@@ -1,0 +1,907 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ClientNotifForwarder.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">com.sun.jmx.remote.internal</a> &gt; <span class="el_source">ClientNotifForwarder.java</span></div><h1>ClientNotifForwarder.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2002, 2008, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package com.sun.jmx.remote.internal;
+
+import java.io.IOException;
+import java.io.NotSerializableException;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.Executor;
+
+import java.security.AccessControlContext;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
+import javax.security.auth.Subject;
+
+import javax.management.Notification;
+import javax.management.NotificationListener;
+import javax.management.NotificationFilter;
+import javax.management.ObjectName;
+import javax.management.MBeanServerNotification;
+import javax.management.InstanceNotFoundException;
+import javax.management.ListenerNotFoundException;
+
+import javax.management.remote.NotificationResult;
+import javax.management.remote.TargetedNotification;
+
+import com.sun.jmx.remote.util.ClassLogger;
+import com.sun.jmx.remote.util.EnvHelp;
+import java.rmi.UnmarshalException;
+
+
+public abstract class ClientNotifForwarder {
+
+    private final AccessControlContext acc;
+
+    public ClientNotifForwarder(Map env) {
+<span class="nc" id="L62">        this(null, env);</span>
+<span class="nc" id="L63">    }</span>
+
+    private static int threadId;
+
+    /* An Executor that allows at most one executing and one pending
+       Runnable.  It uses at most one thread -- as soon as there is
+       no pending Runnable the thread can exit.  Another thread is
+       created as soon as there is a new pending Runnable.  This
+       Executor is adapted for use in a situation where each Runnable
+       usually schedules up another Runnable.  On return from the
+       first one, the second one is immediately executed.  So this
+       just becomes a complicated way to write a while loop, but with
+       the advantage that you can replace it with another Executor,
+       for instance one that you are using to execute a bunch of other
+       unrelated work.
+
+       You might expect that a java.util.concurrent.ThreadPoolExecutor
+       with corePoolSize=0 and maximumPoolSize=1 would have the same
+       behavior, but it does not.  A ThreadPoolExecutor only creates
+       a new thread when a new task is submitted and the number of
+       existing threads is &lt; corePoolSize.  This can never happen when
+       corePoolSize=0, so new threads are never created.  Surprising,
+       but there you are.
+    */
+<span class="nc" id="L87">    private static class LinearExecutor implements Executor {</span>
+        public synchronized void execute(Runnable command) {
+<span class="nc bnc" id="L89" title="All 2 branches missed.">            if (this.command != null)</span>
+<span class="nc" id="L90">                throw new IllegalArgumentException(&quot;More than one command&quot;);</span>
+<span class="nc" id="L91">            this.command = command;</span>
+<span class="nc bnc" id="L92" title="All 2 branches missed.">            if (thread == null) {</span>
+<span class="nc" id="L93">                thread = new Thread() {</span>
+
+                    @Override
+                    public void run() {
+                        while (true) {
+                            Runnable r;
+<span class="nc" id="L99">                            synchronized (LinearExecutor.this) {</span>
+<span class="nc bnc" id="L100" title="All 2 branches missed.">                                if (LinearExecutor.this.command == null) {</span>
+<span class="nc" id="L101">                                    thread = null;</span>
+<span class="nc" id="L102">                                    return;</span>
+                                } else {
+<span class="nc" id="L104">                                    r = LinearExecutor.this.command;</span>
+<span class="nc" id="L105">                                    LinearExecutor.this.command = null;</span>
+                                }
+<span class="nc" id="L107">                            }</span>
+<span class="nc" id="L108">                            r.run();</span>
+<span class="nc" id="L109">                        }</span>
+                    }
+                };
+<span class="nc" id="L112">                thread.setDaemon(true);</span>
+<span class="nc" id="L113">                thread.setName(&quot;ClientNotifForwarder-&quot; + ++threadId);</span>
+<span class="nc" id="L114">                thread.start();</span>
+            }
+<span class="nc" id="L116">        }</span>
+
+        private Runnable command;
+        private Thread thread;
+    }
+
+<span class="nc" id="L122">    public ClientNotifForwarder(ClassLoader defaultClassLoader, Map&lt;String, ?&gt; env) {</span>
+<span class="nc" id="L123">        maxNotifications = EnvHelp.getMaxFetchNotifNumber(env);</span>
+<span class="nc" id="L124">        timeout = EnvHelp.getFetchTimeout(env);</span>
+
+        /* You can supply an Executor in which the remote call to
+           fetchNotifications will be made.  The Executor's execute
+           method reschedules another task, so you must not use
+           an Executor that executes tasks in the caller's thread.  */
+<span class="nc" id="L130">        Executor ex = (Executor)</span>
+<span class="nc" id="L131">            env.get(&quot;jmx.remote.x.fetch.notifications.executor&quot;);</span>
+<span class="nc bnc" id="L132" title="All 2 branches missed.">        if (ex == null)</span>
+<span class="nc" id="L133">            ex = new LinearExecutor();</span>
+<span class="nc bnc" id="L134" title="All 2 branches missed.">        else if (logger.traceOn())</span>
+<span class="nc" id="L135">            logger.trace(&quot;ClientNotifForwarder&quot;, &quot;executor is &quot; + ex);</span>
+
+<span class="nc" id="L137">        this.defaultClassLoader = defaultClassLoader;</span>
+<span class="nc" id="L138">        this.executor = ex;</span>
+<span class="nc" id="L139">        this.acc = AccessController.getContext();</span>
+<span class="nc" id="L140">    }</span>
+
+    /**
+     * Called to to fetch notifications from a server.
+     */
+    abstract protected NotificationResult fetchNotifs(long clientSequenceNumber,
+                                                      int maxNotifications,
+                                                      long timeout)
+            throws IOException, ClassNotFoundException;
+
+    abstract protected Integer addListenerForMBeanRemovedNotif()
+        throws IOException, InstanceNotFoundException;
+
+    abstract protected void removeListenerForMBeanRemovedNotif(Integer id)
+        throws IOException, InstanceNotFoundException,
+               ListenerNotFoundException;
+
+    /**
+     * Used to send out a notification about lost notifs
+     */
+    abstract protected void lostNotifs(String message, long number);
+
+
+    public synchronized void addNotificationListener(Integer listenerID,
+                                        ObjectName name,
+                                        NotificationListener listener,
+                                        NotificationFilter filter,
+                                        Object handback,
+                                        Subject delegationSubject)
+            throws IOException, InstanceNotFoundException {
+
+<span class="nc bnc" id="L171" title="All 2 branches missed.">        if (logger.traceOn()) {</span>
+<span class="nc" id="L172">            logger.trace(&quot;addNotificationListener&quot;,</span>
+                         &quot;Add the listener &quot;+listener+&quot; at &quot;+name);
+        }
+
+<span class="nc" id="L176">        infoList.put(listenerID,</span>
+                     new ClientListenerInfo(listenerID,
+                                            name,
+                                            listener,
+                                            filter,
+                                            handback,
+                                            delegationSubject));
+
+
+<span class="nc" id="L185">        init(false);</span>
+<span class="nc" id="L186">    }</span>
+
+    public synchronized Integer[]
+        removeNotificationListener(ObjectName name,
+                                   NotificationListener listener)
+        throws ListenerNotFoundException, IOException {
+
+<span class="nc" id="L193">        beforeRemove();</span>
+
+<span class="nc bnc" id="L195" title="All 2 branches missed.">        if (logger.traceOn()) {</span>
+<span class="nc" id="L196">            logger.trace(&quot;removeNotificationListener&quot;,</span>
+                         &quot;Remove the listener &quot;+listener+&quot; from &quot;+name);
+        }
+
+<span class="nc" id="L200">        List&lt;Integer&gt; ids = new ArrayList&lt;Integer&gt;();</span>
+<span class="nc" id="L201">        List&lt;ClientListenerInfo&gt; values =</span>
+<span class="nc" id="L202">                new ArrayList&lt;ClientListenerInfo&gt;(infoList.values());</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">        for (int i=values.size()-1; i&gt;=0; i--) {</span>
+<span class="nc" id="L204">            ClientListenerInfo li = values.get(i);</span>
+
+<span class="nc bnc" id="L206" title="All 2 branches missed.">            if (li.sameAs(name, listener)) {</span>
+<span class="nc" id="L207">                ids.add(li.getListenerID());</span>
+
+<span class="nc" id="L209">                infoList.remove(li.getListenerID());</span>
+            }
+        }
+
+<span class="nc bnc" id="L213" title="All 2 branches missed.">        if (ids.isEmpty())</span>
+<span class="nc" id="L214">            throw new ListenerNotFoundException(&quot;Listener not found&quot;);</span>
+
+<span class="nc" id="L216">        return ids.toArray(new Integer[0]);</span>
+    }
+
+    public synchronized Integer
+        removeNotificationListener(ObjectName name,
+                                   NotificationListener listener,
+                                   NotificationFilter filter,
+                                   Object handback)
+            throws ListenerNotFoundException, IOException {
+
+<span class="nc bnc" id="L226" title="All 2 branches missed.">        if (logger.traceOn()) {</span>
+<span class="nc" id="L227">            logger.trace(&quot;removeNotificationListener&quot;,</span>
+                         &quot;Remove the listener &quot;+listener+&quot; from &quot;+name);
+        }
+
+<span class="nc" id="L231">        beforeRemove();</span>
+
+<span class="nc" id="L233">        Integer id = null;</span>
+
+<span class="nc" id="L235">        List&lt;ClientListenerInfo&gt; values =</span>
+<span class="nc" id="L236">                new ArrayList&lt;ClientListenerInfo&gt;(infoList.values());</span>
+<span class="nc bnc" id="L237" title="All 2 branches missed.">        for (int i=values.size()-1; i&gt;=0; i--) {</span>
+<span class="nc" id="L238">            ClientListenerInfo li = values.get(i);</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">            if (li.sameAs(name, listener, filter, handback)) {</span>
+<span class="nc" id="L240">                id=li.getListenerID();</span>
+
+<span class="nc" id="L242">                infoList.remove(id);</span>
+
+<span class="nc" id="L244">                break;</span>
+            }
+        }
+
+<span class="nc bnc" id="L248" title="All 2 branches missed.">        if (id == null)</span>
+<span class="nc" id="L249">            throw new ListenerNotFoundException(&quot;Listener not found&quot;);</span>
+
+<span class="nc" id="L251">        return id;</span>
+    }
+
+    public synchronized Integer[] removeNotificationListener(ObjectName name) {
+<span class="nc bnc" id="L255" title="All 2 branches missed.">        if (logger.traceOn()) {</span>
+<span class="nc" id="L256">            logger.trace(&quot;removeNotificationListener&quot;,</span>
+                         &quot;Remove all listeners registered at &quot;+name);
+        }
+
+<span class="nc" id="L260">        List&lt;Integer&gt; ids = new ArrayList&lt;Integer&gt;();</span>
+
+<span class="nc" id="L262">        List&lt;ClientListenerInfo&gt; values =</span>
+<span class="nc" id="L263">                new ArrayList&lt;ClientListenerInfo&gt;(infoList.values());</span>
+<span class="nc bnc" id="L264" title="All 2 branches missed.">        for (int i=values.size()-1; i&gt;=0; i--) {</span>
+<span class="nc" id="L265">            ClientListenerInfo li = values.get(i);</span>
+<span class="nc bnc" id="L266" title="All 2 branches missed.">            if (li.sameAs(name)) {</span>
+<span class="nc" id="L267">                ids.add(li.getListenerID());</span>
+
+<span class="nc" id="L269">                infoList.remove(li.getListenerID());</span>
+            }
+        }
+
+<span class="nc" id="L273">        return ids.toArray(new Integer[0]);</span>
+    }
+
+    /*
+     * Called when a connector is doing reconnection. Like &lt;code&gt;postReconnection&lt;/code&gt;,
+     * this method is intended to be called only by a client connector:
+     * &lt;code&gt;RMIConnector&lt;/code&gt; and &lt;code&gt;ClientIntermediary&lt;/code&gt;.
+     * Call this method will set the flag beingReconnection to &lt;code&gt;true&lt;/code&gt;,
+     * and the thread used to fetch notifis will be stopped, a new thread can be
+     * created only after the method &lt;code&gt;postReconnection&lt;/code&gt; is called.
+     *
+     * It is caller's responsiblity to not re-call this method before calling
+     * &lt;code&gt;postReconnection&lt;/code&gt;.
+     */
+    public synchronized ClientListenerInfo[] preReconnection() throws IOException {
+<span class="nc bnc" id="L288" title="All 4 branches missed.">        if (state == TERMINATED || beingReconnected) { // should never</span>
+<span class="nc" id="L289">            throw new IOException(&quot;Illegal state.&quot;);</span>
+        }
+
+<span class="nc" id="L292">        final ClientListenerInfo[] tmp =</span>
+<span class="nc" id="L293">            infoList.values().toArray(new ClientListenerInfo[0]);</span>
+
+
+<span class="nc" id="L296">        beingReconnected = true;</span>
+
+<span class="nc" id="L298">        infoList.clear();</span>
+
+<span class="nc" id="L300">        return tmp;</span>
+    }
+
+    /**
+     * Called after reconnection is finished.
+     * This method is intended to be called only by a client connector:
+     * &lt;code&gt;RMIConnector&lt;/code&gt; and &lt;code&gt;ClientIntermediary&lt;/code&gt;.
+     */
+    public synchronized void postReconnection(ClientListenerInfo[] listenerInfos)
+        throws IOException {
+
+<span class="nc bnc" id="L311" title="All 2 branches missed.">        if (state == TERMINATED) {</span>
+<span class="nc" id="L312">            return;</span>
+        }
+
+<span class="nc bnc" id="L315" title="All 2 branches missed.">        while (state == STOPPING) {</span>
+            try {
+<span class="nc" id="L317">                wait();</span>
+<span class="nc" id="L318">            } catch (InterruptedException ire) {</span>
+<span class="nc" id="L319">                IOException ioe = new IOException(ire.toString());</span>
+<span class="nc" id="L320">                EnvHelp.initCause(ioe, ire);</span>
+<span class="nc" id="L321">                throw ioe;</span>
+<span class="nc" id="L322">            }</span>
+        }
+
+<span class="nc" id="L325">        final boolean trace = logger.traceOn();</span>
+<span class="nc" id="L326">        final int len   = listenerInfos.length;</span>
+
+<span class="nc bnc" id="L328" title="All 2 branches missed.">        for (int i=0; i&lt;len; i++) {</span>
+<span class="nc bnc" id="L329" title="All 2 branches missed.">            if (trace) {</span>
+<span class="nc" id="L330">                logger.trace(&quot;addNotificationListeners&quot;,</span>
+                             &quot;Add a listener at &quot;+
+<span class="nc" id="L332">                             listenerInfos[i].getListenerID());</span>
+            }
+
+<span class="nc" id="L335">            infoList.put(listenerInfos[i].getListenerID(), listenerInfos[i]);</span>
+        }
+
+<span class="nc" id="L338">        beingReconnected = false;</span>
+<span class="nc" id="L339">        notifyAll();</span>
+
+<span class="nc bnc" id="L341" title="All 6 branches missed.">        if (currentFetchThread == Thread.currentThread() ||</span>
+              state == STARTING || state == STARTED) { // doing or waiting reconnection
+              // only update mbeanRemovedNotifID
+            try {
+<span class="nc" id="L345">                mbeanRemovedNotifID = addListenerForMBeanRemovedNotif();</span>
+<span class="nc" id="L346">            } catch (Exception e) {</span>
+                final String msg =
+                    &quot;Failed to register a listener to the mbean &quot; +
+                    &quot;server: the client will not do clean when an MBean &quot; +
+                    &quot;is unregistered&quot;;
+<span class="nc bnc" id="L351" title="All 2 branches missed.">                if (logger.traceOn()) {</span>
+<span class="nc" id="L352">                    logger.trace(&quot;init&quot;, msg, e);</span>
+                }
+<span class="nc" id="L354">            }</span>
+        } else {
+<span class="nc bnc" id="L356" title="All 2 branches missed.">              while (state == STOPPING) {</span>
+                  try {
+<span class="nc" id="L358">                      wait();</span>
+<span class="nc" id="L359">                  } catch (InterruptedException ire) {</span>
+<span class="nc" id="L360">                      IOException ioe = new IOException(ire.toString());</span>
+<span class="nc" id="L361">                      EnvHelp.initCause(ioe, ire);</span>
+<span class="nc" id="L362">                      throw ioe;</span>
+<span class="nc" id="L363">                  }</span>
+              }
+
+<span class="nc bnc" id="L366" title="All 2 branches missed.">              if (listenerInfos.length &gt; 0) { // old listeners are re-added</span>
+<span class="nc" id="L367">                  init(true); // not update clientSequenceNumber</span>
+<span class="nc bnc" id="L368" title="All 2 branches missed.">              } else if (infoList.size() &gt; 0) { // only new listeners added during reconnection</span>
+<span class="nc" id="L369">                  init(false); // need update clientSequenceNumber</span>
+              }
+          }
+<span class="nc" id="L372">    }</span>
+
+    public synchronized void terminate() {
+<span class="nc bnc" id="L375" title="All 2 branches missed.">        if (state == TERMINATED) {</span>
+<span class="nc" id="L376">            return;</span>
+        }
+
+<span class="nc bnc" id="L379" title="All 2 branches missed.">        if (logger.traceOn()) {</span>
+<span class="nc" id="L380">            logger.trace(&quot;terminate&quot;, &quot;Terminating...&quot;);</span>
+        }
+
+<span class="nc bnc" id="L383" title="All 2 branches missed.">        if (state == STARTED) {</span>
+<span class="nc" id="L384">           infoList.clear();</span>
+        }
+
+<span class="nc" id="L387">        setState(TERMINATED);</span>
+<span class="nc" id="L388">    }</span>
+
+
+    // -------------------------------------------------
+    // private classes
+    // -------------------------------------------------
+    //
+
+<span class="nc" id="L396">    private class NotifFetcher implements Runnable {</span>
+
+<span class="nc" id="L398">        private volatile boolean alreadyLogged = false;</span>
+
+        private void logOnce(String msg, SecurityException x) {
+<span class="nc bnc" id="L401" title="All 2 branches missed.">            if (alreadyLogged) return;</span>
+            // Log only once.
+<span class="nc" id="L403">            logger.config(&quot;setContextClassLoader&quot;,msg);</span>
+<span class="nc bnc" id="L404" title="All 2 branches missed.">            if (x != null) logger.fine(&quot;setContextClassLoader&quot;, x);</span>
+<span class="nc" id="L405">            alreadyLogged = true;</span>
+<span class="nc" id="L406">        }</span>
+
+        // Set new context class loader, returns previous one.
+        private final ClassLoader setContextClassLoader(final ClassLoader loader) {
+<span class="nc" id="L410">            final AccessControlContext ctxt = ClientNotifForwarder.this.acc;</span>
+            // if ctxt is null, log a config message and throw a
+            // SecurityException.
+<span class="nc bnc" id="L413" title="All 2 branches missed.">            if (ctxt == null) {</span>
+<span class="nc" id="L414">                logOnce(&quot;AccessControlContext must not be null.&quot;,null);</span>
+<span class="nc" id="L415">                throw new SecurityException(&quot;AccessControlContext must not be null&quot;);</span>
+            }
+<span class="nc" id="L417">            return AccessController.doPrivileged(</span>
+<span class="nc" id="L418">                new PrivilegedAction&lt;ClassLoader&gt;() {</span>
+                    public ClassLoader run() {
+                        try {
+                            // get context class loader - may throw
+                            // SecurityException - though unlikely.
+                            final ClassLoader previous =
+<span class="nc" id="L424">                                Thread.currentThread().getContextClassLoader();</span>
+
+                            // if nothing needs to be done, break here...
+<span class="nc bnc" id="L427" title="All 2 branches missed.">                            if (loader == previous) return previous;</span>
+
+                            // reset context class loader - may throw
+                            // SecurityException
+<span class="nc" id="L431">                            Thread.currentThread().setContextClassLoader(loader);</span>
+<span class="nc" id="L432">                            return previous;</span>
+<span class="nc" id="L433">                        } catch (SecurityException x) {</span>
+<span class="nc" id="L434">                            logOnce(&quot;Permission to set ContextClassLoader missing. &quot; +</span>
+                                    &quot;Notifications will not be dispatched. &quot; +
+                                    &quot;Please check your Java policy configuration: &quot; +
+                                    x, x);
+<span class="nc" id="L438">                            throw x;</span>
+                        }
+                    }
+                }, ctxt);
+        }
+
+        public void run() {
+            final ClassLoader previous;
+<span class="nc bnc" id="L446" title="All 2 branches missed.">            if (defaultClassLoader != null) {</span>
+<span class="nc" id="L447">                previous = setContextClassLoader(defaultClassLoader);</span>
+            } else {
+<span class="nc" id="L449">                previous = null;</span>
+            }
+            try {
+<span class="nc" id="L452">                doRun();</span>
+            } finally {
+<span class="nc bnc" id="L454" title="All 4 branches missed.">                if (defaultClassLoader != null) {</span>
+<span class="nc" id="L455">                    setContextClassLoader(previous);</span>
+                }
+            }
+<span class="nc" id="L458">        }</span>
+
+        private void doRun() {
+<span class="nc" id="L461">            synchronized (ClientNotifForwarder.this) {</span>
+<span class="nc" id="L462">                currentFetchThread = Thread.currentThread();</span>
+
+<span class="nc bnc" id="L464" title="All 2 branches missed.">                if (state == STARTING) {</span>
+<span class="nc" id="L465">                    setState(STARTED);</span>
+                }
+<span class="nc" id="L467">            }</span>
+
+
+<span class="nc" id="L470">            NotificationResult nr = null;</span>
+<span class="nc bnc" id="L471" title="All 4 branches missed.">            if (!shouldStop() &amp;&amp; (nr = fetchNotifs()) != null) {</span>
+                // nr == null means got exception
+
+<span class="nc" id="L474">                final TargetedNotification[] notifs =</span>
+<span class="nc" id="L475">                    nr.getTargetedNotifications();</span>
+<span class="nc" id="L476">                final int len = notifs.length;</span>
+                final Map&lt;Integer, ClientListenerInfo&gt; listeners;
+                final Integer myListenerID;
+
+<span class="nc" id="L480">                long missed = 0;</span>
+
+<span class="nc" id="L482">                synchronized(ClientNotifForwarder.this) {</span>
+                    // check sequence number.
+                    //
+<span class="nc bnc" id="L485" title="All 2 branches missed.">                    if (clientSequenceNumber &gt;= 0) {</span>
+<span class="nc" id="L486">                        missed = nr.getEarliestSequenceNumber() -</span>
+<span class="nc" id="L487">                            clientSequenceNumber;</span>
+                    }
+
+<span class="nc" id="L490">                    clientSequenceNumber = nr.getNextSequenceNumber();</span>
+
+<span class="nc" id="L492">                    listeners = new HashMap&lt;Integer, ClientListenerInfo&gt;();</span>
+
+<span class="nc bnc" id="L494" title="All 2 branches missed.">                    for (int i = 0 ; i &lt; len ; i++) {</span>
+<span class="nc" id="L495">                        final TargetedNotification tn = notifs[i];</span>
+<span class="nc" id="L496">                        final Integer listenerID = tn.getListenerID();</span>
+
+                        // check if an mbean unregistration notif
+<span class="nc bnc" id="L499" title="All 2 branches missed.">                        if (!listenerID.equals(mbeanRemovedNotifID)) {</span>
+<span class="nc" id="L500">                            final ClientListenerInfo li = infoList.get(listenerID);</span>
+<span class="nc bnc" id="L501" title="All 2 branches missed.">                            if (li != null) {</span>
+<span class="nc" id="L502">                                listeners.put(listenerID, li);</span>
+                            }
+                            continue;
+                        }
+<span class="nc" id="L506">                        final Notification notif = tn.getNotification();</span>
+                        final String unreg =
+                            MBeanServerNotification.UNREGISTRATION_NOTIFICATION;
+<span class="nc bnc" id="L509" title="All 2 branches missed.">                        if (notif instanceof MBeanServerNotification &amp;&amp;</span>
+<span class="nc bnc" id="L510" title="All 2 branches missed.">                            notif.getType().equals(unreg)) {</span>
+
+<span class="nc" id="L512">                            MBeanServerNotification mbsn =</span>
+                                (MBeanServerNotification) notif;
+<span class="nc" id="L514">                            ObjectName name = mbsn.getMBeanName();</span>
+
+<span class="nc" id="L516">                            removeNotificationListener(name);</span>
+                        }
+                    }
+<span class="nc" id="L519">                    myListenerID = mbeanRemovedNotifID;</span>
+<span class="nc" id="L520">                }</span>
+
+<span class="nc bnc" id="L522" title="All 2 branches missed.">                if (missed &gt; 0) {</span>
+<span class="nc bnc" id="L523" title="All 2 branches missed.">                    final String msg =</span>
+                        &quot;May have lost up to &quot; + missed +
+                        &quot; notification&quot; + (missed == 1 ? &quot;&quot; : &quot;s&quot;);
+<span class="nc" id="L526">                    lostNotifs(msg, missed);</span>
+<span class="nc" id="L527">                    logger.trace(&quot;NotifFetcher.run&quot;, msg);</span>
+                }
+
+                // forward
+<span class="nc bnc" id="L531" title="All 2 branches missed.">                for (int i = 0 ; i &lt; len ; i++) {</span>
+<span class="nc" id="L532">                    final TargetedNotification tn = notifs[i];</span>
+<span class="nc" id="L533">                    dispatchNotification(tn,myListenerID,listeners);</span>
+                }
+            }
+
+<span class="nc" id="L537">            synchronized (ClientNotifForwarder.this) {</span>
+<span class="nc" id="L538">                currentFetchThread = null;</span>
+<span class="nc" id="L539">            }</span>
+
+<span class="nc bnc" id="L541" title="All 4 branches missed.">            if (nr == null || shouldStop()) {</span>
+                // tell that the thread is REALLY stopped
+<span class="nc" id="L543">                setState(STOPPED);</span>
+
+                try {
+<span class="nc" id="L546">                      removeListenerForMBeanRemovedNotif(mbeanRemovedNotifID);</span>
+<span class="nc" id="L547">                } catch (Exception e) {</span>
+<span class="nc bnc" id="L548" title="All 2 branches missed.">                    if (logger.traceOn()) {</span>
+<span class="nc" id="L549">                        logger.trace(&quot;NotifFetcher-run&quot;,</span>
+                                &quot;removeListenerForMBeanRemovedNotif&quot;, e);
+                    }
+<span class="nc" id="L552">                }</span>
+            } else {
+<span class="nc" id="L554">                executor.execute(this);</span>
+            }
+<span class="nc" id="L556">        }</span>
+
+        void dispatchNotification(TargetedNotification tn,
+                                  Integer myListenerID,
+                                  Map&lt;Integer, ClientListenerInfo&gt; listeners) {
+<span class="nc" id="L561">            final Notification notif = tn.getNotification();</span>
+<span class="nc" id="L562">            final Integer listenerID = tn.getListenerID();</span>
+
+<span class="nc bnc" id="L564" title="All 2 branches missed.">            if (listenerID.equals(myListenerID)) return;</span>
+<span class="nc" id="L565">            final ClientListenerInfo li = listeners.get(listenerID);</span>
+
+<span class="nc bnc" id="L567" title="All 2 branches missed.">            if (li == null) {</span>
+<span class="nc" id="L568">                logger.trace(&quot;NotifFetcher.dispatch&quot;,</span>
+                             &quot;Listener ID not in map&quot;);
+<span class="nc" id="L570">                return;</span>
+            }
+
+<span class="nc" id="L573">            NotificationListener l = li.getListener();</span>
+<span class="nc" id="L574">            Object h = li.getHandback();</span>
+            try {
+<span class="nc" id="L576">                l.handleNotification(notif, h);</span>
+<span class="nc" id="L577">            } catch (RuntimeException e) {</span>
+                final String msg =
+                    &quot;Failed to forward a notification &quot; +
+                    &quot;to a listener&quot;;
+<span class="nc" id="L581">                logger.trace(&quot;NotifFetcher-run&quot;, msg, e);</span>
+<span class="nc" id="L582">            }</span>
+
+<span class="nc" id="L584">        }</span>
+
+        private NotificationResult fetchNotifs() {
+            try {
+<span class="nc" id="L588">                NotificationResult nr = ClientNotifForwarder.this.</span>
+<span class="nc" id="L589">                    fetchNotifs(clientSequenceNumber,maxNotifications,</span>
+<span class="nc" id="L590">                                timeout);</span>
+
+<span class="nc bnc" id="L592" title="All 2 branches missed.">                if (logger.traceOn()) {</span>
+<span class="nc" id="L593">                    logger.trace(&quot;NotifFetcher-run&quot;,</span>
+                                 &quot;Got notifications from the server: &quot;+nr);
+                }
+
+<span class="nc" id="L597">                return nr;</span>
+<span class="nc" id="L598">            } catch (ClassNotFoundException | NotSerializableException | UnmarshalException e) {</span>
+<span class="nc" id="L599">                logger.trace(&quot;NotifFetcher.fetchNotifs&quot;, e);</span>
+<span class="nc" id="L600">                return fetchOneNotif();</span>
+<span class="nc" id="L601">            } catch (IOException ioe) {</span>
+<span class="nc bnc" id="L602" title="All 2 branches missed.">                if (!shouldStop()) {</span>
+<span class="nc" id="L603">                    logger.error(&quot;NotifFetcher-run&quot;,</span>
+                                 &quot;Failed to fetch notification, &quot; +
+                                 &quot;stopping thread. Error is: &quot; + ioe, ioe);
+<span class="nc" id="L606">                    logger.debug(&quot;NotifFetcher-run&quot;,ioe);</span>
+                }
+
+                // no more fetching
+<span class="nc" id="L610">                return null;</span>
+            }
+        }
+
+        /* Fetch one notification when we suspect that it might be a
+           notification that we can't deserialize (because of a
+           missing class).  First we ask for 0 notifications with 0
+           timeout.  This allows us to skip sequence numbers for
+           notifications that don't match our filters.  Then we ask
+           for one notification.  If that produces a
+           ClassNotFoundException, NotSerializableException or
+           UnmarshalException, we increase our sequence number and ask again.
+           Eventually we will either get a successful notification, or a
+           return with 0 notifications.  In either case we can return a
+           NotificationResult.  This algorithm works (albeit less
+           well) even if the server implementation doesn't optimize a
+           request for 0 notifications to skip sequence numbers for
+           notifications that don't match our filters.
+
+           If we had at least one
+           ClassNotFoundException/NotSerializableException/UnmarshalException,
+           then we must emit a JMXConnectionNotification.LOST_NOTIFS.
+        */
+        private NotificationResult fetchOneNotif() {
+<span class="nc" id="L634">            ClientNotifForwarder cnf = ClientNotifForwarder.this;</span>
+
+<span class="nc" id="L636">            long startSequenceNumber = clientSequenceNumber;</span>
+
+<span class="nc" id="L638">            int notFoundCount = 0;</span>
+
+<span class="nc" id="L640">            NotificationResult result = null;</span>
+<span class="nc" id="L641">            long firstEarliest = -1;</span>
+
+<span class="nc bnc" id="L643" title="All 4 branches missed.">            while (result == null &amp;&amp; !shouldStop()) {</span>
+                NotificationResult nr;
+
+                try {
+                    // 0 notifs to update startSequenceNumber
+<span class="nc" id="L648">                    nr = cnf.fetchNotifs(startSequenceNumber, 0, 0L);</span>
+<span class="nc" id="L649">                } catch (ClassNotFoundException e) {</span>
+<span class="nc" id="L650">                    logger.warning(&quot;NotifFetcher.fetchOneNotif&quot;,</span>
+                                   &quot;Impossible exception: &quot; + e);
+<span class="nc" id="L652">                    logger.debug(&quot;NotifFetcher.fetchOneNotif&quot;,e);</span>
+<span class="nc" id="L653">                    return null;</span>
+<span class="nc" id="L654">                } catch (IOException e) {</span>
+<span class="nc bnc" id="L655" title="All 2 branches missed.">                    if (!shouldStop())</span>
+<span class="nc" id="L656">                        logger.trace(&quot;NotifFetcher.fetchOneNotif&quot;, e);</span>
+<span class="nc" id="L657">                    return null;</span>
+<span class="nc" id="L658">                }</span>
+
+<span class="nc bnc" id="L660" title="All 2 branches missed.">                if (shouldStop())</span>
+<span class="nc" id="L661">                    return null;</span>
+
+<span class="nc" id="L663">                startSequenceNumber = nr.getNextSequenceNumber();</span>
+<span class="nc bnc" id="L664" title="All 2 branches missed.">                if (firstEarliest &lt; 0)</span>
+<span class="nc" id="L665">                    firstEarliest = nr.getEarliestSequenceNumber();</span>
+
+                try {
+                    // 1 notif to skip possible missing class
+<span class="nc" id="L669">                    result = cnf.fetchNotifs(startSequenceNumber, 1, 0L);</span>
+<span class="nc" id="L670">                } catch (ClassNotFoundException | NotSerializableException | UnmarshalException e) {</span>
+<span class="nc" id="L671">                    logger.warning(&quot;NotifFetcher.fetchOneNotif&quot;,</span>
+<span class="nc" id="L672">                                   &quot;Failed to deserialize a notification: &quot;+e.toString());</span>
+<span class="nc bnc" id="L673" title="All 2 branches missed.">                    if (logger.traceOn()) {</span>
+<span class="nc" id="L674">                        logger.trace(&quot;NotifFetcher.fetchOneNotif&quot;,</span>
+                                     &quot;Failed to deserialize a notification.&quot;, e);
+                    }
+
+<span class="nc" id="L678">                    notFoundCount++;</span>
+<span class="nc" id="L679">                    startSequenceNumber++;</span>
+<span class="nc" id="L680">                } catch (Exception e) {</span>
+<span class="nc bnc" id="L681" title="All 2 branches missed.">                    if (!shouldStop())</span>
+<span class="nc" id="L682">                        logger.trace(&quot;NotifFetcher.fetchOneNotif&quot;, e);</span>
+<span class="nc" id="L683">                    return null;</span>
+<span class="nc" id="L684">                }</span>
+<span class="nc" id="L685">            }</span>
+
+<span class="nc bnc" id="L687" title="All 2 branches missed.">            if (notFoundCount &gt; 0) {</span>
+<span class="nc bnc" id="L688" title="All 2 branches missed.">                final String msg =</span>
+                    &quot;Dropped &quot; + notFoundCount + &quot; notification&quot; +
+                    (notFoundCount == 1 ? &quot;&quot; : &quot;s&quot;) +
+                    &quot; because classes were missing locally or incompatible&quot;;
+<span class="nc" id="L692">                lostNotifs(msg, notFoundCount);</span>
+                // Even if result.getEarliestSequenceNumber() is now greater than
+                // it was initially, meaning some notifs have been dropped
+                // from the buffer, we don't want the caller to see that
+                // because it is then likely to renotify about the lost notifs.
+                // So we put back the first value of earliestSequenceNumber
+                // that we saw.
+<span class="nc bnc" id="L699" title="All 2 branches missed.">                if (result != null) {</span>
+<span class="nc" id="L700">                    result = new NotificationResult(</span>
+<span class="nc" id="L701">                            firstEarliest, result.getNextSequenceNumber(),</span>
+<span class="nc" id="L702">                            result.getTargetedNotifications());</span>
+                }
+            }
+
+<span class="nc" id="L706">            return result;</span>
+        }
+
+        private boolean shouldStop() {
+<span class="nc" id="L710">            synchronized (ClientNotifForwarder.this) {</span>
+<span class="nc bnc" id="L711" title="All 2 branches missed.">                if (state != STARTED) {</span>
+<span class="nc" id="L712">                    return true;</span>
+<span class="nc bnc" id="L713" title="All 2 branches missed.">                } else if (infoList.size() == 0) {</span>
+                    // no more listener, stop fetching
+<span class="nc" id="L715">                    setState(STOPPING);</span>
+
+<span class="nc" id="L717">                    return true;</span>
+                }
+
+<span class="nc" id="L720">                return false;</span>
+<span class="nc" id="L721">            }</span>
+        }
+    }
+
+
+// -------------------------------------------------
+// private methods
+// -------------------------------------------------
+    private synchronized void setState(int newState) {
+<span class="nc bnc" id="L730" title="All 2 branches missed.">        if (state == TERMINATED) {</span>
+<span class="nc" id="L731">            return;</span>
+        }
+
+<span class="nc" id="L734">        state = newState;</span>
+<span class="nc" id="L735">        this.notifyAll();</span>
+<span class="nc" id="L736">    }</span>
+
+    /*
+     * Called to decide whether need to start a thread for fetching notifs.
+     * &lt;P&gt;The parameter reconnected will decide whether to initilize the clientSequenceNumber,
+     * initilaizing the clientSequenceNumber means to ignore all notifications arrived before.
+     * If it is reconnected, we will not initialize in order to get all notifications arrived
+     * during the reconnection. It may cause the newly registered listeners to receive some
+     * notifications arrived before its registray.
+     */
+    private synchronized void init(boolean reconnected) throws IOException {
+<span class="nc bnc" id="L747" title="All 6 branches missed.">        switch (state) {</span>
+        case STARTED:
+<span class="nc" id="L749">            return;</span>
+        case STARTING:
+<span class="nc" id="L751">            return;</span>
+        case TERMINATED:
+<span class="nc" id="L753">            throw new IOException(&quot;The ClientNotifForwarder has been terminated.&quot;);</span>
+        case STOPPING:
+<span class="nc bnc" id="L755" title="All 2 branches missed.">            if (beingReconnected == true) {</span>
+                // wait for another thread to do, which is doing reconnection
+<span class="nc" id="L757">                return;</span>
+            }
+
+<span class="nc bnc" id="L760" title="All 2 branches missed.">            while (state == STOPPING) { // make sure only one fetching thread.</span>
+                try {
+<span class="nc" id="L762">                    wait();</span>
+<span class="nc" id="L763">                } catch (InterruptedException ire) {</span>
+<span class="nc" id="L764">                    IOException ioe = new IOException(ire.toString());</span>
+<span class="nc" id="L765">                    EnvHelp.initCause(ioe, ire);</span>
+
+<span class="nc" id="L767">                    throw ioe;</span>
+<span class="nc" id="L768">                }</span>
+            }
+
+            // re-call this method to check the state again,
+            // the state can be other value like TERMINATED.
+<span class="nc" id="L773">            init(reconnected);</span>
+
+<span class="nc" id="L775">            return;</span>
+        case STOPPED:
+<span class="nc bnc" id="L777" title="All 2 branches missed.">            if (beingReconnected == true) {</span>
+                // wait for another thread to do, which is doing reconnection
+<span class="nc" id="L779">                return;</span>
+            }
+
+<span class="nc bnc" id="L782" title="All 2 branches missed.">            if (logger.traceOn()) {</span>
+<span class="nc" id="L783">                logger.trace(&quot;init&quot;, &quot;Initializing...&quot;);</span>
+            }
+
+            // init the clientSequenceNumber if not reconnected.
+<span class="nc bnc" id="L787" title="All 2 branches missed.">            if (!reconnected) {</span>
+                try {
+<span class="nc" id="L789">                    NotificationResult nr = fetchNotifs(-1, 0, 0);</span>
+<span class="nc" id="L790">                    clientSequenceNumber = nr.getNextSequenceNumber();</span>
+<span class="nc" id="L791">                } catch (ClassNotFoundException e) {</span>
+                    // can't happen
+<span class="nc" id="L793">                    logger.warning(&quot;init&quot;, &quot;Impossible exception: &quot;+ e);</span>
+<span class="nc" id="L794">                    logger.debug(&quot;init&quot;,e);</span>
+<span class="nc" id="L795">                }</span>
+            }
+
+            // for cleaning
+            try {
+<span class="nc" id="L800">                mbeanRemovedNotifID = addListenerForMBeanRemovedNotif();</span>
+<span class="nc" id="L801">            } catch (Exception e) {</span>
+                final String msg =
+                    &quot;Failed to register a listener to the mbean &quot; +
+                    &quot;server: the client will not do clean when an MBean &quot; +
+                    &quot;is unregistered&quot;;
+<span class="nc bnc" id="L806" title="All 2 branches missed.">                if (logger.traceOn()) {</span>
+<span class="nc" id="L807">                    logger.trace(&quot;init&quot;, msg, e);</span>
+                }
+<span class="nc" id="L809">            }</span>
+
+<span class="nc" id="L811">            setState(STARTING);</span>
+
+            // start fetching
+<span class="nc" id="L814">            executor.execute(new NotifFetcher());</span>
+
+<span class="nc" id="L816">            return;</span>
+        default:
+            // should not
+<span class="nc" id="L819">            throw new IOException(&quot;Unknown state.&quot;);</span>
+        }
+    }
+
+    /**
+     * Import: should not remove a listener during reconnection, the reconnection
+     * needs to change the listener list and that will possibly make removal fail.
+     */
+    private synchronized void beforeRemove() throws IOException {
+<span class="nc bnc" id="L828" title="All 2 branches missed.">        while (beingReconnected) {</span>
+<span class="nc bnc" id="L829" title="All 2 branches missed.">            if (state == TERMINATED) {</span>
+<span class="nc" id="L830">                throw new IOException(&quot;Terminated.&quot;);</span>
+            }
+
+            try {
+<span class="nc" id="L834">                wait();</span>
+<span class="nc" id="L835">            } catch (InterruptedException ire) {</span>
+<span class="nc" id="L836">                IOException ioe = new IOException(ire.toString());</span>
+<span class="nc" id="L837">                EnvHelp.initCause(ioe, ire);</span>
+
+<span class="nc" id="L839">                throw ioe;</span>
+<span class="nc" id="L840">            }</span>
+        }
+
+<span class="nc bnc" id="L843" title="All 2 branches missed.">        if (state == TERMINATED) {</span>
+<span class="nc" id="L844">            throw new IOException(&quot;Terminated.&quot;);</span>
+        }
+<span class="nc" id="L846">    }</span>
+
+// -------------------------------------------------
+// private variables
+// -------------------------------------------------
+
+    private final ClassLoader defaultClassLoader;
+    private final Executor executor;
+
+<span class="nc" id="L855">    private final Map&lt;Integer, ClientListenerInfo&gt; infoList =</span>
+            new HashMap&lt;Integer, ClientListenerInfo&gt;();
+
+    // notif stuff
+<span class="nc" id="L859">    private long clientSequenceNumber = -1;</span>
+    private final int maxNotifications;
+    private final long timeout;
+<span class="nc" id="L862">    private Integer mbeanRemovedNotifID = null;</span>
+    private Thread currentFetchThread;
+
+    // state
+    /**
+     * This state means that a thread is being created for fetching and forwarding notifications.
+     */
+    private static final int STARTING = 0;
+
+    /**
+     * This state tells that a thread has been started for fetching and forwarding notifications.
+     */
+    private static final int STARTED = 1;
+
+    /**
+     * This state means that the fetching thread is informed to stop.
+     */
+    private static final int STOPPING = 2;
+
+    /**
+     * This state means that the fetching thread is already stopped.
+     */
+    private static final int STOPPED = 3;
+
+    /**
+     * This state means that this object is terminated and no more thread will be created
+     * for fetching notifications.
+     */
+    private static final int TERMINATED = 4;
+
+<span class="nc" id="L892">    private int state = STOPPED;</span>
+
+    /**
+     * This variable is used to tell whether a connector (RMIConnector or ClientIntermediary)
+     * is doing reconnection.
+     * This variable will be set to true by the method &lt;code&gt;preReconnection&lt;/code&gt;, and set
+     * to false by &lt;code&gt;postReconnection&lt;/code&gt;.
+     * When beingReconnected == true, no thread will be created for fetching notifications.
+     */
+<span class="nc" id="L901">    private boolean beingReconnected = false;</span>
+
+<span class="nc" id="L903">    private static final ClassLogger logger =</span>
+        new ClassLogger(&quot;javax.management.remote.misc&quot;,
+                        &quot;ClientNotifForwarder&quot;);
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

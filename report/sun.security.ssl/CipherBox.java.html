@@ -1,0 +1,1114 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>CipherBox.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.ssl</a> &gt; <span class="el_source">CipherBox.java</span></div><h1>CipherBox.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1996, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+
+package sun.security.ssl;
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.util.Hashtable;
+import java.util.Arrays;
+
+import java.security.*;
+import javax.crypto.*;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.GCMParameterSpec;
+
+import java.nio.*;
+
+import sun.security.ssl.CipherSuite.*;
+import static sun.security.ssl.CipherSuite.*;
+import static sun.security.ssl.CipherSuite.CipherType.*;
+
+import sun.misc.HexDumpEncoder;
+
+
+/**
+ * This class handles bulk data enciphering/deciphering for each SSLv3
+ * message.  This provides data confidentiality.  Stream ciphers (such
+ * as RC4) don't need to do padding; block ciphers (e.g. DES) need it.
+ *
+ * Individual instances are obtained by calling the static method
+ * newCipherBox(), which should only be invoked by BulkCipher.newCipher().
+ *
+ * In RFC 2246, with bock ciphers in CBC mode, the Initialization
+ * Vector (IV) for the first record is generated with the other keys
+ * and secrets when the security parameters are set.  The IV for
+ * subsequent records is the last ciphertext block from the previous
+ * record.
+ *
+ * In RFC 4346, the implicit Initialization Vector (IV) is replaced
+ * with an explicit IV to protect against CBC attacks.  RFC 4346
+ * recommends two algorithms used to generated the per-record IV.
+ * The implementation uses the algorithm (2)(b), as described at
+ * section 6.2.3.2 of RFC 4346.
+ *
+ * The usage of IV in CBC block cipher can be illustrated in
+ * the following diagrams.
+ *
+ *   (random)
+ *        R         P1                    IV        C1
+ *        |          |                     |         |
+ *  SIV---+    |-----+    |-...            |-----    |------
+ *        |    |     |    |                |    |    |     |
+ *     +----+  |  +----+  |             +----+  |  +----+  |
+ *     | Ek |  |  + Ek +  |             | Dk |  |  | Dk |  |
+ *     +----+  |  +----+  |             +----+  |  +----+  |
+ *        |    |     |    |                |    |    |     |
+ *        |----|     |----|           SIV--+    |----|     |-...
+ *        |          |                     |       |
+ *       IV         C1                     R      P1
+ *                                     (discard)
+ *
+ *       CBC Encryption                    CBC Decryption
+ *
+ * NOTE that any ciphering involved in key exchange (e.g. with RSA) is
+ * handled separately.
+ *
+ * @author David Brownell
+ * @author Andreas Sterbenz
+ */
+final class CipherBox {
+
+    // A CipherBox that implements the identity operation
+<span class="nc" id="L96">    final static CipherBox NULL = new CipherBox();</span>
+
+    /* Class and subclass dynamic debugging support */
+<span class="nc" id="L99">    private static final Debug debug = Debug.getInstance(&quot;ssl&quot;);</span>
+
+    // the protocol version this cipher conforms to
+    private final ProtocolVersion protocolVersion;
+
+    // cipher object
+    private final Cipher cipher;
+
+    /**
+     * secure random
+     */
+    private SecureRandom random;
+
+    /**
+     * fixed IV, the implicit nonce of AEAD cipher suite, only apply to
+     * AEAD cipher suites
+     */
+    private final byte[] fixedIv;
+
+    /**
+     * the key, reserved only for AEAD cipher initialization
+     */
+    private final Key key;
+
+    /**
+     * the operation mode, reserved for AEAD cipher initialization
+     */
+    private final int mode;
+
+    /**
+     * the authentication tag size, only apply to AEAD cipher suites
+     */
+    private final int tagSize;
+
+    /**
+     * the record IV length, only apply to AEAD cipher suites
+     */
+    private final int recordIvSize;
+
+    /**
+     * cipher type
+     */
+    private final CipherType cipherType;
+
+    /**
+     * Fixed masks of various block size, as the initial decryption IVs
+     * for TLS 1.1 or later.
+     *
+     * For performance, we do not use random IVs. As the initial decryption
+     * IVs will be discarded by TLS decryption processes, so the fixed masks
+     * do not hurt cryptographic strength.
+     */
+    private static Hashtable&lt;Integer, IvParameterSpec&gt; masks;
+
+    /**
+     * NULL cipherbox. Identity operation, no encryption.
+     */
+<span class="nc" id="L156">    private CipherBox() {</span>
+<span class="nc" id="L157">        this.protocolVersion = ProtocolVersion.DEFAULT;</span>
+<span class="nc" id="L158">        this.cipher = null;</span>
+<span class="nc" id="L159">        this.cipherType = STREAM_CIPHER;</span>
+<span class="nc" id="L160">        this.fixedIv = new byte[0];</span>
+<span class="nc" id="L161">        this.key = null;</span>
+<span class="nc" id="L162">        this.mode = Cipher.ENCRYPT_MODE;    // choose at random</span>
+<span class="nc" id="L163">        this.random = null;</span>
+<span class="nc" id="L164">        this.tagSize = 0;</span>
+<span class="nc" id="L165">        this.recordIvSize = 0;</span>
+<span class="nc" id="L166">    }</span>
+
+    /**
+     * Construct a new CipherBox using the cipher transformation.
+     *
+     * @exception NoSuchAlgorithmException if no appropriate JCE Cipher
+     * implementation could be found.
+     */
+    private CipherBox(ProtocolVersion protocolVersion, BulkCipher bulkCipher,
+            SecretKey key, IvParameterSpec iv, SecureRandom random,
+<span class="nc" id="L176">            boolean encrypt) throws NoSuchAlgorithmException {</span>
+        try {
+<span class="nc" id="L178">            this.protocolVersion = protocolVersion;</span>
+<span class="nc" id="L179">            this.cipher = JsseJce.getCipher(bulkCipher.transformation);</span>
+<span class="nc bnc" id="L180" title="All 2 branches missed.">            this.mode = encrypt ? Cipher.ENCRYPT_MODE : Cipher.DECRYPT_MODE;</span>
+
+<span class="nc bnc" id="L182" title="All 2 branches missed.">            if (random == null) {</span>
+<span class="nc" id="L183">                random = JsseJce.getSecureRandom();</span>
+            }
+<span class="nc" id="L185">            this.random = random;</span>
+<span class="nc" id="L186">            this.cipherType = bulkCipher.cipherType;</span>
+
+            /*
+             * RFC 4346 recommends two algorithms used to generated the
+             * per-record IV. The implementation uses the algorithm (2)(b),
+             * as described at section 6.2.3.2 of RFC 4346.
+             *
+             * As we don't care about the initial IV value for TLS 1.1 or
+             * later, so if the &quot;iv&quot; parameter is null, we use the default
+             * value generated by Cipher.init() for encryption, and a fixed
+             * mask for decryption.
+             */
+<span class="nc bnc" id="L198" title="All 8 branches missed.">            if (iv == null &amp;&amp; bulkCipher.ivSize != 0 &amp;&amp;</span>
+                    mode == Cipher.DECRYPT_MODE &amp;&amp;
+                    protocolVersion.v &gt;= ProtocolVersion.TLS11.v) {
+<span class="nc" id="L201">                iv = getFixedMask(bulkCipher.ivSize);</span>
+            }
+
+<span class="nc bnc" id="L204" title="All 2 branches missed.">            if (cipherType == AEAD_CIPHER) {</span>
+                // AEAD must completely initialize the cipher for each packet,
+                // and so we save initialization parameters for packet
+                // processing time.
+
+                // Set the tag size for AEAD cipher
+<span class="nc" id="L210">                tagSize = bulkCipher.tagSize;</span>
+
+                // Reserve the key for AEAD cipher initialization
+<span class="nc" id="L213">                this.key = key;</span>
+
+<span class="nc" id="L215">                fixedIv = iv.getIV();</span>
+<span class="nc bnc" id="L216" title="All 4 branches missed.">                if (fixedIv == null ||</span>
+                        fixedIv.length != bulkCipher.fixedIvSize) {
+<span class="nc" id="L218">                    throw new RuntimeException(&quot;Improper fixed IV for AEAD&quot;);</span>
+                }
+
+                // Set the record IV length for AEAD cipher
+<span class="nc" id="L222">                recordIvSize = bulkCipher.ivSize - bulkCipher.fixedIvSize;</span>
+
+                // DON'T initialize the cipher for AEAD!
+            } else {
+                // CBC only requires one initialization during its lifetime
+                // (future packets/IVs set the proper CBC state), so we can
+                // initialize now.
+
+                // Zeroize the variables that only apply to AEAD cipher
+<span class="nc" id="L231">                this.tagSize = 0;</span>
+<span class="nc" id="L232">                this.fixedIv = new byte[0];</span>
+<span class="nc" id="L233">                this.recordIvSize = 0;</span>
+<span class="nc" id="L234">                this.key = null;</span>
+
+                // Initialize the cipher
+<span class="nc" id="L237">                cipher.init(mode, key, iv, random);</span>
+            }
+<span class="nc" id="L239">        } catch (NoSuchAlgorithmException e) {</span>
+<span class="nc" id="L240">            throw e;</span>
+<span class="nc" id="L241">        } catch (Exception e) {</span>
+<span class="nc" id="L242">            throw new NoSuchAlgorithmException</span>
+                    (&quot;Could not create cipher &quot; + bulkCipher, e);
+<span class="nc" id="L244">        } catch (ExceptionInInitializerError e) {</span>
+<span class="nc" id="L245">            throw new NoSuchAlgorithmException</span>
+                    (&quot;Could not create cipher &quot; + bulkCipher, e);
+<span class="nc" id="L247">        }</span>
+<span class="nc" id="L248">    }</span>
+
+    /*
+     * Factory method to obtain a new CipherBox object.
+     */
+    static CipherBox newCipherBox(ProtocolVersion version, BulkCipher cipher,
+            SecretKey key, IvParameterSpec iv, SecureRandom random,
+            boolean encrypt) throws NoSuchAlgorithmException {
+<span class="nc bnc" id="L256" title="All 2 branches missed.">        if (cipher.allowed == false) {</span>
+<span class="nc" id="L257">            throw new NoSuchAlgorithmException(&quot;Unsupported cipher &quot; + cipher);</span>
+        }
+
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        if (cipher == B_NULL) {</span>
+<span class="nc" id="L261">            return NULL;</span>
+        } else {
+<span class="nc" id="L263">            return new CipherBox(version, cipher, key, iv, random, encrypt);</span>
+        }
+    }
+
+    /*
+     * Get a fixed mask, as the initial decryption IVs for TLS 1.1 or later.
+     */
+    private static IvParameterSpec getFixedMask(int ivSize) {
+<span class="nc bnc" id="L271" title="All 2 branches missed.">        if (masks == null) {</span>
+<span class="nc" id="L272">            masks = new Hashtable&lt;Integer, IvParameterSpec&gt;(5);</span>
+        }
+
+<span class="nc" id="L275">        IvParameterSpec iv = masks.get(ivSize);</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">        if (iv == null) {</span>
+<span class="nc" id="L277">            iv = new IvParameterSpec(new byte[ivSize]);</span>
+<span class="nc" id="L278">            masks.put(ivSize, iv);</span>
+        }
+
+<span class="nc" id="L281">        return iv;</span>
+    }
+
+    /*
+     * Encrypts a block of data, returning the size of the
+     * resulting block.
+     */
+    int encrypt(byte[] buf, int offset, int len) {
+<span class="nc bnc" id="L289" title="All 2 branches missed.">        if (cipher == null) {</span>
+<span class="nc" id="L290">            return len;</span>
+        }
+
+        try {
+<span class="nc" id="L294">            int blockSize = cipher.getBlockSize();</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">            if (cipherType == BLOCK_CIPHER) {</span>
+<span class="nc" id="L296">                len = addPadding(buf, offset, len, blockSize);</span>
+            }
+
+<span class="nc bnc" id="L299" title="All 4 branches missed.">            if (debug != null &amp;&amp; Debug.isOn(&quot;plaintext&quot;)) {</span>
+                try {
+<span class="nc" id="L301">                    HexDumpEncoder hd = new HexDumpEncoder();</span>
+
+<span class="nc" id="L303">                    System.out.println(</span>
+                        &quot;Padded plaintext before ENCRYPTION:  len = &quot;
+                        + len);
+<span class="nc" id="L306">                    hd.encodeBuffer(</span>
+                        new ByteArrayInputStream(buf, offset, len),
+                        System.out);
+<span class="nc" id="L309">                } catch (IOException e) { }</span>
+            }
+
+
+<span class="nc bnc" id="L313" title="All 2 branches missed.">            if (cipherType == AEAD_CIPHER) {</span>
+                try {
+<span class="nc" id="L315">                    return cipher.doFinal(buf, offset, len, buf, offset);</span>
+<span class="nc" id="L316">                } catch (IllegalBlockSizeException | BadPaddingException ibe) {</span>
+                    // unlikely to happen
+<span class="nc" id="L318">                    throw new RuntimeException(</span>
+                        &quot;Cipher error in AEAD mode in JCE provider &quot; +
+<span class="nc" id="L320">                        cipher.getProvider().getName(), ibe);</span>
+                }
+            } else {
+<span class="nc" id="L323">                int newLen = cipher.update(buf, offset, len, buf, offset);</span>
+<span class="nc bnc" id="L324" title="All 2 branches missed.">                if (newLen != len) {</span>
+                    // catch BouncyCastle buffering error
+<span class="nc" id="L326">                    throw new RuntimeException(&quot;Cipher buffering error &quot; +</span>
+<span class="nc" id="L327">                        &quot;in JCE provider &quot; + cipher.getProvider().getName());</span>
+                }
+<span class="nc" id="L329">                return newLen;</span>
+            }
+<span class="nc" id="L331">        } catch (ShortBufferException e) {</span>
+            // unlikely to happen, we should have enough buffer space here
+<span class="nc" id="L333">            throw new ArrayIndexOutOfBoundsException(e.toString());</span>
+        }
+    }
+
+    /*
+     * Encrypts a ByteBuffer block of data, returning the size of the
+     * resulting block.
+     *
+     * The byte buffers position and limit initially define the amount
+     * to encrypt.  On return, the position and limit are
+     * set to last position padded/encrypted.  The limit may have changed
+     * because of the added padding bytes.
+     */
+    int encrypt(ByteBuffer bb, int outLimit) {
+
+<span class="nc" id="L348">        int len = bb.remaining();</span>
+
+<span class="nc bnc" id="L350" title="All 2 branches missed.">        if (cipher == null) {</span>
+<span class="nc" id="L351">            bb.position(bb.limit());</span>
+<span class="nc" id="L352">            return len;</span>
+        }
+
+<span class="nc" id="L355">        int pos = bb.position();</span>
+
+<span class="nc" id="L357">        int blockSize = cipher.getBlockSize();</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">        if (cipherType == BLOCK_CIPHER) {</span>
+            // addPadding adjusts pos/limit
+<span class="nc" id="L360">            len = addPadding(bb, blockSize);</span>
+<span class="nc" id="L361">            bb.position(pos);</span>
+        }
+
+<span class="nc bnc" id="L364" title="All 4 branches missed.">        if (debug != null &amp;&amp; Debug.isOn(&quot;plaintext&quot;)) {</span>
+            try {
+<span class="nc" id="L366">                HexDumpEncoder hd = new HexDumpEncoder();</span>
+
+<span class="nc" id="L368">                System.out.println(</span>
+                    &quot;Padded plaintext before ENCRYPTION:  len = &quot;
+                    + len);
+<span class="nc" id="L371">                hd.encodeBuffer(bb.duplicate(), System.out);</span>
+
+<span class="nc" id="L373">            } catch (IOException e) { }</span>
+        }
+
+        /*
+         * Encrypt &quot;in-place&quot;.  This does not add its own padding.
+         */
+<span class="nc" id="L379">        ByteBuffer dup = bb.duplicate();</span>
+<span class="nc bnc" id="L380" title="All 2 branches missed.">        if (cipherType == AEAD_CIPHER) {</span>
+            try {
+<span class="nc" id="L382">                int outputSize = cipher.getOutputSize(dup.remaining());</span>
+<span class="nc bnc" id="L383" title="All 2 branches missed.">                if (outputSize &gt; bb.remaining()) {</span>
+                    // need to expand the limit of the output buffer for
+                    // the authentication tag.
+                    //
+                    // DON'T worry about the buffer's capacity, we have
+                    // reserved space for the authentication tag.
+<span class="nc bnc" id="L389" title="All 2 branches missed.">                    if (outLimit &lt; pos + outputSize) {</span>
+                        // unlikely to happen
+<span class="nc" id="L391">                        throw new ShortBufferException(</span>
+                                    &quot;need more space in output buffer&quot;);
+                    }
+<span class="nc" id="L394">                    bb.limit(pos + outputSize);</span>
+                }
+<span class="nc" id="L396">                int newLen = cipher.doFinal(dup, bb);</span>
+<span class="nc bnc" id="L397" title="All 2 branches missed.">                if (newLen != outputSize) {</span>
+<span class="nc" id="L398">                    throw new RuntimeException(</span>
+                            &quot;Cipher buffering error in JCE provider &quot; +
+<span class="nc" id="L400">                            cipher.getProvider().getName());</span>
+                }
+<span class="nc" id="L402">                return newLen;</span>
+<span class="nc" id="L403">            } catch (IllegalBlockSizeException |</span>
+                           BadPaddingException | ShortBufferException ibse) {
+                // unlikely to happen
+<span class="nc" id="L406">                throw new RuntimeException(</span>
+                        &quot;Cipher error in AEAD mode in JCE provider &quot; +
+<span class="nc" id="L408">                        cipher.getProvider().getName(), ibse);</span>
+            }
+        } else {
+            int newLen;
+            try {
+<span class="nc" id="L413">                newLen = cipher.update(dup, bb);</span>
+<span class="nc" id="L414">            } catch (ShortBufferException sbe) {</span>
+                // unlikely to happen
+<span class="nc" id="L416">                throw new RuntimeException(&quot;Cipher buffering error &quot; +</span>
+<span class="nc" id="L417">                    &quot;in JCE provider &quot; + cipher.getProvider().getName());</span>
+<span class="nc" id="L418">            }</span>
+
+<span class="nc bnc" id="L420" title="All 2 branches missed.">            if (bb.position() != dup.position()) {</span>
+<span class="nc" id="L421">                throw new RuntimeException(&quot;bytebuffer padding error&quot;);</span>
+            }
+
+<span class="nc bnc" id="L424" title="All 2 branches missed.">            if (newLen != len) {</span>
+                // catch BouncyCastle buffering error
+<span class="nc" id="L426">                throw new RuntimeException(&quot;Cipher buffering error &quot; +</span>
+<span class="nc" id="L427">                    &quot;in JCE provider &quot; + cipher.getProvider().getName());</span>
+            }
+<span class="nc" id="L429">            return newLen;</span>
+        }
+    }
+
+
+    /*
+     * Decrypts a block of data, returning the size of the
+     * resulting block if padding was required.
+     *
+     * For SSLv3 and TLSv1.0, with block ciphers in CBC mode the
+     * Initialization Vector (IV) for the first record is generated by
+     * the handshake protocol, the IV for subsequent records is the
+     * last ciphertext block from the previous record.
+     *
+     * From TLSv1.1, the implicit IV is replaced with an explicit IV to
+     * protect against CBC attacks.
+     *
+     * Differentiating between bad_record_mac and decryption_failed alerts
+     * may permit certain attacks against CBC mode. It is preferable to
+     * uniformly use the bad_record_mac alert to hide the specific type of
+     * the error.
+     */
+    int decrypt(byte[] buf, int offset, int len,
+            int tagLen) throws BadPaddingException {
+<span class="nc bnc" id="L453" title="All 2 branches missed.">        if (cipher == null) {</span>
+<span class="nc" id="L454">            return len;</span>
+        }
+
+        try {
+            int newLen;
+<span class="nc bnc" id="L459" title="All 2 branches missed.">            if (cipherType == AEAD_CIPHER) {</span>
+                try {
+<span class="nc" id="L461">                    newLen = cipher.doFinal(buf, offset, len, buf, offset);</span>
+<span class="nc" id="L462">                } catch (IllegalBlockSizeException ibse) {</span>
+                    // unlikely to happen
+<span class="nc" id="L464">                    throw new RuntimeException(</span>
+                        &quot;Cipher error in AEAD mode in JCE provider &quot; +
+<span class="nc" id="L466">                        cipher.getProvider().getName(), ibse);</span>
+<span class="nc" id="L467">                }</span>
+            } else {
+<span class="nc" id="L469">                newLen = cipher.update(buf, offset, len, buf, offset);</span>
+<span class="nc bnc" id="L470" title="All 2 branches missed.">                if (newLen != len) {</span>
+                    // catch BouncyCastle buffering error
+<span class="nc" id="L472">                    throw new RuntimeException(&quot;Cipher buffering error &quot; +</span>
+<span class="nc" id="L473">                        &quot;in JCE provider &quot; + cipher.getProvider().getName());</span>
+                }
+            }
+<span class="nc bnc" id="L476" title="All 4 branches missed.">            if (debug != null &amp;&amp; Debug.isOn(&quot;plaintext&quot;)) {</span>
+                try {
+<span class="nc" id="L478">                    HexDumpEncoder hd = new HexDumpEncoder();</span>
+
+<span class="nc" id="L480">                    System.out.println(</span>
+                        &quot;Padded plaintext after DECRYPTION:  len = &quot;
+                        + newLen);
+<span class="nc" id="L483">                    hd.encodeBuffer(</span>
+                        new ByteArrayInputStream(buf, offset, newLen),
+                        System.out);
+<span class="nc" id="L486">                } catch (IOException e) { }</span>
+            }
+
+<span class="nc bnc" id="L489" title="All 2 branches missed.">            if (cipherType == BLOCK_CIPHER) {</span>
+<span class="nc" id="L490">                int blockSize = cipher.getBlockSize();</span>
+<span class="nc" id="L491">                newLen = removePadding(</span>
+                    buf, offset, newLen, tagLen, blockSize, protocolVersion);
+
+<span class="nc bnc" id="L494" title="All 2 branches missed.">                if (protocolVersion.v &gt;= ProtocolVersion.TLS11.v) {</span>
+<span class="nc bnc" id="L495" title="All 2 branches missed.">                    if (newLen &lt; blockSize) {</span>
+<span class="nc" id="L496">                        throw new BadPaddingException(&quot;invalid explicit IV&quot;);</span>
+                    }
+                }
+            }
+<span class="nc" id="L500">            return newLen;</span>
+<span class="nc" id="L501">        } catch (ShortBufferException e) {</span>
+            // unlikely to happen, we should have enough buffer space here
+<span class="nc" id="L503">            throw new ArrayIndexOutOfBoundsException(e.toString());</span>
+        }
+    }
+
+
+    /*
+     * Decrypts a block of data, returning the size of the
+     * resulting block if padding was required.  position and limit
+     * point to the end of the decrypted/depadded data.  The initial
+     * limit and new limit may be different, given we may
+     * have stripped off some padding bytes.
+     *
+     *  @see decrypt(byte[], int, int)
+     */
+    int decrypt(ByteBuffer bb, int tagLen) throws BadPaddingException {
+
+<span class="nc" id="L519">        int len = bb.remaining();</span>
+
+<span class="nc bnc" id="L521" title="All 2 branches missed.">        if (cipher == null) {</span>
+<span class="nc" id="L522">            bb.position(bb.limit());</span>
+<span class="nc" id="L523">            return len;</span>
+        }
+
+        try {
+            /*
+             * Decrypt &quot;in-place&quot;.
+             */
+<span class="nc" id="L530">            int pos = bb.position();</span>
+<span class="nc" id="L531">            ByteBuffer dup = bb.duplicate();</span>
+            int newLen;
+<span class="nc bnc" id="L533" title="All 2 branches missed.">            if (cipherType == AEAD_CIPHER) {</span>
+                try {
+<span class="nc" id="L535">                    newLen = cipher.doFinal(dup, bb);</span>
+<span class="nc" id="L536">                } catch (IllegalBlockSizeException ibse) {</span>
+                    // unlikely to happen
+<span class="nc" id="L538">                    throw new RuntimeException(</span>
+<span class="nc" id="L539">                        &quot;Cipher error in AEAD mode \&quot;&quot; + ibse.getMessage() +</span>
+<span class="nc" id="L540">                        &quot; \&quot;in JCE provider &quot; + cipher.getProvider().getName());</span>
+<span class="nc" id="L541">                }</span>
+            } else {
+<span class="nc" id="L543">                newLen = cipher.update(dup, bb);</span>
+<span class="nc bnc" id="L544" title="All 2 branches missed.">                if (newLen != len) {</span>
+                    // catch BouncyCastle buffering error
+<span class="nc" id="L546">                    throw new RuntimeException(&quot;Cipher buffering error &quot; +</span>
+<span class="nc" id="L547">                        &quot;in JCE provider &quot; + cipher.getProvider().getName());</span>
+                }
+            }
+
+            // reset the limit to the end of the decryted data
+<span class="nc" id="L552">            bb.limit(pos + newLen);</span>
+
+<span class="nc bnc" id="L554" title="All 4 branches missed.">            if (debug != null &amp;&amp; Debug.isOn(&quot;plaintext&quot;)) {</span>
+                try {
+<span class="nc" id="L556">                    HexDumpEncoder hd = new HexDumpEncoder();</span>
+
+<span class="nc" id="L558">                    System.out.println(</span>
+                        &quot;Padded plaintext after DECRYPTION:  len = &quot;
+                        + newLen);
+
+<span class="nc" id="L562">                    hd.encodeBuffer(</span>
+<span class="nc" id="L563">                        (ByteBuffer)bb.duplicate().position(pos), System.out);</span>
+<span class="nc" id="L564">                } catch (IOException e) { }</span>
+            }
+
+            /*
+             * Remove the block padding.
+             */
+<span class="nc bnc" id="L570" title="All 2 branches missed.">            if (cipherType == BLOCK_CIPHER) {</span>
+<span class="nc" id="L571">                int blockSize = cipher.getBlockSize();</span>
+<span class="nc" id="L572">                bb.position(pos);</span>
+<span class="nc" id="L573">                newLen = removePadding(bb, tagLen, blockSize, protocolVersion);</span>
+
+                // check the explicit IV of TLS v1.1 or later
+<span class="nc bnc" id="L576" title="All 2 branches missed.">                if (protocolVersion.v &gt;= ProtocolVersion.TLS11.v) {</span>
+<span class="nc bnc" id="L577" title="All 2 branches missed.">                    if (newLen &lt; blockSize) {</span>
+<span class="nc" id="L578">                        throw new BadPaddingException(&quot;invalid explicit IV&quot;);</span>
+                    }
+
+                    // reset the position to the end of the decrypted data
+<span class="nc" id="L582">                    bb.position(bb.limit());</span>
+                }
+            }
+<span class="nc" id="L585">            return newLen;</span>
+<span class="nc" id="L586">        } catch (ShortBufferException e) {</span>
+            // unlikely to happen, we should have enough buffer space here
+<span class="nc" id="L588">            throw new ArrayIndexOutOfBoundsException(e.toString());</span>
+        }
+    }
+
+    private static int addPadding(byte[] buf, int offset, int len,
+            int blockSize) {
+<span class="nc" id="L594">        int     newlen = len + 1;</span>
+        byte    pad;
+        int     i;
+
+<span class="nc bnc" id="L598" title="All 2 branches missed.">        if ((newlen % blockSize) != 0) {</span>
+<span class="nc" id="L599">            newlen += blockSize - 1;</span>
+<span class="nc" id="L600">            newlen -= newlen % blockSize;</span>
+        }
+<span class="nc" id="L602">        pad = (byte) (newlen - len);</span>
+
+<span class="nc bnc" id="L604" title="All 2 branches missed.">        if (buf.length &lt; (newlen + offset)) {</span>
+<span class="nc" id="L605">            throw new IllegalArgumentException(&quot;no space to pad buffer&quot;);</span>
+        }
+
+        /*
+         * TLS version of the padding works for both SSLv3 and TLSv1
+         */
+<span class="nc bnc" id="L611" title="All 2 branches missed.">        for (i = 0, offset += len; i &lt; pad; i++) {</span>
+<span class="nc" id="L612">            buf [offset++] = (byte) (pad - 1);</span>
+        }
+<span class="nc" id="L614">        return newlen;</span>
+    }
+
+    /*
+     * Apply the padding to the buffer.
+     *
+     * Limit is advanced to the new buffer length.
+     * Position is equal to limit.
+     */
+    private static int addPadding(ByteBuffer bb, int blockSize) {
+
+<span class="nc" id="L625">        int     len = bb.remaining();</span>
+<span class="nc" id="L626">        int     offset = bb.position();</span>
+
+<span class="nc" id="L628">        int     newlen = len + 1;</span>
+        byte    pad;
+        int     i;
+
+<span class="nc bnc" id="L632" title="All 2 branches missed.">        if ((newlen % blockSize) != 0) {</span>
+<span class="nc" id="L633">            newlen += blockSize - 1;</span>
+<span class="nc" id="L634">            newlen -= newlen % blockSize;</span>
+        }
+<span class="nc" id="L636">        pad = (byte) (newlen - len);</span>
+
+        /*
+         * Update the limit to what will be padded.
+         */
+<span class="nc" id="L641">        bb.limit(newlen + offset);</span>
+
+        /*
+         * TLS version of the padding works for both SSLv3 and TLSv1
+         */
+<span class="nc bnc" id="L646" title="All 2 branches missed.">        for (i = 0, offset += len; i &lt; pad; i++) {</span>
+<span class="nc" id="L647">            bb.put(offset++, (byte) (pad - 1));</span>
+        }
+
+<span class="nc" id="L650">        bb.position(offset);</span>
+<span class="nc" id="L651">        bb.limit(offset);</span>
+
+<span class="nc" id="L653">        return newlen;</span>
+    }
+
+    /*
+     * A constant-time check of the padding.
+     *
+     * NOTE that we are checking both the padding and the padLen bytes here.
+     *
+     * The caller MUST ensure that the len parameter is a positive number.
+     */
+    private static int[] checkPadding(
+            byte[] buf, int offset, int len, byte pad) {
+
+<span class="nc bnc" id="L666" title="All 2 branches missed.">        if (len &lt;= 0) {</span>
+<span class="nc" id="L667">            throw new RuntimeException(&quot;padding len must be positive&quot;);</span>
+        }
+
+        // An array of hits is used to prevent Hotspot optimization for
+        // the purpose of a constant-time check.
+<span class="nc" id="L672">        int[] results = {0, 0};    // {missed #, matched #}</span>
+<span class="nc bnc" id="L673" title="All 2 branches missed.">        for (int i = 0; i &lt;= 256;) {</span>
+<span class="nc bnc" id="L674" title="All 4 branches missed.">            for (int j = 0; j &lt; len &amp;&amp; i &lt;= 256; j++, i++) {     // j &lt;= i</span>
+<span class="nc bnc" id="L675" title="All 2 branches missed.">                if (buf[offset + j] != pad) {</span>
+<span class="nc" id="L676">                    results[0]++;       // mismatched padding data</span>
+                } else {
+<span class="nc" id="L678">                    results[1]++;       // matched padding data</span>
+                }
+            }
+        }
+
+<span class="nc" id="L683">        return results;</span>
+    }
+
+    /*
+     * A constant-time check of the padding.
+     *
+     * NOTE that we are checking both the padding and the padLen bytes here.
+     *
+     * The caller MUST ensure that the bb parameter has remaining.
+     */
+    private static int[] checkPadding(ByteBuffer bb, byte pad) {
+
+<span class="nc bnc" id="L695" title="All 2 branches missed.">        if (!bb.hasRemaining()) {</span>
+<span class="nc" id="L696">            throw new RuntimeException(&quot;hasRemaining() must be positive&quot;);</span>
+        }
+
+        // An array of hits is used to prevent Hotspot optimization for
+        // the purpose of a constant-time check.
+<span class="nc" id="L701">        int[] results = {0, 0};    // {missed #, matched #}</span>
+<span class="nc" id="L702">        bb.mark();</span>
+<span class="nc bnc" id="L703" title="All 2 branches missed.">        for (int i = 0; i &lt;= 256; bb.reset()) {</span>
+<span class="nc bnc" id="L704" title="All 4 branches missed.">            for (; bb.hasRemaining() &amp;&amp; i &lt;= 256; i++) {</span>
+<span class="nc bnc" id="L705" title="All 2 branches missed.">                if (bb.get() != pad) {</span>
+<span class="nc" id="L706">                    results[0]++;       // mismatched padding data</span>
+                } else {
+<span class="nc" id="L708">                    results[1]++;       // matched padding data</span>
+                }
+            }
+        }
+
+<span class="nc" id="L713">        return results;</span>
+    }
+
+    /*
+     * Typical TLS padding format for a 64 bit block cipher is as follows:
+     *   xx xx xx xx xx xx xx 00
+     *   xx xx xx xx xx xx 01 01
+     *   ...
+     *   xx 06 06 06 06 06 06 06
+     *   07 07 07 07 07 07 07 07
+     * TLS also allows any amount of padding from 1 and 256 bytes as long
+     * as it makes the data a multiple of the block size
+     */
+    private static int removePadding(byte[] buf, int offset, int len,
+            int tagLen, int blockSize,
+            ProtocolVersion protocolVersion) throws BadPaddingException {
+
+        // last byte is length byte (i.e. actual padding length - 1)
+<span class="nc" id="L731">        int padOffset = offset + len - 1;</span>
+<span class="nc" id="L732">        int padLen = buf[padOffset] &amp; 0xFF;</span>
+
+<span class="nc" id="L734">        int newLen = len - (padLen + 1);</span>
+<span class="nc bnc" id="L735" title="All 2 branches missed.">        if ((newLen - tagLen) &lt; 0) {</span>
+            // If the buffer is not long enough to contain the padding plus
+            // a MAC tag, do a dummy constant-time padding check.
+            //
+            // Note that it is a dummy check, so we won't care about what is
+            // the actual padding data.
+<span class="nc" id="L741">            checkPadding(buf, offset, len, (byte)(padLen &amp; 0xFF));</span>
+
+<span class="nc" id="L743">            throw new BadPaddingException(&quot;Invalid Padding length: &quot; + padLen);</span>
+        }
+
+        // The padding data should be filled with the padding length value.
+<span class="nc" id="L747">        int[] results = checkPadding(buf, offset + newLen,</span>
+                        padLen + 1, (byte)(padLen &amp; 0xFF));
+<span class="nc bnc" id="L749" title="All 2 branches missed.">        if (protocolVersion.v &gt;= ProtocolVersion.TLS10.v) {</span>
+<span class="nc bnc" id="L750" title="All 2 branches missed.">            if (results[0] != 0) {          // padding data has invalid bytes</span>
+<span class="nc" id="L751">                throw new BadPaddingException(&quot;Invalid TLS padding data&quot;);</span>
+            }
+        } else { // SSLv3
+            // SSLv3 requires 0 &lt;= length byte &lt; block size
+            // some implementations do 1 &lt;= length byte &lt;= block size,
+            // so accept that as well
+            // v3 does not require any particular value for the other bytes
+<span class="nc bnc" id="L758" title="All 2 branches missed.">            if (padLen &gt; blockSize) {</span>
+<span class="nc" id="L759">                throw new BadPaddingException(&quot;Invalid SSLv3 padding&quot;);</span>
+            }
+        }
+<span class="nc" id="L762">        return newLen;</span>
+    }
+
+    /*
+     * Position/limit is equal the removed padding.
+     */
+    private static int removePadding(ByteBuffer bb,
+            int tagLen, int blockSize,
+            ProtocolVersion protocolVersion) throws BadPaddingException {
+
+<span class="nc" id="L772">        int len = bb.remaining();</span>
+<span class="nc" id="L773">        int offset = bb.position();</span>
+
+        // last byte is length byte (i.e. actual padding length - 1)
+<span class="nc" id="L776">        int padOffset = offset + len - 1;</span>
+<span class="nc" id="L777">        int padLen = bb.get(padOffset) &amp; 0xFF;</span>
+
+<span class="nc" id="L779">        int newLen = len - (padLen + 1);</span>
+<span class="nc bnc" id="L780" title="All 2 branches missed.">        if ((newLen - tagLen) &lt; 0) {</span>
+            // If the buffer is not long enough to contain the padding plus
+            // a MAC tag, do a dummy constant-time padding check.
+            //
+            // Note that it is a dummy check, so we won't care about what is
+            // the actual padding data.
+<span class="nc" id="L786">            checkPadding(bb.duplicate(), (byte)(padLen &amp; 0xFF));</span>
+
+<span class="nc" id="L788">            throw new BadPaddingException(&quot;Invalid Padding length: &quot; + padLen);</span>
+        }
+
+        // The padding data should be filled with the padding length value.
+<span class="nc" id="L792">        int[] results = checkPadding(</span>
+<span class="nc" id="L793">                (ByteBuffer)bb.duplicate().position(offset + newLen),</span>
+                (byte)(padLen &amp; 0xFF));
+<span class="nc bnc" id="L795" title="All 2 branches missed.">        if (protocolVersion.v &gt;= ProtocolVersion.TLS10.v) {</span>
+<span class="nc bnc" id="L796" title="All 2 branches missed.">            if (results[0] != 0) {          // padding data has invalid bytes</span>
+<span class="nc" id="L797">                throw new BadPaddingException(&quot;Invalid TLS padding data&quot;);</span>
+            }
+        } else { // SSLv3
+            // SSLv3 requires 0 &lt;= length byte &lt; block size
+            // some implementations do 1 &lt;= length byte &lt;= block size,
+            // so accept that as well
+            // v3 does not require any particular value for the other bytes
+<span class="nc bnc" id="L804" title="All 2 branches missed.">            if (padLen &gt; blockSize) {</span>
+<span class="nc" id="L805">                throw new BadPaddingException(&quot;Invalid SSLv3 padding&quot;);</span>
+            }
+        }
+
+        /*
+         * Reset buffer limit to remove padding.
+         */
+<span class="nc" id="L812">        bb.position(offset + newLen);</span>
+<span class="nc" id="L813">        bb.limit(offset + newLen);</span>
+
+<span class="nc" id="L815">        return newLen;</span>
+    }
+
+    /*
+     * Dispose of any intermediate state in the underlying cipher.
+     * For PKCS11 ciphers, this will release any attached sessions, and
+     * thus make finalization faster.
+     */
+    void dispose() {
+        try {
+<span class="nc bnc" id="L825" title="All 2 branches missed.">            if (cipher != null) {</span>
+                // ignore return value.
+<span class="nc" id="L827">                cipher.doFinal();</span>
+            }
+<span class="nc" id="L829">        } catch (Exception e) {</span>
+            // swallow all types of exceptions.
+<span class="nc" id="L831">        }</span>
+<span class="nc" id="L832">    }</span>
+
+    /*
+     * Does the cipher use CBC mode?
+     *
+     * @return true if the cipher use CBC mode, false otherwise.
+     */
+    boolean isCBCMode() {
+<span class="nc bnc" id="L840" title="All 2 branches missed.">        return cipherType == BLOCK_CIPHER;</span>
+    }
+
+    /*
+     * Does the cipher use AEAD mode?
+     *
+     * @return true if the cipher use AEAD mode, false otherwise.
+     */
+    boolean isAEADMode() {
+<span class="nc bnc" id="L849" title="All 2 branches missed.">        return cipherType == AEAD_CIPHER;</span>
+    }
+
+    /*
+     * Is the cipher null?
+     *
+     * @return true if the cipher is null, false otherwise.
+     */
+    boolean isNullCipher() {
+<span class="nc bnc" id="L858" title="All 2 branches missed.">        return cipher == null;</span>
+    }
+
+    /*
+     * Gets the explicit nonce/IV size of the cipher.
+     *
+     * The returned value is the SecurityParameters.record_iv_length in
+     * RFC 4346/5246.  It is the size of explicit IV for CBC mode, and the
+     * size of explicit nonce for AEAD mode.
+     *
+     * @return the explicit nonce size of the cipher.
+     */
+    int getExplicitNonceSize() {
+<span class="nc bnc" id="L871" title="All 3 branches missed.">        switch (cipherType) {</span>
+            case BLOCK_CIPHER:
+                // For block ciphers, the explicit IV length is of length
+                // SecurityParameters.record_iv_length, which is equal to
+                // the SecurityParameters.block_size.
+<span class="nc bnc" id="L876" title="All 2 branches missed.">                if (protocolVersion.v &gt;= ProtocolVersion.TLS11.v) {</span>
+<span class="nc" id="L877">                    return cipher.getBlockSize();</span>
+                }
+                break;
+            case AEAD_CIPHER:
+<span class="nc" id="L881">                return recordIvSize;</span>
+                        // It is also the length of sequence number, which is
+                        // used as the nonce_explicit for AEAD cipher suites.
+        }
+
+<span class="nc" id="L886">        return 0;</span>
+    }
+
+    /*
+     * Applies the explicit nonce/IV to this cipher. This method is used to
+     * decrypt an SSL/TLS input record.
+     *
+     * The returned value is the SecurityParameters.record_iv_length in
+     * RFC 4346/5246.  It is the size of explicit IV for CBC mode, and the
+     * size of explicit nonce for AEAD mode.
+     *
+     * @param  authenticator the authenticator to get the additional
+     *         authentication data
+     * @param  contentType the content type of the input record
+     * @param  bb the byte buffer to get the explicit nonce from
+     *
+     * @return the explicit nonce size of the cipher.
+     */
+    int applyExplicitNonce(Authenticator authenticator, byte contentType,
+            ByteBuffer bb) throws BadPaddingException {
+<span class="nc bnc" id="L906" title="All 3 branches missed.">        switch (cipherType) {</span>
+            case BLOCK_CIPHER:
+                // sanity check length of the ciphertext
+<span class="nc bnc" id="L909" title="All 2 branches missed.">                int tagLen = (authenticator instanceof MAC) ?</span>
+<span class="nc" id="L910">                                    ((MAC)authenticator).MAClen() : 0;</span>
+<span class="nc bnc" id="L911" title="All 2 branches missed.">                if (tagLen != 0) {</span>
+<span class="nc bnc" id="L912" title="All 2 branches missed.">                    if (!sanityCheck(tagLen, bb.remaining())) {</span>
+<span class="nc" id="L913">                        throw new BadPaddingException(</span>
+                                &quot;ciphertext sanity check failed&quot;);
+                    }
+                }
+
+                // For block ciphers, the explicit IV length is of length
+                // SecurityParameters.record_iv_length, which is equal to
+                // the SecurityParameters.block_size.
+<span class="nc bnc" id="L921" title="All 2 branches missed.">                if (protocolVersion.v &gt;= ProtocolVersion.TLS11.v) {</span>
+<span class="nc" id="L922">                    return cipher.getBlockSize();</span>
+                }
+                break;
+            case AEAD_CIPHER:
+<span class="nc bnc" id="L926" title="All 2 branches missed.">                if (bb.remaining() &lt; (recordIvSize + tagSize)) {</span>
+<span class="nc" id="L927">                    throw new BadPaddingException(</span>
+                                        &quot;invalid AEAD cipher fragment&quot;);
+                }
+
+                // initialize the AEAD cipher for the unique IV
+<span class="nc" id="L932">                byte[] iv = Arrays.copyOf(fixedIv,</span>
+                                    fixedIv.length + recordIvSize);
+<span class="nc" id="L934">                bb.get(iv, fixedIv.length, recordIvSize);</span>
+<span class="nc" id="L935">                bb.position(bb.position() - recordIvSize);</span>
+<span class="nc" id="L936">                GCMParameterSpec spec = new GCMParameterSpec(tagSize * 8, iv);</span>
+                try {
+<span class="nc" id="L938">                    cipher.init(mode, key, spec, random);</span>
+<span class="nc" id="L939">                } catch (InvalidKeyException |</span>
+                            InvalidAlgorithmParameterException ikae) {
+                    // unlikely to happen
+<span class="nc" id="L942">                    throw new RuntimeException(</span>
+                                &quot;invalid key or spec in GCM mode&quot;, ikae);
+<span class="nc" id="L944">                }</span>
+
+                // update the additional authentication data
+<span class="nc" id="L947">                byte[] aad = authenticator.acquireAuthenticationBytes(</span>
+<span class="nc" id="L948">                        contentType, bb.remaining() - recordIvSize - tagSize);</span>
+<span class="nc" id="L949">                cipher.updateAAD(aad);</span>
+
+<span class="nc" id="L951">                return recordIvSize;</span>
+                        // It is also the length of sequence number, which is
+                        // used as the nonce_explicit for AEAD cipher suites.
+        }
+
+<span class="nc" id="L956">       return 0;</span>
+    }
+
+    /*
+     * Applies the explicit nonce/IV to this cipher. This method is used to
+     * decrypt an SSL/TLS input record.
+     *
+     * The returned value is the SecurityParameters.record_iv_length in
+     * RFC 4346/5246.  It is the size of explicit IV for CBC mode, and the
+     * size of explicit nonce for AEAD mode.
+     *
+     * @param  authenticator the authenticator to get the additional
+     *         authentication data
+     * @param  contentType the content type of the input record
+     * @param  buf the byte array to get the explicit nonce from
+     * @param  offset the offset of the byte buffer
+     * @param  cipheredLength the ciphered fragment length of the output
+     *         record, it is the TLSCiphertext.length in RFC 4346/5246.
+     *
+     * @return the explicit nonce size of the cipher.
+     */
+    int applyExplicitNonce(Authenticator authenticator,
+            byte contentType, byte[] buf, int offset,
+            int cipheredLength) throws BadPaddingException {
+
+<span class="nc" id="L981">        ByteBuffer bb = ByteBuffer.wrap(buf, offset, cipheredLength);</span>
+
+<span class="nc" id="L983">        return applyExplicitNonce(authenticator, contentType, bb);</span>
+    }
+
+    /*
+     * Creates the explicit nonce/IV to this cipher. This method is used to
+     * encrypt an SSL/TLS output record.
+     *
+     * The size of the returned array is the SecurityParameters.record_iv_length
+     * in RFC 4346/5246.  It is the size of explicit IV for CBC mode, and the
+     * size of explicit nonce for AEAD mode.
+     *
+     * @param  authenticator the authenticator to get the additional
+     *         authentication data
+     * @param  contentType the content type of the input record
+     * @param  fragmentLength the fragment length of the output record, it is
+     *         the TLSCompressed.length in RFC 4346/5246.
+     *
+     * @return the explicit nonce of the cipher.
+     */
+    byte[] createExplicitNonce(Authenticator authenticator,
+            byte contentType, int fragmentLength) {
+
+<span class="nc" id="L1005">        byte[] nonce = new byte[0];</span>
+<span class="nc bnc" id="L1006" title="All 3 branches missed.">        switch (cipherType) {</span>
+            case BLOCK_CIPHER:
+<span class="nc bnc" id="L1008" title="All 2 branches missed.">                if (protocolVersion.v &gt;= ProtocolVersion.TLS11.v) {</span>
+                    // For block ciphers, the explicit IV length is of length
+                    // SecurityParameters.record_iv_length, which is equal to
+                    // the SecurityParameters.block_size.
+                    //
+                    // Generate a random number as the explicit IV parameter.
+<span class="nc" id="L1014">                    nonce = new byte[cipher.getBlockSize()];</span>
+<span class="nc" id="L1015">                    random.nextBytes(nonce);</span>
+                }
+                break;
+            case AEAD_CIPHER:
+                // To be unique and aware of overflow-wrap, sequence number
+                // is used as the nonce_explicit of AEAD cipher suites.
+<span class="nc" id="L1021">                nonce = authenticator.sequenceNumber();</span>
+
+                // initialize the AEAD cipher for the unique IV
+<span class="nc" id="L1024">                byte[] iv = Arrays.copyOf(fixedIv,</span>
+                                            fixedIv.length + nonce.length);
+<span class="nc" id="L1026">                System.arraycopy(nonce, 0, iv, fixedIv.length, nonce.length);</span>
+<span class="nc" id="L1027">                GCMParameterSpec spec = new GCMParameterSpec(tagSize * 8, iv);</span>
+                try {
+<span class="nc" id="L1029">                    cipher.init(mode, key, spec, random);</span>
+<span class="nc" id="L1030">                } catch (InvalidKeyException |</span>
+                            InvalidAlgorithmParameterException ikae) {
+                    // unlikely to happen
+<span class="nc" id="L1033">                    throw new RuntimeException(</span>
+                                &quot;invalid key or spec in GCM mode&quot;, ikae);
+<span class="nc" id="L1035">                }</span>
+
+                // update the additional authentication data
+<span class="nc" id="L1038">                byte[] aad = authenticator.acquireAuthenticationBytes(</span>
+                                                contentType, fragmentLength);
+<span class="nc" id="L1040">                cipher.updateAAD(aad);</span>
+                break;
+        }
+
+<span class="nc" id="L1044">        return nonce;</span>
+    }
+
+    /*
+     * Is this cipher available?
+     *
+     * This method can only be called by CipherSuite.BulkCipher.isAvailable()
+     * to test the availability of a cipher suites.  Please DON'T use it in
+     * other places, otherwise, the behavior may be unexpected because we may
+     * initialize AEAD cipher improperly in the method.
+     */
+    Boolean isAvailable() {
+        // We won't know whether a cipher for a particular key size is
+        // available until the cipher is successfully initialized.
+        //
+        // We do not initialize AEAD cipher in the constructor.  Need to
+        // initialize the cipher to ensure that the AEAD mode for a
+        // particular key size is supported.
+<span class="nc bnc" id="L1062" title="All 2 branches missed.">        if (cipherType == AEAD_CIPHER) {</span>
+            try {
+<span class="nc" id="L1064">                Authenticator authenticator =</span>
+                    new Authenticator(protocolVersion);
+<span class="nc" id="L1066">                byte[] nonce = authenticator.sequenceNumber();</span>
+<span class="nc" id="L1067">                byte[] iv = Arrays.copyOf(fixedIv,</span>
+                                            fixedIv.length + nonce.length);
+<span class="nc" id="L1069">                System.arraycopy(nonce, 0, iv, fixedIv.length, nonce.length);</span>
+<span class="nc" id="L1070">                GCMParameterSpec spec = new GCMParameterSpec(tagSize * 8, iv);</span>
+
+<span class="nc" id="L1072">                cipher.init(mode, key, spec, random);</span>
+<span class="nc" id="L1073">            } catch (Exception e) {</span>
+<span class="nc" id="L1074">                return Boolean.FALSE;</span>
+<span class="nc" id="L1075">            }</span>
+        }   // Otherwise, we have initialized the cipher in the constructor.
+
+<span class="nc" id="L1078">        return Boolean.TRUE;</span>
+    }
+
+    /**
+     * Sanity check the length of a fragment before decryption.
+     *
+     * In CBC mode, check that the fragment length is one or multiple times
+     * of the block size of the cipher suite, and is at least one (one is the
+     * smallest size of padding in CBC mode) bigger than the tag size of the
+     * MAC algorithm except the explicit IV size for TLS 1.1 or later.
+     *
+     * In non-CBC mode, check that the fragment length is not less than the
+     * tag size of the MAC algorithm.
+     *
+     * @return true if the length of a fragment matches above requirements
+     */
+    private boolean sanityCheck(int tagLen, int fragmentLen) {
+<span class="nc bnc" id="L1095" title="All 2 branches missed.">        if (!isCBCMode()) {</span>
+<span class="nc bnc" id="L1096" title="All 2 branches missed.">            return fragmentLen &gt;= tagLen;</span>
+        }
+
+<span class="nc" id="L1099">        int blockSize = cipher.getBlockSize();</span>
+<span class="nc bnc" id="L1100" title="All 2 branches missed.">        if ((fragmentLen % blockSize) == 0) {</span>
+<span class="nc" id="L1101">            int minimal = tagLen + 1;</span>
+<span class="nc bnc" id="L1102" title="All 2 branches missed.">            minimal = (minimal &gt;= blockSize) ? minimal : blockSize;</span>
+<span class="nc bnc" id="L1103" title="All 2 branches missed.">            if (protocolVersion.v &gt;= ProtocolVersion.TLS11.v) {</span>
+<span class="nc" id="L1104">                minimal += blockSize;   // plus the size of the explicit IV</span>
+            }
+
+<span class="nc bnc" id="L1107" title="All 2 branches missed.">            return (fragmentLen &gt;= minimal);</span>
+        }
+
+<span class="nc" id="L1110">        return false;</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

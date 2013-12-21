@@ -1,0 +1,878 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>SSLSessionImpl.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.ssl</a> &gt; <span class="el_source">SSLSessionImpl.java</span></div><h1>SSLSessionImpl.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1996, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+
+package sun.security.ssl;
+
+import java.net.*;
+import java.util.Enumeration;
+import java.util.Hashtable;
+import java.util.Vector;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.ArrayList;
+
+import java.security.Principal;
+import java.security.PrivateKey;
+import java.security.SecureRandom;
+import java.security.cert.X509Certificate;
+import java.security.cert.CertificateEncodingException;
+
+import javax.crypto.SecretKey;
+
+import javax.net.ssl.SSLSessionContext;
+import javax.net.ssl.SSLSessionBindingListener;
+import javax.net.ssl.SSLSessionBindingEvent;
+import javax.net.ssl.SSLPeerUnverifiedException;
+import javax.net.ssl.SSLPermission;
+import javax.net.ssl.ExtendedSSLSession;
+import javax.net.ssl.SNIServerName;
+
+import static sun.security.ssl.CipherSuite.KeyExchange.*;
+
+/**
+ * Implements the SSL session interface, and exposes the session context
+ * which is maintained by SSL servers.
+ *
+ * &lt;P&gt; Servers have the ability to manage the sessions associated with
+ * their authentication context(s).  They can do this by enumerating the
+ * IDs of the sessions which are cached, examining those sessions, and then
+ * perhaps invalidating a given session so that it can't be used again.
+ * If servers do not explicitly manage the cache, sessions will linger
+ * until memory is low enough that the runtime environment purges cache
+ * entries automatically to reclaim space.
+ *
+ * &lt;P&gt;&lt;em&gt; The only reason this class is not package-private is that
+ * there's no other public way to get at the server session context which
+ * is associated with any given authentication context. &lt;/em&gt;
+ *
+ * @author David Brownell
+ */
+final class SSLSessionImpl extends ExtendedSSLSession {
+
+    /*
+     * we only really need a single null session
+     */
+<span class="nc" id="L79">    static final SSLSessionImpl         nullSession = new SSLSessionImpl();</span>
+
+    // compression methods
+    private static final byte           compression_null = 0;
+
+    /*
+     * The state of a single session, as described in section 7.1
+     * of the SSLv3 spec.
+     */
+    private final ProtocolVersion       protocolVersion;
+    private final SessionId             sessionId;
+    private X509Certificate[]   peerCerts;
+    private byte                compressionMethod;
+    private CipherSuite         cipherSuite;
+    private SecretKey           masterSecret;
+
+    /*
+     * Information not part of the SSLv3 protocol spec, but used
+     * to support session management policies.
+     */
+<span class="nc" id="L99">    private final long          creationTime = System.currentTimeMillis();</span>
+<span class="nc" id="L100">    private long                lastUsedTime = 0;</span>
+    private final String        host;
+    private final int           port;
+    private SSLSessionContextImpl       context;
+    private int                 sessionCount;
+    private boolean             invalidated;
+    private X509Certificate[]   localCerts;
+    private PrivateKey          localPrivateKey;
+    private String[]            localSupportedSignAlgs;
+    private String[]            peerSupportedSignAlgs;
+    private List&lt;SNIServerName&gt;    requestedServerNames;
+
+
+    // Principals for non-certificate based cipher suites
+    private Principal peerPrincipal;
+    private Principal localPrincipal;
+
+    /*
+     * We count session creations, eventually for statistical data but
+     * also since counters make shorter debugging IDs than the big ones
+     * we use in the protocol for uniqueness-over-time.
+     */
+<span class="nc" id="L122">    private static volatile int counter = 0;</span>
+
+    /*
+     * Use of session caches is globally enabled/disabled.
+     */
+<span class="nc" id="L127">    private static boolean      defaultRejoinable = true;</span>
+
+    /* Class and subclass dynamic debugging support */
+<span class="nc" id="L130">    private static final Debug debug = Debug.getInstance(&quot;ssl&quot;);</span>
+
+    /*
+     * Create a new non-rejoinable session, using the default (null)
+     * cipher spec.  This constructor returns a session which could
+     * be used either by a client or by a server, as a connection is
+     * first opened and before handshaking begins.
+     */
+    private SSLSessionImpl() {
+<span class="nc" id="L139">        this(ProtocolVersion.NONE, CipherSuite.C_NULL, null,</span>
+            new SessionId(false, null), null, -1);
+<span class="nc" id="L141">    }</span>
+
+    /*
+     * Create a new session, using a given cipher spec.  This will
+     * be rejoinable if session caching is enabled; the constructor
+     * is intended mostly for use by serves.
+     */
+    SSLSessionImpl(ProtocolVersion protocolVersion, CipherSuite cipherSuite,
+            Collection&lt;SignatureAndHashAlgorithm&gt; algorithms,
+            SecureRandom generator, String host, int port) {
+<span class="nc" id="L151">        this(protocolVersion, cipherSuite, algorithms,</span>
+             new SessionId(defaultRejoinable, generator), host, port);
+<span class="nc" id="L153">    }</span>
+
+    /*
+     * Record a new session, using a given cipher spec and session ID.
+     */
+    SSLSessionImpl(ProtocolVersion protocolVersion, CipherSuite cipherSuite,
+            Collection&lt;SignatureAndHashAlgorithm&gt; algorithms,
+<span class="nc" id="L160">            SessionId id, String host, int port) {</span>
+<span class="nc" id="L161">        this.protocolVersion = protocolVersion;</span>
+<span class="nc" id="L162">        sessionId = id;</span>
+<span class="nc" id="L163">        peerCerts = null;</span>
+<span class="nc" id="L164">        compressionMethod = compression_null;</span>
+<span class="nc" id="L165">        this.cipherSuite = cipherSuite;</span>
+<span class="nc" id="L166">        masterSecret = null;</span>
+<span class="nc" id="L167">        this.host = host;</span>
+<span class="nc" id="L168">        this.port = port;</span>
+<span class="nc" id="L169">        sessionCount = ++counter;</span>
+<span class="nc" id="L170">        localSupportedSignAlgs =</span>
+<span class="nc" id="L171">            SignatureAndHashAlgorithm.getAlgorithmNames(algorithms);</span>
+
+<span class="nc bnc" id="L173" title="All 4 branches missed.">        if (debug != null &amp;&amp; Debug.isOn(&quot;session&quot;)) {</span>
+<span class="nc" id="L174">            System.out.println(&quot;%% Initialized:  &quot; + this);</span>
+        }
+<span class="nc" id="L176">    }</span>
+
+    void setMasterSecret(SecretKey secret) {
+<span class="nc bnc" id="L179" title="All 2 branches missed.">        if (masterSecret == null) {</span>
+<span class="nc" id="L180">            masterSecret = secret;</span>
+        } else {
+<span class="nc" id="L182">            throw new RuntimeException(&quot;setMasterSecret() error&quot;);</span>
+        }
+<span class="nc" id="L184">    }</span>
+
+    /**
+     * Returns the master secret ... treat with extreme caution!
+     */
+    SecretKey getMasterSecret() {
+<span class="nc" id="L190">        return masterSecret;</span>
+    }
+
+    void setPeerCertificates(X509Certificate[] peer) {
+<span class="nc bnc" id="L194" title="All 2 branches missed.">        if (peerCerts == null) {</span>
+<span class="nc" id="L195">            peerCerts = peer;</span>
+        }
+<span class="nc" id="L197">    }</span>
+
+    void setLocalCertificates(X509Certificate[] local) {
+<span class="nc" id="L200">        localCerts = local;</span>
+<span class="nc" id="L201">    }</span>
+
+    void setLocalPrivateKey(PrivateKey privateKey) {
+<span class="nc" id="L204">        localPrivateKey = privateKey;</span>
+<span class="nc" id="L205">    }</span>
+
+    void setPeerSupportedSignatureAlgorithms(
+            Collection&lt;SignatureAndHashAlgorithm&gt; algorithms) {
+<span class="nc" id="L209">        peerSupportedSignAlgs =</span>
+<span class="nc" id="L210">            SignatureAndHashAlgorithm.getAlgorithmNames(algorithms);</span>
+<span class="nc" id="L211">    }</span>
+
+    void setRequestedServerNames(List&lt;SNIServerName&gt; requestedServerNames) {
+<span class="nc" id="L214">        this.requestedServerNames = new ArrayList&lt;&gt;(requestedServerNames);</span>
+<span class="nc" id="L215">    }</span>
+
+    /**
+     * Set the peer principal.
+     */
+    void setPeerPrincipal(Principal principal) {
+<span class="nc bnc" id="L221" title="All 2 branches missed.">        if (peerPrincipal == null) {</span>
+<span class="nc" id="L222">            peerPrincipal = principal;</span>
+        }
+<span class="nc" id="L224">    }</span>
+
+    /**
+     * Set the local principal.
+     */
+    void setLocalPrincipal(Principal principal) {
+<span class="nc" id="L230">        localPrincipal = principal;</span>
+<span class="nc" id="L231">    }</span>
+
+    /**
+     * Returns true iff this session may be resumed ... sessions are
+     * usually resumable.  Security policies may suggest otherwise,
+     * for example sessions that haven't been used for a while (say,
+     * a working day) won't be resumable, and sessions might have a
+     * maximum lifetime in any case.
+     */
+    boolean isRejoinable() {
+<span class="nc bnc" id="L241" title="All 6 branches missed.">        return sessionId != null &amp;&amp; sessionId.length() != 0 &amp;&amp;</span>
+<span class="nc bnc" id="L242" title="All 2 branches missed.">            !invalidated &amp;&amp; isLocalAuthenticationValid();</span>
+    }
+
+    @Override
+    public synchronized boolean isValid() {
+<span class="nc" id="L247">        return isRejoinable();</span>
+    }
+
+    /**
+     * Check if the authentication used when establishing this session
+     * is still valid. Returns true if no authentication was used
+     */
+    boolean isLocalAuthenticationValid() {
+<span class="nc bnc" id="L255" title="All 2 branches missed.">        if (localPrivateKey != null) {</span>
+            try {
+                // if the private key is no longer valid, getAlgorithm()
+                // should throw an exception
+                // (e.g. Smartcard has been removed from the reader)
+<span class="nc" id="L260">                localPrivateKey.getAlgorithm();</span>
+<span class="nc" id="L261">            } catch (Exception e) {</span>
+<span class="nc" id="L262">                invalidate();</span>
+<span class="nc" id="L263">                return false;</span>
+<span class="nc" id="L264">            }</span>
+        }
+<span class="nc" id="L266">        return true;</span>
+    }
+
+    /**
+     * Returns the ID for this session.  The ID is fixed for the
+     * duration of the session; neither it, nor its value, changes.
+     */
+    @Override
+    public byte[] getId() {
+<span class="nc" id="L275">        return sessionId.getId();</span>
+    }
+
+    /**
+     * For server sessions, this returns the set of sessions which
+     * are currently valid in this process.  For client sessions,
+     * this returns null.
+     */
+    @Override
+    public SSLSessionContext getSessionContext() {
+        /*
+         * An interim security policy until we can do something
+         * more specific in 1.2. Only allow trusted code (code which
+         * can set system properties) to get an
+         * SSLSessionContext. This is to limit the ability of code to
+         * look up specific sessions or enumerate over them. Otherwise,
+         * code can only get session objects from successful SSL
+         * connections which implies that they must have had permission
+         * to make the network connection in the first place.
+         */
+        SecurityManager sm;
+<span class="nc bnc" id="L296" title="All 2 branches missed.">        if ((sm = System.getSecurityManager()) != null) {</span>
+<span class="nc" id="L297">            sm.checkPermission(new SSLPermission(&quot;getSSLSessionContext&quot;));</span>
+        }
+
+<span class="nc" id="L300">        return context;</span>
+    }
+
+
+    SessionId getSessionId() {
+<span class="nc" id="L305">        return sessionId;</span>
+    }
+
+
+    /**
+     * Returns the cipher spec in use on this session
+     */
+    CipherSuite getSuite() {
+<span class="nc" id="L313">        return cipherSuite;</span>
+    }
+
+    /**
+     * Resets the cipher spec in use on this session
+     */
+    void setSuite(CipherSuite suite) {
+<span class="nc" id="L320">       cipherSuite = suite;</span>
+
+<span class="nc bnc" id="L322" title="All 4 branches missed.">       if (debug != null &amp;&amp; Debug.isOn(&quot;session&quot;)) {</span>
+<span class="nc" id="L323">           System.out.println(&quot;%% Negotiating:  &quot; + this);</span>
+       }
+<span class="nc" id="L325">    }</span>
+
+    /**
+     * Returns the name of the cipher suite in use on this session
+     */
+    @Override
+    public String getCipherSuite() {
+<span class="nc" id="L332">        return getSuite().name;</span>
+    }
+
+    ProtocolVersion getProtocolVersion() {
+<span class="nc" id="L336">        return protocolVersion;</span>
+    }
+
+    /**
+     * Returns the standard name of the protocol in use on this session
+     */
+    @Override
+    public String getProtocol() {
+<span class="nc" id="L344">        return getProtocolVersion().name;</span>
+    }
+
+    /**
+     * Returns the compression technique used in this session
+     */
+    byte getCompression() {
+<span class="nc" id="L351">        return compressionMethod;</span>
+    }
+
+    /**
+     * Returns the hashcode for this session
+     */
+    @Override
+    public int hashCode() {
+<span class="nc" id="L359">        return sessionId.hashCode();</span>
+    }
+
+
+    /**
+     * Returns true if sessions have same ids, false otherwise.
+     */
+    @Override
+    public boolean equals(Object obj) {
+
+<span class="nc bnc" id="L369" title="All 2 branches missed.">        if (obj == this) {</span>
+<span class="nc" id="L370">            return true;</span>
+        }
+
+<span class="nc bnc" id="L373" title="All 2 branches missed.">        if (obj instanceof SSLSessionImpl) {</span>
+<span class="nc" id="L374">            SSLSessionImpl sess = (SSLSessionImpl) obj;</span>
+<span class="nc bnc" id="L375" title="All 4 branches missed.">            return (sessionId != null) &amp;&amp; (sessionId.equals(</span>
+<span class="nc" id="L376">                        sess.getSessionId()));</span>
+        }
+
+<span class="nc" id="L379">        return false;</span>
+    }
+
+
+    /**
+     * Return the cert chain presented by the peer in the
+     * java.security.cert format.
+     * Note: This method can be used only when using certificate-based
+     * cipher suites; using it with non-certificate-based cipher suites,
+     * such as Kerberos, will throw an SSLPeerUnverifiedException.
+     *
+     * @return array of peer X.509 certs, with the peer's own cert
+     *  first in the chain, and with the &quot;root&quot; CA last.
+     */
+    @Override
+    public java.security.cert.Certificate[] getPeerCertificates()
+            throws SSLPeerUnverifiedException {
+        //
+        // clone to preserve integrity of session ... caller can't
+        // change record of peer identity even by accident, much
+        // less do it intentionally.
+        //
+<span class="nc bnc" id="L401" title="All 4 branches missed.">        if ((cipherSuite.keyExchange == K_KRB5) ||</span>
+            (cipherSuite.keyExchange == K_KRB5_EXPORT)) {
+<span class="nc" id="L403">            throw new SSLPeerUnverifiedException(&quot;no certificates expected&quot;</span>
+                        + &quot; for Kerberos cipher suites&quot;);
+        }
+<span class="nc bnc" id="L406" title="All 2 branches missed.">        if (peerCerts == null) {</span>
+<span class="nc" id="L407">            throw new SSLPeerUnverifiedException(&quot;peer not authenticated&quot;);</span>
+        }
+        // Certs are immutable objects, therefore we don't clone them.
+        // But do need to clone the array, so that nothing is inserted
+        // into peerCerts.
+<span class="nc" id="L412">        return (java.security.cert.Certificate[])peerCerts.clone();</span>
+    }
+
+    /**
+     * Return the cert chain presented to the peer in the
+     * java.security.cert format.
+     * Note: This method is useful only when using certificate-based
+     * cipher suites.
+     *
+     * @return array of peer X.509 certs, with the peer's own cert
+     *  first in the chain, and with the &quot;root&quot; CA last.
+     */
+    @Override
+    public java.security.cert.Certificate[] getLocalCertificates() {
+        //
+        // clone to preserve integrity of session ... caller can't
+        // change record of peer identity even by accident, much
+        // less do it intentionally.
+<span class="nc bnc" id="L430" title="All 2 branches missed.">        return (localCerts == null ? null :</span>
+<span class="nc" id="L431">            (java.security.cert.Certificate[])localCerts.clone());</span>
+    }
+
+    /**
+     * Return the cert chain presented by the peer in the
+     * javax.security.cert format.
+     * Note: This method can be used only when using certificate-based
+     * cipher suites; using it with non-certificate-based cipher suites,
+     * such as Kerberos, will throw an SSLPeerUnverifiedException.
+     *
+     * @return array of peer X.509 certs, with the peer's own cert
+     *  first in the chain, and with the &quot;root&quot; CA last.
+     */
+    @Override
+    public javax.security.cert.X509Certificate[] getPeerCertificateChain()
+            throws SSLPeerUnverifiedException {
+        //
+        // clone to preserve integrity of session ... caller can't
+        // change record of peer identity even by accident, much
+        // less do it intentionally.
+        //
+<span class="nc bnc" id="L452" title="All 4 branches missed.">        if ((cipherSuite.keyExchange == K_KRB5) ||</span>
+            (cipherSuite.keyExchange == K_KRB5_EXPORT)) {
+<span class="nc" id="L454">            throw new SSLPeerUnverifiedException(&quot;no certificates expected&quot;</span>
+                        + &quot; for Kerberos cipher suites&quot;);
+        }
+<span class="nc bnc" id="L457" title="All 2 branches missed.">        if (peerCerts == null) {</span>
+<span class="nc" id="L458">            throw new SSLPeerUnverifiedException(&quot;peer not authenticated&quot;);</span>
+        }
+        javax.security.cert.X509Certificate[] certs;
+<span class="nc" id="L461">        certs = new javax.security.cert.X509Certificate[peerCerts.length];</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">        for (int i = 0; i &lt; peerCerts.length; i++) {</span>
+<span class="nc" id="L463">            byte[] der = null;</span>
+            try {
+<span class="nc" id="L465">                der = peerCerts[i].getEncoded();</span>
+<span class="nc" id="L466">                certs[i] = javax.security.cert.X509Certificate.getInstance(der);</span>
+<span class="nc" id="L467">            } catch (CertificateEncodingException e) {</span>
+<span class="nc" id="L468">                throw new SSLPeerUnverifiedException(e.getMessage());</span>
+<span class="nc" id="L469">            } catch (javax.security.cert.CertificateException e) {</span>
+<span class="nc" id="L470">                throw new SSLPeerUnverifiedException(e.getMessage());</span>
+<span class="nc" id="L471">            }</span>
+        }
+
+<span class="nc" id="L474">        return certs;</span>
+    }
+
+    /**
+     * Return the cert chain presented by the peer.
+     * Note: This method can be used only when using certificate-based
+     * cipher suites; using it with non-certificate-based cipher suites,
+     * such as Kerberos, will throw an SSLPeerUnverifiedException.
+     *
+     * @return array of peer X.509 certs, with the peer's own cert
+     *  first in the chain, and with the &quot;root&quot; CA last.
+     */
+    public X509Certificate[] getCertificateChain()
+            throws SSLPeerUnverifiedException {
+        /*
+         * clone to preserve integrity of session ... caller can't
+         * change record of peer identity even by accident, much
+         * less do it intentionally.
+         */
+<span class="nc bnc" id="L493" title="All 4 branches missed.">        if ((cipherSuite.keyExchange == K_KRB5) ||</span>
+            (cipherSuite.keyExchange == K_KRB5_EXPORT)) {
+<span class="nc" id="L495">            throw new SSLPeerUnverifiedException(&quot;no certificates expected&quot;</span>
+                        + &quot; for Kerberos cipher suites&quot;);
+        }
+<span class="nc bnc" id="L498" title="All 2 branches missed.">        if (peerCerts != null) {</span>
+<span class="nc" id="L499">            return peerCerts.clone();</span>
+        } else {
+<span class="nc" id="L501">            throw new SSLPeerUnverifiedException(&quot;peer not authenticated&quot;);</span>
+        }
+    }
+
+    /**
+     * Returns the identity of the peer which was established as part of
+     * defining the session.
+     *
+     * @return the peer's principal. Returns an X500Principal of the
+     * end-entity certificate for X509-based cipher suites, and
+     * Principal for Kerberos cipher suites.
+     *
+     * @throws SSLPeerUnverifiedException if the peer's identity has not
+     *          been verified
+     */
+    @Override
+    public Principal getPeerPrincipal()
+                throws SSLPeerUnverifiedException
+    {
+<span class="nc bnc" id="L520" title="All 4 branches missed.">        if ((cipherSuite.keyExchange == K_KRB5) ||</span>
+            (cipherSuite.keyExchange == K_KRB5_EXPORT)) {
+<span class="nc bnc" id="L522" title="All 2 branches missed.">            if (peerPrincipal == null) {</span>
+<span class="nc" id="L523">                throw new SSLPeerUnverifiedException(&quot;peer not authenticated&quot;);</span>
+            } else {
+                // Eliminate dependency on KerberosPrincipal
+<span class="nc" id="L526">                return peerPrincipal;</span>
+            }
+        }
+<span class="nc bnc" id="L529" title="All 2 branches missed.">        if (peerCerts == null) {</span>
+<span class="nc" id="L530">            throw new SSLPeerUnverifiedException(&quot;peer not authenticated&quot;);</span>
+        }
+<span class="nc" id="L532">        return peerCerts[0].getSubjectX500Principal();</span>
+    }
+
+    /**
+     * Returns the principal that was sent to the peer during handshaking.
+     *
+     * @return the principal sent to the peer. Returns an X500Principal
+     * of the end-entity certificate for X509-based cipher suites, and
+     * Principal for Kerberos cipher suites. If no principal was
+     * sent, then null is returned.
+     */
+    @Override
+    public Principal getLocalPrincipal() {
+
+<span class="nc bnc" id="L546" title="All 4 branches missed.">        if ((cipherSuite.keyExchange == K_KRB5) ||</span>
+            (cipherSuite.keyExchange == K_KRB5_EXPORT)) {
+                // Eliminate dependency on KerberosPrincipal
+<span class="nc bnc" id="L549" title="All 2 branches missed.">                return (localPrincipal == null ? null : localPrincipal);</span>
+        }
+<span class="nc bnc" id="L551" title="All 2 branches missed.">        return (localCerts == null ? null :</span>
+<span class="nc" id="L552">                localCerts[0].getSubjectX500Principal());</span>
+    }
+
+    /**
+     * Returns the time this session was created.
+     */
+    @Override
+    public long getCreationTime() {
+<span class="nc" id="L560">        return creationTime;</span>
+    }
+
+    /**
+     * Returns the last time this session was used to initialize
+     * a connection.
+     */
+    @Override
+    public long getLastAccessedTime() {
+<span class="nc bnc" id="L569" title="All 2 branches missed.">        return (lastUsedTime != 0) ? lastUsedTime : creationTime;</span>
+    }
+
+    void setLastAccessedTime(long time) {
+<span class="nc" id="L573">        lastUsedTime = time;</span>
+<span class="nc" id="L574">    }</span>
+
+
+    /**
+     * Returns the network address of the session's peer.  This
+     * implementation does not insist that connections between
+     * different ports on the same host must necessarily belong
+     * to different sessions, though that is of course allowed.
+     */
+    public InetAddress getPeerAddress() {
+        try {
+<span class="nc" id="L585">            return InetAddress.getByName(host);</span>
+<span class="nc" id="L586">        } catch (java.net.UnknownHostException e) {</span>
+<span class="nc" id="L587">            return null;</span>
+        }
+    }
+
+    @Override
+    public String getPeerHost() {
+<span class="nc" id="L593">        return host;</span>
+    }
+
+    /**
+     * Need to provide the port info for caching sessions based on
+     * host and port. Accessed by SSLSessionContextImpl
+     */
+    @Override
+    public int getPeerPort() {
+<span class="nc" id="L602">        return port;</span>
+    }
+
+    void setContext(SSLSessionContextImpl ctx) {
+<span class="nc bnc" id="L606" title="All 2 branches missed.">        if (context == null) {</span>
+<span class="nc" id="L607">            context = ctx;</span>
+        }
+<span class="nc" id="L609">    }</span>
+
+    /**
+     * Invalidate a session.  Active connections may still exist, but
+     * no connections will be able to rejoin this session.
+     */
+    @Override
+    synchronized public void invalidate() {
+        //
+        // Can't invalidate the NULL session -- this would be
+        // attempted when we get a handshaking error on a brand
+        // new connection, with no &quot;real&quot; session yet.
+        //
+<span class="nc bnc" id="L622" title="All 2 branches missed.">        if (this == nullSession) {</span>
+<span class="nc" id="L623">            return;</span>
+        }
+<span class="nc" id="L625">        invalidated = true;</span>
+<span class="nc bnc" id="L626" title="All 4 branches missed.">        if (debug != null &amp;&amp; Debug.isOn(&quot;session&quot;)) {</span>
+<span class="nc" id="L627">            System.out.println(&quot;%% Invalidated:  &quot; + this);</span>
+        }
+<span class="nc bnc" id="L629" title="All 2 branches missed.">        if (context != null) {</span>
+<span class="nc" id="L630">            context.remove(sessionId);</span>
+<span class="nc" id="L631">            context = null;</span>
+        }
+<span class="nc" id="L633">    }</span>
+
+    /*
+     * Table of application-specific session data indexed by an application
+     * key and the calling security context. This is important since
+     * sessions can be shared across different protection domains.
+     */
+<span class="nc" id="L640">    private Hashtable&lt;SecureKey, Object&gt; table = new Hashtable&lt;&gt;();</span>
+
+    /**
+     * Assigns a session value.  Session change events are given if
+     * appropriate, to any original value as well as the new value.
+     */
+    @Override
+    public void putValue(String key, Object value) {
+<span class="nc bnc" id="L648" title="All 4 branches missed.">        if ((key == null) || (value == null)) {</span>
+<span class="nc" id="L649">            throw new IllegalArgumentException(&quot;arguments can not be null&quot;);</span>
+        }
+
+<span class="nc" id="L652">        SecureKey secureKey = new SecureKey(key);</span>
+<span class="nc" id="L653">        Object oldValue = table.put(secureKey, value);</span>
+
+<span class="nc bnc" id="L655" title="All 2 branches missed.">        if (oldValue instanceof SSLSessionBindingListener) {</span>
+            SSLSessionBindingEvent e;
+
+<span class="nc" id="L658">            e = new SSLSessionBindingEvent(this, key);</span>
+<span class="nc" id="L659">            ((SSLSessionBindingListener)oldValue).valueUnbound(e);</span>
+        }
+<span class="nc bnc" id="L661" title="All 2 branches missed.">        if (value instanceof SSLSessionBindingListener) {</span>
+            SSLSessionBindingEvent e;
+
+<span class="nc" id="L664">            e = new SSLSessionBindingEvent(this, key);</span>
+<span class="nc" id="L665">            ((SSLSessionBindingListener)value).valueBound(e);</span>
+        }
+<span class="nc" id="L667">    }</span>
+
+
+    /**
+     * Returns the specified session value.
+     */
+    @Override
+    public Object getValue(String key) {
+<span class="nc bnc" id="L675" title="All 2 branches missed.">        if (key == null) {</span>
+<span class="nc" id="L676">            throw new IllegalArgumentException(&quot;argument can not be null&quot;);</span>
+        }
+
+<span class="nc" id="L679">        SecureKey secureKey = new SecureKey(key);</span>
+<span class="nc" id="L680">        return table.get(secureKey);</span>
+    }
+
+
+    /**
+     * Removes the specified session value, delivering a session changed
+     * event as appropriate.
+     */
+    @Override
+    public void removeValue(String key) {
+<span class="nc bnc" id="L690" title="All 2 branches missed.">        if (key == null) {</span>
+<span class="nc" id="L691">            throw new IllegalArgumentException(&quot;argument can not be null&quot;);</span>
+        }
+
+<span class="nc" id="L694">        SecureKey secureKey = new SecureKey(key);</span>
+<span class="nc" id="L695">        Object value = table.remove(secureKey);</span>
+
+<span class="nc bnc" id="L697" title="All 2 branches missed.">        if (value instanceof SSLSessionBindingListener) {</span>
+            SSLSessionBindingEvent e;
+
+<span class="nc" id="L700">            e = new SSLSessionBindingEvent(this, key);</span>
+<span class="nc" id="L701">            ((SSLSessionBindingListener)value).valueUnbound(e);</span>
+        }
+<span class="nc" id="L703">    }</span>
+
+
+    /**
+     * Lists the names of the session values.
+     */
+    @Override
+    public String[] getValueNames() {
+        Enumeration&lt;SecureKey&gt; e;
+<span class="nc" id="L712">        Vector&lt;Object&gt; v = new Vector&lt;&gt;();</span>
+        SecureKey key;
+<span class="nc" id="L714">        Object securityCtx = SecureKey.getCurrentSecurityContext();</span>
+
+<span class="nc bnc" id="L716" title="All 2 branches missed.">        for (e = table.keys(); e.hasMoreElements(); ) {</span>
+<span class="nc" id="L717">            key = e.nextElement();</span>
+
+<span class="nc bnc" id="L719" title="All 2 branches missed.">            if (securityCtx.equals(key.getSecurityContext())) {</span>
+<span class="nc" id="L720">                v.addElement(key.getAppKey());</span>
+            }
+        }
+<span class="nc" id="L723">        String[] names = new String[v.size()];</span>
+<span class="nc" id="L724">        v.copyInto(names);</span>
+
+<span class="nc" id="L726">        return names;</span>
+    }
+
+    /**
+     * Use large packet sizes now or follow RFC 2246 packet sizes (2^14)
+     * until changed.
+     *
+     * In the TLS specification (section 6.2.1, RFC2246), it is not
+     * recommended that the plaintext has more than 2^14 bytes.
+     * However, some TLS implementations violate the specification.
+     * This is a workaround for interoperability with these stacks.
+     *
+     * Application could accept large fragments up to 2^15 bytes by
+     * setting the system property jsse.SSLEngine.acceptLargeFragments
+     * to &quot;true&quot;.
+     */
+<span class="nc" id="L742">    private boolean acceptLargeFragments =</span>
+<span class="nc" id="L743">        Debug.getBooleanProperty(&quot;jsse.SSLEngine.acceptLargeFragments&quot;, false);</span>
+
+    /**
+     * Expand the buffer size of both SSL/TLS network packet and
+     * application data.
+     */
+    protected synchronized void expandBufferSizes() {
+<span class="nc" id="L750">        acceptLargeFragments = true;</span>
+<span class="nc" id="L751">    }</span>
+
+    /**
+     * Gets the current size of the largest SSL/TLS packet that is expected
+     * when using this session.
+     */
+    @Override
+    public synchronized int getPacketBufferSize() {
+<span class="nc bnc" id="L759" title="All 2 branches missed.">        return acceptLargeFragments ?</span>
+                Record.maxLargeRecordSize : Record.maxRecordSize;
+    }
+
+    /**
+     * Gets the current size of the largest application data that is
+     * expected when using this session.
+     */
+    @Override
+    public synchronized int getApplicationBufferSize() {
+<span class="nc" id="L769">        return getPacketBufferSize() - Record.headerSize;</span>
+    }
+
+    /**
+     * Gets an array of supported signature algorithms that the local side is
+     * willing to verify.
+     */
+    @Override
+    public String[] getLocalSupportedSignatureAlgorithms() {
+<span class="nc bnc" id="L778" title="All 2 branches missed.">        if (localSupportedSignAlgs != null) {</span>
+<span class="nc" id="L779">            return localSupportedSignAlgs.clone();</span>
+        }
+
+<span class="nc" id="L782">        return new String[0];</span>
+    }
+
+    /**
+     * Gets an array of supported signature algorithms that the peer is
+     * able to verify.
+     */
+    @Override
+    public String[] getPeerSupportedSignatureAlgorithms() {
+<span class="nc bnc" id="L791" title="All 2 branches missed.">        if (peerSupportedSignAlgs != null) {</span>
+<span class="nc" id="L792">            return peerSupportedSignAlgs.clone();</span>
+        }
+
+<span class="nc" id="L795">        return new String[0];</span>
+    }
+
+    /**
+     * Obtains a &lt;code&gt;List&lt;/code&gt; containing all {@link SNIServerName}s
+     * of the requested Server Name Indication (SNI) extension.
+     */
+    @Override
+    public List&lt;SNIServerName&gt; getRequestedServerNames() {
+<span class="nc bnc" id="L804" title="All 4 branches missed.">        if (requestedServerNames != null &amp;&amp; !requestedServerNames.isEmpty()) {</span>
+<span class="nc" id="L805">            return Collections.&lt;SNIServerName&gt;unmodifiableList(</span>
+                                                requestedServerNames);
+        }
+
+<span class="nc" id="L809">        return Collections.&lt;SNIServerName&gt;emptyList();</span>
+    }
+
+    /** Returns a string representation of this SSL session */
+    @Override
+    public String toString() {
+<span class="nc" id="L815">        return &quot;[Session-&quot; + sessionCount</span>
+<span class="nc" id="L816">            + &quot;, &quot; + getCipherSuite()</span>
+            + &quot;]&quot;;
+    }
+
+    /**
+     * When SSL sessions are finalized, all values bound to
+     * them are removed.
+     */
+    @Override
+    protected void finalize() throws Throwable {
+<span class="nc" id="L826">        String[] names = getValueNames();</span>
+<span class="nc bnc" id="L827" title="All 2 branches missed.">        for (int i = 0; i &lt; names.length; i++) {</span>
+<span class="nc" id="L828">            removeValue(names[i]);</span>
+        }
+<span class="nc" id="L830">    }</span>
+}
+
+
+/**
+ * This &quot;struct&quot; class serves as a Hash Key that combines an
+ * application-specific key and a security context.
+ */
+class SecureKey {
+<span class="nc" id="L839">    private static Object       nullObject = new Object();</span>
+    private Object        appKey;
+    private Object      securityCtx;
+
+    static Object getCurrentSecurityContext() {
+<span class="nc" id="L844">        SecurityManager sm = System.getSecurityManager();</span>
+<span class="nc" id="L845">        Object context = null;</span>
+
+<span class="nc bnc" id="L847" title="All 2 branches missed.">        if (sm != null)</span>
+<span class="nc" id="L848">            context = sm.getSecurityContext();</span>
+<span class="nc bnc" id="L849" title="All 2 branches missed.">        if (context == null)</span>
+<span class="nc" id="L850">            context = nullObject;</span>
+<span class="nc" id="L851">        return context;</span>
+    }
+
+<span class="nc" id="L854">    SecureKey(Object key) {</span>
+<span class="nc" id="L855">        this.appKey = key;</span>
+<span class="nc" id="L856">        this.securityCtx = getCurrentSecurityContext();</span>
+<span class="nc" id="L857">    }</span>
+
+    Object getAppKey() {
+<span class="nc" id="L860">        return appKey;</span>
+    }
+
+    Object getSecurityContext() {
+<span class="nc" id="L864">        return securityCtx;</span>
+    }
+
+    @Override
+    public int hashCode() {
+<span class="nc" id="L869">        return appKey.hashCode() ^ securityCtx.hashCode();</span>
+    }
+
+    @Override
+    public boolean equals(Object o) {
+<span class="nc bnc" id="L874" title="All 4 branches missed.">        return o instanceof SecureKey &amp;&amp; ((SecureKey)o).appKey.equals(appKey)</span>
+<span class="nc bnc" id="L875" title="All 2 branches missed.">                        &amp;&amp; ((SecureKey)o).securityCtx.equals(securityCtx);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

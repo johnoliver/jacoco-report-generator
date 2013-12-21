@@ -1,0 +1,907 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>Coding.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">com.sun.java.util.jar.pack</a> &gt; <span class="el_source">Coding.java</span></div><h1>Coding.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2001, 2011, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package com.sun.java.util.jar.pack;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.HashMap;
+import java.util.Map;
+import static com.sun.java.util.jar.pack.Constants.*;
+/**
+ * Define the conversions between sequences of small integers and raw bytes.
+ * This is a schema of encodings which incorporates varying lengths,
+ * varying degrees of length variability, and varying amounts of signed-ness.
+ * @author John Rose
+ */
+<span class="nc bnc" id="L40" title="All 2 branches missed.">class Coding implements Comparable&lt;Coding&gt;, CodingMethod, Histogram.BitMetric {</span>
+    /*
+      Coding schema for single integers, parameterized by (B,H,S):
+
+      Let B in [1,5], H in [1,256], S in [0,3].
+      (S limit is arbitrary.  B follows the 32-bit limit.  H is byte size.)
+
+      A given (B,H,S) code varies in length from 1 to B bytes.
+
+      The 256 values a byte may take on are divided into L=(256-H) and H
+      values, with all the H values larger than the L values.
+      (That is, the L values are [0,L) and the H are [L,256).)
+
+      The last byte is always either the B-th byte, a byte with &quot;L value&quot;
+      (&lt;L), or both.  There is no other byte that satisfies these conditions.
+      All bytes before the last always have &quot;H values&quot; (&gt;=L).
+
+      Therefore, if L==0, the code always has the full length of B bytes.
+      The coding then becomes a classic B-byte little-endian unsigned integer.
+      (Also, if L==128, the high bit of each byte acts signals the presence
+      of a following byte, up to the maximum length.)
+
+      In the unsigned case (S==0), the coding is compact and monotonic
+      in the ordering of byte sequences defined by appending zero bytes
+      to pad them to a common length B, reversing them, and ordering them
+      lexicographically.  (This agrees with &quot;little-endian&quot; byte order.)
+
+      Therefore, the unsigned value of a byte sequence may be defined as:
+      &lt;pre&gt;
+        U(b0)           == b0
+                           in [0..L)
+                           or [0..256) if B==1 (**)
+
+        U(b0,b1)        == b0 + b1*H
+                           in [L..L*(1+H))
+                           or [L..L*(1+H) + H^2) if B==2
+
+        U(b0,b1,b2)     == b0 + b1*H + b2*H^2
+                           in [L*(1+H)..L*(1+H+H^2))
+                           or [L*(1+H)..L*(1+H+H^2) + H^3) if B==3
+
+        U(b[i]: i&lt;n)    == Sum[i&lt;n]( b[i] * H^i )
+                           up to  L*Sum[i&lt;n]( H^i )
+                           or to  L*Sum[i&lt;n]( H^i ) + H^n if n==B
+      &lt;/pre&gt;
+
+      (**) If B==1, the values H,L play no role in the coding.
+      As a convention, we require that any (1,H,S) code must always
+      encode values less than H.  Thus, a simple unsigned byte is coded
+      specifically by the code (1,256,0).
+
+      (Properly speaking, the unsigned case should be parameterized as
+      S==Infinity.  If the schema were regular, the case S==0 would really
+      denote a numbering in which all coded values are negative.)
+
+      If S&gt;0, the unsigned value of a byte sequence is regarded as a binary
+      integer.  If any of the S low-order bits are zero, the corresponding
+      signed value will be non-negative.  If all of the S low-order bits
+      (S&gt;0) are one, the the corresponding signed value will be negative.
+
+      The non-negative signed values are compact and monotonically increasing
+      (from 0) in the ordering of the corresponding unsigned values.
+
+      The negative signed values are compact and monotonically decreasing
+      (from -1) in the ordering of the corresponding unsigned values.
+
+      In essence, the low-order S bits function as a collective sign bit
+      for negative signed numbers, and as a low-order base-(2^S-1) digit
+      for non-negative signed numbers.
+
+      Therefore, the signed value corresponding to an unsigned value is:
+      &lt;pre&gt;
+        Sgn(x)  == x                               if S==0
+        Sgn(x)  == (x / 2^S)*(2^S-1) + (x % 2^S),  if S&gt;0, (x % 2^S) &lt; 2^S-1
+        Sgn(x)  == -(x / 2^S)-1,                   if S&gt;0, (x % 2^S) == 2^S-1
+      &lt;/pre&gt;
+
+      Finally, the value of a byte sequence, given the coding parameters
+      (B,H,S), is defined as:
+      &lt;pre&gt;
+        V(b[i]: i&lt;n)  == Sgn(U(b[i]: i&lt;n))
+      &lt;/pre&gt;
+
+      The extremal positive and negative signed value for a given range
+      of unsigned values may be found by sign-encoding the largest unsigned
+      value which is not 2^S-1 mod 2^S, and that which is, respectively.
+
+      Because B,H,S are variable, this is not a single coding but a schema
+      of codings.  For optimal compression, it is necessary to adaptively
+      select specific codings to the data being compressed.
+
+      For example, if a sequence of values happens never to be negative,
+      S==0 is the best choice.  If the values are equally balanced between
+      negative and positive, S==1.  If negative values are rare, then S&gt;1
+      is more appropriate.
+
+      A (B,H,S) encoding is called a &quot;subrange&quot; if it does not encode
+      the largest 32-bit value, and if the number R of values it does
+      encode can be expressed as a positive 32-bit value.  (Note that
+      B=1 implies R&lt;=256, B=2 implies R&lt;=65536, etc.)
+
+      A delta version of a given (B,H,S) coding encodes an array of integers
+      by writing their successive differences in the (B,H,S) coding.
+      The original integers themselves may be recovered by making a
+      running accumulation of sum of the differences as they are read.
+
+      As a special case, if a (B,H,S) encoding is a subrange, its delta
+      version will only encode arrays of numbers in the coding's unsigned
+      range, [0..R-1].  The coding of deltas is still in the normal signed
+      range, if S!=0.  During delta encoding, all subtraction results are
+      reduced to the signed range, by adding multiples of R.  Likewise,
+.     during encoding, all addition results are reduced to the unsigned range.
+      This special case for subranges allows the benefits of wraparound
+      when encoding correlated sequences of very small positive numbers.
+     */
+
+    // Code-specific limits:
+    private static int saturate32(long x) {
+<span class="nc bnc" id="L158" title="All 2 branches missed.">        if (x &gt; Integer.MAX_VALUE)   return Integer.MAX_VALUE;</span>
+<span class="nc bnc" id="L159" title="All 2 branches missed.">        if (x &lt; Integer.MIN_VALUE)   return Integer.MIN_VALUE;</span>
+<span class="nc" id="L160">        return (int)x;</span>
+    }
+    private static long codeRangeLong(int B, int H) {
+<span class="nc" id="L163">        return codeRangeLong(B, H, B);</span>
+    }
+    private static long codeRangeLong(int B, int H, int nMax) {
+        // Code range for a all (B,H) codes of length &lt;=nMax (&lt;=B).
+        // n &lt; B:   L*Sum[i&lt;n]( H^i )
+        // n == B:  L*Sum[i&lt;B]( H^i ) + H^B
+<span class="nc bnc" id="L169" title="All 6 branches missed.">        assert(nMax &gt;= 0 &amp;&amp; nMax &lt;= B);</span>
+<span class="nc bnc" id="L170" title="All 6 branches missed.">        assert(B &gt;= 1 &amp;&amp; B &lt;= 5);</span>
+<span class="nc bnc" id="L171" title="All 6 branches missed.">        assert(H &gt;= 1 &amp;&amp; H &lt;= 256);</span>
+<span class="nc bnc" id="L172" title="All 2 branches missed.">        if (nMax == 0)  return 0;  // no codes of zero length</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">        if (B == 1)     return H;  // special case; see (**) above</span>
+<span class="nc" id="L174">        int L = 256-H;</span>
+<span class="nc" id="L175">        long sum = 0;</span>
+<span class="nc" id="L176">        long H_i = 1;</span>
+<span class="nc bnc" id="L177" title="All 2 branches missed.">        for (int n = 1; n &lt;= nMax; n++) {</span>
+<span class="nc" id="L178">            sum += H_i;</span>
+<span class="nc" id="L179">            H_i *= H;</span>
+        }
+<span class="nc" id="L181">        sum *= L;</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">        if (nMax == B)</span>
+<span class="nc" id="L183">            sum += H_i;</span>
+<span class="nc" id="L184">        return sum;</span>
+    }
+    /** Largest int representable by (B,H,S) in up to nMax bytes. */
+    public static int codeMax(int B, int H, int S, int nMax) {
+        //assert(S &gt;= 0 &amp;&amp; S &lt;= S_MAX);
+<span class="nc" id="L189">        long range = codeRangeLong(B, H, nMax);</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">        if (range == 0)</span>
+<span class="nc" id="L191">            return -1;  // degenerate max value for empty set of codes</span>
+<span class="nc bnc" id="L192" title="All 4 branches missed.">        if (S == 0 || range &gt;= (long)1&lt;&lt;32)</span>
+<span class="nc" id="L193">            return saturate32(range-1);</span>
+<span class="nc" id="L194">        long maxPos = range-1;</span>
+<span class="nc bnc" id="L195" title="All 2 branches missed.">        while (isNegativeCode(maxPos, S)) {</span>
+<span class="nc" id="L196">            --maxPos;</span>
+        }
+<span class="nc bnc" id="L198" title="All 2 branches missed.">        if (maxPos &lt; 0)  return -1;  // No positive codings at all.</span>
+<span class="nc" id="L199">        int smax = decodeSign32(maxPos, S);</span>
+        // check for 32-bit wraparound:
+<span class="nc bnc" id="L201" title="All 2 branches missed.">        if (smax &lt; 0)</span>
+<span class="nc" id="L202">            return Integer.MAX_VALUE;</span>
+<span class="nc" id="L203">        return smax;</span>
+    }
+    /** Smallest int representable by (B,H,S) in up to nMax bytes.
+        Returns Integer.MIN_VALUE if 32-bit wraparound covers
+        the entire negative range.
+     */
+    public static int codeMin(int B, int H, int S, int nMax) {
+        //assert(S &gt;= 0 &amp;&amp; S &lt;= S_MAX);
+<span class="nc" id="L211">        long range = codeRangeLong(B, H, nMax);</span>
+<span class="nc bnc" id="L212" title="All 4 branches missed.">        if (range &gt;= (long)1&lt;&lt;32 &amp;&amp; nMax == B) {</span>
+            // Can code negative values via 32-bit wraparound.
+<span class="nc" id="L214">            return Integer.MIN_VALUE;</span>
+        }
+<span class="nc bnc" id="L216" title="All 2 branches missed.">        if (S == 0) {</span>
+<span class="nc" id="L217">            return 0;</span>
+        }
+<span class="nc" id="L219">        long maxNeg = range-1;</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">        while (!isNegativeCode(maxNeg, S))</span>
+<span class="nc" id="L221">            --maxNeg;</span>
+
+<span class="nc bnc" id="L223" title="All 2 branches missed.">        if (maxNeg &lt; 0)  return 0;  // No negative codings at all.</span>
+<span class="nc" id="L224">        return decodeSign32(maxNeg, S);</span>
+    }
+
+    // Some of the arithmetic below is on unsigned 32-bit integers.
+    // These must be represented in Java as longs in the range [0..2^32-1].
+    // The conversion to a signed int is just the Java cast (int), but
+    // the conversion to an unsigned int is the following little method:
+    private static long toUnsigned32(int sx) {
+<span class="nc" id="L232">        return ((long)sx &lt;&lt; 32) &gt;&gt;&gt; 32;</span>
+    }
+
+    // Sign encoding:
+    private static boolean isNegativeCode(long ux, int S) {
+<span class="nc bnc" id="L237" title="All 4 branches missed.">        assert(S &gt; 0);</span>
+<span class="nc bnc" id="L238" title="All 4 branches missed.">        assert(ux &gt;= -1);  // can be out of 32-bit range; who cares</span>
+<span class="nc" id="L239">        int Smask = (1&lt;&lt;S)-1;</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">        return (((int)ux+1) &amp; Smask) == 0;</span>
+    }
+    private static boolean hasNegativeCode(int sx, int S) {
+<span class="nc bnc" id="L243" title="All 4 branches missed.">        assert(S &gt; 0);</span>
+        // If S&gt;=2 very low negatives are coded by 32-bit-wrapped positives.
+        // The lowest negative representable by a negative coding is
+        // ~(umax32 &gt;&gt; S), and the next lower number is coded by wrapping
+        // the highest positive:
+        //    CodePos(umax32-1)  -&gt;  (umax32-1)-((umax32-1)&gt;&gt;S)
+        // which simplifies to ~(umax32 &gt;&gt; S)-1.
+<span class="nc bnc" id="L250" title="All 4 branches missed.">        return (0 &gt; sx) &amp;&amp; (sx &gt;= ~(-1&gt;&gt;&gt;S));</span>
+    }
+    private static int decodeSign32(long ux, int S) {
+<span class="nc bnc" id="L253" title="All 4 branches missed.">        assert(ux == toUnsigned32((int)ux))  // must be unsigned 32-bit number</span>
+<span class="nc" id="L254">            : (Long.toHexString(ux));</span>
+<span class="nc bnc" id="L255" title="All 2 branches missed.">        if (S == 0) {</span>
+<span class="nc" id="L256">            return (int) ux;  // cast to signed int</span>
+        }
+        int sx;
+<span class="nc bnc" id="L259" title="All 2 branches missed.">        if (isNegativeCode(ux, S)) {</span>
+            // Sgn(x)  == -(x / 2^S)-1
+<span class="nc" id="L261">            sx = ~((int)ux &gt;&gt;&gt; S);</span>
+        } else {
+            // Sgn(x)  == (x / 2^S)*(2^S-1) + (x % 2^S)
+<span class="nc" id="L264">            sx = (int)ux - ((int)ux &gt;&gt;&gt; S);</span>
+        }
+        // Assert special case of S==1:
+<span class="nc bnc" id="L267" title="All 6 branches missed.">        assert(!(S == 1) || sx == (((int)ux &gt;&gt;&gt; 1) ^ -((int)ux &amp; 1)));</span>
+<span class="nc" id="L268">        return sx;</span>
+    }
+    private static long encodeSign32(int sx, int S) {
+<span class="nc bnc" id="L271" title="All 2 branches missed.">        if (S == 0) {</span>
+<span class="nc" id="L272">            return toUnsigned32(sx);  // unsigned 32-bit int</span>
+        }
+<span class="nc" id="L274">        int Smask = (1&lt;&lt;S)-1;</span>
+        long ux;
+<span class="nc bnc" id="L276" title="All 2 branches missed.">        if (!hasNegativeCode(sx, S)) {</span>
+            // InvSgn(sx) = (sx / (2^S-1))*2^S + (sx % (2^S-1))
+<span class="nc" id="L278">            ux = sx + (toUnsigned32(sx) / Smask);</span>
+        } else {
+            // InvSgn(sx) = (-sx-1)*2^S + (2^S-1)
+<span class="nc" id="L281">            ux = (-sx &lt;&lt; S) - 1;</span>
+        }
+<span class="nc" id="L283">        ux = toUnsigned32((int)ux);</span>
+<span class="nc bnc" id="L284" title="All 4 branches missed.">        assert(sx == decodeSign32(ux, S))</span>
+<span class="nc" id="L285">            : (Long.toHexString(ux)+&quot; -&gt; &quot;+</span>
+<span class="nc" id="L286">               Integer.toHexString(sx)+&quot; != &quot;+</span>
+<span class="nc" id="L287">               Integer.toHexString(decodeSign32(ux, S)));</span>
+<span class="nc" id="L288">        return ux;</span>
+    }
+
+    // Top-level coding of single integers:
+    public static void writeInt(byte[] out, int[] outpos, int sx, int B, int H, int S) {
+<span class="nc" id="L293">        long ux = encodeSign32(sx, S);</span>
+<span class="nc bnc" id="L294" title="All 4 branches missed.">        assert(ux == toUnsigned32((int)ux));</span>
+<span class="nc bnc" id="L295" title="All 4 branches missed.">        assert(ux &lt; codeRangeLong(B, H))</span>
+<span class="nc" id="L296">            : Long.toHexString(ux);</span>
+<span class="nc" id="L297">        int L = 256-H;</span>
+<span class="nc" id="L298">        long sum = ux;</span>
+<span class="nc" id="L299">        int pos = outpos[0];</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">        for (int i = 0; i &lt; B-1; i++) {</span>
+<span class="nc bnc" id="L301" title="All 2 branches missed.">            if (sum &lt; L)</span>
+<span class="nc" id="L302">                break;</span>
+<span class="nc" id="L303">            sum -= L;</span>
+<span class="nc" id="L304">            int b_i = (int)( L + (sum % H) );</span>
+<span class="nc" id="L305">            sum /= H;</span>
+<span class="nc" id="L306">            out[pos++] = (byte)b_i;</span>
+        }
+<span class="nc" id="L308">        out[pos++] = (byte)sum;</span>
+        // Report number of bytes written by updating outpos[0]:
+<span class="nc" id="L310">        outpos[0] = pos;</span>
+        // Check right away for mis-coding.
+        //assert(sx == readInt(out, new int[1], B, H, S));
+<span class="nc" id="L313">    }</span>
+    public static int readInt(byte[] in, int[] inpos, int B, int H, int S) {
+        // U(b[i]: i&lt;n) == Sum[i&lt;n]( b[i] * H^i )
+<span class="nc" id="L316">        int L = 256-H;</span>
+<span class="nc" id="L317">        long sum = 0;</span>
+<span class="nc" id="L318">        long H_i = 1;</span>
+<span class="nc" id="L319">        int pos = inpos[0];</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">        for (int i = 0; i &lt; B; i++) {</span>
+<span class="nc" id="L321">            int b_i = in[pos++] &amp; 0xFF;</span>
+<span class="nc" id="L322">            sum += b_i*H_i;</span>
+<span class="nc" id="L323">            H_i *= H;</span>
+<span class="nc bnc" id="L324" title="All 2 branches missed.">            if (b_i &lt; L)  break;</span>
+        }
+        //assert(sum &gt;= 0 &amp;&amp; sum &lt; codeRangeLong(B, H));
+        // Report number of bytes read by updating inpos[0]:
+<span class="nc" id="L328">        inpos[0] = pos;</span>
+<span class="nc" id="L329">        return decodeSign32(sum, S);</span>
+    }
+    // The Stream version doesn't fetch a byte unless it is needed for coding.
+    public static int readIntFrom(InputStream in, int B, int H, int S) throws IOException {
+        // U(b[i]: i&lt;n) == Sum[i&lt;n]( b[i] * H^i )
+<span class="nc" id="L334">        int L = 256-H;</span>
+<span class="nc" id="L335">        long sum = 0;</span>
+<span class="nc" id="L336">        long H_i = 1;</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">        for (int i = 0; i &lt; B; i++) {</span>
+<span class="nc" id="L338">            int b_i = in.read();</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">            if (b_i &lt; 0)  throw new RuntimeException(&quot;unexpected EOF&quot;);</span>
+<span class="nc" id="L340">            sum += b_i*H_i;</span>
+<span class="nc" id="L341">            H_i *= H;</span>
+<span class="nc bnc" id="L342" title="All 2 branches missed.">            if (b_i &lt; L)  break;</span>
+        }
+<span class="nc bnc" id="L344" title="All 6 branches missed.">        assert(sum &gt;= 0 &amp;&amp; sum &lt; codeRangeLong(B, H));</span>
+<span class="nc" id="L345">        return decodeSign32(sum, S);</span>
+    }
+
+    public static final int B_MAX = 5;    /* B: [1,5] */
+    public static final int H_MAX = 256;  /* H: [1,256] */
+    public static final int S_MAX = 2;    /* S: [0,2] */
+
+    // END OF STATICS.
+
+    private final int B; /*1..5*/       // # bytes (1..5)
+    private final int H; /*1..256*/     // # codes requiring a higher byte
+    private final int L; /*0..255*/     // # codes requiring a higher byte
+    private final int S; /*0..3*/       // # low-order bits representing sign
+    private final int del; /*0..2*/     // type of delta encoding (0 == none)
+    private final int min;              // smallest representable value
+    private final int max;              // largest representable value
+    private final int umin;             // smallest representable uns. value
+    private final int umax;             // largest representable uns. value
+    private final int[] byteMin;        // smallest repr. value, given # bytes
+    private final int[] byteMax;        // largest repr. value, given # bytes
+
+    private Coding(int B, int H, int S) {
+<span class="nc" id="L367">        this(B, H, S, 0);</span>
+<span class="nc" id="L368">    }</span>
+<span class="nc" id="L369">    private Coding(int B, int H, int S, int del) {</span>
+<span class="nc" id="L370">        this.B = B;</span>
+<span class="nc" id="L371">        this.H = H;</span>
+<span class="nc" id="L372">        this.L = 256-H;</span>
+<span class="nc" id="L373">        this.S = S;</span>
+<span class="nc" id="L374">        this.del = del;</span>
+<span class="nc" id="L375">        this.min = codeMin(B, H, S, B);</span>
+<span class="nc" id="L376">        this.max = codeMax(B, H, S, B);</span>
+<span class="nc" id="L377">        this.umin = codeMin(B, H, 0, B);</span>
+<span class="nc" id="L378">        this.umax = codeMax(B, H, 0, B);</span>
+<span class="nc" id="L379">        this.byteMin = new int[B];</span>
+<span class="nc" id="L380">        this.byteMax = new int[B];</span>
+
+<span class="nc bnc" id="L382" title="All 2 branches missed.">        for (int nMax = 1; nMax &lt;= B; nMax++) {</span>
+<span class="nc" id="L383">            byteMin[nMax-1] = codeMin(B, H, S, nMax);</span>
+<span class="nc" id="L384">            byteMax[nMax-1] = codeMax(B, H, S, nMax);</span>
+        }
+<span class="nc" id="L386">    }</span>
+
+    public boolean equals(Object x) {
+<span class="nc bnc" id="L389" title="All 2 branches missed.">        if (!(x instanceof Coding))  return false;</span>
+<span class="nc" id="L390">        Coding that = (Coding) x;</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">        if (this.B != that.B)  return false;</span>
+<span class="nc bnc" id="L392" title="All 2 branches missed.">        if (this.H != that.H)  return false;</span>
+<span class="nc bnc" id="L393" title="All 2 branches missed.">        if (this.S != that.S)  return false;</span>
+<span class="nc bnc" id="L394" title="All 2 branches missed.">        if (this.del != that.del)  return false;</span>
+<span class="nc" id="L395">        return true;</span>
+    }
+
+    public int hashCode() {
+<span class="nc" id="L399">        return (del&lt;&lt;14)+(S&lt;&lt;11)+(B&lt;&lt;8)+(H&lt;&lt;0);</span>
+    }
+
+    private static Map&lt;Coding, Coding&gt; codeMap;
+
+    private static synchronized Coding of(int B, int H, int S, int del) {
+<span class="nc bnc" id="L405" title="All 2 branches missed.">        if (codeMap == null)  codeMap = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L406">        Coding x0 = new Coding(B, H, S, del);</span>
+<span class="nc" id="L407">        Coding x1 = codeMap.get(x0);</span>
+<span class="nc bnc" id="L408" title="All 2 branches missed.">        if (x1 == null)  codeMap.put(x0, x1 = x0);</span>
+<span class="nc" id="L409">        return x1;</span>
+    }
+
+    public static Coding of(int B, int H) {
+<span class="nc" id="L413">        return of(B, H, 0, 0);</span>
+    }
+
+    public static Coding of(int B, int H, int S) {
+<span class="nc" id="L417">        return of(B, H, S, 0);</span>
+    }
+
+    public boolean canRepresentValue(int x) {
+<span class="nc bnc" id="L421" title="All 2 branches missed.">        if (isSubrange())</span>
+<span class="nc" id="L422">            return canRepresentUnsigned(x);</span>
+        else
+<span class="nc" id="L424">            return canRepresentSigned(x);</span>
+    }
+    /** Can this coding represent a single value, possibly a delta?
+     *  This ignores the D property.  That is, for delta codings,
+     *  this tests whether a delta value of 'x' can be coded.
+     *  For signed delta codings which produce unsigned end values,
+     *  use canRepresentUnsigned.
+     */
+    public boolean canRepresentSigned(int x) {
+<span class="nc bnc" id="L433" title="All 4 branches missed.">        return (x &gt;= min &amp;&amp; x &lt;= max);</span>
+    }
+    /** Can this coding, apart from its S property,
+     *  represent a single value?  (Negative values
+     *  can only be represented via 32-bit overflow,
+     *  so this returns true for negative values
+     *  if isFullRange is true.)
+     */
+    public boolean canRepresentUnsigned(int x) {
+<span class="nc bnc" id="L442" title="All 4 branches missed.">        return (x &gt;= umin &amp;&amp; x &lt;= umax);</span>
+    }
+
+    // object-oriented code/decode
+    public int readFrom(byte[] in, int[] inpos) {
+<span class="nc" id="L447">        return readInt(in, inpos, B, H, S);</span>
+    }
+    public void writeTo(byte[] out, int[] outpos, int x) {
+<span class="nc" id="L450">        writeInt(out, outpos, x, B, H, S);</span>
+<span class="nc" id="L451">    }</span>
+
+    // Stream versions
+    public int readFrom(InputStream in) throws IOException {
+<span class="nc" id="L455">        return readIntFrom(in, B, H, S);</span>
+    }
+    public void writeTo(OutputStream out, int x) throws IOException {
+<span class="nc" id="L458">        byte[] buf = new byte[B];</span>
+<span class="nc" id="L459">        int[] pos = new int[1];</span>
+<span class="nc" id="L460">        writeInt(buf, pos, x, B, H, S);</span>
+<span class="nc" id="L461">        out.write(buf, 0, pos[0]);</span>
+<span class="nc" id="L462">    }</span>
+
+    // Stream/array versions
+    public void readArrayFrom(InputStream in, int[] a, int start, int end) throws IOException {
+        // %%% use byte[] buffer
+<span class="nc bnc" id="L467" title="All 2 branches missed.">        for (int i = start; i &lt; end; i++)</span>
+<span class="nc" id="L468">            a[i] = readFrom(in);</span>
+
+<span class="nc bnc" id="L470" title="All 2 branches missed.">        for (int dstep = 0; dstep &lt; del; dstep++) {</span>
+<span class="nc" id="L471">            long state = 0;</span>
+<span class="nc bnc" id="L472" title="All 2 branches missed.">            for (int i = start; i &lt; end; i++) {</span>
+<span class="nc" id="L473">                state += a[i];</span>
+                // Reduce array values to the required range.
+<span class="nc bnc" id="L475" title="All 2 branches missed.">                if (isSubrange()) {</span>
+<span class="nc" id="L476">                    state = reduceToUnsignedRange(state);</span>
+                }
+<span class="nc" id="L478">                a[i] = (int) state;</span>
+            }
+        }
+<span class="nc" id="L481">    }</span>
+    public void writeArrayTo(OutputStream out, int[] a, int start, int end) throws IOException {
+<span class="nc bnc" id="L483" title="All 2 branches missed.">        if (end &lt;= start)  return;</span>
+<span class="nc bnc" id="L484" title="All 2 branches missed.">        for (int dstep = 0; dstep &lt; del; dstep++) {</span>
+            int[] deltas;
+<span class="nc bnc" id="L486" title="All 2 branches missed.">            if (!isSubrange())</span>
+<span class="nc" id="L487">                deltas = makeDeltas(a, start, end, 0, 0);</span>
+            else
+<span class="nc" id="L489">                deltas = makeDeltas(a, start, end, min, max);</span>
+<span class="nc" id="L490">            a = deltas;</span>
+<span class="nc" id="L491">            start = 0;</span>
+<span class="nc" id="L492">            end = deltas.length;</span>
+        }
+        // The following code is a buffered version of this loop:
+        //    for (int i = start; i &lt; end; i++)
+        //        writeTo(out, a[i]);
+<span class="nc" id="L497">        byte[] buf = new byte[1&lt;&lt;8];</span>
+<span class="nc" id="L498">        final int bufmax = buf.length-B;</span>
+<span class="nc" id="L499">        int[] pos = { 0 };</span>
+<span class="nc bnc" id="L500" title="All 2 branches missed.">        for (int i = start; i &lt; end; ) {</span>
+<span class="nc bnc" id="L501" title="All 2 branches missed.">            while (pos[0] &lt;= bufmax) {</span>
+<span class="nc" id="L502">                writeTo(buf, pos, a[i++]);</span>
+<span class="nc bnc" id="L503" title="All 2 branches missed.">                if (i &gt;= end)  break;</span>
+            }
+<span class="nc" id="L505">            out.write(buf, 0, pos[0]);</span>
+<span class="nc" id="L506">            pos[0] = 0;</span>
+        }
+<span class="nc" id="L508">    }</span>
+
+    /** Tell if the range of this coding (number of distinct
+     *  representable values) can be expressed in 32 bits.
+     */
+    boolean isSubrange() {
+<span class="nc bnc" id="L514" title="All 4 branches missed.">        return max &lt; Integer.MAX_VALUE</span>
+            &amp;&amp; ((long)max - (long)min + 1) &lt;= Integer.MAX_VALUE;
+    }
+
+    /** Tell if this coding can represent all 32-bit values.
+     *  Note:  Some codings, such as unsigned ones, can be neither
+     *  subranges nor full-range codings.
+     */
+    boolean isFullRange() {
+<span class="nc bnc" id="L523" title="All 4 branches missed.">        return max == Integer.MAX_VALUE &amp;&amp; min == Integer.MIN_VALUE;</span>
+    }
+
+    /** Return the number of values this coding (a subrange) can represent. */
+    int getRange() {
+<span class="nc bnc" id="L528" title="All 4 branches missed.">        assert(isSubrange());</span>
+<span class="nc" id="L529">        return (max - min) + 1;  // range includes both min &amp; max</span>
+    }
+
+<span class="nc" id="L532">    Coding setB(int B) { return Coding.of(B, H, S, del); }</span>
+<span class="nc" id="L533">    Coding setH(int H) { return Coding.of(B, H, S, del); }</span>
+<span class="nc" id="L534">    Coding setS(int S) { return Coding.of(B, H, S, del); }</span>
+<span class="nc" id="L535">    Coding setL(int L) { return setH(256-L); }</span>
+<span class="nc" id="L536">    Coding setD(int del) { return Coding.of(B, H, S, del); }</span>
+<span class="nc" id="L537">    Coding getDeltaCoding() { return setD(del+1); }</span>
+
+    /** Return a coding suitable for representing summed, modulo-reduced values. */
+    Coding getValueCoding() {
+<span class="nc bnc" id="L541" title="All 2 branches missed.">        if (isDelta())</span>
+<span class="nc" id="L542">            return Coding.of(B, H, 0, del-1);</span>
+        else
+<span class="nc" id="L544">            return this;</span>
+    }
+
+    /** Reduce the given value to be within this coding's unsigned range,
+     *  by adding or subtracting a multiple of (max-min+1).
+     */
+    int reduceToUnsignedRange(long value) {
+<span class="nc bnc" id="L551" title="All 4 branches missed.">        if (value == (int)value &amp;&amp; canRepresentUnsigned((int)value))</span>
+            // already in unsigned range
+<span class="nc" id="L553">            return (int)value;</span>
+<span class="nc" id="L554">        int range = getRange();</span>
+<span class="nc bnc" id="L555" title="All 4 branches missed.">        assert(range &gt; 0);</span>
+<span class="nc" id="L556">        value %= range;</span>
+<span class="nc bnc" id="L557" title="All 2 branches missed.">        if (value &lt; 0)  value += range;</span>
+<span class="nc bnc" id="L558" title="All 4 branches missed.">        assert(canRepresentUnsigned((int)value));</span>
+<span class="nc" id="L559">        return (int)value;</span>
+    }
+
+    int reduceToSignedRange(int value) {
+<span class="nc bnc" id="L563" title="All 2 branches missed.">        if (canRepresentSigned(value))</span>
+            // already in signed range
+<span class="nc" id="L565">            return value;</span>
+<span class="nc" id="L566">        return reduceToSignedRange(value, min, max);</span>
+    }
+    static int reduceToSignedRange(int value, int min, int max) {
+<span class="nc" id="L569">        int range = (max-min+1);</span>
+<span class="nc bnc" id="L570" title="All 4 branches missed.">        assert(range &gt; 0);</span>
+<span class="nc" id="L571">        int value0 = value;</span>
+<span class="nc" id="L572">        value -= min;</span>
+<span class="nc bnc" id="L573" title="All 4 branches missed.">        if (value &lt; 0 &amp;&amp; value0 &gt;= 0) {</span>
+            // 32-bit overflow, but the next '%=' op needs to be unsigned
+<span class="nc" id="L575">            value -= range;</span>
+<span class="nc bnc" id="L576" title="All 4 branches missed.">            assert(value &gt;= 0);</span>
+        }
+<span class="nc" id="L578">        value %= range;</span>
+<span class="nc bnc" id="L579" title="All 2 branches missed.">        if (value &lt; 0)  value += range;</span>
+<span class="nc" id="L580">        value += min;</span>
+<span class="nc bnc" id="L581" title="All 6 branches missed.">        assert(min &lt;= value &amp;&amp; value &lt;= max);</span>
+<span class="nc" id="L582">        return value;</span>
+    }
+
+    /** Does this coding support at least one negative value?
+        Includes codings that can do so via 32-bit wraparound.
+     */
+    boolean isSigned() {
+<span class="nc bnc" id="L589" title="All 2 branches missed.">        return min &lt; 0;</span>
+    }
+    /** Does this coding code arrays by making successive differences? */
+    boolean isDelta() {
+<span class="nc bnc" id="L593" title="All 2 branches missed.">        return del != 0;</span>
+    }
+
+<span class="nc" id="L596">    public int B() { return B; }</span>
+<span class="nc" id="L597">    public int H() { return H; }</span>
+<span class="nc" id="L598">    public int L() { return L; }</span>
+<span class="nc" id="L599">    public int S() { return S; }</span>
+<span class="nc" id="L600">    public int del() { return del; }</span>
+<span class="nc" id="L601">    public int min() { return min; }</span>
+<span class="nc" id="L602">    public int max() { return max; }</span>
+<span class="nc" id="L603">    public int umin() { return umin; }</span>
+<span class="nc" id="L604">    public int umax() { return umax; }</span>
+<span class="nc" id="L605">    public int byteMin(int b) { return byteMin[b-1]; }</span>
+<span class="nc" id="L606">    public int byteMax(int b) { return byteMax[b-1]; }</span>
+
+    public int compareTo(Coding that) {
+<span class="nc" id="L609">        int dkey = this.del - that.del;</span>
+<span class="nc bnc" id="L610" title="All 2 branches missed.">        if (dkey == 0)</span>
+<span class="nc" id="L611">            dkey = this.B - that.B;</span>
+<span class="nc bnc" id="L612" title="All 2 branches missed.">        if (dkey == 0)</span>
+<span class="nc" id="L613">            dkey = this.H - that.H;</span>
+<span class="nc bnc" id="L614" title="All 2 branches missed.">        if (dkey == 0)</span>
+<span class="nc" id="L615">            dkey = this.S - that.S;</span>
+<span class="nc" id="L616">        return dkey;</span>
+    }
+
+    /** Heuristic measure of the difference between two codings. */
+    public int distanceFrom(Coding that) {
+<span class="nc" id="L621">        int diffdel = this.del - that.del;</span>
+<span class="nc bnc" id="L622" title="All 2 branches missed.">        if (diffdel &lt; 0)  diffdel = -diffdel;</span>
+<span class="nc" id="L623">        int diffS = this.S - that.S;</span>
+<span class="nc bnc" id="L624" title="All 2 branches missed.">        if (diffS &lt; 0)  diffS = -diffS;</span>
+<span class="nc" id="L625">        int diffB = this.B - that.B;</span>
+<span class="nc bnc" id="L626" title="All 2 branches missed.">        if (diffB &lt; 0)  diffB = -diffB;</span>
+        int diffHL;
+<span class="nc bnc" id="L628" title="All 2 branches missed.">        if (this.H == that.H) {</span>
+<span class="nc" id="L629">            diffHL = 0;</span>
+        } else {
+            // Distance in log space of H (&lt;=128) and L (&lt;128).
+<span class="nc" id="L632">            int thisHL = this.getHL();</span>
+<span class="nc" id="L633">            int thatHL = that.getHL();</span>
+            // Double the accuracy of the log:
+<span class="nc" id="L635">            thisHL *= thisHL;</span>
+<span class="nc" id="L636">            thatHL *= thatHL;</span>
+<span class="nc bnc" id="L637" title="All 2 branches missed.">            if (thisHL &gt; thatHL)</span>
+<span class="nc" id="L638">                diffHL = ceil_lg2(1+(thisHL-1)/thatHL);</span>
+            else
+<span class="nc" id="L640">                diffHL = ceil_lg2(1+(thatHL-1)/thisHL);</span>
+        }
+<span class="nc" id="L642">        int norm = 5*(diffdel + diffS + diffB) + diffHL;</span>
+<span class="nc bnc" id="L643" title="All 6 branches missed.">        assert(norm != 0 || this.compareTo(that) == 0);</span>
+<span class="nc" id="L644">        return norm;</span>
+    }
+    private int getHL() {
+        // Follow H in log space by the multiplicative inverse of L.
+<span class="nc bnc" id="L648" title="All 2 branches missed.">        if (H &lt;= 128)  return H;</span>
+<span class="nc bnc" id="L649" title="All 2 branches missed.">        if (L &gt;= 1)    return 128*128/L;</span>
+<span class="nc" id="L650">        return 128*256;</span>
+    }
+
+    /** ceiling(log[2](x)): {1-&gt;0, 2-&gt;1, 3-&gt;2, 4-&gt;2, ...} */
+    static int ceil_lg2(int x) {
+<span class="nc bnc" id="L655" title="All 4 branches missed.">        assert(x-1 &gt;= 0);  // x in range (int.MIN_VALUE -&gt; 32)</span>
+<span class="nc" id="L656">        x -= 1;</span>
+<span class="nc" id="L657">        int lg = 0;</span>
+<span class="nc bnc" id="L658" title="All 2 branches missed.">        while (x != 0) {</span>
+<span class="nc" id="L659">            lg++;</span>
+<span class="nc" id="L660">            x &gt;&gt;= 1;</span>
+        }
+<span class="nc" id="L662">        return lg;</span>
+    }
+
+<span class="nc" id="L665">    static private final byte[] byteBitWidths = new byte[0x100];</span>
+    static {
+<span class="nc bnc" id="L667" title="All 2 branches missed.">        for (int b = 0; b &lt; byteBitWidths.length; b++) {</span>
+<span class="nc" id="L668">            byteBitWidths[b] = (byte) ceil_lg2(b + 1);</span>
+        }
+<span class="nc bnc" id="L670" title="All 2 branches missed.">        for (int i = 10; i &gt;= 0; i = (i &lt;&lt; 1) - (i &gt;&gt; 3)) {</span>
+<span class="nc bnc" id="L671" title="All 4 branches missed.">            assert(bitWidth(i) == ceil_lg2(i + 1));</span>
+        }
+    }
+
+    /** Number of significant bits in i, not counting sign bits.
+     *  For positive i, it is ceil_lg2(i + 1).
+     */
+    static int bitWidth(int i) {
+<span class="nc bnc" id="L679" title="All 2 branches missed.">        if (i &lt; 0)  i = ~i;  // change sign</span>
+<span class="nc" id="L680">        int w = 0;</span>
+<span class="nc" id="L681">        int lo = i;</span>
+<span class="nc bnc" id="L682" title="All 2 branches missed.">        if (lo &lt; byteBitWidths.length)</span>
+<span class="nc" id="L683">            return byteBitWidths[lo];</span>
+        int hi;
+<span class="nc" id="L685">        hi = (lo &gt;&gt;&gt; 16);</span>
+<span class="nc bnc" id="L686" title="All 2 branches missed.">        if (hi != 0) {</span>
+<span class="nc" id="L687">            lo = hi;</span>
+<span class="nc" id="L688">            w += 16;</span>
+        }
+<span class="nc" id="L690">        hi = (lo &gt;&gt;&gt; 8);</span>
+<span class="nc bnc" id="L691" title="All 2 branches missed.">        if (hi != 0) {</span>
+<span class="nc" id="L692">            lo = hi;</span>
+<span class="nc" id="L693">            w += 8;</span>
+        }
+<span class="nc" id="L695">        w += byteBitWidths[lo];</span>
+        //assert(w == ceil_lg2(i + 1));
+<span class="nc" id="L697">        return w;</span>
+    }
+
+    /** Create an array of successive differences.
+     *  If min==max, accept any and all 32-bit overflow.
+     *  Otherwise, avoid 32-bit overflow, and reduce all differences
+     *  to a value in the given range, by adding or subtracting
+     *  multiples of the range cardinality (max-min+1).
+     *  Also, the values are assumed to be in the range [0..(max-min)].
+     */
+    static int[] makeDeltas(int[] values, int start, int end,
+                            int min, int max) {
+<span class="nc bnc" id="L709" title="All 4 branches missed.">        assert(max &gt;= min);</span>
+<span class="nc" id="L710">        int count = end-start;</span>
+<span class="nc" id="L711">        int[] deltas = new int[count];</span>
+<span class="nc" id="L712">        int state = 0;</span>
+<span class="nc bnc" id="L713" title="All 2 branches missed.">        if (min == max) {</span>
+<span class="nc bnc" id="L714" title="All 2 branches missed.">            for (int i = 0; i &lt; count; i++) {</span>
+<span class="nc" id="L715">                int value = values[start+i];</span>
+<span class="nc" id="L716">                deltas[i] = value - state;</span>
+<span class="nc" id="L717">                state = value;</span>
+            }
+        } else {
+<span class="nc bnc" id="L720" title="All 2 branches missed.">            for (int i = 0; i &lt; count; i++) {</span>
+<span class="nc" id="L721">                int value = values[start+i];</span>
+<span class="nc bnc" id="L722" title="All 6 branches missed.">                assert(value &gt;= 0 &amp;&amp; value+min &lt;= max);</span>
+<span class="nc" id="L723">                int delta = value - state;</span>
+<span class="nc bnc" id="L724" title="All 4 branches missed.">                assert(delta == (long)value - (long)state); // no overflow</span>
+<span class="nc" id="L725">                state = value;</span>
+                // Reduce delta values to the required range.
+<span class="nc" id="L727">                delta = reduceToSignedRange(delta, min, max);</span>
+<span class="nc" id="L728">                deltas[i] = delta;</span>
+            }
+        }
+<span class="nc" id="L731">        return deltas;</span>
+    }
+
+    boolean canRepresent(int minValue, int maxValue) {
+<span class="nc bnc" id="L735" title="All 4 branches missed.">        assert(minValue &lt;= maxValue);</span>
+<span class="nc bnc" id="L736" title="All 2 branches missed.">        if (del &gt; 0) {</span>
+<span class="nc bnc" id="L737" title="All 2 branches missed.">            if (isSubrange()) {</span>
+                // We will force the values to reduce to the right subrange.
+<span class="nc bnc" id="L739" title="All 2 branches missed.">                return canRepresentUnsigned(maxValue)</span>
+<span class="nc bnc" id="L740" title="All 2 branches missed.">                    &amp;&amp; canRepresentUnsigned(minValue);</span>
+            } else {
+                // Huge range; delta values must assume full 32-bit range.
+<span class="nc" id="L743">                return isFullRange();</span>
+            }
+        }
+        else
+            // final values must be representable
+<span class="nc bnc" id="L748" title="All 2 branches missed.">            return canRepresentSigned(maxValue)</span>
+<span class="nc bnc" id="L749" title="All 2 branches missed.">                &amp;&amp; canRepresentSigned(minValue);</span>
+    }
+
+    boolean canRepresent(int[] values, int start, int end) {
+<span class="nc" id="L753">        int len = end-start;</span>
+<span class="nc bnc" id="L754" title="All 2 branches missed.">        if (len == 0)       return true;</span>
+<span class="nc bnc" id="L755" title="All 2 branches missed.">        if (isFullRange())  return true;</span>
+        // Calculate max, min:
+<span class="nc" id="L757">        int lmax = values[start];</span>
+<span class="nc" id="L758">        int lmin = lmax;</span>
+<span class="nc bnc" id="L759" title="All 2 branches missed.">        for (int i = 1; i &lt; len; i++) {</span>
+<span class="nc" id="L760">            int value = values[start+i];</span>
+<span class="nc bnc" id="L761" title="All 2 branches missed.">            if (lmax &lt; value)  lmax = value;</span>
+<span class="nc bnc" id="L762" title="All 2 branches missed.">            if (lmin &gt; value)  lmin = value;</span>
+        }
+<span class="nc" id="L764">        return canRepresent(lmin, lmax);</span>
+    }
+
+    public double getBitLength(int value) {  // implements BitMetric
+<span class="nc" id="L768">        return (double) getLength(value) * 8;</span>
+    }
+
+    /** How many bytes are in the coding of this value?
+     *  Returns Integer.MAX_VALUE if the value has no coding.
+     *  The coding must not be a delta coding, since there is no
+     *  definite size for a single value apart from its context.
+     */
+    public int getLength(int value) {
+<span class="nc bnc" id="L777" title="All 4 branches missed.">        if (isDelta() &amp;&amp; isSubrange()) {</span>
+<span class="nc bnc" id="L778" title="All 2 branches missed.">            if (!canRepresentUnsigned(value))</span>
+<span class="nc" id="L779">                return Integer.MAX_VALUE;</span>
+<span class="nc" id="L780">            value = reduceToSignedRange(value);</span>
+        }
+<span class="nc bnc" id="L782" title="All 2 branches missed.">        if (value &gt;= 0) {</span>
+<span class="nc bnc" id="L783" title="All 2 branches missed.">            for (int n = 0; n &lt; B; n++) {</span>
+<span class="nc bnc" id="L784" title="All 2 branches missed.">                if (value &lt;= byteMax[n])  return n+1;</span>
+            }
+        } else {
+<span class="nc bnc" id="L787" title="All 2 branches missed.">            for (int n = 0; n &lt; B; n++) {</span>
+<span class="nc bnc" id="L788" title="All 2 branches missed.">                if (value &gt;= byteMin[n])  return n+1;</span>
+            }
+        }
+<span class="nc" id="L791">        return Integer.MAX_VALUE;</span>
+    }
+
+    public int getLength(int[] values, int start, int end) {
+<span class="nc" id="L795">        int len = end-start;</span>
+<span class="nc bnc" id="L796" title="All 2 branches missed.">        if (B == 1)  return len;</span>
+<span class="nc bnc" id="L797" title="All 2 branches missed.">        if (L == 0)  return len * B;</span>
+<span class="nc bnc" id="L798" title="All 2 branches missed.">        if (isDelta()) {</span>
+            int[] deltas;
+<span class="nc bnc" id="L800" title="All 2 branches missed.">            if (!isSubrange())</span>
+<span class="nc" id="L801">                deltas = makeDeltas(values, start, end, 0, 0);</span>
+            else
+<span class="nc" id="L803">                deltas = makeDeltas(values, start, end, min, max);</span>
+            //return Coding.of(B, H, S).getLength(deltas, 0, len);
+<span class="nc" id="L805">            values = deltas;</span>
+<span class="nc" id="L806">            start = 0;</span>
+        }
+<span class="nc" id="L808">        int sum = len;  // at least 1 byte per</span>
+        // add extra bytes for extra-long values
+<span class="nc bnc" id="L810" title="All 2 branches missed.">        for (int n = 1; n &lt;= B; n++) {</span>
+            // what is the coding interval [min..max] for n bytes?
+<span class="nc" id="L812">            int lmax = byteMax[n-1];</span>
+<span class="nc" id="L813">            int lmin = byteMin[n-1];</span>
+<span class="nc" id="L814">            int longer = 0;  // count of guys longer than n bytes</span>
+<span class="nc bnc" id="L815" title="All 2 branches missed.">            for (int i = 0; i &lt; len; i++) {</span>
+<span class="nc" id="L816">                int value = values[start+i];</span>
+<span class="nc bnc" id="L817" title="All 2 branches missed.">                if (value &gt;= 0) {</span>
+<span class="nc bnc" id="L818" title="All 2 branches missed.">                    if (value &gt; lmax)  longer++;</span>
+                } else {
+<span class="nc bnc" id="L820" title="All 2 branches missed.">                    if (value &lt; lmin)  longer++;</span>
+                }
+            }
+<span class="nc bnc" id="L823" title="All 2 branches missed.">            if (longer == 0)  break;  // no more passes needed</span>
+<span class="nc bnc" id="L824" title="All 2 branches missed.">            if (n == B)  return Integer.MAX_VALUE;  // cannot represent!</span>
+<span class="nc" id="L825">            sum += longer;</span>
+        }
+<span class="nc" id="L827">        return sum;</span>
+    }
+
+    public byte[] getMetaCoding(Coding dflt) {
+<span class="nc bnc" id="L831" title="All 2 branches missed.">        if (dflt == this)  return new byte[]{ (byte) _meta_default };</span>
+<span class="nc" id="L832">        int canonicalIndex = BandStructure.indexOf(this);</span>
+<span class="nc bnc" id="L833" title="All 2 branches missed.">        if (canonicalIndex &gt; 0)</span>
+<span class="nc" id="L834">            return new byte[]{ (byte) canonicalIndex };</span>
+<span class="nc" id="L835">        return new byte[]{</span>
+            (byte)_meta_arb,
+            (byte)(del + 2*S + 8*(B-1)),
+            (byte)(H-1)
+        };
+    }
+    public static int parseMetaCoding(byte[] bytes, int pos, Coding dflt, CodingMethod res[]) {
+<span class="nc" id="L842">        int op = bytes[pos++] &amp; 0xFF;</span>
+<span class="nc bnc" id="L843" title="All 4 branches missed.">        if (_meta_canon_min &lt;= op &amp;&amp; op &lt;= _meta_canon_max) {</span>
+<span class="nc" id="L844">            Coding c = BandStructure.codingForIndex(op);</span>
+<span class="nc bnc" id="L845" title="All 4 branches missed.">            assert(c != null);</span>
+<span class="nc" id="L846">            res[0] = c;</span>
+<span class="nc" id="L847">            return pos;</span>
+        }
+<span class="nc bnc" id="L849" title="All 2 branches missed.">        if (op == _meta_arb) {</span>
+<span class="nc" id="L850">            int dsb = bytes[pos++] &amp; 0xFF;</span>
+<span class="nc" id="L851">            int H_1 = bytes[pos++] &amp; 0xFF;</span>
+<span class="nc" id="L852">            int del = dsb % 2;</span>
+<span class="nc" id="L853">            int S = (dsb / 2) % 4;</span>
+<span class="nc" id="L854">            int B = (dsb / 8)+1;</span>
+<span class="nc" id="L855">            int H = H_1+1;</span>
+<span class="nc bnc" id="L856" title="All 24 branches missed.">            if (!((1 &lt;= B &amp;&amp; B &lt;= B_MAX) &amp;&amp;</span>
+                  (0 &lt;= S &amp;&amp; S &lt;= S_MAX) &amp;&amp;
+                  (1 &lt;= H &amp;&amp; H &lt;= H_MAX) &amp;&amp;
+                  (0 &lt;= del &amp;&amp; del &lt;= 1))
+                || (B == 1 &amp;&amp; H != 256)
+                || (B == 5 &amp;&amp; H == 256)) {
+<span class="nc" id="L862">                throw new RuntimeException(&quot;Bad arb. coding: (&quot;+B+&quot;,&quot;+H+&quot;,&quot;+S+&quot;,&quot;+del);</span>
+            }
+<span class="nc" id="L864">            res[0] = Coding.of(B, H, S, del);</span>
+<span class="nc" id="L865">            return pos;</span>
+        }
+<span class="nc" id="L867">        return pos-1;  // backup</span>
+    }
+
+
+    public String keyString() {
+<span class="nc" id="L872">        return &quot;(&quot;+B+&quot;,&quot;+H+&quot;,&quot;+S+&quot;,&quot;+del+&quot;)&quot;;</span>
+    }
+
+    public String toString() {
+<span class="nc" id="L876">        String str = &quot;Coding&quot;+keyString();</span>
+        // If -ea, print out more informative strings!
+        //assert((str = stringForDebug()) != null);
+<span class="nc" id="L879">        return str;</span>
+    }
+
+<span class="nc" id="L882">    static boolean verboseStringForDebug = false;</span>
+    String stringForDebug() {
+<span class="nc bnc" id="L884" title="All 2 branches missed.">        String minS = (min == Integer.MIN_VALUE ? &quot;min&quot; : &quot;&quot;+min);</span>
+<span class="nc bnc" id="L885" title="All 2 branches missed.">        String maxS = (max == Integer.MAX_VALUE ? &quot;max&quot; : &quot;&quot;+max);</span>
+<span class="nc" id="L886">        String str = keyString()+&quot; L=&quot;+L+&quot; r=[&quot;+minS+&quot;,&quot;+maxS+&quot;]&quot;;</span>
+<span class="nc bnc" id="L887" title="All 2 branches missed.">        if (isSubrange())</span>
+<span class="nc" id="L888">            str += &quot; subrange&quot;;</span>
+<span class="nc bnc" id="L889" title="All 2 branches missed.">        else if (!isFullRange())</span>
+<span class="nc" id="L890">            str += &quot; MIDRANGE&quot;;</span>
+<span class="nc bnc" id="L891" title="All 2 branches missed.">        if (verboseStringForDebug) {</span>
+<span class="nc" id="L892">            str += &quot; {&quot;;</span>
+<span class="nc" id="L893">            int prev_range = 0;</span>
+<span class="nc bnc" id="L894" title="All 2 branches missed.">            for (int n = 1; n &lt;= B; n++) {</span>
+<span class="nc" id="L895">                int range_n = saturate32((long)byteMax[n-1] - byteMin[n-1] + 1);</span>
+<span class="nc bnc" id="L896" title="All 4 branches missed.">                assert(range_n == saturate32(codeRangeLong(B, H, n)));</span>
+<span class="nc" id="L897">                range_n -= prev_range;</span>
+<span class="nc" id="L898">                prev_range = range_n;</span>
+<span class="nc bnc" id="L899" title="All 2 branches missed.">                String rngS = (range_n == Integer.MAX_VALUE ? &quot;max&quot; : &quot;&quot;+range_n);</span>
+<span class="nc" id="L900">                str += &quot; #&quot;+n+&quot;=&quot;+rngS;</span>
+            }
+<span class="nc" id="L902">            str += &quot; }&quot;;</span>
+        }
+<span class="nc" id="L904">        return str;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

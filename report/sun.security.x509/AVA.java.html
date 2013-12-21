@@ -1,0 +1,1357 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>AVA.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.x509</a> &gt; <span class="el_source">AVA.java</span></div><h1>AVA.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1996, 2011, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.security.x509;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.io.Reader;
+import java.security.AccessController;
+import java.text.Normalizer;
+import java.util.*;
+
+import sun.security.action.GetBooleanAction;
+import sun.security.util.*;
+import sun.security.pkcs.PKCS9Attribute;
+
+
+/**
+ * X.500 Attribute-Value-Assertion (AVA):  an attribute, as identified by
+ * some attribute ID, has some particular value.  Values are as a rule ASN.1
+ * printable strings.  A conventional set of type IDs is recognized when
+ * parsing (and generating) RFC 1779, 2253 or 4514 syntax strings.
+ *
+ * &lt;P&gt;AVAs are components of X.500 relative names.  Think of them as being
+ * individual fields of a database record.  The attribute ID is how you
+ * identify the field, and the value is part of a particular record.
+ * &lt;p&gt;
+ * Note that instances of this class are immutable.
+ *
+ * @see X500Name
+ * @see RDN
+ *
+ *
+ * @author David Brownell
+ * @author Amit Kapoor
+ * @author Hemma Prafullchandra
+ */
+public class AVA implements DerEncoder {
+
+<span class="fc" id="L63">    private static final Debug debug = Debug.getInstance(&quot;x509&quot;, &quot;\t[AVA]&quot;);</span>
+    // See CR 6391482: if enabled this flag preserves the old but incorrect
+    // PrintableString encoding for DomainComponent. It may need to be set to
+    // avoid breaking preexisting certificates generated with sun.security APIs.
+<span class="fc" id="L67">    private static final boolean PRESERVE_OLD_DC_ENCODING =</span>
+<span class="fc" id="L68">        AccessController.doPrivileged(new GetBooleanAction</span>
+            (&quot;com.sun.security.preserveOldDCEncoding&quot;));
+
+    /**
+     * DEFAULT format allows both RFC1779 and RFC2253 syntax and
+     * additional keywords.
+     */
+    final static int DEFAULT = 1;
+    /**
+     * RFC1779 specifies format according to RFC1779.
+     */
+    final static int RFC1779 = 2;
+    /**
+     * RFC2253 specifies format according to RFC2253.
+     */
+    final static int RFC2253 = 3;
+
+    // currently not private, accessed directly from RDN
+    final ObjectIdentifier oid;
+    final DerValue value;
+
+    /*
+     * If the value has any of these characters in it, it must be quoted.
+     * Backslash and quote characters must also be individually escaped.
+     * Leading and trailing spaces, also multiple internal spaces, also
+     * call for quoting the whole string.
+     */
+    private static final String specialChars1779 = &quot;,=\n+&lt;&gt;#;\\\&quot;&quot;;
+
+    /*
+     * In RFC2253, if the value has any of these characters in it, it
+     * must be quoted by a preceding \.
+     */
+    private static final String specialChars2253 = &quot;,=+&lt;&gt;#;\\\&quot;&quot;;
+
+    /*
+     * includes special chars from RFC1779 and RFC2253, as well as ' ' from
+     * RFC 4514.
+     */
+    private static final String specialCharsDefault = &quot;,=\n+&lt;&gt;#;\\\&quot; &quot;;
+    private static final String escapedDefault = &quot;,+&lt;&gt;;\&quot;&quot;;
+
+    /*
+     * Values that aren't printable strings are emitted as BER-encoded
+     * hex data.
+     */
+    private static final String hexDigits = &quot;0123456789ABCDEF&quot;;
+
+<span class="fc" id="L116">    public AVA(ObjectIdentifier type, DerValue val) {</span>
+<span class="pc bpc" id="L117" title="2 of 4 branches missed.">        if ((type == null) || (val == null)) {</span>
+<span class="nc" id="L118">            throw new NullPointerException();</span>
+        }
+<span class="fc" id="L120">        oid = type;</span>
+<span class="fc" id="L121">        value = val;</span>
+<span class="fc" id="L122">    }</span>
+
+    /**
+     * Parse an RFC 1779, 2253 or 4514 style AVA string:  CN=fee fie foe fum
+     * or perhaps with quotes.  Not all defined AVA tags are supported;
+     * of current note are X.400 related ones (PRMD, ADMD, etc).
+     *
+     * This terminates at unescaped AVA separators (&quot;+&quot;) or RDN
+     * separators (&quot;,&quot;, &quot;;&quot;), and removes cosmetic whitespace at the end of
+     * values.
+     */
+    AVA(Reader in) throws IOException {
+<span class="nc" id="L134">        this(in, DEFAULT);</span>
+<span class="nc" id="L135">    }</span>
+
+    /**
+     * Parse an RFC 1779, 2253 or 4514 style AVA string:  CN=fee fie foe fum
+     * or perhaps with quotes. Additional keywords can be specified in the
+     * keyword/OID map.
+     *
+     * This terminates at unescaped AVA separators (&quot;+&quot;) or RDN
+     * separators (&quot;,&quot;, &quot;;&quot;), and removes cosmetic whitespace at the end of
+     * values.
+     */
+    AVA(Reader in, Map&lt;String, String&gt; keywordMap) throws IOException {
+<span class="fc" id="L147">        this(in, DEFAULT, keywordMap);</span>
+<span class="fc" id="L148">    }</span>
+
+    /**
+     * Parse an AVA string formatted according to format.
+     */
+    AVA(Reader in, int format) throws IOException {
+<span class="nc" id="L154">        this(in, format, Collections.&lt;String, String&gt;emptyMap());</span>
+<span class="nc" id="L155">    }</span>
+
+    /**
+     * Parse an AVA string formatted according to format.
+     *
+     * @param in Reader containing AVA String
+     * @param format parsing format
+     * @param keywordMap a Map where a keyword String maps to a corresponding
+     *   OID String. Each AVA keyword will be mapped to the corresponding OID.
+     *   If an entry does not exist, it will fallback to the builtin
+     *   keyword/OID mapping.
+     * @throws IOException if the AVA String is not valid in the specified
+     *   format or an OID String from the keywordMap is improperly formatted
+     */
+    AVA(Reader in, int format, Map&lt;String, String&gt; keywordMap)
+<span class="fc" id="L170">        throws IOException {</span>
+        // assume format is one of DEFAULT or RFC2253
+
+<span class="fc" id="L173">        StringBuilder   temp = new StringBuilder();</span>
+        int             c;
+
+        /*
+         * First get the keyword indicating the attribute's type,
+         * and map it to the appropriate OID.
+         */
+        while (true) {
+<span class="fc" id="L181">            c = readChar(in, &quot;Incorrect AVA format&quot;);</span>
+<span class="fc bfc" id="L182" title="All 2 branches covered.">            if (c == '=') {</span>
+<span class="fc" id="L183">                break;</span>
+            }
+<span class="fc" id="L185">            temp.append((char)c);</span>
+        }
+
+<span class="fc" id="L188">        oid = AVAKeyword.getOID(temp.toString(), format, keywordMap);</span>
+
+        /*
+         * Now parse the value.  &quot;#hex&quot;, a quoted string, or a string
+         * terminated by &quot;+&quot;, &quot;,&quot;, &quot;;&quot;.  Whitespace before or after
+         * the value is stripped away unless format is RFC2253.
+         */
+<span class="fc" id="L195">        temp.setLength(0);</span>
+<span class="fc bfc" id="L196" title="All 2 branches covered.">        if (format == RFC2253) {</span>
+            // read next character
+<span class="fc" id="L198">            c = in.read();</span>
+<span class="fc bfc" id="L199" title="All 2 branches covered.">            if (c == ' ') {</span>
+<span class="fc" id="L200">                throw new IOException(&quot;Incorrect AVA RFC2253 format - &quot; +</span>
+                                      &quot;leading space must be escaped&quot;);
+            }
+        } else {
+            // read next character skipping whitespace
+            do {
+<span class="fc" id="L206">                c = in.read();</span>
+<span class="pc bpc" id="L207" title="1 of 4 branches missed.">            } while ((c == ' ') || (c == '\n'));</span>
+        }
+<span class="pc bpc" id="L209" title="1 of 2 branches missed.">        if (c == -1) {</span>
+            // empty value
+<span class="nc" id="L211">            value = new DerValue(&quot;&quot;);</span>
+<span class="nc" id="L212">            return;</span>
+        }
+
+<span class="fc bfc" id="L215" title="All 2 branches covered.">        if (c == '#') {</span>
+<span class="fc" id="L216">            value = parseHexString(in, format);</span>
+<span class="pc bpc" id="L217" title="1 of 4 branches missed.">        } else if ((c == '&quot;') &amp;&amp; (format != RFC2253)) {</span>
+<span class="fc" id="L218">            value = parseQuotedString(in, temp);</span>
+        } else {
+<span class="fc" id="L220">            value = parseString(in, c, format, temp);</span>
+        }
+<span class="fc" id="L222">    }</span>
+
+    /**
+     * Get the ObjectIdentifier of this AVA.
+     */
+    public ObjectIdentifier getObjectIdentifier() {
+<span class="nc" id="L228">        return oid;</span>
+    }
+
+    /**
+     * Get the value of this AVA as a DerValue.
+     */
+    public DerValue getDerValue() {
+<span class="nc" id="L235">        return value;</span>
+    }
+
+    /**
+     * Get the value of this AVA as a String.
+     *
+     * @exception RuntimeException if we could not obtain the string form
+     *    (should not occur)
+     */
+    public String getValueString() {
+        try {
+<span class="nc" id="L246">            String s = value.getAsString();</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">            if (s == null) {</span>
+<span class="nc" id="L248">                throw new RuntimeException(&quot;AVA string is null&quot;);</span>
+            }
+<span class="nc" id="L250">            return s;</span>
+<span class="nc" id="L251">        } catch (IOException e) {</span>
+            // should not occur
+<span class="nc" id="L253">            throw new RuntimeException(&quot;AVA error: &quot; + e, e);</span>
+        }
+    }
+
+    private static DerValue parseHexString
+        (Reader in, int format) throws IOException {
+
+        int c;
+<span class="fc" id="L261">        ByteArrayOutputStream baos = new ByteArrayOutputStream();</span>
+<span class="fc" id="L262">        byte b = 0;</span>
+<span class="fc" id="L263">        int cNdx = 0;</span>
+        while (true) {
+<span class="fc" id="L265">            c = in.read();</span>
+
+<span class="fc bfc" id="L267" title="All 2 branches covered.">            if (isTerminator(c, format)) {</span>
+<span class="fc" id="L268">                break;</span>
+            }
+
+<span class="fc" id="L271">            int cVal = hexDigits.indexOf(Character.toUpperCase((char)c));</span>
+
+<span class="pc bpc" id="L273" title="1 of 2 branches missed.">            if (cVal == -1) {</span>
+<span class="nc" id="L274">                throw new IOException(&quot;AVA parse, invalid hex &quot; +</span>
+                                              &quot;digit: &quot;+ (char)c);
+            }
+
+<span class="fc bfc" id="L278" title="All 2 branches covered.">            if ((cNdx % 2) == 1) {</span>
+<span class="fc" id="L279">                b = (byte)((b * 16) + (byte)(cVal));</span>
+<span class="fc" id="L280">                baos.write(b);</span>
+            } else {
+<span class="fc" id="L282">                b = (byte)(cVal);</span>
+            }
+<span class="fc" id="L284">            cNdx++;</span>
+<span class="fc" id="L285">        }</span>
+
+        // throw exception if no hex digits
+<span class="pc bpc" id="L288" title="1 of 2 branches missed.">        if (cNdx == 0) {</span>
+<span class="nc" id="L289">            throw new IOException(&quot;AVA parse, zero hex digits&quot;);</span>
+        }
+
+        // throw exception if odd number of hex digits
+<span class="pc bpc" id="L293" title="1 of 2 branches missed.">        if (cNdx % 2 == 1) {</span>
+<span class="nc" id="L294">            throw new IOException(&quot;AVA parse, odd number of hex digits&quot;);</span>
+        }
+
+<span class="fc" id="L297">        return new DerValue(baos.toByteArray());</span>
+    }
+
+    private DerValue parseQuotedString
+        (Reader in, StringBuilder temp) throws IOException {
+
+        // RFC1779 specifies that an entire RDN may be enclosed in double
+        // quotes. In this case the syntax is any sequence of
+        // backslash-specialChar, backslash-backslash,
+        // backslash-doublequote, or character other than backslash or
+        // doublequote.
+<span class="fc" id="L308">        int c = readChar(in, &quot;Quoted string did not end in quote&quot;);</span>
+
+<span class="fc" id="L310">        List&lt;Byte&gt; embeddedHex = new ArrayList&lt;Byte&gt;();</span>
+<span class="fc" id="L311">        boolean isPrintableString = true;</span>
+<span class="fc bfc" id="L312" title="All 2 branches covered.">        while (c != '&quot;') {</span>
+<span class="fc bfc" id="L313" title="All 2 branches covered.">            if (c == '\\') {</span>
+<span class="fc" id="L314">                c = readChar(in, &quot;Quoted string did not end in quote&quot;);</span>
+
+                // check for embedded hex pairs
+<span class="fc" id="L317">                Byte hexByte = null;</span>
+<span class="pc bpc" id="L318" title="1 of 2 branches missed.">                if ((hexByte = getEmbeddedHexPair(c, in)) != null) {</span>
+
+                    // always encode AVAs with embedded hex as UTF8
+<span class="nc" id="L321">                    isPrintableString = false;</span>
+
+                    // append consecutive embedded hex
+                    // as single string later
+<span class="nc" id="L325">                    embeddedHex.add(hexByte);</span>
+<span class="nc" id="L326">                    c = in.read();</span>
+<span class="nc" id="L327">                    continue;</span>
+                }
+
+<span class="pc bpc" id="L330" title="1 of 2 branches missed.">                if (specialChars1779.indexOf((char)c) &lt; 0) {</span>
+<span class="nc" id="L331">                    throw new IOException</span>
+                        (&quot;Invalid escaped character in AVA: &quot; +
+                        (char)c);
+                }
+            }
+
+            // add embedded hex bytes before next char
+<span class="pc bpc" id="L338" title="1 of 2 branches missed.">            if (embeddedHex.size() &gt; 0) {</span>
+<span class="nc" id="L339">                String hexString = getEmbeddedHexString(embeddedHex);</span>
+<span class="nc" id="L340">                temp.append(hexString);</span>
+<span class="nc" id="L341">                embeddedHex.clear();</span>
+            }
+
+            // check for non-PrintableString chars
+<span class="fc" id="L345">            isPrintableString &amp;= DerValue.isPrintableStringChar((char)c);</span>
+<span class="fc" id="L346">            temp.append((char)c);</span>
+<span class="fc" id="L347">            c = readChar(in, &quot;Quoted string did not end in quote&quot;);</span>
+        }
+
+        // add trailing embedded hex bytes
+<span class="pc bpc" id="L351" title="1 of 2 branches missed.">        if (embeddedHex.size() &gt; 0) {</span>
+<span class="nc" id="L352">            String hexString = getEmbeddedHexString(embeddedHex);</span>
+<span class="nc" id="L353">            temp.append(hexString);</span>
+<span class="nc" id="L354">            embeddedHex.clear();</span>
+        }
+
+        do {
+<span class="fc" id="L358">            c = in.read();</span>
+<span class="pc bpc" id="L359" title="2 of 4 branches missed.">        } while ((c == '\n') || (c == ' '));</span>
+<span class="pc bpc" id="L360" title="1 of 2 branches missed.">        if (c != -1) {</span>
+<span class="nc" id="L361">            throw new IOException(&quot;AVA had characters other than &quot;</span>
+                    + &quot;whitespace after terminating quote&quot;);
+        }
+
+        // encode as PrintableString unless value contains
+        // non-PrintableString chars
+<span class="pc bpc" id="L367" title="1 of 2 branches missed.">        if (this.oid.equals((Object)PKCS9Attribute.EMAIL_ADDRESS_OID) ||</span>
+<span class="pc bpc" id="L368" title="3 of 4 branches missed.">            (this.oid.equals((Object)X500Name.DOMAIN_COMPONENT_OID) &amp;&amp;</span>
+                PRESERVE_OLD_DC_ENCODING == false)) {
+            // EmailAddress and DomainComponent must be IA5String
+<span class="nc" id="L371">            return new DerValue(DerValue.tag_IA5String,</span>
+<span class="nc" id="L372">                                        temp.toString().trim());</span>
+<span class="pc bpc" id="L373" title="1 of 2 branches missed.">        } else if (isPrintableString) {</span>
+<span class="nc" id="L374">            return new DerValue(temp.toString().trim());</span>
+        } else {
+<span class="fc" id="L376">            return new DerValue(DerValue.tag_UTF8String,</span>
+<span class="fc" id="L377">                                        temp.toString().trim());</span>
+        }
+    }
+
+    private DerValue parseString
+        (Reader in, int c, int format, StringBuilder temp) throws IOException {
+
+<span class="fc" id="L384">        List&lt;Byte&gt; embeddedHex = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L385">        boolean isPrintableString = true;</span>
+<span class="fc" id="L386">        boolean escape = false;</span>
+<span class="fc" id="L387">        boolean leadingChar = true;</span>
+<span class="fc" id="L388">        int spaceCount = 0;</span>
+        do {
+<span class="fc" id="L390">            escape = false;</span>
+<span class="fc bfc" id="L391" title="All 2 branches covered.">            if (c == '\\') {</span>
+<span class="fc" id="L392">                escape = true;</span>
+<span class="fc" id="L393">                c = readChar(in, &quot;Invalid trailing backslash&quot;);</span>
+
+                // check for embedded hex pairs
+<span class="fc" id="L396">                Byte hexByte = null;</span>
+<span class="fc bfc" id="L397" title="All 2 branches covered.">                if ((hexByte = getEmbeddedHexPair(c, in)) != null) {</span>
+
+                    // always encode AVAs with embedded hex as UTF8
+<span class="fc" id="L400">                    isPrintableString = false;</span>
+
+                    // append consecutive embedded hex
+                    // as single string later
+<span class="fc" id="L404">                    embeddedHex.add(hexByte);</span>
+<span class="fc" id="L405">                    c = in.read();</span>
+<span class="fc" id="L406">                    leadingChar = false;</span>
+<span class="fc" id="L407">                    continue;</span>
+                }
+
+                // check if character was improperly escaped
+<span class="pc bpc" id="L411" title="1 of 2 branches missed.">                if (format == DEFAULT &amp;&amp;</span>
+<span class="fc bfc" id="L412" title="All 2 branches covered.">                       specialCharsDefault.indexOf((char)c) == -1) {</span>
+<span class="fc" id="L413">                    throw new IOException</span>
+                        (&quot;Invalid escaped character in AVA: '&quot; +
+                        (char)c + &quot;'&quot;);
+<span class="pc bpc" id="L416" title="1 of 2 branches missed.">                } else if (format == RFC2253) {</span>
+<span class="nc bnc" id="L417" title="All 2 branches missed.">                    if (c == ' ') {</span>
+                        // only leading/trailing space can be escaped
+<span class="nc bnc" id="L419" title="All 4 branches missed.">                        if (!leadingChar &amp;&amp; !trailingSpace(in)) {</span>
+<span class="nc" id="L420">                            throw new IOException</span>
+                                    (&quot;Invalid escaped space character &quot; +
+                                    &quot;in AVA.  Only a leading or trailing &quot; +
+                                    &quot;space character can be escaped.&quot;);
+                        }
+<span class="nc bnc" id="L425" title="All 2 branches missed.">                    } else if (c == '#') {</span>
+                        // only leading '#' can be escaped
+<span class="nc bnc" id="L427" title="All 2 branches missed.">                        if (!leadingChar) {</span>
+<span class="nc" id="L428">                            throw new IOException</span>
+                                (&quot;Invalid escaped '#' character in AVA.  &quot; +
+                                &quot;Only a leading '#' can be escaped.&quot;);
+                        }
+<span class="nc bnc" id="L432" title="All 2 branches missed.">                    } else if (specialChars2253.indexOf((char)c) == -1) {</span>
+<span class="nc" id="L433">                        throw new IOException</span>
+                                (&quot;Invalid escaped character in AVA: '&quot; +
+                                (char)c + &quot;'&quot;);
+                    }
+                }
+<span class="fc" id="L438">            } else {</span>
+                // check if character should have been escaped
+<span class="fc bfc" id="L440" title="All 2 branches covered.">                if (format == RFC2253) {</span>
+<span class="pc bpc" id="L441" title="1 of 2 branches missed.">                    if (specialChars2253.indexOf((char)c) != -1) {</span>
+<span class="nc" id="L442">                        throw new IOException</span>
+                                (&quot;Character '&quot; + (char)c +
+                                 &quot;' in AVA appears without escape&quot;);
+                    }
+<span class="pc bpc" id="L446" title="1 of 2 branches missed.">                } else if (escapedDefault.indexOf((char)c) != -1) {</span>
+<span class="nc" id="L447">                    throw new IOException</span>
+                            (&quot;Character '&quot; + (char)c +
+                            &quot;' in AVA appears without escape&quot;);
+                }
+            }
+
+            // add embedded hex bytes before next char
+<span class="fc bfc" id="L454" title="All 2 branches covered.">            if (embeddedHex.size() &gt; 0) {</span>
+                // add space(s) before embedded hex bytes
+<span class="pc bpc" id="L456" title="1 of 2 branches missed.">                for (int i = 0; i &lt; spaceCount; i++) {</span>
+<span class="nc" id="L457">                    temp.append(&quot; &quot;);</span>
+                }
+<span class="fc" id="L459">                spaceCount = 0;</span>
+
+<span class="fc" id="L461">                String hexString = getEmbeddedHexString(embeddedHex);</span>
+<span class="fc" id="L462">                temp.append(hexString);</span>
+<span class="fc" id="L463">                embeddedHex.clear();</span>
+            }
+
+            // check for non-PrintableString chars
+<span class="fc" id="L467">            isPrintableString &amp;= DerValue.isPrintableStringChar((char)c);</span>
+<span class="fc bfc" id="L468" title="All 4 branches covered.">            if (c == ' ' &amp;&amp; escape == false) {</span>
+                // do not add non-escaped spaces yet
+                // (non-escaped trailing spaces are ignored)
+<span class="fc" id="L471">                spaceCount++;</span>
+            } else {
+                // add space(s)
+<span class="fc bfc" id="L474" title="All 2 branches covered.">                for (int i = 0; i &lt; spaceCount; i++) {</span>
+<span class="fc" id="L475">                    temp.append(&quot; &quot;);</span>
+                }
+<span class="fc" id="L477">                spaceCount = 0;</span>
+<span class="fc" id="L478">                temp.append((char)c);</span>
+            }
+<span class="fc" id="L480">            c = in.read();</span>
+<span class="fc" id="L481">            leadingChar = false;</span>
+<span class="fc bfc" id="L482" title="All 2 branches covered.">        } while (isTerminator(c, format) == false);</span>
+
+<span class="pc bpc" id="L484" title="1 of 4 branches missed.">        if (format == RFC2253 &amp;&amp; spaceCount &gt; 0) {</span>
+<span class="fc" id="L485">            throw new IOException(&quot;Incorrect AVA RFC2253 format - &quot; +</span>
+                                        &quot;trailing space must be escaped&quot;);
+        }
+
+        // add trailing embedded hex bytes
+<span class="fc bfc" id="L490" title="All 2 branches covered.">        if (embeddedHex.size() &gt; 0) {</span>
+<span class="fc" id="L491">            String hexString = getEmbeddedHexString(embeddedHex);</span>
+<span class="fc" id="L492">            temp.append(hexString);</span>
+<span class="fc" id="L493">            embeddedHex.clear();</span>
+        }
+
+        // encode as PrintableString unless value contains
+        // non-PrintableString chars
+<span class="fc bfc" id="L498" title="All 2 branches covered.">        if (this.oid.equals((Object)PKCS9Attribute.EMAIL_ADDRESS_OID) ||</span>
+<span class="pc bpc" id="L499" title="1 of 4 branches missed.">            (this.oid.equals((Object)X500Name.DOMAIN_COMPONENT_OID) &amp;&amp;</span>
+                PRESERVE_OLD_DC_ENCODING == false)) {
+            // EmailAddress and DomainComponent must be IA5String
+<span class="fc" id="L502">            return new DerValue(DerValue.tag_IA5String, temp.toString());</span>
+<span class="fc bfc" id="L503" title="All 2 branches covered.">        } else if (isPrintableString) {</span>
+<span class="fc" id="L504">            return new DerValue(temp.toString());</span>
+        } else {
+<span class="fc" id="L506">            return new DerValue(DerValue.tag_UTF8String, temp.toString());</span>
+        }
+    }
+
+    private static Byte getEmbeddedHexPair(int c1, Reader in)
+        throws IOException {
+
+<span class="fc bfc" id="L513" title="All 2 branches covered.">        if (hexDigits.indexOf(Character.toUpperCase((char)c1)) &gt;= 0) {</span>
+<span class="fc" id="L514">            int c2 = readChar(in, &quot;unexpected EOF - &quot; +</span>
+                        &quot;escaped hex value must include two valid digits&quot;);
+
+<span class="pc bpc" id="L517" title="1 of 2 branches missed.">            if (hexDigits.indexOf(Character.toUpperCase((char)c2)) &gt;= 0) {</span>
+<span class="fc" id="L518">                int hi = Character.digit((char)c1, 16);</span>
+<span class="fc" id="L519">                int lo = Character.digit((char)c2, 16);</span>
+<span class="fc" id="L520">                return new Byte((byte)((hi&lt;&lt;4) + lo));</span>
+            } else {
+<span class="nc" id="L522">                throw new IOException</span>
+                        (&quot;escaped hex value must include two valid digits&quot;);
+            }
+        }
+<span class="fc" id="L526">        return null;</span>
+    }
+
+    private static String getEmbeddedHexString(List&lt;Byte&gt; hexList)
+                                                throws IOException {
+<span class="fc" id="L531">        int n = hexList.size();</span>
+<span class="fc" id="L532">        byte[] hexBytes = new byte[n];</span>
+<span class="fc bfc" id="L533" title="All 2 branches covered.">        for (int i = 0; i &lt; n; i++) {</span>
+<span class="fc" id="L534">                hexBytes[i] = hexList.get(i).byteValue();</span>
+        }
+<span class="fc" id="L536">        return new String(hexBytes, &quot;UTF8&quot;);</span>
+    }
+
+    private static boolean isTerminator(int ch, int format) {
+<span class="pc bpc" id="L540" title="1 of 3 branches missed.">        switch (ch) {</span>
+        case -1:
+        case '+':
+        case ',':
+<span class="fc" id="L544">            return true;</span>
+        case ';':
+<span class="nc bnc" id="L546" title="All 2 branches missed.">            return format != RFC2253;</span>
+        default:
+<span class="fc" id="L548">            return false;</span>
+        }
+    }
+
+    private static int readChar(Reader in, String errMsg) throws IOException {
+<span class="fc" id="L553">        int c = in.read();</span>
+<span class="fc bfc" id="L554" title="All 2 branches covered.">        if (c == -1) {</span>
+<span class="fc" id="L555">            throw new IOException(errMsg);</span>
+        }
+<span class="fc" id="L557">        return c;</span>
+    }
+
+    private static boolean trailingSpace(Reader in) throws IOException {
+
+<span class="nc" id="L562">        boolean trailing = false;</span>
+
+<span class="nc bnc" id="L564" title="All 2 branches missed.">        if (!in.markSupported()) {</span>
+            // oh well
+<span class="nc" id="L566">            return true;</span>
+        } else {
+            // make readAheadLimit huge -
+            // in practice, AVA was passed a StringReader from X500Name,
+            // and StringReader ignores readAheadLimit anyways
+<span class="nc" id="L571">            in.mark(9999);</span>
+            while (true) {
+<span class="nc" id="L573">                int nextChar = in.read();</span>
+<span class="nc bnc" id="L574" title="All 2 branches missed.">                if (nextChar == -1) {</span>
+<span class="nc" id="L575">                    trailing = true;</span>
+<span class="nc" id="L576">                    break;</span>
+<span class="nc bnc" id="L577" title="All 2 branches missed.">                } else if (nextChar == ' ') {</span>
+<span class="nc" id="L578">                    continue;</span>
+<span class="nc bnc" id="L579" title="All 2 branches missed.">                } else if (nextChar == '\\') {</span>
+<span class="nc" id="L580">                    int followingChar = in.read();</span>
+<span class="nc bnc" id="L581" title="All 2 branches missed.">                    if (followingChar != ' ') {</span>
+<span class="nc" id="L582">                        trailing = false;</span>
+<span class="nc" id="L583">                        break;</span>
+                    }
+<span class="nc" id="L585">                } else {</span>
+<span class="nc" id="L586">                    trailing = false;</span>
+<span class="nc" id="L587">                    break;</span>
+                }
+<span class="nc" id="L589">            }</span>
+
+<span class="nc" id="L591">            in.reset();</span>
+<span class="nc" id="L592">            return trailing;</span>
+        }
+    }
+
+<span class="fc" id="L596">    AVA(DerValue derval) throws IOException {</span>
+        // Individual attribute value assertions are SEQUENCE of two values.
+        // That'd be a &quot;struct&quot; outside of ASN.1.
+<span class="pc bpc" id="L599" title="1 of 2 branches missed.">        if (derval.tag != DerValue.tag_Sequence) {</span>
+<span class="nc" id="L600">            throw new IOException(&quot;AVA not a sequence&quot;);</span>
+        }
+<span class="fc" id="L602">        oid = X500Name.intern(derval.data.getOID());</span>
+<span class="fc" id="L603">        value = derval.data.getDerValue();</span>
+
+<span class="pc bpc" id="L605" title="1 of 2 branches missed.">        if (derval.data.available() != 0) {</span>
+<span class="nc" id="L606">            throw new IOException(&quot;AVA, extra bytes = &quot;</span>
+<span class="nc" id="L607">                + derval.data.available());</span>
+        }
+<span class="fc" id="L609">    }</span>
+
+    AVA(DerInputStream in) throws IOException {
+<span class="nc" id="L612">        this(in.getDerValue());</span>
+<span class="nc" id="L613">    }</span>
+
+    public boolean equals(Object obj) {
+<span class="pc bpc" id="L616" title="1 of 2 branches missed.">        if (this == obj) {</span>
+<span class="nc" id="L617">            return true;</span>
+        }
+<span class="pc bpc" id="L619" title="1 of 2 branches missed.">        if (obj instanceof AVA == false) {</span>
+<span class="nc" id="L620">            return false;</span>
+        }
+<span class="fc" id="L622">        AVA other = (AVA)obj;</span>
+<span class="fc" id="L623">        return this.toRFC2253CanonicalString().equals</span>
+<span class="fc" id="L624">                                (other.toRFC2253CanonicalString());</span>
+    }
+
+    /**
+     * Returns a hashcode for this AVA.
+     *
+     * @return a hashcode for this AVA.
+     */
+    public int hashCode() {
+<span class="fc" id="L633">        return toRFC2253CanonicalString().hashCode();</span>
+    }
+
+    /*
+     * AVAs are encoded as a SEQUENCE of two elements.
+     */
+    public void encode(DerOutputStream out) throws IOException {
+<span class="nc" id="L640">        derEncode(out);</span>
+<span class="nc" id="L641">    }</span>
+
+    /**
+     * DER encode this object onto an output stream.
+     * Implements the &lt;code&gt;DerEncoder&lt;/code&gt; interface.
+     *
+     * @param out
+     * the output stream on which to write the DER encoding.
+     *
+     * @exception IOException on encoding error.
+     */
+    public void derEncode(OutputStream out) throws IOException {
+<span class="fc" id="L653">        DerOutputStream         tmp = new DerOutputStream();</span>
+<span class="fc" id="L654">        DerOutputStream         tmp2 = new DerOutputStream();</span>
+
+<span class="fc" id="L656">        tmp.putOID(oid);</span>
+<span class="fc" id="L657">        value.encode(tmp);</span>
+<span class="fc" id="L658">        tmp2.write(DerValue.tag_Sequence, tmp);</span>
+<span class="fc" id="L659">        out.write(tmp2.toByteArray());</span>
+<span class="fc" id="L660">    }</span>
+
+    private String toKeyword(int format, Map&lt;String, String&gt; oidMap) {
+<span class="fc" id="L663">        return AVAKeyword.getKeyword(oid, format, oidMap);</span>
+    }
+
+    /**
+     * Returns a printable form of this attribute, using RFC 1779
+     * syntax for individual attribute/value assertions.
+     */
+    public String toString() {
+<span class="fc" id="L671">        return toKeywordValueString</span>
+<span class="fc" id="L672">            (toKeyword(DEFAULT, Collections.&lt;String, String&gt;emptyMap()));</span>
+    }
+
+    /**
+     * Returns a printable form of this attribute, using RFC 1779
+     * syntax for individual attribute/value assertions. It only
+     * emits standardised keywords.
+     */
+    public String toRFC1779String() {
+<span class="nc" id="L681">        return toRFC1779String(Collections.&lt;String, String&gt;emptyMap());</span>
+    }
+
+    /**
+     * Returns a printable form of this attribute, using RFC 1779
+     * syntax for individual attribute/value assertions. It
+     * emits standardised keywords, as well as keywords contained in the
+     * OID/keyword map.
+     */
+    public String toRFC1779String(Map&lt;String, String&gt; oidMap) {
+<span class="fc" id="L691">        return toKeywordValueString(toKeyword(RFC1779, oidMap));</span>
+    }
+
+    /**
+     * Returns a printable form of this attribute, using RFC 2253
+     * syntax for individual attribute/value assertions. It only
+     * emits standardised keywords.
+     */
+    public String toRFC2253String() {
+<span class="nc" id="L700">        return toRFC2253String(Collections.&lt;String, String&gt;emptyMap());</span>
+    }
+
+    /**
+     * Returns a printable form of this attribute, using RFC 2253
+     * syntax for individual attribute/value assertions. It
+     * emits standardised keywords, as well as keywords contained in the
+     * OID/keyword map.
+     */
+    public String toRFC2253String(Map&lt;String, String&gt; oidMap) {
+        /*
+         * Section 2.3: The AttributeTypeAndValue is encoded as the string
+         * representation of the AttributeType, followed by an equals character
+         * ('=' ASCII 61), followed by the string representation of the
+         * AttributeValue. The encoding of the AttributeValue is given in
+         * section 2.4.
+         */
+<span class="fc" id="L717">        StringBuilder typeAndValue = new StringBuilder(100);</span>
+<span class="fc" id="L718">        typeAndValue.append(toKeyword(RFC2253, oidMap));</span>
+<span class="fc" id="L719">        typeAndValue.append('=');</span>
+
+        /*
+         * Section 2.4: Converting an AttributeValue from ASN.1 to a String.
+         * If the AttributeValue is of a type which does not have a string
+         * representation defined for it, then it is simply encoded as an
+         * octothorpe character ('#' ASCII 35) followed by the hexadecimal
+         * representation of each of the bytes of the BER encoding of the X.500
+         * AttributeValue.  This form SHOULD be used if the AttributeType is of
+         * the dotted-decimal form.
+         */
+<span class="pc bpc" id="L730" title="1 of 4 branches missed.">        if ((typeAndValue.charAt(0) &gt;= '0' &amp;&amp; typeAndValue.charAt(0) &lt;= '9') ||</span>
+<span class="pc bpc" id="L731" title="1 of 2 branches missed.">            !isDerString(value, false))</span>
+        {
+<span class="fc" id="L733">            byte[] data = null;</span>
+            try {
+<span class="fc" id="L735">                data = value.toByteArray();</span>
+<span class="nc" id="L736">            } catch (IOException ie) {</span>
+<span class="nc" id="L737">                throw new IllegalArgumentException(&quot;DER Value conversion&quot;);</span>
+<span class="fc" id="L738">            }</span>
+<span class="fc" id="L739">            typeAndValue.append('#');</span>
+<span class="fc bfc" id="L740" title="All 2 branches covered.">            for (int j = 0; j &lt; data.length; j++) {</span>
+<span class="fc" id="L741">                byte b = data[j];</span>
+<span class="fc" id="L742">                typeAndValue.append(Character.forDigit(0xF &amp; (b &gt;&gt;&gt; 4), 16));</span>
+<span class="fc" id="L743">                typeAndValue.append(Character.forDigit(0xF &amp; b, 16));</span>
+            }
+<span class="fc" id="L745">        } else {</span>
+            /*
+             * 2.4 (cont): Otherwise, if the AttributeValue is of a type which
+             * has a string representation, the value is converted first to a
+             * UTF-8 string according to its syntax specification.
+             *
+             * NOTE: this implementation only emits DirectoryStrings of the
+             * types returned by isDerString().
+             */
+<span class="fc" id="L754">            String valStr = null;</span>
+            try {
+<span class="fc" id="L756">                valStr = new String(value.getDataBytes(), &quot;UTF8&quot;);</span>
+<span class="nc" id="L757">            } catch (IOException ie) {</span>
+<span class="nc" id="L758">                throw new IllegalArgumentException(&quot;DER Value conversion&quot;);</span>
+<span class="fc" id="L759">            }</span>
+
+            /*
+             * 2.4 (cont): If the UTF-8 string does not have any of the
+             * following characters which need escaping, then that string can be
+             * used as the string representation of the value.
+             *
+             *   o   a space or &quot;#&quot; character occurring at the beginning of the
+             *       string
+             *   o   a space character occurring at the end of the string
+             *   o   one of the characters &quot;,&quot;, &quot;+&quot;, &quot;&quot;&quot;, &quot;\&quot;, &quot;&lt;&quot;, &quot;&gt;&quot; or &quot;;&quot;
+             *
+             * Implementations MAY escape other characters.
+             *
+             * NOTE: this implementation also recognizes &quot;=&quot; and &quot;#&quot; as
+             * characters which need escaping, and null which is escaped as
+             * '\00' (see RFC 4514).
+             *
+             * If a character to be escaped is one of the list shown above, then
+             * it is prefixed by a backslash ('\' ASCII 92).
+             *
+             * Otherwise the character to be escaped is replaced by a backslash
+             * and two hex digits, which form a single byte in the code of the
+             * character.
+             */
+            final String escapees = &quot;,=+&lt;&gt;#;\&quot;\\&quot;;
+<span class="fc" id="L785">            StringBuilder sbuffer = new StringBuilder();</span>
+
+<span class="fc bfc" id="L787" title="All 2 branches covered.">            for (int i = 0; i &lt; valStr.length(); i++) {</span>
+<span class="fc" id="L788">                char c = valStr.charAt(i);</span>
+<span class="fc bfc" id="L789" title="All 2 branches covered.">                if (DerValue.isPrintableStringChar(c) ||</span>
+<span class="pc bpc" id="L790" title="1 of 2 branches missed.">                    escapees.indexOf(c) &gt;= 0) {</span>
+
+                    // escape escapees
+<span class="pc bpc" id="L793" title="1 of 2 branches missed.">                    if (escapees.indexOf(c) &gt;= 0) {</span>
+<span class="nc" id="L794">                        sbuffer.append('\\');</span>
+                    }
+
+                    // append printable/escaped char
+<span class="fc" id="L798">                    sbuffer.append(c);</span>
+
+<span class="pc bpc" id="L800" title="1 of 2 branches missed.">                } else if (c == '\u0000') {</span>
+                    // escape null character
+<span class="nc" id="L802">                    sbuffer.append(&quot;\\00&quot;);</span>
+
+<span class="pc bpc" id="L804" title="2 of 4 branches missed.">                } else if (debug != null &amp;&amp; Debug.isOn(&quot;ava&quot;)) {</span>
+
+                    // embed non-printable/non-escaped char
+                    // as escaped hex pairs for debugging
+<span class="fc" id="L808">                    byte[] valueBytes = null;</span>
+                    try {
+<span class="fc" id="L810">                        valueBytes = Character.toString(c).getBytes(&quot;UTF8&quot;);</span>
+<span class="nc" id="L811">                    } catch (IOException ie) {</span>
+<span class="nc" id="L812">                        throw new IllegalArgumentException</span>
+                                        (&quot;DER Value conversion&quot;);
+<span class="fc" id="L814">                    }</span>
+<span class="fc bfc" id="L815" title="All 2 branches covered.">                    for (int j = 0; j &lt; valueBytes.length; j++) {</span>
+<span class="fc" id="L816">                        sbuffer.append('\\');</span>
+<span class="fc" id="L817">                        char hexChar = Character.forDigit</span>
+<span class="fc" id="L818">                                (0xF &amp; (valueBytes[j] &gt;&gt;&gt; 4), 16);</span>
+<span class="fc" id="L819">                        sbuffer.append(Character.toUpperCase(hexChar));</span>
+<span class="fc" id="L820">                        hexChar = Character.forDigit</span>
+<span class="fc" id="L821">                                (0xF &amp; (valueBytes[j]), 16);</span>
+<span class="fc" id="L822">                        sbuffer.append(Character.toUpperCase(hexChar));</span>
+                    }
+<span class="fc" id="L824">                } else {</span>
+
+                    // append non-printable/non-escaped char
+<span class="nc" id="L827">                    sbuffer.append(c);</span>
+                }
+            }
+
+<span class="fc" id="L831">            char[] chars = sbuffer.toString().toCharArray();</span>
+<span class="fc" id="L832">            sbuffer = new StringBuilder();</span>
+
+            // Find leading and trailing whitespace.
+            int lead;   // index of first char that is not leading whitespace
+<span class="pc bpc" id="L836" title="1 of 2 branches missed.">            for (lead = 0; lead &lt; chars.length; lead++) {</span>
+<span class="pc bpc" id="L837" title="1 of 4 branches missed.">                if (chars[lead] != ' ' &amp;&amp; chars[lead] != '\r') {</span>
+<span class="fc" id="L838">                    break;</span>
+                }
+            }
+            int trail;  // index of last char that is not trailing whitespace
+<span class="pc bpc" id="L842" title="1 of 2 branches missed.">            for (trail = chars.length - 1; trail &gt;= 0; trail--) {</span>
+<span class="pc bpc" id="L843" title="1 of 4 branches missed.">                if (chars[trail] != ' ' &amp;&amp; chars[trail] != '\r') {</span>
+<span class="fc" id="L844">                    break;</span>
+                }
+            }
+
+            // escape leading and trailing whitespace
+<span class="fc bfc" id="L849" title="All 2 branches covered.">            for (int i = 0; i &lt; chars.length; i++) {</span>
+<span class="fc" id="L850">                char c = chars[i];</span>
+<span class="fc bfc" id="L851" title="All 4 branches covered.">                if (i &lt; lead || i &gt; trail) {</span>
+<span class="fc" id="L852">                    sbuffer.append('\\');</span>
+                }
+<span class="fc" id="L854">                sbuffer.append(c);</span>
+            }
+<span class="fc" id="L856">            typeAndValue.append(sbuffer.toString());</span>
+        }
+<span class="fc" id="L858">        return typeAndValue.toString();</span>
+    }
+
+    public String toRFC2253CanonicalString() {
+        /*
+         * Section 2.3: The AttributeTypeAndValue is encoded as the string
+         * representation of the AttributeType, followed by an equals character
+         * ('=' ASCII 61), followed by the string representation of the
+         * AttributeValue. The encoding of the AttributeValue is given in
+         * section 2.4.
+         */
+<span class="fc" id="L869">        StringBuilder typeAndValue = new StringBuilder(40);</span>
+<span class="fc" id="L870">        typeAndValue.append</span>
+<span class="fc" id="L871">            (toKeyword(RFC2253, Collections.&lt;String, String&gt;emptyMap()));</span>
+<span class="fc" id="L872">        typeAndValue.append('=');</span>
+
+        /*
+         * Section 2.4: Converting an AttributeValue from ASN.1 to a String.
+         * If the AttributeValue is of a type which does not have a string
+         * representation defined for it, then it is simply encoded as an
+         * octothorpe character ('#' ASCII 35) followed by the hexadecimal
+         * representation of each of the bytes of the BER encoding of the X.500
+         * AttributeValue.  This form SHOULD be used if the AttributeType is of
+         * the dotted-decimal form.
+         */
+<span class="pc bpc" id="L883" title="1 of 4 branches missed.">        if ((typeAndValue.charAt(0) &gt;= '0' &amp;&amp; typeAndValue.charAt(0) &lt;= '9') ||</span>
+<span class="fc bfc" id="L884" title="All 2 branches covered.">            !isDerString(value, true))</span>
+        {
+<span class="fc" id="L886">            byte[] data = null;</span>
+            try {
+<span class="fc" id="L888">                data = value.toByteArray();</span>
+<span class="nc" id="L889">            } catch (IOException ie) {</span>
+<span class="nc" id="L890">                throw new IllegalArgumentException(&quot;DER Value conversion&quot;);</span>
+<span class="fc" id="L891">            }</span>
+<span class="fc" id="L892">            typeAndValue.append('#');</span>
+<span class="fc bfc" id="L893" title="All 2 branches covered.">            for (int j = 0; j &lt; data.length; j++) {</span>
+<span class="fc" id="L894">                byte b = data[j];</span>
+<span class="fc" id="L895">                typeAndValue.append(Character.forDigit(0xF &amp; (b &gt;&gt;&gt; 4), 16));</span>
+<span class="fc" id="L896">                typeAndValue.append(Character.forDigit(0xF &amp; b, 16));</span>
+            }
+<span class="fc" id="L898">        } else {</span>
+            /*
+             * 2.4 (cont): Otherwise, if the AttributeValue is of a type which
+             * has a string representation, the value is converted first to a
+             * UTF-8 string according to its syntax specification.
+             *
+             * NOTE: this implementation only emits DirectoryStrings of the
+             * types returned by isDerString().
+             */
+<span class="fc" id="L907">            String valStr = null;</span>
+            try {
+<span class="fc" id="L909">                valStr = new String(value.getDataBytes(), &quot;UTF8&quot;);</span>
+<span class="nc" id="L910">            } catch (IOException ie) {</span>
+<span class="nc" id="L911">                throw new IllegalArgumentException(&quot;DER Value conversion&quot;);</span>
+<span class="fc" id="L912">            }</span>
+
+            /*
+             * 2.4 (cont): If the UTF-8 string does not have any of the
+             * following characters which need escaping, then that string can be
+             * used as the string representation of the value.
+             *
+             *   o   a space or &quot;#&quot; character occurring at the beginning of the
+             *       string
+             *   o   a space character occurring at the end of the string
+             *
+             *   o   one of the characters &quot;,&quot;, &quot;+&quot;, &quot;&quot;&quot;, &quot;\&quot;, &quot;&lt;&quot;, &quot;&gt;&quot; or &quot;;&quot;
+             *
+             * If a character to be escaped is one of the list shown above, then
+             * it is prefixed by a backslash ('\' ASCII 92).
+             *
+             * Otherwise the character to be escaped is replaced by a backslash
+             * and two hex digits, which form a single byte in the code of the
+             * character.
+             */
+            final String escapees = &quot;,+&lt;&gt;;\&quot;\\&quot;;
+<span class="fc" id="L933">            StringBuilder sbuffer = new StringBuilder();</span>
+<span class="fc" id="L934">            boolean previousWhite = false;</span>
+
+<span class="fc bfc" id="L936" title="All 2 branches covered.">            for (int i = 0; i &lt; valStr.length(); i++) {</span>
+<span class="fc" id="L937">                char c = valStr.charAt(i);</span>
+
+<span class="fc bfc" id="L939" title="All 2 branches covered.">                if (DerValue.isPrintableStringChar(c) ||</span>
+<span class="pc bpc" id="L940" title="1 of 6 branches missed.">                    escapees.indexOf(c) &gt;= 0 ||</span>
+                    (i == 0 &amp;&amp; c == '#')) {
+
+                    // escape leading '#' and escapees
+<span class="pc bpc" id="L944" title="1 of 6 branches missed.">                    if ((i == 0 &amp;&amp; c == '#') || escapees.indexOf(c) &gt;= 0) {</span>
+<span class="fc" id="L945">                        sbuffer.append('\\');</span>
+                    }
+
+                    // convert multiple whitespace to single whitespace
+<span class="fc bfc" id="L949" title="All 2 branches covered.">                    if (!Character.isWhitespace(c)) {</span>
+<span class="fc" id="L950">                        previousWhite = false;</span>
+<span class="fc" id="L951">                        sbuffer.append(c);</span>
+                    } else {
+<span class="pc bpc" id="L953" title="1 of 2 branches missed.">                        if (previousWhite == false) {</span>
+                            // add single whitespace
+<span class="fc" id="L955">                            previousWhite = true;</span>
+<span class="fc" id="L956">                            sbuffer.append(c);</span>
+                        } else {
+                            // ignore subsequent consecutive whitespace
+                            continue;
+                        }
+                    }
+
+<span class="pc bpc" id="L963" title="1 of 4 branches missed.">                } else if (debug != null &amp;&amp; Debug.isOn(&quot;ava&quot;)) {</span>
+
+                    // embed non-printable/non-escaped char
+                    // as escaped hex pairs for debugging
+
+<span class="fc" id="L968">                    previousWhite = false;</span>
+
+<span class="fc" id="L970">                    byte valueBytes[] = null;</span>
+                    try {
+<span class="fc" id="L972">                        valueBytes = Character.toString(c).getBytes(&quot;UTF8&quot;);</span>
+<span class="nc" id="L973">                    } catch (IOException ie) {</span>
+<span class="nc" id="L974">                        throw new IllegalArgumentException</span>
+                                        (&quot;DER Value conversion&quot;);
+<span class="fc" id="L976">                    }</span>
+<span class="fc bfc" id="L977" title="All 2 branches covered.">                    for (int j = 0; j &lt; valueBytes.length; j++) {</span>
+<span class="fc" id="L978">                        sbuffer.append('\\');</span>
+<span class="fc" id="L979">                        sbuffer.append(Character.forDigit</span>
+<span class="fc" id="L980">                                        (0xF &amp; (valueBytes[j] &gt;&gt;&gt; 4), 16));</span>
+<span class="fc" id="L981">                        sbuffer.append(Character.forDigit</span>
+<span class="fc" id="L982">                                        (0xF &amp; (valueBytes[j]), 16));</span>
+                    }
+<span class="fc" id="L984">                } else {</span>
+
+                    // append non-printable/non-escaped char
+
+<span class="fc" id="L988">                    previousWhite = false;</span>
+<span class="fc" id="L989">                    sbuffer.append(c);</span>
+                }
+            }
+
+            // remove leading and trailing whitespace from value
+<span class="fc" id="L994">            typeAndValue.append(sbuffer.toString().trim());</span>
+        }
+
+<span class="fc" id="L997">        String canon = typeAndValue.toString();</span>
+<span class="fc" id="L998">        canon = canon.toUpperCase(Locale.US).toLowerCase(Locale.US);</span>
+<span class="fc" id="L999">        return Normalizer.normalize(canon, Normalizer.Form.NFKD);</span>
+    }
+
+    /*
+     * Return true if DerValue can be represented as a String.
+     */
+    private static boolean isDerString(DerValue value, boolean canonical) {
+<span class="fc bfc" id="L1006" title="All 2 branches covered.">        if (canonical) {</span>
+<span class="fc bfc" id="L1007" title="All 2 branches covered.">            switch (value.tag) {</span>
+                case DerValue.tag_PrintableString:
+                case DerValue.tag_UTF8String:
+<span class="fc" id="L1010">                    return true;</span>
+                default:
+<span class="fc" id="L1012">                    return false;</span>
+            }
+        } else {
+<span class="pc bpc" id="L1015" title="1 of 2 branches missed.">            switch (value.tag) {</span>
+                case DerValue.tag_PrintableString:
+                case DerValue.tag_T61String:
+                case DerValue.tag_IA5String:
+                case DerValue.tag_GeneralString:
+                case DerValue.tag_BMPString:
+                case DerValue.tag_UTF8String:
+<span class="fc" id="L1022">                    return true;</span>
+                default:
+<span class="nc" id="L1024">                    return false;</span>
+            }
+        }
+    }
+
+    boolean hasRFC2253Keyword() {
+<span class="nc" id="L1030">        return AVAKeyword.hasKeyword(oid, RFC2253);</span>
+    }
+
+    private String toKeywordValueString(String keyword) {
+        /*
+         * Construct the value with as little copying and garbage
+         * production as practical.  First the keyword (mandatory),
+         * then the equals sign, finally the value.
+         */
+<span class="fc" id="L1039">        StringBuilder   retval = new StringBuilder(40);</span>
+
+<span class="fc" id="L1041">        retval.append(keyword);</span>
+<span class="fc" id="L1042">        retval.append(&quot;=&quot;);</span>
+
+        try {
+<span class="fc" id="L1045">            String valStr = value.getAsString();</span>
+
+<span class="pc bpc" id="L1047" title="1 of 2 branches missed.">            if (valStr == null) {</span>
+
+                // rfc1779 specifies that attribute values associated
+                // with non-standard keyword attributes may be represented
+                // using the hex format below.  This will be used only
+                // when the value is not a string type
+
+<span class="nc" id="L1054">                byte    data [] = value.toByteArray();</span>
+
+<span class="nc" id="L1056">                retval.append('#');</span>
+<span class="nc bnc" id="L1057" title="All 2 branches missed.">                for (int i = 0; i &lt; data.length; i++) {</span>
+<span class="nc" id="L1058">                    retval.append(hexDigits.charAt((data [i] &gt;&gt; 4) &amp; 0x0f));</span>
+<span class="nc" id="L1059">                    retval.append(hexDigits.charAt(data [i] &amp; 0x0f));</span>
+                }
+
+<span class="nc" id="L1062">            } else {</span>
+
+<span class="fc" id="L1064">                boolean quoteNeeded = false;</span>
+<span class="fc" id="L1065">                StringBuilder sbuffer = new StringBuilder();</span>
+<span class="fc" id="L1066">                boolean previousWhite = false;</span>
+                final String escapees = &quot;,+=\n&lt;&gt;#;\\\&quot;&quot;;
+
+                /*
+                 * Special characters (e.g. AVA list separators) cause strings
+                 * to need quoting, or at least escaping.  So do leading or
+                 * trailing spaces, and multiple internal spaces.
+                 */
+<span class="fc" id="L1074">                int length = valStr.length();</span>
+<span class="fc bfc" id="L1075" title="All 2 branches covered.">                boolean alreadyQuoted =</span>
+<span class="fc bfc" id="L1076" title="All 2 branches covered.">                    (length &gt; 1 &amp;&amp; valStr.charAt(0) == '\&quot;'</span>
+<span class="pc bpc" id="L1077" title="1 of 2 branches missed.">                     &amp;&amp; valStr.charAt(length - 1) == '\&quot;');</span>
+
+<span class="fc bfc" id="L1079" title="All 2 branches covered.">                for (int i = 0; i &lt; length; i++) {</span>
+<span class="fc" id="L1080">                    char c = valStr.charAt(i);</span>
+<span class="fc bfc" id="L1081" title="All 6 branches covered.">                    if (alreadyQuoted &amp;&amp; (i == 0 || i == length - 1)) {</span>
+<span class="fc" id="L1082">                        sbuffer.append(c);</span>
+<span class="fc" id="L1083">                        continue;</span>
+                    }
+<span class="fc bfc" id="L1085" title="All 2 branches covered.">                    if (DerValue.isPrintableStringChar(c) ||</span>
+<span class="fc bfc" id="L1086" title="All 2 branches covered.">                        escapees.indexOf(c) &gt;= 0) {</span>
+
+                        // quote if leading whitespace or special chars
+<span class="pc bpc" id="L1089" title="1 of 8 branches missed.">                        if (!quoteNeeded &amp;&amp;</span>
+                            ((i == 0 &amp;&amp; (c == ' ' || c == '\n')) ||
+<span class="fc bfc" id="L1091" title="All 2 branches covered.">                                escapees.indexOf(c) &gt;= 0)) {</span>
+<span class="fc" id="L1092">                            quoteNeeded = true;</span>
+                        }
+
+                        // quote if multiple internal whitespace
+<span class="pc bpc" id="L1096" title="1 of 4 branches missed.">                        if (!(c == ' ' || c == '\n')) {</span>
+                            // escape '&quot;' and '\'
+<span class="pc bpc" id="L1098" title="1 of 4 branches missed.">                            if (c == '&quot;' || c == '\\') {</span>
+<span class="fc" id="L1099">                                sbuffer.append('\\');</span>
+                            }
+<span class="fc" id="L1101">                            previousWhite = false;</span>
+                        } else {
+<span class="pc bpc" id="L1103" title="1 of 4 branches missed.">                            if (!quoteNeeded &amp;&amp; previousWhite) {</span>
+<span class="nc" id="L1104">                                quoteNeeded = true;</span>
+                            }
+<span class="fc" id="L1106">                            previousWhite = true;</span>
+                        }
+
+<span class="fc" id="L1109">                        sbuffer.append(c);</span>
+
+<span class="pc bpc" id="L1111" title="1 of 4 branches missed.">                    } else if (debug != null &amp;&amp; Debug.isOn(&quot;ava&quot;)) {</span>
+
+                        // embed non-printable/non-escaped char
+                        // as escaped hex pairs for debugging
+
+<span class="fc" id="L1116">                        previousWhite = false;</span>
+
+                        // embed escaped hex pairs
+<span class="fc" id="L1119">                        byte[] valueBytes =</span>
+<span class="fc" id="L1120">                                Character.toString(c).getBytes(&quot;UTF8&quot;);</span>
+<span class="fc bfc" id="L1121" title="All 2 branches covered.">                        for (int j = 0; j &lt; valueBytes.length; j++) {</span>
+<span class="fc" id="L1122">                            sbuffer.append('\\');</span>
+<span class="fc" id="L1123">                            char hexChar = Character.forDigit</span>
+<span class="fc" id="L1124">                                        (0xF &amp; (valueBytes[j] &gt;&gt;&gt; 4), 16);</span>
+<span class="fc" id="L1125">                            sbuffer.append(Character.toUpperCase(hexChar));</span>
+<span class="fc" id="L1126">                            hexChar = Character.forDigit</span>
+<span class="fc" id="L1127">                                        (0xF &amp; (valueBytes[j]), 16);</span>
+<span class="fc" id="L1128">                            sbuffer.append(Character.toUpperCase(hexChar));</span>
+                        }
+<span class="fc" id="L1130">                    } else {</span>
+
+                        // append non-printable/non-escaped char
+
+<span class="fc" id="L1134">                        previousWhite = false;</span>
+<span class="fc" id="L1135">                        sbuffer.append(c);</span>
+                    }
+                }
+
+                // quote if trailing whitespace
+<span class="pc bpc" id="L1140" title="1 of 2 branches missed.">                if (sbuffer.length() &gt; 0) {</span>
+<span class="fc" id="L1141">                    char trailChar = sbuffer.charAt(sbuffer.length() - 1);</span>
+<span class="pc bpc" id="L1142" title="1 of 4 branches missed.">                    if (trailChar == ' ' || trailChar == '\n') {</span>
+<span class="fc" id="L1143">                        quoteNeeded = true;</span>
+                    }
+                }
+
+                // Emit the string ... quote it if needed
+                // if string is already quoted, don't re-quote
+<span class="fc bfc" id="L1149" title="All 4 branches covered.">                if (!alreadyQuoted &amp;&amp; quoteNeeded) {</span>
+<span class="fc" id="L1150">                    retval.append(&quot;\&quot;&quot; + sbuffer.toString() + &quot;\&quot;&quot;);</span>
+                } else {
+<span class="fc" id="L1152">                    retval.append(sbuffer.toString());</span>
+                }
+            }
+<span class="nc" id="L1155">        } catch (IOException e) {</span>
+<span class="nc" id="L1156">            throw new IllegalArgumentException(&quot;DER Value conversion&quot;);</span>
+<span class="fc" id="L1157">        }</span>
+
+<span class="fc" id="L1159">        return retval.toString();</span>
+    }
+
+}
+
+/**
+ * Helper class that allows conversion from String to ObjectIdentifier and
+ * vice versa according to RFC1779, RFC2253, and an augmented version of
+ * those standards.
+ */
+class AVAKeyword {
+
+    private static final Map&lt;ObjectIdentifier,AVAKeyword&gt; oidMap;
+    private static final Map&lt;String,AVAKeyword&gt; keywordMap;
+
+    private String keyword;
+    private ObjectIdentifier oid;
+    private boolean rfc1779Compliant, rfc2253Compliant;
+
+    private AVAKeyword(String keyword, ObjectIdentifier oid,
+<span class="fc" id="L1179">               boolean rfc1779Compliant, boolean rfc2253Compliant) {</span>
+<span class="fc" id="L1180">        this.keyword = keyword;</span>
+<span class="fc" id="L1181">        this.oid = oid;</span>
+<span class="fc" id="L1182">        this.rfc1779Compliant = rfc1779Compliant;</span>
+<span class="fc" id="L1183">        this.rfc2253Compliant = rfc2253Compliant;</span>
+
+        // register it
+<span class="fc" id="L1186">        oidMap.put(oid, this);</span>
+<span class="fc" id="L1187">        keywordMap.put(keyword, this);</span>
+<span class="fc" id="L1188">    }</span>
+
+    private boolean isCompliant(int standard) {
+<span class="pc bpc" id="L1191" title="1 of 4 branches missed.">        switch (standard) {</span>
+        case AVA.RFC1779:
+<span class="fc" id="L1193">            return rfc1779Compliant;</span>
+        case AVA.RFC2253:
+<span class="fc" id="L1195">            return rfc2253Compliant;</span>
+        case AVA.DEFAULT:
+<span class="fc" id="L1197">            return true;</span>
+        default:
+            // should not occur, internal error
+<span class="nc" id="L1200">            throw new IllegalArgumentException(&quot;Invalid standard &quot; + standard);</span>
+        }
+    }
+
+    /**
+     * Get an object identifier representing the specified keyword (or
+     * string encoded object identifier) in the given standard.
+     *
+     * @param keywordMap a Map where a keyword String maps to a corresponding
+     *   OID String. Each AVA keyword will be mapped to the corresponding OID.
+     *   If an entry does not exist, it will fallback to the builtin
+     *   keyword/OID mapping.
+     * @throws IOException If the keyword is not valid in the specified standard
+     *   or the OID String to which a keyword maps to is improperly formatted.
+     */
+    static ObjectIdentifier getOID
+        (String keyword, int standard, Map&lt;String, String&gt; extraKeywordMap)
+            throws IOException {
+
+<span class="fc" id="L1219">        keyword = keyword.toUpperCase(Locale.ENGLISH);</span>
+<span class="fc bfc" id="L1220" title="All 2 branches covered.">        if (standard == AVA.RFC2253) {</span>
+<span class="pc bpc" id="L1221" title="2 of 4 branches missed.">            if (keyword.startsWith(&quot; &quot;) || keyword.endsWith(&quot; &quot;)) {</span>
+<span class="nc" id="L1222">                throw new IOException(&quot;Invalid leading or trailing space &quot; +</span>
+                        &quot;in keyword \&quot;&quot; + keyword + &quot;\&quot;&quot;);
+            }
+        } else {
+<span class="fc" id="L1226">            keyword = keyword.trim();</span>
+        }
+
+        // check user-specified keyword map first, then fallback to built-in
+        // map
+<span class="fc" id="L1231">        String oidString = extraKeywordMap.get(keyword);</span>
+<span class="pc bpc" id="L1232" title="1 of 2 branches missed.">        if (oidString == null) {</span>
+<span class="fc" id="L1233">            AVAKeyword ak = keywordMap.get(keyword);</span>
+<span class="pc bpc" id="L1234" title="1 of 4 branches missed.">            if ((ak != null) &amp;&amp; ak.isCompliant(standard)) {</span>
+<span class="fc" id="L1235">                return ak.oid;</span>
+            }
+<span class="fc" id="L1237">        } else {</span>
+<span class="nc" id="L1238">            return new ObjectIdentifier(oidString);</span>
+        }
+
+        // no keyword found, check if OID string
+<span class="pc bpc" id="L1242" title="2 of 4 branches missed.">        if (standard == AVA.DEFAULT &amp;&amp; keyword.startsWith(&quot;OID.&quot;)) {</span>
+<span class="nc" id="L1243">            keyword = keyword.substring(4);</span>
+        }
+
+<span class="fc" id="L1246">        boolean number = false;</span>
+<span class="pc bpc" id="L1247" title="1 of 2 branches missed.">        if (keyword.length() != 0) {</span>
+<span class="fc" id="L1248">            char ch = keyword.charAt(0);</span>
+<span class="pc bpc" id="L1249" title="2 of 4 branches missed.">            if ((ch &gt;= '0') &amp;&amp; (ch &lt;= '9')) {</span>
+<span class="fc" id="L1250">                number = true;</span>
+            }
+        }
+<span class="pc bpc" id="L1253" title="1 of 2 branches missed.">        if (number == false) {</span>
+<span class="nc" id="L1254">            throw new IOException(&quot;Invalid keyword \&quot;&quot; + keyword + &quot;\&quot;&quot;);</span>
+        }
+<span class="fc" id="L1256">        return new ObjectIdentifier(keyword);</span>
+    }
+
+    /**
+     * Get a keyword for the given ObjectIdentifier according to standard.
+     * If no keyword is available, the ObjectIdentifier is encoded as a
+     * String.
+     */
+    static String getKeyword(ObjectIdentifier oid, int standard) {
+<span class="nc" id="L1265">        return getKeyword</span>
+<span class="nc" id="L1266">            (oid, standard, Collections.&lt;String, String&gt;emptyMap());</span>
+    }
+
+    /**
+     * Get a keyword for the given ObjectIdentifier according to standard.
+     * Checks the extraOidMap for a keyword first, then falls back to the
+     * builtin/default set. If no keyword is available, the ObjectIdentifier
+     * is encoded as a String.
+     */
+    static String getKeyword
+        (ObjectIdentifier oid, int standard, Map&lt;String, String&gt; extraOidMap) {
+
+        // check extraOidMap first, then fallback to built-in map
+<span class="fc" id="L1279">        String oidString = oid.toString();</span>
+<span class="fc" id="L1280">        String keywordString = extraOidMap.get(oidString);</span>
+<span class="pc bpc" id="L1281" title="1 of 2 branches missed.">        if (keywordString == null) {</span>
+<span class="fc" id="L1282">            AVAKeyword ak = oidMap.get(oid);</span>
+<span class="fc bfc" id="L1283" title="All 4 branches covered.">            if ((ak != null) &amp;&amp; ak.isCompliant(standard)) {</span>
+<span class="fc" id="L1284">                return ak.keyword;</span>
+            }
+<span class="fc" id="L1286">        } else {</span>
+<span class="nc bnc" id="L1287" title="All 2 branches missed.">            if (keywordString.length() == 0) {</span>
+<span class="nc" id="L1288">                throw new IllegalArgumentException(&quot;keyword cannot be empty&quot;);</span>
+            }
+<span class="nc" id="L1290">            keywordString = keywordString.trim();</span>
+<span class="nc" id="L1291">            char c = keywordString.charAt(0);</span>
+<span class="nc bnc" id="L1292" title="All 8 branches missed.">            if (c &lt; 65 || c &gt; 122 || (c &gt; 90 &amp;&amp; c &lt; 97)) {</span>
+<span class="nc" id="L1293">                throw new IllegalArgumentException</span>
+                    (&quot;keyword does not start with letter&quot;);
+            }
+<span class="nc bnc" id="L1296" title="All 2 branches missed.">            for (int i=1; i&lt;keywordString.length(); i++) {</span>
+<span class="nc" id="L1297">                c = keywordString.charAt(i);</span>
+<span class="nc bnc" id="L1298" title="All 14 branches missed.">                if ((c &lt; 65 || c &gt; 122 || (c &gt; 90 &amp;&amp; c &lt; 97)) &amp;&amp;</span>
+                    (c &lt; 48 || c &gt; 57) &amp;&amp; c != '_') {
+<span class="nc" id="L1300">                    throw new IllegalArgumentException</span>
+                    (&quot;keyword character is not a letter, digit, or underscore&quot;);
+                }
+            }
+<span class="nc" id="L1304">            return keywordString;</span>
+        }
+        // no compliant keyword, use OID
+<span class="fc bfc" id="L1307" title="All 2 branches covered.">        if (standard == AVA.RFC2253) {</span>
+<span class="fc" id="L1308">            return oidString;</span>
+        } else {
+<span class="fc" id="L1310">            return &quot;OID.&quot; + oidString;</span>
+        }
+    }
+
+    /**
+     * Test if oid has an associated keyword in standard.
+     */
+    static boolean hasKeyword(ObjectIdentifier oid, int standard) {
+<span class="nc" id="L1318">        AVAKeyword ak = oidMap.get(oid);</span>
+<span class="nc bnc" id="L1319" title="All 2 branches missed.">        if (ak == null) {</span>
+<span class="nc" id="L1320">            return false;</span>
+        }
+<span class="nc" id="L1322">        return ak.isCompliant(standard);</span>
+    }
+
+    static {
+<span class="fc" id="L1326">        oidMap = new HashMap&lt;ObjectIdentifier,AVAKeyword&gt;();</span>
+<span class="fc" id="L1327">        keywordMap = new HashMap&lt;String,AVAKeyword&gt;();</span>
+
+        // NOTE if multiple keywords are available for one OID, order
+        // is significant!! Preferred *LAST*.
+<span class="fc" id="L1331">        new AVAKeyword(&quot;CN&quot;,           X500Name.commonName_oid,   true,  true);</span>
+<span class="fc" id="L1332">        new AVAKeyword(&quot;C&quot;,            X500Name.countryName_oid,  true,  true);</span>
+<span class="fc" id="L1333">        new AVAKeyword(&quot;L&quot;,            X500Name.localityName_oid, true,  true);</span>
+<span class="fc" id="L1334">        new AVAKeyword(&quot;S&quot;,            X500Name.stateName_oid,    false, false);</span>
+<span class="fc" id="L1335">        new AVAKeyword(&quot;ST&quot;,           X500Name.stateName_oid,    true,  true);</span>
+<span class="fc" id="L1336">        new AVAKeyword(&quot;O&quot;,            X500Name.orgName_oid,      true,  true);</span>
+<span class="fc" id="L1337">        new AVAKeyword(&quot;OU&quot;,           X500Name.orgUnitName_oid,  true,  true);</span>
+<span class="fc" id="L1338">        new AVAKeyword(&quot;T&quot;,            X500Name.title_oid,        false, false);</span>
+<span class="fc" id="L1339">        new AVAKeyword(&quot;IP&quot;,           X500Name.ipAddress_oid,    false, false);</span>
+<span class="fc" id="L1340">        new AVAKeyword(&quot;STREET&quot;,       X500Name.streetAddress_oid,true,  true);</span>
+<span class="fc" id="L1341">        new AVAKeyword(&quot;DC&quot;,           X500Name.DOMAIN_COMPONENT_OID,</span>
+                                                                  false, true);
+<span class="fc" id="L1343">        new AVAKeyword(&quot;DNQUALIFIER&quot;,  X500Name.DNQUALIFIER_OID,  false, false);</span>
+<span class="fc" id="L1344">        new AVAKeyword(&quot;DNQ&quot;,          X500Name.DNQUALIFIER_OID,  false, false);</span>
+<span class="fc" id="L1345">        new AVAKeyword(&quot;SURNAME&quot;,      X500Name.SURNAME_OID,      false, false);</span>
+<span class="fc" id="L1346">        new AVAKeyword(&quot;GIVENNAME&quot;,    X500Name.GIVENNAME_OID,    false, false);</span>
+<span class="fc" id="L1347">        new AVAKeyword(&quot;INITIALS&quot;,     X500Name.INITIALS_OID,     false, false);</span>
+<span class="fc" id="L1348">        new AVAKeyword(&quot;GENERATION&quot;,   X500Name.GENERATIONQUALIFIER_OID,</span>
+                                                                  false, false);
+<span class="fc" id="L1350">        new AVAKeyword(&quot;EMAIL&quot;, PKCS9Attribute.EMAIL_ADDRESS_OID, false, false);</span>
+<span class="fc" id="L1351">        new AVAKeyword(&quot;EMAILADDRESS&quot;, PKCS9Attribute.EMAIL_ADDRESS_OID,</span>
+                                                                  false, false);
+<span class="fc" id="L1353">        new AVAKeyword(&quot;UID&quot;,          X500Name.userid_oid,       false, true);</span>
+<span class="fc" id="L1354">        new AVAKeyword(&quot;SERIALNUMBER&quot;, X500Name.SERIALNUMBER_OID, false, false);</span>
+<span class="fc" id="L1355">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

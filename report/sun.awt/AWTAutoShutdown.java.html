@@ -1,0 +1,391 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>AWTAutoShutdown.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.awt</a> &gt; <span class="el_source">AWTAutoShutdown.java</span></div><h1>AWTAutoShutdown.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2000, 2006, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.awt;
+
+import java.awt.AWTEvent;
+
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.Map;
+import java.util.Set;
+
+import sun.util.logging.PlatformLogger;
+
+/**
+ * This class is to let AWT shutdown automatically when a user is done
+ * with AWT. It tracks AWT state using the following parameters:
+ * &lt;ul&gt;
+ * &lt;li&gt;&lt;code&gt;peerMap&lt;/code&gt; - the map between the existing peer objects
+ *     and their associated targets
+ * &lt;li&gt;&lt;code&gt;toolkitThreadBusy&lt;/code&gt; - whether the toolkit thread
+ *     is waiting for a new native event to appear in its queue
+ *     or is dispatching an event
+ * &lt;li&gt;&lt;code&gt;busyThreadSet&lt;/code&gt; - a set of all the event dispatch
+ *     threads that are busy at this moment, i.e. those that are not
+ *     waiting for a new event to appear in their event queue.
+ * &lt;/ul&gt;&lt;p&gt;
+ * AWT is considered to be in ready-to-shutdown state when
+ * &lt;code&gt;peerMap&lt;/code&gt; is empty and &lt;code&gt;toolkitThreadBusy&lt;/code&gt;
+ * is false and &lt;code&gt;busyThreadSet&lt;/code&gt; is empty.
+ * The internal AWTAutoShutdown logic secures that the single non-daemon
+ * thread (&lt;code&gt;blockerThread&lt;/code&gt;) is running when AWT is not in
+ * ready-to-shutdown state. This blocker thread is to prevent AWT from
+ * exiting since the toolkit thread is now daemon and all the event
+ * dispatch threads are started only when needed. Once it is detected
+ * that AWT is in ready-to-shutdown state this blocker thread waits
+ * for a certain timeout and if AWT state doesn't change during timeout
+ * this blocker thread terminates all the event dispatch threads and
+ * exits.
+ */
+public final class AWTAutoShutdown implements Runnable {
+
+<span class="nc" id="L66">    private static final AWTAutoShutdown theInstance = new AWTAutoShutdown();</span>
+
+    /**
+     * This lock object is used to synchronize shutdown operations.
+     */
+<span class="nc" id="L71">    private final Object mainLock = new Object();</span>
+
+    /**
+     * This lock object is to secure that when a new blocker thread is
+     * started it will be the first who acquire the main lock after
+     * the thread that created the new blocker released the main lock
+     * by calling lock.wait() to wait for the blocker to start.
+     */
+<span class="nc" id="L79">    private final Object activationLock = new Object();</span>
+
+    /**
+     * This set keeps references to all the event dispatch threads that
+     * are busy at this moment, i.e. those that are not waiting for a
+     * new event to appear in their event queue.
+     * Access is synchronized on the main lock object.
+     */
+<span class="nc" id="L87">    private final Set&lt;Thread&gt; busyThreadSet = new HashSet&lt;&gt;(7);</span>
+
+    /**
+     * Indicates whether the toolkit thread is waiting for a new native
+     * event to appear or is dispatching an event.
+     */
+<span class="nc" id="L93">    private boolean toolkitThreadBusy = false;</span>
+
+    /**
+     * This is a map between components and their peers.
+     * we should work with in under activationLock&amp;mainLock lock.
+     */
+<span class="nc" id="L99">    private final Map&lt;Object, Object&gt; peerMap = new IdentityHashMap&lt;&gt;();</span>
+
+    /**
+     * References the alive non-daemon thread that is currently used
+     * for keeping AWT from exiting.
+     */
+<span class="nc" id="L105">    private Thread blockerThread = null;</span>
+
+    /**
+     * We need this flag to secure that AWT state hasn't changed while
+     * we were waiting for the safety timeout to pass.
+     */
+<span class="nc" id="L111">    private boolean timeoutPassed = false;</span>
+
+    /**
+     * Once we detect that AWT is ready to shutdown we wait for a certain
+     * timeout to pass before stopping event dispatch threads.
+     */
+    private static final int SAFETY_TIMEOUT = 1000;
+
+    /**
+     * Constructor method is intentionally made private to secure
+     * a single instance. Use getInstance() to reference it.
+     *
+     * @see     AWTAutoShutdown#getInstance
+     */
+<span class="nc" id="L125">    private AWTAutoShutdown() {}</span>
+
+    /**
+     * Returns reference to a single AWTAutoShutdown instance.
+     */
+    public static AWTAutoShutdown getInstance() {
+<span class="nc" id="L131">        return theInstance;</span>
+    }
+
+    /**
+     * Notify that the toolkit thread is not waiting for a native event
+     * to appear in its queue.
+     *
+     * @see     AWTAutoShutdown#notifyToolkitThreadFree
+     * @see     AWTAutoShutdown#setToolkitBusy
+     * @see     AWTAutoShutdown#isReadyToShutdown
+     */
+    public static void notifyToolkitThreadBusy() {
+<span class="nc" id="L143">        getInstance().setToolkitBusy(true);</span>
+<span class="nc" id="L144">    }</span>
+
+    /**
+     * Notify that the toolkit thread is waiting for a native event
+     * to appear in its queue.
+     *
+     * @see     AWTAutoShutdown#notifyToolkitThreadFree
+     * @see     AWTAutoShutdown#setToolkitBusy
+     * @see     AWTAutoShutdown#isReadyToShutdown
+     */
+    public static void notifyToolkitThreadFree() {
+<span class="nc" id="L155">        getInstance().setToolkitBusy(false);</span>
+<span class="nc" id="L156">    }</span>
+
+    /**
+     * Add a specified thread to the set of busy event dispatch threads.
+     * If this set already contains the specified thread or the thread is null,
+     * the call leaves this set unchanged and returns silently.
+     *
+     * @param thread thread to be added to this set, if not present.
+     * @see     AWTAutoShutdown#notifyThreadFree
+     * @see     AWTAutoShutdown#isReadyToShutdown
+     */
+    public void notifyThreadBusy(final Thread thread) {
+<span class="nc bnc" id="L168" title="All 2 branches missed.">        if (thread == null) {</span>
+<span class="nc" id="L169">            return;</span>
+        }
+<span class="nc" id="L171">        synchronized (activationLock) {</span>
+<span class="nc" id="L172">            synchronized (mainLock) {</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">                if (blockerThread == null) {</span>
+<span class="nc" id="L174">                    activateBlockerThread();</span>
+<span class="nc bnc" id="L175" title="All 2 branches missed.">                } else if (isReadyToShutdown()) {</span>
+<span class="nc" id="L176">                    mainLock.notifyAll();</span>
+<span class="nc" id="L177">                    timeoutPassed = false;</span>
+                }
+<span class="nc" id="L179">                busyThreadSet.add(thread);</span>
+<span class="nc" id="L180">            }</span>
+<span class="nc" id="L181">        }</span>
+<span class="nc" id="L182">    }</span>
+
+    /**
+     * Remove a specified thread from the set of busy event dispatch threads.
+     * If this set doesn't contain the specified thread or the thread is null,
+     * the call leaves this set unchanged and returns silently.
+     *
+     * @param thread thread to be removed from this set, if present.
+     * @see     AWTAutoShutdown#notifyThreadBusy
+     * @see     AWTAutoShutdown#isReadyToShutdown
+     */
+    public void notifyThreadFree(final Thread thread) {
+<span class="nc bnc" id="L194" title="All 2 branches missed.">        if (thread == null) {</span>
+<span class="nc" id="L195">            return;</span>
+        }
+<span class="nc" id="L197">        synchronized (activationLock) {</span>
+<span class="nc" id="L198">            synchronized (mainLock) {</span>
+<span class="nc" id="L199">                busyThreadSet.remove(thread);</span>
+<span class="nc bnc" id="L200" title="All 2 branches missed.">                if (isReadyToShutdown()) {</span>
+<span class="nc" id="L201">                    mainLock.notifyAll();</span>
+<span class="nc" id="L202">                    timeoutPassed = false;</span>
+                }
+<span class="nc" id="L204">            }</span>
+<span class="nc" id="L205">        }</span>
+<span class="nc" id="L206">    }</span>
+
+    /**
+     * Notify that the peermap has been updated, that means a new peer
+     * has been created or some existing peer has been disposed.
+     *
+     * @see     AWTAutoShutdown#isReadyToShutdown
+     */
+    void notifyPeerMapUpdated() {
+<span class="nc" id="L215">        synchronized (activationLock) {</span>
+<span class="nc" id="L216">            synchronized (mainLock) {</span>
+<span class="nc bnc" id="L217" title="All 4 branches missed.">                if (!isReadyToShutdown() &amp;&amp; blockerThread == null) {</span>
+<span class="nc" id="L218">                    activateBlockerThread();</span>
+                } else {
+<span class="nc" id="L220">                    mainLock.notifyAll();</span>
+<span class="nc" id="L221">                    timeoutPassed = false;</span>
+                }
+<span class="nc" id="L223">            }</span>
+<span class="nc" id="L224">        }</span>
+<span class="nc" id="L225">    }</span>
+
+    /**
+     * Determine whether AWT is currently in ready-to-shutdown state.
+     * AWT is considered to be in ready-to-shutdown state if
+     * &lt;code&gt;peerMap&lt;/code&gt; is empty and &lt;code&gt;toolkitThreadBusy&lt;/code&gt;
+     * is false and &lt;code&gt;busyThreadSet&lt;/code&gt; is empty.
+     *
+     * @return true if AWT is in ready-to-shutdown state.
+     */
+    private boolean isReadyToShutdown() {
+<span class="nc bnc" id="L236" title="All 2 branches missed.">        return (!toolkitThreadBusy &amp;&amp;</span>
+<span class="nc bnc" id="L237" title="All 2 branches missed.">                 peerMap.isEmpty() &amp;&amp;</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">                 busyThreadSet.isEmpty());</span>
+    }
+
+    /**
+     * Notify about the toolkit thread state change.
+     *
+     * @param busy true if the toolkit thread state changes from idle
+     *             to busy.
+     * @see     AWTAutoShutdown#notifyToolkitThreadBusy
+     * @see     AWTAutoShutdown#notifyToolkitThreadFree
+     * @see     AWTAutoShutdown#isReadyToShutdown
+     */
+    private void setToolkitBusy(final boolean busy) {
+<span class="nc bnc" id="L251" title="All 2 branches missed.">        if (busy != toolkitThreadBusy) {</span>
+<span class="nc" id="L252">            synchronized (activationLock) {</span>
+<span class="nc" id="L253">                synchronized (mainLock) {</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">                    if (busy != toolkitThreadBusy) {</span>
+<span class="nc bnc" id="L255" title="All 2 branches missed.">                        if (busy) {</span>
+<span class="nc bnc" id="L256" title="All 2 branches missed.">                            if (blockerThread == null) {</span>
+<span class="nc" id="L257">                                activateBlockerThread();</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">                            } else if (isReadyToShutdown()) {</span>
+<span class="nc" id="L259">                                mainLock.notifyAll();</span>
+<span class="nc" id="L260">                                timeoutPassed = false;</span>
+                            }
+<span class="nc" id="L262">                            toolkitThreadBusy = busy;</span>
+                        } else {
+<span class="nc" id="L264">                            toolkitThreadBusy = busy;</span>
+<span class="nc bnc" id="L265" title="All 2 branches missed.">                            if (isReadyToShutdown()) {</span>
+<span class="nc" id="L266">                                mainLock.notifyAll();</span>
+<span class="nc" id="L267">                                timeoutPassed = false;</span>
+                            }
+                        }
+                    }
+<span class="nc" id="L271">                }</span>
+<span class="nc" id="L272">            }</span>
+        }
+<span class="nc" id="L274">    }</span>
+
+    /**
+     * Implementation of the Runnable interface.
+     * Incapsulates the blocker thread functionality.
+     *
+     * @see     AWTAutoShutdown#isReadyToShutdown
+     */
+    public void run() {
+<span class="nc" id="L283">        Thread currentThread = Thread.currentThread();</span>
+<span class="nc" id="L284">        boolean interrupted = false;</span>
+<span class="nc" id="L285">        synchronized (mainLock) {</span>
+            try {
+                /* Notify that the thread is started. */
+<span class="nc" id="L288">                mainLock.notifyAll();</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">                while (blockerThread == currentThread) {</span>
+<span class="nc" id="L290">                    mainLock.wait();</span>
+<span class="nc" id="L291">                    timeoutPassed = false;</span>
+                    /*
+                     * This loop is introduced to handle the following case:
+                     * it is possible that while we are waiting for the
+                     * safety timeout to pass AWT state can change to
+                     * not-ready-to-shutdown and back to ready-to-shutdown.
+                     * In this case we have to wait once again.
+                     * NOTE: we shouldn't break into the outer loop
+                     * in this case, since we may never be notified
+                     * in an outer infinite wait at this point.
+                     */
+<span class="nc bnc" id="L302" title="All 2 branches missed.">                    while (isReadyToShutdown()) {</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">                        if (timeoutPassed) {</span>
+<span class="nc" id="L304">                            timeoutPassed = false;</span>
+<span class="nc" id="L305">                            blockerThread = null;</span>
+<span class="nc" id="L306">                            break;</span>
+                        }
+<span class="nc" id="L308">                        timeoutPassed = true;</span>
+<span class="nc" id="L309">                        mainLock.wait(SAFETY_TIMEOUT);</span>
+                    }
+                }
+<span class="nc" id="L312">            } catch (InterruptedException e) {</span>
+<span class="nc" id="L313">                interrupted = true;</span>
+            } finally {
+<span class="nc bnc" id="L315" title="All 6 branches missed.">                if (blockerThread == currentThread) {</span>
+<span class="nc" id="L316">                    blockerThread = null;</span>
+                }
+            }
+<span class="nc" id="L319">        }</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">        if (!interrupted) {</span>
+<span class="nc" id="L321">            AppContext.stopEventDispatchThreads();</span>
+        }
+<span class="nc" id="L323">    }</span>
+
+    @SuppressWarnings(&quot;serial&quot;)
+    static AWTEvent getShutdownEvent() {
+<span class="nc" id="L327">        return new AWTEvent(getInstance(), 0) {</span>
+        };
+    }
+
+    /**
+     * Creates and starts a new blocker thread. Doesn't return until
+     * the new blocker thread starts.
+     */
+    private void activateBlockerThread() {
+<span class="nc" id="L336">        Thread thread = new Thread(this, &quot;AWT-Shutdown&quot;);</span>
+<span class="nc" id="L337">        thread.setDaemon(false);</span>
+<span class="nc" id="L338">        blockerThread = thread;</span>
+<span class="nc" id="L339">        thread.start();</span>
+        try {
+            /* Wait for the blocker thread to start. */
+<span class="nc" id="L342">            mainLock.wait();</span>
+<span class="nc" id="L343">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L344">            System.err.println(&quot;AWT blocker activation interrupted:&quot;);</span>
+<span class="nc" id="L345">            e.printStackTrace();</span>
+<span class="nc" id="L346">        }</span>
+<span class="nc" id="L347">    }</span>
+
+    final void registerPeer(final Object target, final Object peer) {
+<span class="nc" id="L350">        synchronized (activationLock) {</span>
+<span class="nc" id="L351">            synchronized (mainLock) {</span>
+<span class="nc" id="L352">                peerMap.put(target, peer);</span>
+<span class="nc" id="L353">                notifyPeerMapUpdated();</span>
+<span class="nc" id="L354">            }</span>
+<span class="nc" id="L355">        }</span>
+<span class="nc" id="L356">    }</span>
+
+    final void unregisterPeer(final Object target, final Object peer) {
+<span class="nc" id="L359">        synchronized (activationLock) {</span>
+<span class="nc" id="L360">            synchronized (mainLock) {</span>
+<span class="nc bnc" id="L361" title="All 2 branches missed.">                if (peerMap.get(target) == peer) {</span>
+<span class="nc" id="L362">                    peerMap.remove(target);</span>
+<span class="nc" id="L363">                    notifyPeerMapUpdated();</span>
+                }
+<span class="nc" id="L365">            }</span>
+<span class="nc" id="L366">        }</span>
+<span class="nc" id="L367">    }</span>
+
+    final Object getPeer(final Object target) {
+<span class="nc" id="L370">        synchronized (activationLock) {</span>
+<span class="nc" id="L371">            synchronized (mainLock) {</span>
+<span class="nc" id="L372">                return peerMap.get(target);</span>
+<span class="nc" id="L373">            }</span>
+<span class="nc" id="L374">        }</span>
+    }
+
+    final void dumpPeers(final PlatformLogger aLog) {
+<span class="nc bnc" id="L378" title="All 2 branches missed.">        if (aLog.isLoggable(PlatformLogger.Level.FINE)) {</span>
+<span class="nc" id="L379">            synchronized (activationLock) {</span>
+<span class="nc" id="L380">                synchronized (mainLock) {</span>
+<span class="nc" id="L381">                    aLog.fine(&quot;Mapped peers:&quot;);</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">                    for (Object key : peerMap.keySet()) {</span>
+<span class="nc" id="L383">                        aLog.fine(key + &quot;-&gt;&quot; + peerMap.get(key));</span>
+<span class="nc" id="L384">                    }</span>
+<span class="nc" id="L385">                }</span>
+<span class="nc" id="L386">            }</span>
+        }
+<span class="nc" id="L388">    }</span>
+
+} // class AWTAutoShutdown
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

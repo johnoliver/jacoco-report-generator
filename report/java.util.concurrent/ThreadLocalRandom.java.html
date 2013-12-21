@@ -1,0 +1,1102 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ThreadLocalRandom.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">java.util.concurrent</a> &gt; <span class="el_source">ThreadLocalRandom.java</span></div><h1>ThreadLocalRandom.java</h1><pre class="source lang-java linenums">/*
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+/*
+ * This file is available under and governed by the GNU General Public
+ * License version 2 only, as published by the Free Software Foundation.
+ * However, the following notice accompanied the original version of this
+ * file:
+ *
+ * Written by Doug Lea with assistance from members of JCP JSR-166
+ * Expert Group and released to the public domain, as explained at
+ * http://creativecommons.org/publicdomain/zero/1.0/
+ */
+
+package java.util.concurrent;
+
+import java.io.ObjectStreamField;
+import java.net.NetworkInterface;
+import java.util.Enumeration;
+import java.util.Random;
+import java.util.Spliterator;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.DoubleConsumer;
+import java.util.function.IntConsumer;
+import java.util.function.LongConsumer;
+import java.util.stream.DoubleStream;
+import java.util.stream.IntStream;
+import java.util.stream.LongStream;
+import java.util.stream.StreamSupport;
+
+/**
+ * A random number generator isolated to the current thread.  Like the
+ * global {@link java.util.Random} generator used by the {@link
+ * java.lang.Math} class, a {@code ThreadLocalRandom} is initialized
+ * with an internally generated seed that may not otherwise be
+ * modified. When applicable, use of {@code ThreadLocalRandom} rather
+ * than shared {@code Random} objects in concurrent programs will
+ * typically encounter much less overhead and contention.  Use of
+ * {@code ThreadLocalRandom} is particularly appropriate when multiple
+ * tasks (for example, each a {@link ForkJoinTask}) use random numbers
+ * in parallel in thread pools.
+ *
+ * &lt;p&gt;Usages of this class should typically be of the form:
+ * {@code ThreadLocalRandom.current().nextX(...)} (where
+ * {@code X} is {@code Int}, {@code Long}, etc).
+ * When all usages are of this form, it is never possible to
+ * accidently share a {@code ThreadLocalRandom} across multiple threads.
+ *
+ * &lt;p&gt;This class also provides additional commonly used bounded random
+ * generation methods.
+ *
+ * &lt;p&gt;Instances of {@code ThreadLocalRandom} are not cryptographically
+ * secure.  Consider instead using {@link java.security.SecureRandom}
+ * in security-sensitive applications. Additionally,
+ * default-constructed instances do not use a cryptographically random
+ * seed unless the {@linkplain System#getProperty system property}
+ * {@code java.util.secureRandomSeed} is set to {@code true}.
+ *
+ * @since 1.7
+ * @author Doug Lea
+ */
+public class ThreadLocalRandom extends Random {
+    /*
+     * This class implements the java.util.Random API (and subclasses
+     * Random) using a single static instance that accesses random
+     * number state held in class Thread (primarily, field
+     * threadLocalRandomSeed). In doing so, it also provides a home
+     * for managing package-private utilities that rely on exactly the
+     * same state as needed to maintain the ThreadLocalRandom
+     * instances. We leverage the need for an initialization flag
+     * field to also use it as a &quot;probe&quot; -- a self-adjusting thread
+     * hash used for contention avoidance, as well as a secondary
+     * simpler (xorShift) random seed that is conservatively used to
+     * avoid otherwise surprising users by hijacking the
+     * ThreadLocalRandom sequence.  The dual use is a marriage of
+     * convenience, but is a simple and efficient way of reducing
+     * application-level overhead and footprint of most concurrent
+     * programs.
+     *
+     * Even though this class subclasses java.util.Random, it uses the
+     * same basic algorithm as java.util.SplittableRandom.  (See its
+     * internal documentation for explanations, which are not repeated
+     * here.)  Because ThreadLocalRandoms are not splittable
+     * though, we use only a single 64bit gamma.
+     *
+     * Because this class is in a different package than class Thread,
+     * field access methods use Unsafe to bypass access control rules.
+     * To conform to the requirements of the Random superclass
+     * constructor, the common static ThreadLocalRandom maintains an
+     * &quot;initialized&quot; field for the sake of rejecting user calls to
+     * setSeed while still allowing a call from constructor.  Note
+     * that serialization is completely unnecessary because there is
+     * only a static singleton.  But we generate a serial form
+     * containing &quot;rnd&quot; and &quot;initialized&quot; fields to ensure
+     * compatibility across versions.
+     *
+     * Implementations of non-core methods are mostly the same as in
+     * SplittableRandom, that were in part derived from a previous
+     * version of this class.
+     *
+     * The nextLocalGaussian ThreadLocal supports the very rarely used
+     * nextGaussian method by providing a holder for the second of a
+     * pair of them. As is true for the base class version of this
+     * method, this time/space tradeoff is probably never worthwhile,
+     * but we provide identical statistical properties.
+     */
+
+    /** Generates per-thread initialization/probe field */
+<span class="fc" id="L131">    private static final AtomicInteger probeGenerator =</span>
+        new AtomicInteger();
+
+    /**
+     * The next seed for default constructors.
+     */
+<span class="fc" id="L137">    private static final AtomicLong seeder = new AtomicLong(initialSeed());</span>
+
+    private static long initialSeed() {
+<span class="fc" id="L140">        String pp = java.security.AccessController.doPrivileged(</span>
+                new sun.security.action.GetPropertyAction(
+                        &quot;java.util.secureRandomSeed&quot;));
+<span class="pc bpc" id="L143" title="3 of 4 branches missed.">        if (pp != null &amp;&amp; pp.equalsIgnoreCase(&quot;true&quot;)) {</span>
+<span class="nc" id="L144">            byte[] seedBytes = java.security.SecureRandom.getSeed(8);</span>
+<span class="nc" id="L145">            long s = (long)(seedBytes[0]) &amp; 0xffL;</span>
+<span class="nc bnc" id="L146" title="All 2 branches missed.">            for (int i = 1; i &lt; 8; ++i)</span>
+<span class="nc" id="L147">                s = (s &lt;&lt; 8) | ((long)(seedBytes[i]) &amp; 0xffL);</span>
+<span class="nc" id="L148">            return s;</span>
+        }
+<span class="fc" id="L150">        long h = 0L;</span>
+        try {
+            Enumeration&lt;NetworkInterface&gt; ifcs =
+<span class="fc" id="L153">                    NetworkInterface.getNetworkInterfaces();</span>
+<span class="fc" id="L154">            boolean retry = false; // retry once if getHardwareAddress is null</span>
+<span class="pc bpc" id="L155" title="1 of 2 branches missed.">            while (ifcs.hasMoreElements()) {</span>
+<span class="fc" id="L156">                NetworkInterface ifc = ifcs.nextElement();</span>
+<span class="pc bpc" id="L157" title="1 of 2 branches missed.">                if (!ifc.isVirtual()) { // skip fake addresses</span>
+<span class="fc" id="L158">                    byte[] bs = ifc.getHardwareAddress();</span>
+<span class="fc bfc" id="L159" title="All 2 branches covered.">                    if (bs != null) {</span>
+<span class="fc" id="L160">                        int n = bs.length;</span>
+<span class="fc" id="L161">                        int m = Math.min(n &gt;&gt;&gt; 1, 4);</span>
+<span class="fc bfc" id="L162" title="All 2 branches covered.">                        for (int i = 0; i &lt; m; ++i)</span>
+<span class="fc" id="L163">                            h = (h &lt;&lt; 16) ^ (bs[i] &lt;&lt; 8) ^ bs[n-1-i];</span>
+<span class="pc bpc" id="L164" title="1 of 2 branches missed.">                        if (m &lt; 4)</span>
+<span class="fc" id="L165">                            h = (h &lt;&lt; 8) ^ bs[n-1-m];</span>
+<span class="fc" id="L166">                        h = mix64(h);</span>
+<span class="fc" id="L167">                        break;</span>
+                    }
+<span class="pc bpc" id="L169" title="1 of 2 branches missed.">                    else if (!retry)</span>
+<span class="fc" id="L170">                        retry = true;</span>
+                    else
+                        break;
+                }
+<span class="fc" id="L174">            }</span>
+<span class="nc" id="L175">        } catch (Exception ignore) {</span>
+<span class="fc" id="L176">        }</span>
+<span class="fc" id="L177">        return (h ^ mix64(System.currentTimeMillis()) ^</span>
+<span class="fc" id="L178">                mix64(System.nanoTime()));</span>
+    }
+
+    /**
+     * The seed increment
+     */
+    private static final long GAMMA = 0x9e3779b97f4a7c15L;
+
+    /**
+     * The increment for generating probe values
+     */
+    private static final int PROBE_INCREMENT = 0x9e3779b9;
+
+    /**
+     * The increment of seeder per new instance
+     */
+    private static final long SEEDER_INCREMENT = 0xbb67ae8584caa73bL;
+
+    // Constants from SplittableRandom
+    private static final double DOUBLE_UNIT = 0x1.0p-53;  // 1.0  / (1L &lt;&lt; 53)
+    private static final float  FLOAT_UNIT  = 0x1.0p-24f; // 1.0f / (1 &lt;&lt; 24)
+
+    /** Rarely-used holder for the second of a pair of Gaussians */
+<span class="fc" id="L201">    private static final ThreadLocal&lt;Double&gt; nextLocalGaussian =</span>
+        new ThreadLocal&lt;Double&gt;();
+
+    private static long mix64(long z) {
+<span class="fc" id="L205">        z = (z ^ (z &gt;&gt;&gt; 33)) * 0xff51afd7ed558ccdL;</span>
+<span class="fc" id="L206">        z = (z ^ (z &gt;&gt;&gt; 33)) * 0xc4ceb9fe1a85ec53L;</span>
+<span class="fc" id="L207">        return z ^ (z &gt;&gt;&gt; 33);</span>
+    }
+
+    private static int mix32(long z) {
+<span class="fc" id="L211">        z = (z ^ (z &gt;&gt;&gt; 33)) * 0xff51afd7ed558ccdL;</span>
+<span class="fc" id="L212">        return (int)(((z ^ (z &gt;&gt;&gt; 33)) * 0xc4ceb9fe1a85ec53L) &gt;&gt;&gt; 32);</span>
+    }
+
+    /**
+     * Field used only during singleton initialization.
+     * True when constructor completes.
+     */
+    boolean initialized;
+
+    /** Constructor used only for static singleton */
+<span class="fc" id="L222">    private ThreadLocalRandom() {</span>
+<span class="fc" id="L223">        initialized = true; // false during super() call</span>
+<span class="fc" id="L224">    }</span>
+
+    /** The common ThreadLocalRandom */
+<span class="fc" id="L227">    static final ThreadLocalRandom instance = new ThreadLocalRandom();</span>
+
+    /**
+     * Initialize Thread fields for the current thread.  Called only
+     * when Thread.threadLocalRandomProbe is zero, indicating that a
+     * thread local seed value needs to be generated. Note that even
+     * though the initialization is purely thread-local, we need to
+     * rely on (static) atomic generators to initialize the values.
+     */
+    static final void localInit() {
+<span class="fc" id="L237">        int p = probeGenerator.addAndGet(PROBE_INCREMENT);</span>
+<span class="pc bpc" id="L238" title="1 of 2 branches missed.">        int probe = (p == 0) ? 1 : p; // skip 0</span>
+<span class="fc" id="L239">        long seed = mix64(seeder.getAndAdd(SEEDER_INCREMENT));</span>
+<span class="fc" id="L240">        Thread t = Thread.currentThread();</span>
+<span class="fc" id="L241">        UNSAFE.putLong(t, SEED, seed);</span>
+<span class="fc" id="L242">        UNSAFE.putInt(t, PROBE, probe);</span>
+<span class="fc" id="L243">    }</span>
+
+    /**
+     * Returns the current thread's {@code ThreadLocalRandom}.
+     *
+     * @return the current thread's {@code ThreadLocalRandom}
+     */
+    public static ThreadLocalRandom current() {
+<span class="fc bfc" id="L251" title="All 2 branches covered.">        if (UNSAFE.getInt(Thread.currentThread(), PROBE) == 0)</span>
+<span class="fc" id="L252">            localInit();</span>
+<span class="fc" id="L253">        return instance;</span>
+    }
+
+    /**
+     * Throws {@code UnsupportedOperationException}.  Setting seeds in
+     * this generator is not supported.
+     *
+     * @throws UnsupportedOperationException always
+     */
+    public void setSeed(long seed) {
+        // only allow call from super() constructor
+<span class="pc bpc" id="L264" title="1 of 2 branches missed.">        if (initialized)</span>
+<span class="nc" id="L265">            throw new UnsupportedOperationException();</span>
+<span class="fc" id="L266">    }</span>
+
+    final long nextSeed() {
+        Thread t; long r; // read and update per-thread seed
+<span class="fc" id="L270">        UNSAFE.putLong(t = Thread.currentThread(), SEED,</span>
+<span class="fc" id="L271">                       r = UNSAFE.getLong(t, SEED) + GAMMA);</span>
+<span class="fc" id="L272">        return r;</span>
+    }
+
+    // We must define this, but never use it.
+    protected int next(int bits) {
+<span class="nc" id="L277">        return (int)(mix64(nextSeed()) &gt;&gt;&gt; (64 - bits));</span>
+    }
+
+    // IllegalArgumentException messages
+    static final String BadBound = &quot;bound must be positive&quot;;
+    static final String BadRange = &quot;bound must be greater than origin&quot;;
+    static final String BadSize  = &quot;size must be non-negative&quot;;
+
+    /**
+     * The form of nextLong used by LongStream Spliterators.  If
+     * origin is greater than bound, acts as unbounded form of
+     * nextLong, else as bounded form.
+     *
+     * @param origin the least value, unless greater than bound
+     * @param bound the upper bound (exclusive), must not equal origin
+     * @return a pseudorandom value
+     */
+    final long internalNextLong(long origin, long bound) {
+<span class="nc" id="L295">        long r = mix64(nextSeed());</span>
+<span class="nc bnc" id="L296" title="All 2 branches missed.">        if (origin &lt; bound) {</span>
+<span class="nc" id="L297">            long n = bound - origin, m = n - 1;</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">            if ((n &amp; m) == 0L)  // power of two</span>
+<span class="nc" id="L299">                r = (r &amp; m) + origin;</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">            else if (n &gt; 0L) {  // reject over-represented candidates</span>
+<span class="nc" id="L301">                for (long u = r &gt;&gt;&gt; 1;            // ensure nonnegative</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">                     u + m - (r = u % n) &lt; 0L;    // rejection check</span>
+<span class="nc" id="L303">                     u = mix64(nextSeed()) &gt;&gt;&gt; 1) // retry</span>
+                    ;
+<span class="nc" id="L305">                r += origin;</span>
+            }
+            else {              // range not representable as long
+<span class="nc bnc" id="L308" title="All 4 branches missed.">                while (r &lt; origin || r &gt;= bound)</span>
+<span class="nc" id="L309">                    r = mix64(nextSeed());</span>
+            }
+        }
+<span class="nc" id="L312">        return r;</span>
+    }
+
+    /**
+     * The form of nextInt used by IntStream Spliterators.
+     * Exactly the same as long version, except for types.
+     *
+     * @param origin the least value, unless greater than bound
+     * @param bound the upper bound (exclusive), must not equal origin
+     * @return a pseudorandom value
+     */
+    final int internalNextInt(int origin, int bound) {
+<span class="nc" id="L324">        int r = mix32(nextSeed());</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">        if (origin &lt; bound) {</span>
+<span class="nc" id="L326">            int n = bound - origin, m = n - 1;</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">            if ((n &amp; m) == 0)</span>
+<span class="nc" id="L328">                r = (r &amp; m) + origin;</span>
+<span class="nc bnc" id="L329" title="All 2 branches missed.">            else if (n &gt; 0) {</span>
+<span class="nc" id="L330">                for (int u = r &gt;&gt;&gt; 1;</span>
+<span class="nc bnc" id="L331" title="All 2 branches missed.">                     u + m - (r = u % n) &lt; 0;</span>
+<span class="nc" id="L332">                     u = mix32(nextSeed()) &gt;&gt;&gt; 1)</span>
+                    ;
+<span class="nc" id="L334">                r += origin;</span>
+            }
+            else {
+<span class="nc bnc" id="L337" title="All 4 branches missed.">                while (r &lt; origin || r &gt;= bound)</span>
+<span class="nc" id="L338">                    r = mix32(nextSeed());</span>
+            }
+        }
+<span class="nc" id="L341">        return r;</span>
+    }
+
+    /**
+     * The form of nextDouble used by DoubleStream Spliterators.
+     *
+     * @param origin the least value, unless greater than bound
+     * @param bound the upper bound (exclusive), must not equal origin
+     * @return a pseudorandom value
+     */
+    final double internalNextDouble(double origin, double bound) {
+<span class="nc" id="L352">        double r = (nextLong() &gt;&gt;&gt; 11) * DOUBLE_UNIT;</span>
+<span class="nc bnc" id="L353" title="All 2 branches missed.">        if (origin &lt; bound) {</span>
+<span class="nc" id="L354">            r = r * (bound - origin) + origin;</span>
+<span class="nc bnc" id="L355" title="All 2 branches missed.">            if (r &gt;= bound) // correct for rounding</span>
+<span class="nc" id="L356">                r = Double.longBitsToDouble(Double.doubleToLongBits(bound) - 1);</span>
+        }
+<span class="nc" id="L358">        return r;</span>
+    }
+
+    /**
+     * Returns a pseudorandom {@code int} value.
+     *
+     * @return a pseudorandom {@code int} value
+     */
+    public int nextInt() {
+<span class="fc" id="L367">        return mix32(nextSeed());</span>
+    }
+
+    /**
+     * Returns a pseudorandom {@code int} value between zero (inclusive)
+     * and the specified bound (exclusive).
+     *
+     * @param bound the upper bound (exclusive).  Must be positive.
+     * @return a pseudorandom {@code int} value between zero
+     *         (inclusive) and the bound (exclusive)
+     * @throws IllegalArgumentException if {@code bound} is not positive
+     */
+    public int nextInt(int bound) {
+<span class="pc bpc" id="L380" title="1 of 2 branches missed.">        if (bound &lt;= 0)</span>
+<span class="nc" id="L381">            throw new IllegalArgumentException(BadBound);</span>
+<span class="fc" id="L382">        int r = mix32(nextSeed());</span>
+<span class="fc" id="L383">        int m = bound - 1;</span>
+<span class="pc bpc" id="L384" title="1 of 2 branches missed.">        if ((bound &amp; m) == 0) // power of two</span>
+<span class="fc" id="L385">            r &amp;= m;</span>
+        else { // reject over-represented candidates
+<span class="nc" id="L387">            for (int u = r &gt;&gt;&gt; 1;</span>
+<span class="nc bnc" id="L388" title="All 2 branches missed.">                 u + m - (r = u % bound) &lt; 0;</span>
+<span class="nc" id="L389">                 u = mix32(nextSeed()) &gt;&gt;&gt; 1)</span>
+                ;
+        }
+<span class="fc" id="L392">        return r;</span>
+    }
+
+    /**
+     * Returns a pseudorandom {@code int} value between the specified
+     * origin (inclusive) and the specified bound (exclusive).
+     *
+     * @param origin the least value returned
+     * @param bound the upper bound (exclusive)
+     * @return a pseudorandom {@code int} value between the origin
+     *         (inclusive) and the bound (exclusive)
+     * @throws IllegalArgumentException if {@code origin} is greater than
+     *         or equal to {@code bound}
+     */
+    public int nextInt(int origin, int bound) {
+<span class="nc bnc" id="L407" title="All 2 branches missed.">        if (origin &gt;= bound)</span>
+<span class="nc" id="L408">            throw new IllegalArgumentException(BadRange);</span>
+<span class="nc" id="L409">        return internalNextInt(origin, bound);</span>
+    }
+
+    /**
+     * Returns a pseudorandom {@code long} value.
+     *
+     * @return a pseudorandom {@code long} value
+     */
+    public long nextLong() {
+<span class="nc" id="L418">        return mix64(nextSeed());</span>
+    }
+
+    /**
+     * Returns a pseudorandom {@code long} value between zero (inclusive)
+     * and the specified bound (exclusive).
+     *
+     * @param bound the upper bound (exclusive).  Must be positive.
+     * @return a pseudorandom {@code long} value between zero
+     *         (inclusive) and the bound (exclusive)
+     * @throws IllegalArgumentException if {@code bound} is not positive
+     */
+    public long nextLong(long bound) {
+<span class="nc bnc" id="L431" title="All 2 branches missed.">        if (bound &lt;= 0)</span>
+<span class="nc" id="L432">            throw new IllegalArgumentException(BadBound);</span>
+<span class="nc" id="L433">        long r = mix64(nextSeed());</span>
+<span class="nc" id="L434">        long m = bound - 1;</span>
+<span class="nc bnc" id="L435" title="All 2 branches missed.">        if ((bound &amp; m) == 0L) // power of two</span>
+<span class="nc" id="L436">            r &amp;= m;</span>
+        else { // reject over-represented candidates
+<span class="nc" id="L438">            for (long u = r &gt;&gt;&gt; 1;</span>
+<span class="nc bnc" id="L439" title="All 2 branches missed.">                 u + m - (r = u % bound) &lt; 0L;</span>
+<span class="nc" id="L440">                 u = mix64(nextSeed()) &gt;&gt;&gt; 1)</span>
+                ;
+        }
+<span class="nc" id="L443">        return r;</span>
+    }
+
+    /**
+     * Returns a pseudorandom {@code long} value between the specified
+     * origin (inclusive) and the specified bound (exclusive).
+     *
+     * @param origin the least value returned
+     * @param bound the upper bound (exclusive)
+     * @return a pseudorandom {@code long} value between the origin
+     *         (inclusive) and the bound (exclusive)
+     * @throws IllegalArgumentException if {@code origin} is greater than
+     *         or equal to {@code bound}
+     */
+    public long nextLong(long origin, long bound) {
+<span class="nc bnc" id="L458" title="All 2 branches missed.">        if (origin &gt;= bound)</span>
+<span class="nc" id="L459">            throw new IllegalArgumentException(BadRange);</span>
+<span class="nc" id="L460">        return internalNextLong(origin, bound);</span>
+    }
+
+    /**
+     * Returns a pseudorandom {@code double} value between zero
+     * (inclusive) and one (exclusive).
+     *
+     * @return a pseudorandom {@code double} value between zero
+     *         (inclusive) and one (exclusive)
+     */
+    public double nextDouble() {
+<span class="nc" id="L471">        return (mix64(nextSeed()) &gt;&gt;&gt; 11) * DOUBLE_UNIT;</span>
+    }
+
+    /**
+     * Returns a pseudorandom {@code double} value between 0.0
+     * (inclusive) and the specified bound (exclusive).
+     *
+     * @param bound the upper bound (exclusive).  Must be positive.
+     * @return a pseudorandom {@code double} value between zero
+     *         (inclusive) and the bound (exclusive)
+     * @throws IllegalArgumentException if {@code bound} is not positive
+     */
+    public double nextDouble(double bound) {
+<span class="nc bnc" id="L484" title="All 2 branches missed.">        if (!(bound &gt; 0.0))</span>
+<span class="nc" id="L485">            throw new IllegalArgumentException(BadBound);</span>
+<span class="nc" id="L486">        double result = (mix64(nextSeed()) &gt;&gt;&gt; 11) * DOUBLE_UNIT * bound;</span>
+<span class="nc bnc" id="L487" title="All 2 branches missed.">        return (result &lt; bound) ?  result : // correct for rounding</span>
+<span class="nc" id="L488">            Double.longBitsToDouble(Double.doubleToLongBits(bound) - 1);</span>
+    }
+
+    /**
+     * Returns a pseudorandom {@code double} value between the specified
+     * origin (inclusive) and bound (exclusive).
+     *
+     * @param origin the least value returned
+     * @param bound the upper bound (exclusive)
+     * @return a pseudorandom {@code double} value between the origin
+     *         (inclusive) and the bound (exclusive)
+     * @throws IllegalArgumentException if {@code origin} is greater than
+     *         or equal to {@code bound}
+     */
+    public double nextDouble(double origin, double bound) {
+<span class="nc bnc" id="L503" title="All 2 branches missed.">        if (!(origin &lt; bound))</span>
+<span class="nc" id="L504">            throw new IllegalArgumentException(BadRange);</span>
+<span class="nc" id="L505">        return internalNextDouble(origin, bound);</span>
+    }
+
+    /**
+     * Returns a pseudorandom {@code boolean} value.
+     *
+     * @return a pseudorandom {@code boolean} value
+     */
+    public boolean nextBoolean() {
+<span class="nc bnc" id="L514" title="All 2 branches missed.">        return mix32(nextSeed()) &lt; 0;</span>
+    }
+
+    /**
+     * Returns a pseudorandom {@code float} value between zero
+     * (inclusive) and one (exclusive).
+     *
+     * @return a pseudorandom {@code float} value between zero
+     *         (inclusive) and one (exclusive)
+     */
+    public float nextFloat() {
+<span class="nc" id="L525">        return (mix32(nextSeed()) &gt;&gt;&gt; 8) * FLOAT_UNIT;</span>
+    }
+
+    public double nextGaussian() {
+        // Use nextLocalGaussian instead of nextGaussian field
+<span class="nc" id="L530">        Double d = nextLocalGaussian.get();</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">        if (d != null) {</span>
+<span class="nc" id="L532">            nextLocalGaussian.set(null);</span>
+<span class="nc" id="L533">            return d.doubleValue();</span>
+        }
+        double v1, v2, s;
+        do {
+<span class="nc" id="L537">            v1 = 2 * nextDouble() - 1; // between -1 and 1</span>
+<span class="nc" id="L538">            v2 = 2 * nextDouble() - 1; // between -1 and 1</span>
+<span class="nc" id="L539">            s = v1 * v1 + v2 * v2;</span>
+<span class="nc bnc" id="L540" title="All 4 branches missed.">        } while (s &gt;= 1 || s == 0);</span>
+<span class="nc" id="L541">        double multiplier = StrictMath.sqrt(-2 * StrictMath.log(s)/s);</span>
+<span class="nc" id="L542">        nextLocalGaussian.set(new Double(v2 * multiplier));</span>
+<span class="nc" id="L543">        return v1 * multiplier;</span>
+    }
+
+    // stream methods, coded in a way intended to better isolate for
+    // maintenance purposes the small differences across forms.
+
+    /**
+     * Returns a stream producing the given {@code streamSize} number of
+     * pseudorandom {@code int} values.
+     *
+     * @param streamSize the number of values to generate
+     * @return a stream of pseudorandom {@code int} values
+     * @throws IllegalArgumentException if {@code streamSize} is
+     *         less than zero
+     * @since 1.8
+     */
+    public IntStream ints(long streamSize) {
+<span class="nc bnc" id="L560" title="All 2 branches missed.">        if (streamSize &lt; 0L)</span>
+<span class="nc" id="L561">            throw new IllegalArgumentException(BadSize);</span>
+<span class="nc" id="L562">        return StreamSupport.intStream</span>
+<span class="nc" id="L563">            (new RandomIntsSpliterator</span>
+             (0L, streamSize, Integer.MAX_VALUE, 0),
+             false);
+    }
+
+    /**
+     * Returns an effectively unlimited stream of pseudorandom {@code int}
+     * values.
+     *
+     * @implNote This method is implemented to be equivalent to {@code
+     * ints(Long.MAX_VALUE)}.
+     *
+     * @return a stream of pseudorandom {@code int} values
+     * @since 1.8
+     */
+    public IntStream ints() {
+<span class="nc" id="L579">        return StreamSupport.intStream</span>
+<span class="nc" id="L580">            (new RandomIntsSpliterator</span>
+             (0L, Long.MAX_VALUE, Integer.MAX_VALUE, 0),
+             false);
+    }
+
+    /**
+     * Returns a stream producing the given {@code streamSize} number
+     * of pseudorandom {@code int} values, each conforming to the given
+     * origin (inclusive) and bound (exclusive).
+     *
+     * @param streamSize the number of values to generate
+     * @param randomNumberOrigin the origin (inclusive) of each random value
+     * @param randomNumberBound the bound (exclusive) of each random value
+     * @return a stream of pseudorandom {@code int} values,
+     *         each with the given origin (inclusive) and bound (exclusive)
+     * @throws IllegalArgumentException if {@code streamSize} is
+     *         less than zero, or {@code randomNumberOrigin}
+     *         is greater than or equal to {@code randomNumberBound}
+     * @since 1.8
+     */
+    public IntStream ints(long streamSize, int randomNumberOrigin,
+                          int randomNumberBound) {
+<span class="nc bnc" id="L602" title="All 2 branches missed.">        if (streamSize &lt; 0L)</span>
+<span class="nc" id="L603">            throw new IllegalArgumentException(BadSize);</span>
+<span class="nc bnc" id="L604" title="All 2 branches missed.">        if (randomNumberOrigin &gt;= randomNumberBound)</span>
+<span class="nc" id="L605">            throw new IllegalArgumentException(BadRange);</span>
+<span class="nc" id="L606">        return StreamSupport.intStream</span>
+<span class="nc" id="L607">            (new RandomIntsSpliterator</span>
+             (0L, streamSize, randomNumberOrigin, randomNumberBound),
+             false);
+    }
+
+    /**
+     * Returns an effectively unlimited stream of pseudorandom {@code
+     * int} values, each conforming to the given origin (inclusive) and bound
+     * (exclusive).
+     *
+     * @implNote This method is implemented to be equivalent to {@code
+     * ints(Long.MAX_VALUE, randomNumberOrigin, randomNumberBound)}.
+     *
+     * @param randomNumberOrigin the origin (inclusive) of each random value
+     * @param randomNumberBound the bound (exclusive) of each random value
+     * @return a stream of pseudorandom {@code int} values,
+     *         each with the given origin (inclusive) and bound (exclusive)
+     * @throws IllegalArgumentException if {@code randomNumberOrigin}
+     *         is greater than or equal to {@code randomNumberBound}
+     * @since 1.8
+     */
+    public IntStream ints(int randomNumberOrigin, int randomNumberBound) {
+<span class="nc bnc" id="L629" title="All 2 branches missed.">        if (randomNumberOrigin &gt;= randomNumberBound)</span>
+<span class="nc" id="L630">            throw new IllegalArgumentException(BadRange);</span>
+<span class="nc" id="L631">        return StreamSupport.intStream</span>
+<span class="nc" id="L632">            (new RandomIntsSpliterator</span>
+             (0L, Long.MAX_VALUE, randomNumberOrigin, randomNumberBound),
+             false);
+    }
+
+    /**
+     * Returns a stream producing the given {@code streamSize} number of
+     * pseudorandom {@code long} values.
+     *
+     * @param streamSize the number of values to generate
+     * @return a stream of pseudorandom {@code long} values
+     * @throws IllegalArgumentException if {@code streamSize} is
+     *         less than zero
+     * @since 1.8
+     */
+    public LongStream longs(long streamSize) {
+<span class="nc bnc" id="L648" title="All 2 branches missed.">        if (streamSize &lt; 0L)</span>
+<span class="nc" id="L649">            throw new IllegalArgumentException(BadSize);</span>
+<span class="nc" id="L650">        return StreamSupport.longStream</span>
+<span class="nc" id="L651">            (new RandomLongsSpliterator</span>
+             (0L, streamSize, Long.MAX_VALUE, 0L),
+             false);
+    }
+
+    /**
+     * Returns an effectively unlimited stream of pseudorandom {@code long}
+     * values.
+     *
+     * @implNote This method is implemented to be equivalent to {@code
+     * longs(Long.MAX_VALUE)}.
+     *
+     * @return a stream of pseudorandom {@code long} values
+     * @since 1.8
+     */
+    public LongStream longs() {
+<span class="nc" id="L667">        return StreamSupport.longStream</span>
+<span class="nc" id="L668">            (new RandomLongsSpliterator</span>
+             (0L, Long.MAX_VALUE, Long.MAX_VALUE, 0L),
+             false);
+    }
+
+    /**
+     * Returns a stream producing the given {@code streamSize} number of
+     * pseudorandom {@code long}, each conforming to the given origin
+     * (inclusive) and bound (exclusive).
+     *
+     * @param streamSize the number of values to generate
+     * @param randomNumberOrigin the origin (inclusive) of each random value
+     * @param randomNumberBound the bound (exclusive) of each random value
+     * @return a stream of pseudorandom {@code long} values,
+     *         each with the given origin (inclusive) and bound (exclusive)
+     * @throws IllegalArgumentException if {@code streamSize} is
+     *         less than zero, or {@code randomNumberOrigin}
+     *         is greater than or equal to {@code randomNumberBound}
+     * @since 1.8
+     */
+    public LongStream longs(long streamSize, long randomNumberOrigin,
+                            long randomNumberBound) {
+<span class="nc bnc" id="L690" title="All 2 branches missed.">        if (streamSize &lt; 0L)</span>
+<span class="nc" id="L691">            throw new IllegalArgumentException(BadSize);</span>
+<span class="nc bnc" id="L692" title="All 2 branches missed.">        if (randomNumberOrigin &gt;= randomNumberBound)</span>
+<span class="nc" id="L693">            throw new IllegalArgumentException(BadRange);</span>
+<span class="nc" id="L694">        return StreamSupport.longStream</span>
+<span class="nc" id="L695">            (new RandomLongsSpliterator</span>
+             (0L, streamSize, randomNumberOrigin, randomNumberBound),
+             false);
+    }
+
+    /**
+     * Returns an effectively unlimited stream of pseudorandom {@code
+     * long} values, each conforming to the given origin (inclusive) and bound
+     * (exclusive).
+     *
+     * @implNote This method is implemented to be equivalent to {@code
+     * longs(Long.MAX_VALUE, randomNumberOrigin, randomNumberBound)}.
+     *
+     * @param randomNumberOrigin the origin (inclusive) of each random value
+     * @param randomNumberBound the bound (exclusive) of each random value
+     * @return a stream of pseudorandom {@code long} values,
+     *         each with the given origin (inclusive) and bound (exclusive)
+     * @throws IllegalArgumentException if {@code randomNumberOrigin}
+     *         is greater than or equal to {@code randomNumberBound}
+     * @since 1.8
+     */
+    public LongStream longs(long randomNumberOrigin, long randomNumberBound) {
+<span class="nc bnc" id="L717" title="All 2 branches missed.">        if (randomNumberOrigin &gt;= randomNumberBound)</span>
+<span class="nc" id="L718">            throw new IllegalArgumentException(BadRange);</span>
+<span class="nc" id="L719">        return StreamSupport.longStream</span>
+<span class="nc" id="L720">            (new RandomLongsSpliterator</span>
+             (0L, Long.MAX_VALUE, randomNumberOrigin, randomNumberBound),
+             false);
+    }
+
+    /**
+     * Returns a stream producing the given {@code streamSize} number of
+     * pseudorandom {@code double} values, each between zero
+     * (inclusive) and one (exclusive).
+     *
+     * @param streamSize the number of values to generate
+     * @return a stream of {@code double} values
+     * @throws IllegalArgumentException if {@code streamSize} is
+     *         less than zero
+     * @since 1.8
+     */
+    public DoubleStream doubles(long streamSize) {
+<span class="nc bnc" id="L737" title="All 2 branches missed.">        if (streamSize &lt; 0L)</span>
+<span class="nc" id="L738">            throw new IllegalArgumentException(BadSize);</span>
+<span class="nc" id="L739">        return StreamSupport.doubleStream</span>
+<span class="nc" id="L740">            (new RandomDoublesSpliterator</span>
+             (0L, streamSize, Double.MAX_VALUE, 0.0),
+             false);
+    }
+
+    /**
+     * Returns an effectively unlimited stream of pseudorandom {@code
+     * double} values, each between zero (inclusive) and one
+     * (exclusive).
+     *
+     * @implNote This method is implemented to be equivalent to {@code
+     * doubles(Long.MAX_VALUE)}.
+     *
+     * @return a stream of pseudorandom {@code double} values
+     * @since 1.8
+     */
+    public DoubleStream doubles() {
+<span class="nc" id="L757">        return StreamSupport.doubleStream</span>
+<span class="nc" id="L758">            (new RandomDoublesSpliterator</span>
+             (0L, Long.MAX_VALUE, Double.MAX_VALUE, 0.0),
+             false);
+    }
+
+    /**
+     * Returns a stream producing the given {@code streamSize} number of
+     * pseudorandom {@code double} values, each conforming to the given origin
+     * (inclusive) and bound (exclusive).
+     *
+     * @param streamSize the number of values to generate
+     * @param randomNumberOrigin the origin (inclusive) of each random value
+     * @param randomNumberBound the bound (exclusive) of each random value
+     * @return a stream of pseudorandom {@code double} values,
+     *         each with the given origin (inclusive) and bound (exclusive)
+     * @throws IllegalArgumentException if {@code streamSize} is
+     *         less than zero
+     * @throws IllegalArgumentException if {@code randomNumberOrigin}
+     *         is greater than or equal to {@code randomNumberBound}
+     * @since 1.8
+     */
+    public DoubleStream doubles(long streamSize, double randomNumberOrigin,
+                                double randomNumberBound) {
+<span class="nc bnc" id="L781" title="All 2 branches missed.">        if (streamSize &lt; 0L)</span>
+<span class="nc" id="L782">            throw new IllegalArgumentException(BadSize);</span>
+<span class="nc bnc" id="L783" title="All 2 branches missed.">        if (!(randomNumberOrigin &lt; randomNumberBound))</span>
+<span class="nc" id="L784">            throw new IllegalArgumentException(BadRange);</span>
+<span class="nc" id="L785">        return StreamSupport.doubleStream</span>
+<span class="nc" id="L786">            (new RandomDoublesSpliterator</span>
+             (0L, streamSize, randomNumberOrigin, randomNumberBound),
+             false);
+    }
+
+    /**
+     * Returns an effectively unlimited stream of pseudorandom {@code
+     * double} values, each conforming to the given origin (inclusive) and bound
+     * (exclusive).
+     *
+     * @implNote This method is implemented to be equivalent to {@code
+     * doubles(Long.MAX_VALUE, randomNumberOrigin, randomNumberBound)}.
+     *
+     * @param randomNumberOrigin the origin (inclusive) of each random value
+     * @param randomNumberBound the bound (exclusive) of each random value
+     * @return a stream of pseudorandom {@code double} values,
+     *         each with the given origin (inclusive) and bound (exclusive)
+     * @throws IllegalArgumentException if {@code randomNumberOrigin}
+     *         is greater than or equal to {@code randomNumberBound}
+     * @since 1.8
+     */
+    public DoubleStream doubles(double randomNumberOrigin, double randomNumberBound) {
+<span class="nc bnc" id="L808" title="All 2 branches missed.">        if (!(randomNumberOrigin &lt; randomNumberBound))</span>
+<span class="nc" id="L809">            throw new IllegalArgumentException(BadRange);</span>
+<span class="nc" id="L810">        return StreamSupport.doubleStream</span>
+<span class="nc" id="L811">            (new RandomDoublesSpliterator</span>
+             (0L, Long.MAX_VALUE, randomNumberOrigin, randomNumberBound),
+             false);
+    }
+
+    /**
+     * Spliterator for int streams.  We multiplex the four int
+     * versions into one class by treating a bound less than origin as
+     * unbounded, and also by treating &quot;infinite&quot; as equivalent to
+     * Long.MAX_VALUE. For splits, it uses the standard divide-by-two
+     * approach. The long and double versions of this class are
+     * identical except for types.
+     */
+    static final class RandomIntsSpliterator implements Spliterator.OfInt {
+        long index;
+        final long fence;
+        final int origin;
+        final int bound;
+        RandomIntsSpliterator(long index, long fence,
+<span class="nc" id="L830">                              int origin, int bound) {</span>
+<span class="nc" id="L831">            this.index = index; this.fence = fence;</span>
+<span class="nc" id="L832">            this.origin = origin; this.bound = bound;</span>
+<span class="nc" id="L833">        }</span>
+
+        public RandomIntsSpliterator trySplit() {
+<span class="nc" id="L836">            long i = index, m = (i + fence) &gt;&gt;&gt; 1;</span>
+<span class="nc bnc" id="L837" title="All 2 branches missed.">            return (m &lt;= i) ? null :</span>
+                new RandomIntsSpliterator(i, index = m, origin, bound);
+        }
+
+        public long estimateSize() {
+<span class="nc" id="L842">            return fence - index;</span>
+        }
+
+        public int characteristics() {
+<span class="nc" id="L846">            return (Spliterator.SIZED | Spliterator.SUBSIZED |</span>
+                    Spliterator.NONNULL | Spliterator.IMMUTABLE);
+        }
+
+        public boolean tryAdvance(IntConsumer consumer) {
+<span class="nc bnc" id="L851" title="All 2 branches missed.">            if (consumer == null) throw new NullPointerException();</span>
+<span class="nc" id="L852">            long i = index, f = fence;</span>
+<span class="nc bnc" id="L853" title="All 2 branches missed.">            if (i &lt; f) {</span>
+<span class="nc" id="L854">                consumer.accept(ThreadLocalRandom.current().internalNextInt(origin, bound));</span>
+<span class="nc" id="L855">                index = i + 1;</span>
+<span class="nc" id="L856">                return true;</span>
+            }
+<span class="nc" id="L858">            return false;</span>
+        }
+
+        public void forEachRemaining(IntConsumer consumer) {
+<span class="nc bnc" id="L862" title="All 2 branches missed.">            if (consumer == null) throw new NullPointerException();</span>
+<span class="nc" id="L863">            long i = index, f = fence;</span>
+<span class="nc bnc" id="L864" title="All 2 branches missed.">            if (i &lt; f) {</span>
+<span class="nc" id="L865">                index = f;</span>
+<span class="nc" id="L866">                int o = origin, b = bound;</span>
+<span class="nc" id="L867">                ThreadLocalRandom rng = ThreadLocalRandom.current();</span>
+                do {
+<span class="nc" id="L869">                    consumer.accept(rng.internalNextInt(o, b));</span>
+<span class="nc bnc" id="L870" title="All 2 branches missed.">                } while (++i &lt; f);</span>
+            }
+<span class="nc" id="L872">        }</span>
+    }
+
+    /**
+     * Spliterator for long streams.
+     */
+    static final class RandomLongsSpliterator implements Spliterator.OfLong {
+        long index;
+        final long fence;
+        final long origin;
+        final long bound;
+        RandomLongsSpliterator(long index, long fence,
+<span class="nc" id="L884">                               long origin, long bound) {</span>
+<span class="nc" id="L885">            this.index = index; this.fence = fence;</span>
+<span class="nc" id="L886">            this.origin = origin; this.bound = bound;</span>
+<span class="nc" id="L887">        }</span>
+
+        public RandomLongsSpliterator trySplit() {
+<span class="nc" id="L890">            long i = index, m = (i + fence) &gt;&gt;&gt; 1;</span>
+<span class="nc bnc" id="L891" title="All 2 branches missed.">            return (m &lt;= i) ? null :</span>
+                new RandomLongsSpliterator(i, index = m, origin, bound);
+        }
+
+        public long estimateSize() {
+<span class="nc" id="L896">            return fence - index;</span>
+        }
+
+        public int characteristics() {
+<span class="nc" id="L900">            return (Spliterator.SIZED | Spliterator.SUBSIZED |</span>
+                    Spliterator.NONNULL | Spliterator.IMMUTABLE);
+        }
+
+        public boolean tryAdvance(LongConsumer consumer) {
+<span class="nc bnc" id="L905" title="All 2 branches missed.">            if (consumer == null) throw new NullPointerException();</span>
+<span class="nc" id="L906">            long i = index, f = fence;</span>
+<span class="nc bnc" id="L907" title="All 2 branches missed.">            if (i &lt; f) {</span>
+<span class="nc" id="L908">                consumer.accept(ThreadLocalRandom.current().internalNextLong(origin, bound));</span>
+<span class="nc" id="L909">                index = i + 1;</span>
+<span class="nc" id="L910">                return true;</span>
+            }
+<span class="nc" id="L912">            return false;</span>
+        }
+
+        public void forEachRemaining(LongConsumer consumer) {
+<span class="nc bnc" id="L916" title="All 2 branches missed.">            if (consumer == null) throw new NullPointerException();</span>
+<span class="nc" id="L917">            long i = index, f = fence;</span>
+<span class="nc bnc" id="L918" title="All 2 branches missed.">            if (i &lt; f) {</span>
+<span class="nc" id="L919">                index = f;</span>
+<span class="nc" id="L920">                long o = origin, b = bound;</span>
+<span class="nc" id="L921">                ThreadLocalRandom rng = ThreadLocalRandom.current();</span>
+                do {
+<span class="nc" id="L923">                    consumer.accept(rng.internalNextLong(o, b));</span>
+<span class="nc bnc" id="L924" title="All 2 branches missed.">                } while (++i &lt; f);</span>
+            }
+<span class="nc" id="L926">        }</span>
+
+    }
+
+    /**
+     * Spliterator for double streams.
+     */
+    static final class RandomDoublesSpliterator implements Spliterator.OfDouble {
+        long index;
+        final long fence;
+        final double origin;
+        final double bound;
+        RandomDoublesSpliterator(long index, long fence,
+<span class="nc" id="L939">                                 double origin, double bound) {</span>
+<span class="nc" id="L940">            this.index = index; this.fence = fence;</span>
+<span class="nc" id="L941">            this.origin = origin; this.bound = bound;</span>
+<span class="nc" id="L942">        }</span>
+
+        public RandomDoublesSpliterator trySplit() {
+<span class="nc" id="L945">            long i = index, m = (i + fence) &gt;&gt;&gt; 1;</span>
+<span class="nc bnc" id="L946" title="All 2 branches missed.">            return (m &lt;= i) ? null :</span>
+                new RandomDoublesSpliterator(i, index = m, origin, bound);
+        }
+
+        public long estimateSize() {
+<span class="nc" id="L951">            return fence - index;</span>
+        }
+
+        public int characteristics() {
+<span class="nc" id="L955">            return (Spliterator.SIZED | Spliterator.SUBSIZED |</span>
+                    Spliterator.NONNULL | Spliterator.IMMUTABLE);
+        }
+
+        public boolean tryAdvance(DoubleConsumer consumer) {
+<span class="nc bnc" id="L960" title="All 2 branches missed.">            if (consumer == null) throw new NullPointerException();</span>
+<span class="nc" id="L961">            long i = index, f = fence;</span>
+<span class="nc bnc" id="L962" title="All 2 branches missed.">            if (i &lt; f) {</span>
+<span class="nc" id="L963">                consumer.accept(ThreadLocalRandom.current().internalNextDouble(origin, bound));</span>
+<span class="nc" id="L964">                index = i + 1;</span>
+<span class="nc" id="L965">                return true;</span>
+            }
+<span class="nc" id="L967">            return false;</span>
+        }
+
+        public void forEachRemaining(DoubleConsumer consumer) {
+<span class="nc bnc" id="L971" title="All 2 branches missed.">            if (consumer == null) throw new NullPointerException();</span>
+<span class="nc" id="L972">            long i = index, f = fence;</span>
+<span class="nc bnc" id="L973" title="All 2 branches missed.">            if (i &lt; f) {</span>
+<span class="nc" id="L974">                index = f;</span>
+<span class="nc" id="L975">                double o = origin, b = bound;</span>
+<span class="nc" id="L976">                ThreadLocalRandom rng = ThreadLocalRandom.current();</span>
+                do {
+<span class="nc" id="L978">                    consumer.accept(rng.internalNextDouble(o, b));</span>
+<span class="nc bnc" id="L979" title="All 2 branches missed.">                } while (++i &lt; f);</span>
+            }
+<span class="nc" id="L981">        }</span>
+    }
+
+
+    // Within-package utilities
+
+    /*
+     * Descriptions of the usages of the methods below can be found in
+     * the classes that use them. Briefly, a thread's &quot;probe&quot; value is
+     * a non-zero hash code that (probably) does not collide with
+     * other existing threads with respect to any power of two
+     * collision space. When it does collide, it is pseudo-randomly
+     * adjusted (using a Marsaglia XorShift). The nextSecondarySeed
+     * method is used in the same contexts as ThreadLocalRandom, but
+     * only for transient usages such as random adaptive spin/block
+     * sequences for which a cheap RNG suffices and for which it could
+     * in principle disrupt user-visible statistical properties of the
+     * main ThreadLocalRandom if we were to use it.
+     *
+     * Note: Because of package-protection issues, versions of some
+     * these methods also appear in some subpackage classes.
+     */
+
+    /**
+     * Returns the probe value for the current thread without forcing
+     * initialization. Note that invoking ThreadLocalRandom.current()
+     * can be used to force initialization on zero return.
+     */
+    static final int getProbe() {
+<span class="fc" id="L1010">        return UNSAFE.getInt(Thread.currentThread(), PROBE);</span>
+    }
+
+    /**
+     * Pseudo-randomly advances and records the given probe value for the
+     * given thread.
+     */
+    static final int advanceProbe(int probe) {
+<span class="nc" id="L1018">        probe ^= probe &lt;&lt; 13;   // xorshift</span>
+<span class="nc" id="L1019">        probe ^= probe &gt;&gt;&gt; 17;</span>
+<span class="nc" id="L1020">        probe ^= probe &lt;&lt; 5;</span>
+<span class="nc" id="L1021">        UNSAFE.putInt(Thread.currentThread(), PROBE, probe);</span>
+<span class="nc" id="L1022">        return probe;</span>
+    }
+
+    /**
+     * Returns the pseudo-randomly initialized or updated secondary seed.
+     */
+    static final int nextSecondarySeed() {
+        int r;
+<span class="fc" id="L1030">        Thread t = Thread.currentThread();</span>
+<span class="fc bfc" id="L1031" title="All 2 branches covered.">        if ((r = UNSAFE.getInt(t, SECONDARY)) != 0) {</span>
+<span class="fc" id="L1032">            r ^= r &lt;&lt; 13;   // xorshift</span>
+<span class="fc" id="L1033">            r ^= r &gt;&gt;&gt; 17;</span>
+<span class="fc" id="L1034">            r ^= r &lt;&lt; 5;</span>
+        }
+        else {
+<span class="fc" id="L1037">            localInit();</span>
+<span class="pc bpc" id="L1038" title="1 of 2 branches missed.">            if ((r = (int)UNSAFE.getLong(t, SEED)) == 0)</span>
+<span class="nc" id="L1039">                r = 1; // avoid zero</span>
+        }
+<span class="fc" id="L1041">        UNSAFE.putInt(t, SECONDARY, r);</span>
+<span class="fc" id="L1042">        return r;</span>
+    }
+
+    // Serialization support
+
+    private static final long serialVersionUID = -5851777807851030925L;
+
+    /**
+     * @serialField rnd long
+     *              seed for random computations
+     * @serialField initialized boolean
+     *              always true
+     */
+<span class="fc" id="L1055">    private static final ObjectStreamField[] serialPersistentFields = {</span>
+            new ObjectStreamField(&quot;rnd&quot;, long.class),
+            new ObjectStreamField(&quot;initialized&quot;, boolean.class),
+    };
+
+    /**
+     * Saves the {@code ThreadLocalRandom} to a stream (that is, serializes it).
+     * @param s the stream
+     * @throws java.io.IOException if an I/O error occurs
+     */
+    private void writeObject(java.io.ObjectOutputStream s)
+        throws java.io.IOException {
+
+<span class="nc" id="L1068">        java.io.ObjectOutputStream.PutField fields = s.putFields();</span>
+<span class="nc" id="L1069">        fields.put(&quot;rnd&quot;, UNSAFE.getLong(Thread.currentThread(), SEED));</span>
+<span class="nc" id="L1070">        fields.put(&quot;initialized&quot;, true);</span>
+<span class="nc" id="L1071">        s.writeFields();</span>
+<span class="nc" id="L1072">    }</span>
+
+    /**
+     * Returns the {@link #current() current} thread's {@code ThreadLocalRandom}.
+     * @return the {@link #current() current} thread's {@code ThreadLocalRandom}
+     */
+    private Object readResolve() {
+<span class="nc" id="L1079">        return current();</span>
+    }
+
+    // Unsafe mechanics
+    private static final sun.misc.Unsafe UNSAFE;
+    private static final long SEED;
+    private static final long PROBE;
+    private static final long SECONDARY;
+    static {
+        try {
+<span class="fc" id="L1089">            UNSAFE = sun.misc.Unsafe.getUnsafe();</span>
+<span class="fc" id="L1090">            Class&lt;?&gt; tk = Thread.class;</span>
+<span class="fc" id="L1091">            SEED = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L1092">                (tk.getDeclaredField(&quot;threadLocalRandomSeed&quot;));</span>
+<span class="fc" id="L1093">            PROBE = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L1094">                (tk.getDeclaredField(&quot;threadLocalRandomProbe&quot;));</span>
+<span class="fc" id="L1095">            SECONDARY = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L1096">                (tk.getDeclaredField(&quot;threadLocalRandomSecondarySeed&quot;));</span>
+<span class="nc" id="L1097">        } catch (Exception e) {</span>
+<span class="nc" id="L1098">            throw new Error(e);</span>
+<span class="fc" id="L1099">        }</span>
+<span class="fc" id="L1100">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

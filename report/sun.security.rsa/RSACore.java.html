@@ -1,0 +1,290 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>RSACore.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.rsa</a> &gt; <span class="el_source">RSACore.java</span></div><h1>RSACore.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2003, 2011, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.security.rsa;
+
+import java.math.BigInteger;
+import java.util.*;
+
+import java.security.SecureRandom;
+import java.security.interfaces.*;
+
+import javax.crypto.BadPaddingException;
+
+import sun.security.jca.JCAUtil;
+
+/**
+ * Core of the RSA implementation. Has code to perform public and private key
+ * RSA operations (with and without CRT for private key ops). Private CRT ops
+ * also support blinding to twart timing attacks.
+ *
+ * The code in this class only does the core RSA operation. Padding and
+ * unpadding must be done externally.
+ *
+ * Note: RSA keys should be at least 512 bits long
+ *
+ * @since   1.5
+ * @author  Andreas Sterbenz
+ */
+<span class="pc bpc" id="L51" title="1 of 2 branches missed.">public final class RSACore {</span>
+
+<span class="nc" id="L53">    private RSACore() {</span>
+        // empty
+<span class="nc" id="L55">    }</span>
+
+    /**
+     * Return the number of bytes required to store the magnitude byte[] of
+     * this BigInteger. Do not count a 0x00 byte toByteArray() would
+     * prefix for 2's complement form.
+     */
+    public static int getByteLength(BigInteger b) {
+<span class="fc" id="L63">        int n = b.bitLength();</span>
+<span class="fc" id="L64">        return (n + 7) &gt;&gt; 3;</span>
+    }
+
+    /**
+     * Return the number of bytes required to store the modulus of this
+     * RSA key.
+     */
+    public static int getByteLength(RSAKey key) {
+<span class="fc" id="L72">        return getByteLength(key.getModulus());</span>
+    }
+
+    // temporary, used by RSACipher and RSAPadding. Move this somewhere else
+    public static byte[] convert(byte[] b, int ofs, int len) {
+<span class="pc bpc" id="L77" title="1 of 4 branches missed.">        if ((ofs == 0) &amp;&amp; (len == b.length)) {</span>
+<span class="fc" id="L78">            return b;</span>
+        } else {
+<span class="fc" id="L80">            byte[] t = new byte[len];</span>
+<span class="fc" id="L81">            System.arraycopy(b, ofs, t, 0, len);</span>
+<span class="fc" id="L82">            return t;</span>
+        }
+    }
+
+    /**
+     * Perform an RSA public key operation.
+     */
+    public static byte[] rsa(byte[] msg, RSAPublicKey key)
+            throws BadPaddingException {
+<span class="fc" id="L91">        return crypt(msg, key.getModulus(), key.getPublicExponent());</span>
+    }
+
+    /**
+     * Perform an RSA private key operation. Uses CRT if the key is a
+     * CRT key.
+     */
+    public static byte[] rsa(byte[] msg, RSAPrivateKey key)
+            throws BadPaddingException {
+<span class="fc bfc" id="L100" title="All 2 branches covered.">        if (key instanceof RSAPrivateCrtKey) {</span>
+<span class="fc" id="L101">            return crtCrypt(msg, (RSAPrivateCrtKey)key);</span>
+        } else {
+<span class="fc" id="L103">            return crypt(msg, key.getModulus(), key.getPrivateExponent());</span>
+        }
+    }
+
+    /**
+     * RSA public key ops and non-CRT private key ops. Simple modPow().
+     */
+    private static byte[] crypt(byte[] msg, BigInteger n, BigInteger exp)
+            throws BadPaddingException {
+<span class="fc" id="L112">        BigInteger m = parseMsg(msg, n);</span>
+<span class="fc" id="L113">        BigInteger c = m.modPow(exp, n);</span>
+<span class="fc" id="L114">        return toByteArray(c, getByteLength(n));</span>
+    }
+
+    /**
+     * RSA private key operations with CRT. Algorithm and variable naming
+     * are taken from PKCS#1 v2.1, section 5.1.2.
+     *
+     * The only difference is the addition of blinding to twart timing attacks.
+     * This is described in the RSA Bulletin#2 (Jan 96) among other places.
+     * This means instead of implementing RSA as
+     *   m = c ^ d mod n (or RSA in CRT variant)
+     * we do
+     *   r  = random(0, n-1)
+     *   c' = c  * r^e  mod n
+     *   m' = c' ^ d    mod n (or RSA in CRT variant)
+     *   m  = m' * r^-1 mod n (where r^-1 is the modular inverse of r mod n)
+     * This works because r^(e*d) * r^-1 = r * r^-1 = 1 (all mod n)
+     *
+     * We do not generate new blinding parameters for each operation but reuse
+     * them BLINDING_MAX_REUSE times (see definition below).
+     */
+    private static byte[] crtCrypt(byte[] msg, RSAPrivateCrtKey key)
+            throws BadPaddingException {
+<span class="fc" id="L137">        BigInteger n = key.getModulus();</span>
+<span class="fc" id="L138">        BigInteger c = parseMsg(msg, n);</span>
+<span class="fc" id="L139">        BigInteger p = key.getPrimeP();</span>
+<span class="fc" id="L140">        BigInteger q = key.getPrimeQ();</span>
+<span class="fc" id="L141">        BigInteger dP = key.getPrimeExponentP();</span>
+<span class="fc" id="L142">        BigInteger dQ = key.getPrimeExponentQ();</span>
+<span class="fc" id="L143">        BigInteger qInv = key.getCrtCoefficient();</span>
+
+        BlindingParameters params;
+        if (ENABLE_BLINDING) {
+<span class="fc" id="L147">            params = getBlindingParameters(key);</span>
+<span class="fc" id="L148">            c = c.multiply(params.re).mod(n);</span>
+        } else {
+            params = null;
+        }
+
+        // m1 = c ^ dP mod p
+<span class="fc" id="L154">        BigInteger m1 = c.modPow(dP, p);</span>
+        // m2 = c ^ dQ mod q
+<span class="fc" id="L156">        BigInteger m2 = c.modPow(dQ, q);</span>
+
+        // h = (m1 - m2) * qInv mod p
+<span class="fc" id="L159">        BigInteger mtmp = m1.subtract(m2);</span>
+<span class="fc bfc" id="L160" title="All 2 branches covered.">        if (mtmp.signum() &lt; 0) {</span>
+<span class="fc" id="L161">            mtmp = mtmp.add(p);</span>
+        }
+<span class="fc" id="L163">        BigInteger h = mtmp.multiply(qInv).mod(p);</span>
+
+        // m = m2 + q * h
+<span class="fc" id="L166">        BigInteger m = h.multiply(q).add(m2);</span>
+
+<span class="pc bpc" id="L168" title="1 of 2 branches missed.">        if (params != null) {</span>
+<span class="fc" id="L169">            m = m.multiply(params.rInv).mod(n);</span>
+        }
+
+<span class="fc" id="L172">        return toByteArray(m, getByteLength(n));</span>
+    }
+
+    /**
+     * Parse the msg into a BigInteger and check against the modulus n.
+     */
+    private static BigInteger parseMsg(byte[] msg, BigInteger n)
+            throws BadPaddingException {
+<span class="fc" id="L180">        BigInteger m = new BigInteger(1, msg);</span>
+<span class="pc bpc" id="L181" title="1 of 2 branches missed.">        if (m.compareTo(n) &gt;= 0) {</span>
+<span class="nc" id="L182">            throw new BadPaddingException(&quot;Message is larger than modulus&quot;);</span>
+        }
+<span class="fc" id="L184">        return m;</span>
+    }
+
+    /**
+     * Return the encoding of this BigInteger that is exactly len bytes long.
+     * Prefix/strip off leading 0x00 bytes if necessary.
+     * Precondition: bi must fit into len bytes
+     */
+    private static byte[] toByteArray(BigInteger bi, int len) {
+<span class="fc" id="L193">        byte[] b = bi.toByteArray();</span>
+<span class="fc" id="L194">        int n = b.length;</span>
+<span class="fc bfc" id="L195" title="All 2 branches covered.">        if (n == len) {</span>
+<span class="fc" id="L196">            return b;</span>
+        }
+        // BigInteger prefixed a 0x00 byte for 2's complement form, remove it
+<span class="pc bpc" id="L199" title="1 of 4 branches missed.">        if ((n == len + 1) &amp;&amp; (b[0] == 0)) {</span>
+<span class="fc" id="L200">            byte[] t = new byte[len];</span>
+<span class="fc" id="L201">            System.arraycopy(b, 1, t, 0, len);</span>
+<span class="fc" id="L202">            return t;</span>
+        }
+        // must be smaller
+<span class="pc bpc" id="L205" title="2 of 4 branches missed.">        assert (n &lt; len);</span>
+<span class="fc" id="L206">        byte[] t = new byte[len];</span>
+<span class="fc" id="L207">        System.arraycopy(b, 0, t, (len - n), n);</span>
+<span class="fc" id="L208">        return t;</span>
+    }
+
+    // globally enable/disable use of blinding
+    private final static boolean ENABLE_BLINDING = true;
+
+    // maximum number of times that we will use a set of blinding parameters
+    // value suggested by Paul Kocher (quoted by NSS)
+    private final static int BLINDING_MAX_REUSE = 50;
+
+    // cache for blinding parameters. Map&lt;BigInteger, BlindingParameters&gt;
+    // use a weak hashmap so that cached values are automatically cleared
+    // when the modulus is GC'ed
+<span class="fc" id="L221">    private final static Map&lt;BigInteger, BlindingParameters&gt; blindingCache =</span>
+                new WeakHashMap&lt;&gt;();
+
+    /**
+     * Set of blinding parameters for a given RSA key.
+     *
+     * The RSA modulus is usually unique, so we index by modulus in
+     * blindingCache. However, to protect against the unlikely case of two
+     * keys sharing the same modulus, we also store the public exponent.
+     * This means we cannot cache blinding parameters for multiple keys that
+     * share the same modulus, but since sharing moduli is fundamentally broken
+     * an insecure, this does not matter.
+     */
+    private static final class BlindingParameters {
+        // e (RSA public exponent)
+        final BigInteger e;
+        // r ^ e mod n
+        final BigInteger re;
+        // inverse of r mod n
+        final BigInteger rInv;
+        // how many more times this parameter object can be used
+        private volatile int remainingUses;
+<span class="fc" id="L243">        BlindingParameters(BigInteger e, BigInteger re, BigInteger rInv) {</span>
+<span class="fc" id="L244">            this.e = e;</span>
+<span class="fc" id="L245">            this.re = re;</span>
+<span class="fc" id="L246">            this.rInv = rInv;</span>
+            // initialize remaining uses, subtract current use now
+<span class="fc" id="L248">            remainingUses = BLINDING_MAX_REUSE - 1;</span>
+<span class="fc" id="L249">        }</span>
+        boolean valid(BigInteger e) {
+<span class="fc" id="L251">            int k = remainingUses--;</span>
+<span class="pc bpc" id="L252" title="1 of 4 branches missed.">            return (k &gt; 0) &amp;&amp; this.e.equals(e);</span>
+        }
+    }
+
+    /**
+     * Return valid RSA blinding parameters for the given private key.
+     * Use cached parameters if available. If not, generate new parameters
+     * and cache.
+     */
+    private static BlindingParameters getBlindingParameters
+            (RSAPrivateCrtKey key) {
+<span class="fc" id="L263">        BigInteger modulus = key.getModulus();</span>
+<span class="fc" id="L264">        BigInteger e = key.getPublicExponent();</span>
+        BlindingParameters params;
+        // we release the lock between get() and put()
+        // that means threads might concurrently generate new blinding
+        // parameters for the same modulus. this is only a slight waste
+        // of cycles and seems preferable in terms of scalability
+        // to locking out all threads while generating new parameters
+<span class="fc" id="L271">        synchronized (blindingCache) {</span>
+<span class="fc" id="L272">            params = blindingCache.get(modulus);</span>
+<span class="pc" id="L273">        }</span>
+<span class="fc bfc" id="L274" title="All 4 branches covered.">        if ((params != null) &amp;&amp; params.valid(e)) {</span>
+<span class="fc" id="L275">            return params;</span>
+        }
+<span class="fc" id="L277">        int len = modulus.bitLength();</span>
+<span class="fc" id="L278">        SecureRandom random = JCAUtil.getSecureRandom();</span>
+<span class="fc" id="L279">        BigInteger r = new BigInteger(len, random).mod(modulus);</span>
+<span class="fc" id="L280">        BigInteger re = r.modPow(e, modulus);</span>
+<span class="fc" id="L281">        BigInteger rInv = r.modInverse(modulus);</span>
+<span class="fc" id="L282">        params = new BlindingParameters(e, re, rInv);</span>
+<span class="fc" id="L283">        synchronized (blindingCache) {</span>
+<span class="fc" id="L284">            blindingCache.put(modulus, params);</span>
+<span class="pc" id="L285">        }</span>
+<span class="fc" id="L286">        return params;</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

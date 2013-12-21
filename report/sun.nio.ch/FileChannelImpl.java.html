@@ -1,0 +1,1180 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>FileChannelImpl.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.nio.ch</a> &gt; <span class="el_source">FileChannelImpl.java</span></div><h1>FileChannelImpl.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.nio.ch;
+
+import java.io.FileDescriptor;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.security.AccessController;
+import sun.misc.Cleaner;
+import sun.security.action.GetPropertyAction;
+
+<span class="nc bnc" id="L39" title="All 2 branches missed.">public class FileChannelImpl</span>
+    extends FileChannel
+{
+    // Memory allocation size for mapping buffers
+    private static final long allocationGranularity;
+
+    // Used to make native read and write calls
+    private final FileDispatcher nd;
+
+    // File descriptor
+    private final FileDescriptor fd;
+
+    // File access mode (immutable)
+    private final boolean writable;
+    private final boolean readable;
+    private final boolean append;
+
+    // Required to prevent finalization of creating stream (immutable)
+    private final Object parent;
+
+    // Thread-safe set of IDs of native threads, for signalling
+<span class="nc" id="L60">    private final NativeThreadSet threads = new NativeThreadSet(2);</span>
+
+    // Lock for operations involving position and size
+<span class="nc" id="L63">    private final Object positionLock = new Object();</span>
+
+    private FileChannelImpl(FileDescriptor fd, boolean readable,
+                            boolean writable, boolean append, Object parent)
+<span class="nc" id="L67">    {</span>
+<span class="nc" id="L68">        this.fd = fd;</span>
+<span class="nc" id="L69">        this.readable = readable;</span>
+<span class="nc" id="L70">        this.writable = writable;</span>
+<span class="nc" id="L71">        this.append = append;</span>
+<span class="nc" id="L72">        this.parent = parent;</span>
+<span class="nc" id="L73">        this.nd = new FileDispatcherImpl(append);</span>
+<span class="nc" id="L74">    }</span>
+
+    // Used by FileInputStream.getChannel() and RandomAccessFile.getChannel()
+    public static FileChannel open(FileDescriptor fd,
+                                   boolean readable, boolean writable,
+                                   Object parent)
+    {
+<span class="nc" id="L81">        return new FileChannelImpl(fd, readable, writable, false, parent);</span>
+    }
+
+    // Used by FileOutputStream.getChannel
+    public static FileChannel open(FileDescriptor fd,
+                                   boolean readable, boolean writable,
+                                   boolean append, Object parent)
+    {
+<span class="nc" id="L89">        return new FileChannelImpl(fd, readable, writable, append, parent);</span>
+    }
+
+    private void ensureOpen() throws IOException {
+<span class="nc bnc" id="L93" title="All 2 branches missed.">        if (!isOpen())</span>
+<span class="nc" id="L94">            throw new ClosedChannelException();</span>
+<span class="nc" id="L95">    }</span>
+
+
+    // -- Standard channel operations --
+
+    protected void implCloseChannel() throws IOException {
+        // Release and invalidate any locks that we still hold
+<span class="nc bnc" id="L102" title="All 2 branches missed.">        if (fileLockTable != null) {</span>
+<span class="nc bnc" id="L103" title="All 2 branches missed.">            for (FileLock fl: fileLockTable.removeAll()) {</span>
+<span class="nc" id="L104">                synchronized (fl) {</span>
+<span class="nc bnc" id="L105" title="All 2 branches missed.">                    if (fl.isValid()) {</span>
+<span class="nc" id="L106">                        nd.release(fd, fl.position(), fl.size());</span>
+<span class="nc" id="L107">                        ((FileLockImpl)fl).invalidate();</span>
+                    }
+<span class="nc" id="L109">                }</span>
+<span class="nc" id="L110">            }</span>
+        }
+
+<span class="nc" id="L113">        nd.preClose(fd);</span>
+<span class="nc" id="L114">        threads.signalAndWait();</span>
+
+<span class="nc bnc" id="L116" title="All 2 branches missed.">        if (parent != null) {</span>
+
+            // Close the fd via the parent stream's close method.  The parent
+            // will reinvoke our close method, which is defined in the
+            // superclass AbstractInterruptibleChannel, but the isOpen logic in
+            // that method will prevent this method from being reinvoked.
+            //
+<span class="nc" id="L123">            ((java.io.Closeable)parent).close();</span>
+        } else {
+<span class="nc" id="L125">            nd.close(fd);</span>
+        }
+
+<span class="nc" id="L128">    }</span>
+
+    public int read(ByteBuffer dst) throws IOException {
+<span class="nc" id="L131">        ensureOpen();</span>
+<span class="nc bnc" id="L132" title="All 2 branches missed.">        if (!readable)</span>
+<span class="nc" id="L133">            throw new NonReadableChannelException();</span>
+<span class="nc" id="L134">        synchronized (positionLock) {</span>
+<span class="nc" id="L135">            int n = 0;</span>
+<span class="nc" id="L136">            int ti = -1;</span>
+            try {
+<span class="nc" id="L138">                begin();</span>
+<span class="nc" id="L139">                ti = threads.add();</span>
+<span class="nc bnc" id="L140" title="All 2 branches missed.">                if (!isOpen())</span>
+<span class="nc" id="L141">                    return 0;</span>
+                do {
+<span class="nc" id="L143">                    n = IOUtil.read(fd, dst, -1, nd);</span>
+<span class="nc bnc" id="L144" title="All 4 branches missed.">                } while ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="nc" id="L145">                return IOStatus.normalize(n);</span>
+            } finally {
+<span class="nc" id="L147">                threads.remove(ti);</span>
+<span class="nc bnc" id="L148" title="All 6 branches missed.">                end(n &gt; 0);</span>
+<span class="nc bnc" id="L149" title="All 12 branches missed.">                assert IOStatus.check(n);</span>
+            }
+<span class="nc" id="L151">        }</span>
+    }
+
+    public long read(ByteBuffer[] dsts, int offset, int length)
+        throws IOException
+    {
+<span class="nc bnc" id="L157" title="All 6 branches missed.">        if ((offset &lt; 0) || (length &lt; 0) || (offset &gt; dsts.length - length))</span>
+<span class="nc" id="L158">            throw new IndexOutOfBoundsException();</span>
+<span class="nc" id="L159">        ensureOpen();</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">        if (!readable)</span>
+<span class="nc" id="L161">            throw new NonReadableChannelException();</span>
+<span class="nc" id="L162">        synchronized (positionLock) {</span>
+<span class="nc" id="L163">            long n = 0;</span>
+<span class="nc" id="L164">            int ti = -1;</span>
+            try {
+<span class="nc" id="L166">                begin();</span>
+<span class="nc" id="L167">                ti = threads.add();</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">                if (!isOpen())</span>
+<span class="nc" id="L169">                    return 0;</span>
+                do {
+<span class="nc" id="L171">                    n = IOUtil.read(fd, dsts, offset, length, nd);</span>
+<span class="nc bnc" id="L172" title="All 4 branches missed.">                } while ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="nc" id="L173">                return IOStatus.normalize(n);</span>
+            } finally {
+<span class="nc" id="L175">                threads.remove(ti);</span>
+<span class="nc bnc" id="L176" title="All 6 branches missed.">                end(n &gt; 0);</span>
+<span class="nc bnc" id="L177" title="All 12 branches missed.">                assert IOStatus.check(n);</span>
+            }
+<span class="nc" id="L179">        }</span>
+    }
+
+    public int write(ByteBuffer src) throws IOException {
+<span class="nc" id="L183">        ensureOpen();</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">        if (!writable)</span>
+<span class="nc" id="L185">            throw new NonWritableChannelException();</span>
+<span class="nc" id="L186">        synchronized (positionLock) {</span>
+<span class="nc" id="L187">            int n = 0;</span>
+<span class="nc" id="L188">            int ti = -1;</span>
+            try {
+<span class="nc" id="L190">                begin();</span>
+<span class="nc" id="L191">                ti = threads.add();</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">                if (!isOpen())</span>
+<span class="nc" id="L193">                    return 0;</span>
+                do {
+<span class="nc" id="L195">                    n = IOUtil.write(fd, src, -1, nd);</span>
+<span class="nc bnc" id="L196" title="All 4 branches missed.">                } while ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="nc" id="L197">                return IOStatus.normalize(n);</span>
+            } finally {
+<span class="nc" id="L199">                threads.remove(ti);</span>
+<span class="nc bnc" id="L200" title="All 6 branches missed.">                end(n &gt; 0);</span>
+<span class="nc bnc" id="L201" title="All 12 branches missed.">                assert IOStatus.check(n);</span>
+            }
+<span class="nc" id="L203">        }</span>
+    }
+
+    public long write(ByteBuffer[] srcs, int offset, int length)
+        throws IOException
+    {
+<span class="nc bnc" id="L209" title="All 6 branches missed.">        if ((offset &lt; 0) || (length &lt; 0) || (offset &gt; srcs.length - length))</span>
+<span class="nc" id="L210">            throw new IndexOutOfBoundsException();</span>
+<span class="nc" id="L211">        ensureOpen();</span>
+<span class="nc bnc" id="L212" title="All 2 branches missed.">        if (!writable)</span>
+<span class="nc" id="L213">            throw new NonWritableChannelException();</span>
+<span class="nc" id="L214">        synchronized (positionLock) {</span>
+<span class="nc" id="L215">            long n = 0;</span>
+<span class="nc" id="L216">            int ti = -1;</span>
+            try {
+<span class="nc" id="L218">                begin();</span>
+<span class="nc" id="L219">                ti = threads.add();</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">                if (!isOpen())</span>
+<span class="nc" id="L221">                    return 0;</span>
+                do {
+<span class="nc" id="L223">                    n = IOUtil.write(fd, srcs, offset, length, nd);</span>
+<span class="nc bnc" id="L224" title="All 4 branches missed.">                } while ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="nc" id="L225">                return IOStatus.normalize(n);</span>
+            } finally {
+<span class="nc" id="L227">                threads.remove(ti);</span>
+<span class="nc bnc" id="L228" title="All 6 branches missed.">                end(n &gt; 0);</span>
+<span class="nc bnc" id="L229" title="All 12 branches missed.">                assert IOStatus.check(n);</span>
+            }
+<span class="nc" id="L231">        }</span>
+    }
+
+    // -- Other operations --
+
+    public long position() throws IOException {
+<span class="nc" id="L237">        ensureOpen();</span>
+<span class="nc" id="L238">        synchronized (positionLock) {</span>
+<span class="nc" id="L239">            long p = -1;</span>
+<span class="nc" id="L240">            int ti = -1;</span>
+            try {
+<span class="nc" id="L242">                begin();</span>
+<span class="nc" id="L243">                ti = threads.add();</span>
+<span class="nc bnc" id="L244" title="All 2 branches missed.">                if (!isOpen())</span>
+<span class="nc" id="L245">                    return 0;</span>
+                do {
+                    // in append-mode then position is advanced to end before writing
+<span class="nc bnc" id="L248" title="All 2 branches missed.">                    p = (append) ? nd.size(fd) : position0(fd, -1);</span>
+<span class="nc bnc" id="L249" title="All 4 branches missed.">                } while ((p == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="nc" id="L250">                return IOStatus.normalize(p);</span>
+            } finally {
+<span class="nc" id="L252">                threads.remove(ti);</span>
+<span class="nc bnc" id="L253" title="All 6 branches missed.">                end(p &gt; -1);</span>
+<span class="nc bnc" id="L254" title="All 12 branches missed.">                assert IOStatus.check(p);</span>
+            }
+<span class="nc" id="L256">        }</span>
+    }
+
+    public FileChannel position(long newPosition) throws IOException {
+<span class="nc" id="L260">        ensureOpen();</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">        if (newPosition &lt; 0)</span>
+<span class="nc" id="L262">            throw new IllegalArgumentException();</span>
+<span class="nc" id="L263">        synchronized (positionLock) {</span>
+<span class="nc" id="L264">            long p = -1;</span>
+<span class="nc" id="L265">            int ti = -1;</span>
+            try {
+<span class="nc" id="L267">                begin();</span>
+<span class="nc" id="L268">                ti = threads.add();</span>
+<span class="nc bnc" id="L269" title="All 2 branches missed.">                if (!isOpen())</span>
+<span class="nc" id="L270">                    return null;</span>
+                do {
+<span class="nc" id="L272">                    p  = position0(fd, newPosition);</span>
+<span class="nc bnc" id="L273" title="All 4 branches missed.">                } while ((p == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="nc" id="L274">                return this;</span>
+            } finally {
+<span class="nc" id="L276">                threads.remove(ti);</span>
+<span class="nc bnc" id="L277" title="All 6 branches missed.">                end(p &gt; -1);</span>
+<span class="nc bnc" id="L278" title="All 12 branches missed.">                assert IOStatus.check(p);</span>
+            }
+<span class="nc" id="L280">        }</span>
+    }
+
+    public long size() throws IOException {
+<span class="nc" id="L284">        ensureOpen();</span>
+<span class="nc" id="L285">        synchronized (positionLock) {</span>
+<span class="nc" id="L286">            long s = -1;</span>
+<span class="nc" id="L287">            int ti = -1;</span>
+            try {
+<span class="nc" id="L289">                begin();</span>
+<span class="nc" id="L290">                ti = threads.add();</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">                if (!isOpen())</span>
+<span class="nc" id="L292">                    return -1;</span>
+                do {
+<span class="nc" id="L294">                    s = nd.size(fd);</span>
+<span class="nc bnc" id="L295" title="All 4 branches missed.">                } while ((s == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="nc" id="L296">                return IOStatus.normalize(s);</span>
+            } finally {
+<span class="nc" id="L298">                threads.remove(ti);</span>
+<span class="nc bnc" id="L299" title="All 6 branches missed.">                end(s &gt; -1);</span>
+<span class="nc bnc" id="L300" title="All 12 branches missed.">                assert IOStatus.check(s);</span>
+            }
+<span class="nc" id="L302">        }</span>
+    }
+
+    public FileChannel truncate(long newSize) throws IOException {
+<span class="nc" id="L306">        ensureOpen();</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">        if (newSize &lt; 0)</span>
+<span class="nc" id="L308">            throw new IllegalArgumentException(&quot;Negative size&quot;);</span>
+<span class="nc bnc" id="L309" title="All 2 branches missed.">        if (!writable)</span>
+<span class="nc" id="L310">            throw new NonWritableChannelException();</span>
+<span class="nc" id="L311">        synchronized (positionLock) {</span>
+<span class="nc" id="L312">            int rv = -1;</span>
+<span class="nc" id="L313">            long p = -1;</span>
+<span class="nc" id="L314">            int ti = -1;</span>
+            try {
+<span class="nc" id="L316">                begin();</span>
+<span class="nc" id="L317">                ti = threads.add();</span>
+<span class="nc bnc" id="L318" title="All 2 branches missed.">                if (!isOpen())</span>
+<span class="nc" id="L319">                    return null;</span>
+
+                // get current size
+                long size;
+                do {
+<span class="nc" id="L324">                    size = nd.size(fd);</span>
+<span class="nc bnc" id="L325" title="All 4 branches missed.">                } while ((size == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="nc bnc" id="L326" title="All 2 branches missed.">                if (!isOpen())</span>
+<span class="nc" id="L327">                    return null;</span>
+
+                // get current position
+                do {
+<span class="nc" id="L331">                    p = position0(fd, -1);</span>
+<span class="nc bnc" id="L332" title="All 4 branches missed.">                } while ((p == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">                if (!isOpen())</span>
+<span class="nc" id="L334">                    return null;</span>
+<span class="nc bnc" id="L335" title="All 4 branches missed.">                assert p &gt;= 0;</span>
+
+                // truncate file if given size is less than the current size
+<span class="nc bnc" id="L338" title="All 2 branches missed.">                if (newSize &lt; size) {</span>
+                    do {
+<span class="nc" id="L340">                        rv = nd.truncate(fd, newSize);</span>
+<span class="nc bnc" id="L341" title="All 4 branches missed.">                    } while ((rv == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="nc bnc" id="L342" title="All 2 branches missed.">                    if (!isOpen())</span>
+<span class="nc" id="L343">                        return null;</span>
+                }
+
+                // if position is beyond new size then adjust it
+<span class="nc bnc" id="L347" title="All 2 branches missed.">                if (p &gt; newSize)</span>
+<span class="nc" id="L348">                    p = newSize;</span>
+                do {
+<span class="nc" id="L350">                    rv = (int)position0(fd, p);</span>
+<span class="nc bnc" id="L351" title="All 4 branches missed.">                } while ((rv == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="nc" id="L352">                return this;</span>
+            } finally {
+<span class="nc" id="L354">                threads.remove(ti);</span>
+<span class="nc bnc" id="L355" title="All 12 branches missed.">                end(rv &gt; -1);</span>
+<span class="nc bnc" id="L356" title="All 24 branches missed.">                assert IOStatus.check(rv);</span>
+            }
+<span class="nc" id="L358">        }</span>
+    }
+
+    public void force(boolean metaData) throws IOException {
+<span class="nc" id="L362">        ensureOpen();</span>
+<span class="nc" id="L363">        int rv = -1;</span>
+<span class="nc" id="L364">        int ti = -1;</span>
+        try {
+<span class="nc" id="L366">            begin();</span>
+<span class="nc" id="L367">            ti = threads.add();</span>
+<span class="nc bnc" id="L368" title="All 2 branches missed.">            if (!isOpen())</span>
+<span class="nc" id="L369">                return;</span>
+            do {
+<span class="nc" id="L371">                rv = nd.force(fd, metaData);</span>
+<span class="nc bnc" id="L372" title="All 4 branches missed.">            } while ((rv == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+        } finally {
+<span class="nc" id="L374">            threads.remove(ti);</span>
+<span class="nc bnc" id="L375" title="All 6 branches missed.">            end(rv &gt; -1);</span>
+<span class="nc bnc" id="L376" title="All 12 branches missed.">            assert IOStatus.check(rv);</span>
+        }
+<span class="nc" id="L378">    }</span>
+
+    // Assume at first that the underlying kernel supports sendfile();
+    // set this to false if we find out later that it doesn't
+    //
+<span class="nc" id="L383">    private static volatile boolean transferSupported = true;</span>
+
+    // Assume that the underlying kernel sendfile() will work if the target
+    // fd is a pipe; set this to false if we find out later that it doesn't
+    //
+<span class="nc" id="L388">    private static volatile boolean pipeSupported = true;</span>
+
+    // Assume that the underlying kernel sendfile() will work if the target
+    // fd is a file; set this to false if we find out later that it doesn't
+    //
+<span class="nc" id="L393">    private static volatile boolean fileSupported = true;</span>
+
+    private long transferToDirectly(long position, int icount,
+                                    WritableByteChannel target)
+        throws IOException
+    {
+<span class="nc bnc" id="L399" title="All 2 branches missed.">        if (!transferSupported)</span>
+<span class="nc" id="L400">            return IOStatus.UNSUPPORTED;</span>
+
+<span class="nc" id="L402">        FileDescriptor targetFD = null;</span>
+<span class="nc bnc" id="L403" title="All 2 branches missed.">        if (target instanceof FileChannelImpl) {</span>
+<span class="nc bnc" id="L404" title="All 2 branches missed.">            if (!fileSupported)</span>
+<span class="nc" id="L405">                return IOStatus.UNSUPPORTED_CASE;</span>
+<span class="nc" id="L406">            targetFD = ((FileChannelImpl)target).fd;</span>
+<span class="nc bnc" id="L407" title="All 2 branches missed.">        } else if (target instanceof SelChImpl) {</span>
+            // Direct transfer to pipe causes EINVAL on some configurations
+<span class="nc bnc" id="L409" title="All 4 branches missed.">            if ((target instanceof SinkChannelImpl) &amp;&amp; !pipeSupported)</span>
+<span class="nc" id="L410">                return IOStatus.UNSUPPORTED_CASE;</span>
+<span class="nc" id="L411">            targetFD = ((SelChImpl)target).getFD();</span>
+        }
+<span class="nc bnc" id="L413" title="All 2 branches missed.">        if (targetFD == null)</span>
+<span class="nc" id="L414">            return IOStatus.UNSUPPORTED;</span>
+<span class="nc" id="L415">        int thisFDVal = IOUtil.fdVal(fd);</span>
+<span class="nc" id="L416">        int targetFDVal = IOUtil.fdVal(targetFD);</span>
+<span class="nc bnc" id="L417" title="All 2 branches missed.">        if (thisFDVal == targetFDVal) // Not supported on some configurations</span>
+<span class="nc" id="L418">            return IOStatus.UNSUPPORTED;</span>
+
+<span class="nc" id="L420">        long n = -1;</span>
+<span class="nc" id="L421">        int ti = -1;</span>
+        try {
+<span class="nc" id="L423">            begin();</span>
+<span class="nc" id="L424">            ti = threads.add();</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">            if (!isOpen())</span>
+<span class="nc" id="L426">                return -1;</span>
+            do {
+<span class="nc" id="L428">                n = transferTo0(thisFDVal, position, icount, targetFDVal);</span>
+<span class="nc bnc" id="L429" title="All 4 branches missed.">            } while ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="nc bnc" id="L430" title="All 2 branches missed.">            if (n == IOStatus.UNSUPPORTED_CASE) {</span>
+<span class="nc bnc" id="L431" title="All 2 branches missed.">                if (target instanceof SinkChannelImpl)</span>
+<span class="nc" id="L432">                    pipeSupported = false;</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">                if (target instanceof FileChannelImpl)</span>
+<span class="nc" id="L434">                    fileSupported = false;</span>
+<span class="nc" id="L435">                return IOStatus.UNSUPPORTED_CASE;</span>
+            }
+<span class="nc bnc" id="L437" title="All 2 branches missed.">            if (n == IOStatus.UNSUPPORTED) {</span>
+                // Don't bother trying again
+<span class="nc" id="L439">                transferSupported = false;</span>
+<span class="nc" id="L440">                return IOStatus.UNSUPPORTED;</span>
+            }
+<span class="nc" id="L442">            return IOStatus.normalize(n);</span>
+        } finally {
+<span class="nc" id="L444">            threads.remove(ti);</span>
+<span class="nc bnc" id="L445" title="All 10 branches missed.">            end (n &gt; -1);</span>
+        }
+    }
+
+    // Maximum size to map when using a mapped buffer
+    private static final long MAPPED_TRANSFER_SIZE = 8L*1024L*1024L;
+
+    private long transferToTrustedChannel(long position, long count,
+                                          WritableByteChannel target)
+        throws IOException
+    {
+<span class="nc" id="L456">        boolean isSelChImpl = (target instanceof SelChImpl);</span>
+<span class="nc bnc" id="L457" title="All 4 branches missed.">        if (!((target instanceof FileChannelImpl) || isSelChImpl))</span>
+<span class="nc" id="L458">            return IOStatus.UNSUPPORTED;</span>
+
+        // Trusted target: Use a mapped buffer
+<span class="nc" id="L461">        long remaining = count;</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">        while (remaining &gt; 0L) {</span>
+<span class="nc" id="L463">            long size = Math.min(remaining, MAPPED_TRANSFER_SIZE);</span>
+            try {
+<span class="nc" id="L465">                MappedByteBuffer dbb = map(MapMode.READ_ONLY, position, size);</span>
+                try {
+                    // ## Bug: Closing this channel will not terminate the write
+<span class="nc" id="L468">                    int n = target.write(dbb);</span>
+<span class="nc bnc" id="L469" title="All 4 branches missed.">                    assert n &gt;= 0;</span>
+<span class="nc" id="L470">                    remaining -= n;</span>
+<span class="nc bnc" id="L471" title="All 2 branches missed.">                    if (isSelChImpl) {</span>
+                        // one attempt to write to selectable channel
+                        break;
+                    }
+<span class="nc bnc" id="L475" title="All 4 branches missed.">                    assert n &gt; 0;</span>
+<span class="nc" id="L476">                    position += n;</span>
+                } finally {
+<span class="nc" id="L478">                    unmap(dbb);</span>
+<span class="nc" id="L479">                }</span>
+<span class="nc" id="L480">            } catch (ClosedByInterruptException e) {</span>
+                // target closed by interrupt as ClosedByInterruptException needs
+                // to be thrown after closing this channel.
+<span class="nc bnc" id="L483" title="All 4 branches missed.">                assert !target.isOpen();</span>
+                try {
+<span class="nc" id="L485">                    close();</span>
+<span class="nc" id="L486">                } catch (Throwable suppressed) {</span>
+<span class="nc" id="L487">                    e.addSuppressed(suppressed);</span>
+<span class="nc" id="L488">                }</span>
+<span class="nc" id="L489">                throw e;</span>
+<span class="nc" id="L490">            } catch (IOException ioe) {</span>
+                // Only throw exception if no bytes have been written
+<span class="nc bnc" id="L492" title="All 2 branches missed.">                if (remaining == count)</span>
+<span class="nc" id="L493">                    throw ioe;</span>
+<span class="nc" id="L494">                break;</span>
+<span class="nc" id="L495">            }</span>
+<span class="nc" id="L496">        }</span>
+<span class="nc" id="L497">        return count - remaining;</span>
+    }
+
+    private long transferToArbitraryChannel(long position, int icount,
+                                            WritableByteChannel target)
+        throws IOException
+    {
+        // Untrusted target: Use a newly-erased buffer
+<span class="nc" id="L505">        int c = Math.min(icount, TRANSFER_SIZE);</span>
+<span class="nc" id="L506">        ByteBuffer bb = Util.getTemporaryDirectBuffer(c);</span>
+<span class="nc" id="L507">        long tw = 0;                    // Total bytes written</span>
+<span class="nc" id="L508">        long pos = position;</span>
+        try {
+<span class="nc" id="L510">            Util.erase(bb);</span>
+<span class="nc bnc" id="L511" title="All 2 branches missed.">            while (tw &lt; icount) {</span>
+<span class="nc" id="L512">                bb.limit(Math.min((int)(icount - tw), TRANSFER_SIZE));</span>
+<span class="nc" id="L513">                int nr = read(bb, pos);</span>
+<span class="nc bnc" id="L514" title="All 2 branches missed.">                if (nr &lt;= 0)</span>
+<span class="nc" id="L515">                    break;</span>
+<span class="nc" id="L516">                bb.flip();</span>
+                // ## Bug: Will block writing target if this channel
+                // ##      is asynchronously closed
+<span class="nc" id="L519">                int nw = target.write(bb);</span>
+<span class="nc" id="L520">                tw += nw;</span>
+<span class="nc bnc" id="L521" title="All 2 branches missed.">                if (nw != nr)</span>
+<span class="nc" id="L522">                    break;</span>
+<span class="nc" id="L523">                pos += nw;</span>
+<span class="nc" id="L524">                bb.clear();</span>
+<span class="nc" id="L525">            }</span>
+<span class="nc" id="L526">            return tw;</span>
+<span class="nc" id="L527">        } catch (IOException x) {</span>
+<span class="nc bnc" id="L528" title="All 2 branches missed.">            if (tw &gt; 0)</span>
+<span class="nc" id="L529">                return tw;</span>
+<span class="nc" id="L530">            throw x;</span>
+        } finally {
+<span class="nc" id="L532">            Util.releaseTemporaryDirectBuffer(bb);</span>
+        }
+    }
+
+    public long transferTo(long position, long count,
+                           WritableByteChannel target)
+        throws IOException
+    {
+<span class="nc" id="L540">        ensureOpen();</span>
+<span class="nc bnc" id="L541" title="All 2 branches missed.">        if (!target.isOpen())</span>
+<span class="nc" id="L542">            throw new ClosedChannelException();</span>
+<span class="nc bnc" id="L543" title="All 2 branches missed.">        if (!readable)</span>
+<span class="nc" id="L544">            throw new NonReadableChannelException();</span>
+<span class="nc bnc" id="L545" title="All 4 branches missed.">        if (target instanceof FileChannelImpl &amp;&amp;</span>
+            !((FileChannelImpl)target).writable)
+<span class="nc" id="L547">            throw new NonWritableChannelException();</span>
+<span class="nc bnc" id="L548" title="All 4 branches missed.">        if ((position &lt; 0) || (count &lt; 0))</span>
+<span class="nc" id="L549">            throw new IllegalArgumentException();</span>
+<span class="nc" id="L550">        long sz = size();</span>
+<span class="nc bnc" id="L551" title="All 2 branches missed.">        if (position &gt; sz)</span>
+<span class="nc" id="L552">            return 0;</span>
+<span class="nc" id="L553">        int icount = (int)Math.min(count, Integer.MAX_VALUE);</span>
+<span class="nc bnc" id="L554" title="All 2 branches missed.">        if ((sz - position) &lt; icount)</span>
+<span class="nc" id="L555">            icount = (int)(sz - position);</span>
+
+        long n;
+
+        // Attempt a direct transfer, if the kernel supports it
+<span class="nc bnc" id="L560" title="All 2 branches missed.">        if ((n = transferToDirectly(position, icount, target)) &gt;= 0)</span>
+<span class="nc" id="L561">            return n;</span>
+
+        // Attempt a mapped transfer, but only to trusted channel types
+<span class="nc bnc" id="L564" title="All 2 branches missed.">        if ((n = transferToTrustedChannel(position, icount, target)) &gt;= 0)</span>
+<span class="nc" id="L565">            return n;</span>
+
+        // Slow path for untrusted targets
+<span class="nc" id="L568">        return transferToArbitraryChannel(position, icount, target);</span>
+    }
+
+    private long transferFromFileChannel(FileChannelImpl src,
+                                         long position, long count)
+        throws IOException
+    {
+<span class="nc bnc" id="L575" title="All 2 branches missed.">        if (!src.readable)</span>
+<span class="nc" id="L576">            throw new NonReadableChannelException();</span>
+<span class="nc" id="L577">        synchronized (src.positionLock) {</span>
+<span class="nc" id="L578">            long pos = src.position();</span>
+<span class="nc" id="L579">            long max = Math.min(count, src.size() - pos);</span>
+
+<span class="nc" id="L581">            long remaining = max;</span>
+<span class="nc" id="L582">            long p = pos;</span>
+<span class="nc bnc" id="L583" title="All 2 branches missed.">            while (remaining &gt; 0L) {</span>
+<span class="nc" id="L584">                long size = Math.min(remaining, MAPPED_TRANSFER_SIZE);</span>
+                // ## Bug: Closing this channel will not terminate the write
+<span class="nc" id="L586">                MappedByteBuffer bb = src.map(MapMode.READ_ONLY, p, size);</span>
+                try {
+<span class="nc" id="L588">                    long n = write(bb, position);</span>
+<span class="nc bnc" id="L589" title="All 4 branches missed.">                    assert n &gt; 0;</span>
+<span class="nc" id="L590">                    p += n;</span>
+<span class="nc" id="L591">                    position += n;</span>
+<span class="nc" id="L592">                    remaining -= n;</span>
+<span class="nc" id="L593">                } catch (IOException ioe) {</span>
+                    // Only throw exception if no bytes have been written
+<span class="nc bnc" id="L595" title="All 2 branches missed.">                    if (remaining == max)</span>
+<span class="nc" id="L596">                        throw ioe;</span>
+                    break;
+                } finally {
+<span class="nc" id="L599">                    unmap(bb);</span>
+<span class="nc" id="L600">                }</span>
+<span class="nc" id="L601">            }</span>
+<span class="nc" id="L602">            long nwritten = max - remaining;</span>
+<span class="nc" id="L603">            src.position(pos + nwritten);</span>
+<span class="nc" id="L604">            return nwritten;</span>
+<span class="nc" id="L605">        }</span>
+    }
+
+    private static final int TRANSFER_SIZE = 8192;
+
+    private long transferFromArbitraryChannel(ReadableByteChannel src,
+                                              long position, long count)
+        throws IOException
+    {
+        // Untrusted target: Use a newly-erased buffer
+<span class="nc" id="L615">        int c = (int)Math.min(count, TRANSFER_SIZE);</span>
+<span class="nc" id="L616">        ByteBuffer bb = Util.getTemporaryDirectBuffer(c);</span>
+<span class="nc" id="L617">        long tw = 0;                    // Total bytes written</span>
+<span class="nc" id="L618">        long pos = position;</span>
+        try {
+<span class="nc" id="L620">            Util.erase(bb);</span>
+<span class="nc bnc" id="L621" title="All 2 branches missed.">            while (tw &lt; count) {</span>
+<span class="nc" id="L622">                bb.limit((int)Math.min((count - tw), (long)TRANSFER_SIZE));</span>
+                // ## Bug: Will block reading src if this channel
+                // ##      is asynchronously closed
+<span class="nc" id="L625">                int nr = src.read(bb);</span>
+<span class="nc bnc" id="L626" title="All 2 branches missed.">                if (nr &lt;= 0)</span>
+<span class="nc" id="L627">                    break;</span>
+<span class="nc" id="L628">                bb.flip();</span>
+<span class="nc" id="L629">                int nw = write(bb, pos);</span>
+<span class="nc" id="L630">                tw += nw;</span>
+<span class="nc bnc" id="L631" title="All 2 branches missed.">                if (nw != nr)</span>
+<span class="nc" id="L632">                    break;</span>
+<span class="nc" id="L633">                pos += nw;</span>
+<span class="nc" id="L634">                bb.clear();</span>
+<span class="nc" id="L635">            }</span>
+<span class="nc" id="L636">            return tw;</span>
+<span class="nc" id="L637">        } catch (IOException x) {</span>
+<span class="nc bnc" id="L638" title="All 2 branches missed.">            if (tw &gt; 0)</span>
+<span class="nc" id="L639">                return tw;</span>
+<span class="nc" id="L640">            throw x;</span>
+        } finally {
+<span class="nc" id="L642">            Util.releaseTemporaryDirectBuffer(bb);</span>
+        }
+    }
+
+    public long transferFrom(ReadableByteChannel src,
+                             long position, long count)
+        throws IOException
+    {
+<span class="nc" id="L650">        ensureOpen();</span>
+<span class="nc bnc" id="L651" title="All 2 branches missed.">        if (!src.isOpen())</span>
+<span class="nc" id="L652">            throw new ClosedChannelException();</span>
+<span class="nc bnc" id="L653" title="All 2 branches missed.">        if (!writable)</span>
+<span class="nc" id="L654">            throw new NonWritableChannelException();</span>
+<span class="nc bnc" id="L655" title="All 4 branches missed.">        if ((position &lt; 0) || (count &lt; 0))</span>
+<span class="nc" id="L656">            throw new IllegalArgumentException();</span>
+<span class="nc bnc" id="L657" title="All 2 branches missed.">        if (position &gt; size())</span>
+<span class="nc" id="L658">            return 0;</span>
+<span class="nc bnc" id="L659" title="All 2 branches missed.">        if (src instanceof FileChannelImpl)</span>
+<span class="nc" id="L660">           return transferFromFileChannel((FileChannelImpl)src,</span>
+                                          position, count);
+
+<span class="nc" id="L663">        return transferFromArbitraryChannel(src, position, count);</span>
+    }
+
+    public int read(ByteBuffer dst, long position) throws IOException {
+<span class="nc bnc" id="L667" title="All 2 branches missed.">        if (dst == null)</span>
+<span class="nc" id="L668">            throw new NullPointerException();</span>
+<span class="nc bnc" id="L669" title="All 2 branches missed.">        if (position &lt; 0)</span>
+<span class="nc" id="L670">            throw new IllegalArgumentException(&quot;Negative position&quot;);</span>
+<span class="nc bnc" id="L671" title="All 2 branches missed.">        if (!readable)</span>
+<span class="nc" id="L672">            throw new NonReadableChannelException();</span>
+<span class="nc" id="L673">        ensureOpen();</span>
+<span class="nc bnc" id="L674" title="All 2 branches missed.">        if (nd.needsPositionLock()) {</span>
+<span class="nc" id="L675">            synchronized (positionLock) {</span>
+<span class="nc" id="L676">                return readInternal(dst, position);</span>
+<span class="nc" id="L677">            }</span>
+        } else {
+<span class="nc" id="L679">            return readInternal(dst, position);</span>
+        }
+    }
+
+    private int readInternal(ByteBuffer dst, long position) throws IOException {
+<span class="nc bnc" id="L684" title="All 6 branches missed.">        assert !nd.needsPositionLock() || Thread.holdsLock(positionLock);</span>
+<span class="nc" id="L685">        int n = 0;</span>
+<span class="nc" id="L686">        int ti = -1;</span>
+        try {
+<span class="nc" id="L688">            begin();</span>
+<span class="nc" id="L689">            ti = threads.add();</span>
+<span class="nc bnc" id="L690" title="All 2 branches missed.">            if (!isOpen())</span>
+<span class="nc" id="L691">                return -1;</span>
+            do {
+<span class="nc" id="L693">                n = IOUtil.read(fd, dst, position, nd);</span>
+<span class="nc bnc" id="L694" title="All 4 branches missed.">            } while ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="nc" id="L695">            return IOStatus.normalize(n);</span>
+        } finally {
+<span class="nc" id="L697">            threads.remove(ti);</span>
+<span class="nc bnc" id="L698" title="All 6 branches missed.">            end(n &gt; 0);</span>
+<span class="nc bnc" id="L699" title="All 12 branches missed.">            assert IOStatus.check(n);</span>
+        }
+    }
+
+    public int write(ByteBuffer src, long position) throws IOException {
+<span class="nc bnc" id="L704" title="All 2 branches missed.">        if (src == null)</span>
+<span class="nc" id="L705">            throw new NullPointerException();</span>
+<span class="nc bnc" id="L706" title="All 2 branches missed.">        if (position &lt; 0)</span>
+<span class="nc" id="L707">            throw new IllegalArgumentException(&quot;Negative position&quot;);</span>
+<span class="nc bnc" id="L708" title="All 2 branches missed.">        if (!writable)</span>
+<span class="nc" id="L709">            throw new NonWritableChannelException();</span>
+<span class="nc" id="L710">        ensureOpen();</span>
+<span class="nc bnc" id="L711" title="All 2 branches missed.">        if (nd.needsPositionLock()) {</span>
+<span class="nc" id="L712">            synchronized (positionLock) {</span>
+<span class="nc" id="L713">                return writeInternal(src, position);</span>
+<span class="nc" id="L714">            }</span>
+        } else {
+<span class="nc" id="L716">            return writeInternal(src, position);</span>
+        }
+    }
+
+    private int writeInternal(ByteBuffer src, long position) throws IOException {
+<span class="nc bnc" id="L721" title="All 6 branches missed.">        assert !nd.needsPositionLock() || Thread.holdsLock(positionLock);</span>
+<span class="nc" id="L722">        int n = 0;</span>
+<span class="nc" id="L723">        int ti = -1;</span>
+        try {
+<span class="nc" id="L725">            begin();</span>
+<span class="nc" id="L726">            ti = threads.add();</span>
+<span class="nc bnc" id="L727" title="All 2 branches missed.">            if (!isOpen())</span>
+<span class="nc" id="L728">                return -1;</span>
+            do {
+<span class="nc" id="L730">                n = IOUtil.write(fd, src, position, nd);</span>
+<span class="nc bnc" id="L731" title="All 4 branches missed.">            } while ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="nc" id="L732">            return IOStatus.normalize(n);</span>
+        } finally {
+<span class="nc" id="L734">            threads.remove(ti);</span>
+<span class="nc bnc" id="L735" title="All 6 branches missed.">            end(n &gt; 0);</span>
+<span class="nc bnc" id="L736" title="All 12 branches missed.">            assert IOStatus.check(n);</span>
+        }
+    }
+
+
+    // -- Memory-mapped buffers --
+
+<span class="pc bpc" id="L743" title="1 of 2 branches missed.">    private static class Unmapper</span>
+        implements Runnable
+    {
+        // may be required to close file
+<span class="fc" id="L747">        private static final NativeDispatcher nd = new FileDispatcherImpl();</span>
+
+        // keep track of mapped buffer usage
+        static volatile int count;
+        static volatile long totalSize;
+        static volatile long totalCapacity;
+
+        private volatile long address;
+        private final long size;
+        private final int cap;
+        private final FileDescriptor fd;
+
+        private Unmapper(long address, long size, int cap,
+                         FileDescriptor fd)
+<span class="fc" id="L761">        {</span>
+<span class="pc bpc" id="L762" title="2 of 4 branches missed.">            assert (address != 0);</span>
+<span class="fc" id="L763">            this.address = address;</span>
+<span class="fc" id="L764">            this.size = size;</span>
+<span class="fc" id="L765">            this.cap = cap;</span>
+<span class="fc" id="L766">            this.fd = fd;</span>
+
+<span class="fc" id="L768">            synchronized (Unmapper.class) {</span>
+<span class="fc" id="L769">                count++;</span>
+<span class="fc" id="L770">                totalSize += size;</span>
+<span class="fc" id="L771">                totalCapacity += cap;</span>
+<span class="pc" id="L772">            }</span>
+<span class="fc" id="L773">        }</span>
+
+        public void run() {
+<span class="pc bpc" id="L776" title="1 of 2 branches missed.">            if (address == 0)</span>
+<span class="nc" id="L777">                return;</span>
+<span class="fc" id="L778">            unmap0(address, size);</span>
+<span class="fc" id="L779">            address = 0;</span>
+
+            // if this mapping has a valid file descriptor then we close it
+<span class="pc bpc" id="L782" title="1 of 2 branches missed.">            if (fd.valid()) {</span>
+                try {
+<span class="nc" id="L784">                    nd.close(fd);</span>
+<span class="nc" id="L785">                } catch (IOException ignore) {</span>
+                    // nothing we can do
+<span class="nc" id="L787">                }</span>
+            }
+
+<span class="fc" id="L790">            synchronized (Unmapper.class) {</span>
+<span class="fc" id="L791">                count--;</span>
+<span class="fc" id="L792">                totalSize -= size;</span>
+<span class="fc" id="L793">                totalCapacity -= cap;</span>
+<span class="pc" id="L794">            }</span>
+<span class="fc" id="L795">        }</span>
+    }
+
+    private static void unmap(MappedByteBuffer bb) {
+<span class="nc" id="L799">        Cleaner cl = ((DirectBuffer)bb).cleaner();</span>
+<span class="nc bnc" id="L800" title="All 2 branches missed.">        if (cl != null)</span>
+<span class="nc" id="L801">            cl.clean();</span>
+<span class="nc" id="L802">    }</span>
+
+    private static final int MAP_RO = 0;
+    private static final int MAP_RW = 1;
+    private static final int MAP_PV = 2;
+
+    public MappedByteBuffer map(MapMode mode, long position, long size)
+        throws IOException
+    {
+<span class="nc" id="L811">        ensureOpen();</span>
+<span class="nc bnc" id="L812" title="All 2 branches missed.">        if (mode == null)</span>
+<span class="nc" id="L813">            throw new NullPointerException(&quot;Mode is null&quot;);</span>
+<span class="nc bnc" id="L814" title="All 2 branches missed.">        if (position &lt; 0L)</span>
+<span class="nc" id="L815">            throw new IllegalArgumentException(&quot;Negative position&quot;);</span>
+<span class="nc bnc" id="L816" title="All 2 branches missed.">        if (size &lt; 0L)</span>
+<span class="nc" id="L817">            throw new IllegalArgumentException(&quot;Negative size&quot;);</span>
+<span class="nc bnc" id="L818" title="All 2 branches missed.">        if (position + size &lt; 0)</span>
+<span class="nc" id="L819">            throw new IllegalArgumentException(&quot;Position + size overflow&quot;);</span>
+<span class="nc bnc" id="L820" title="All 2 branches missed.">        if (size &gt; Integer.MAX_VALUE)</span>
+<span class="nc" id="L821">            throw new IllegalArgumentException(&quot;Size exceeds Integer.MAX_VALUE&quot;);</span>
+
+<span class="nc" id="L823">        int imode = -1;</span>
+<span class="nc bnc" id="L824" title="All 2 branches missed.">        if (mode == MapMode.READ_ONLY)</span>
+<span class="nc" id="L825">            imode = MAP_RO;</span>
+<span class="nc bnc" id="L826" title="All 2 branches missed.">        else if (mode == MapMode.READ_WRITE)</span>
+<span class="nc" id="L827">            imode = MAP_RW;</span>
+<span class="nc bnc" id="L828" title="All 2 branches missed.">        else if (mode == MapMode.PRIVATE)</span>
+<span class="nc" id="L829">            imode = MAP_PV;</span>
+<span class="nc bnc" id="L830" title="All 4 branches missed.">        assert (imode &gt;= 0);</span>
+<span class="nc bnc" id="L831" title="All 4 branches missed.">        if ((mode != MapMode.READ_ONLY) &amp;&amp; !writable)</span>
+<span class="nc" id="L832">            throw new NonWritableChannelException();</span>
+<span class="nc bnc" id="L833" title="All 2 branches missed.">        if (!readable)</span>
+<span class="nc" id="L834">            throw new NonReadableChannelException();</span>
+
+<span class="nc" id="L836">        long addr = -1;</span>
+<span class="nc" id="L837">        int ti = -1;</span>
+        try {
+<span class="nc" id="L839">            begin();</span>
+<span class="nc" id="L840">            ti = threads.add();</span>
+<span class="nc bnc" id="L841" title="All 2 branches missed.">            if (!isOpen())</span>
+<span class="nc" id="L842">                return null;</span>
+
+            long filesize;
+            do {
+<span class="nc" id="L846">                filesize = nd.size(fd);</span>
+<span class="nc bnc" id="L847" title="All 4 branches missed.">            } while ((filesize == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="nc bnc" id="L848" title="All 2 branches missed.">            if (!isOpen())</span>
+<span class="nc" id="L849">                return null;</span>
+
+<span class="nc bnc" id="L851" title="All 2 branches missed.">            if (filesize &lt; position + size) { // Extend file size</span>
+<span class="nc bnc" id="L852" title="All 2 branches missed.">                if (!writable) {</span>
+<span class="nc" id="L853">                    throw new IOException(&quot;Channel not open for writing &quot; +</span>
+                        &quot;- cannot extend file to required size&quot;);
+                }
+                int rv;
+                do {
+<span class="nc" id="L858">                    rv = nd.truncate(fd, position + size);</span>
+<span class="nc bnc" id="L859" title="All 4 branches missed.">                } while ((rv == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="nc bnc" id="L860" title="All 2 branches missed.">                if (!isOpen())</span>
+<span class="nc" id="L861">                    return null;</span>
+            }
+<span class="nc bnc" id="L863" title="All 2 branches missed.">            if (size == 0) {</span>
+<span class="nc" id="L864">                addr = 0;</span>
+                // a valid file descriptor is not required
+<span class="nc" id="L866">                FileDescriptor dummy = new FileDescriptor();</span>
+<span class="nc bnc" id="L867" title="All 4 branches missed.">                if ((!writable) || (imode == MAP_RO))</span>
+<span class="nc" id="L868">                    return Util.newMappedByteBufferR(0, 0, dummy, null);</span>
+                else
+<span class="nc" id="L870">                    return Util.newMappedByteBuffer(0, 0, dummy, null);</span>
+            }
+
+<span class="nc" id="L873">            int pagePosition = (int)(position % allocationGranularity);</span>
+<span class="nc" id="L874">            long mapPosition = position - pagePosition;</span>
+<span class="nc" id="L875">            long mapSize = size + pagePosition;</span>
+            try {
+                // If no exception was thrown from map0, the address is valid
+<span class="nc" id="L878">                addr = map0(imode, mapPosition, mapSize);</span>
+<span class="nc" id="L879">            } catch (OutOfMemoryError x) {</span>
+                // An OutOfMemoryError may indicate that we've exhausted memory
+                // so force gc and re-attempt map
+<span class="nc" id="L882">                System.gc();</span>
+                try {
+<span class="nc" id="L884">                    Thread.sleep(100);</span>
+<span class="nc" id="L885">                } catch (InterruptedException y) {</span>
+<span class="nc" id="L886">                    Thread.currentThread().interrupt();</span>
+<span class="nc" id="L887">                }</span>
+                try {
+<span class="nc" id="L889">                    addr = map0(imode, mapPosition, mapSize);</span>
+<span class="nc" id="L890">                } catch (OutOfMemoryError y) {</span>
+                    // After a second OOME, fail
+<span class="nc" id="L892">                    throw new IOException(&quot;Map failed&quot;, y);</span>
+<span class="nc" id="L893">                }</span>
+<span class="nc" id="L894">            }</span>
+
+            // On Windows, and potentially other platforms, we need an open
+            // file descriptor for some mapping operations.
+            FileDescriptor mfd;
+            try {
+<span class="nc" id="L900">                mfd = nd.duplicateForMapping(fd);</span>
+<span class="nc" id="L901">            } catch (IOException ioe) {</span>
+<span class="nc" id="L902">                unmap0(addr, mapSize);</span>
+<span class="nc" id="L903">                throw ioe;</span>
+<span class="nc" id="L904">            }</span>
+
+<span class="nc bnc" id="L906" title="All 4 branches missed.">            assert (IOStatus.checkAll(addr));</span>
+<span class="nc bnc" id="L907" title="All 4 branches missed.">            assert (addr % allocationGranularity == 0);</span>
+<span class="nc" id="L908">            int isize = (int)size;</span>
+<span class="nc" id="L909">            Unmapper um = new Unmapper(addr, mapSize, isize, mfd);</span>
+<span class="nc bnc" id="L910" title="All 4 branches missed.">            if ((!writable) || (imode == MAP_RO)) {</span>
+<span class="nc" id="L911">                return Util.newMappedByteBufferR(isize,</span>
+                                                 addr + pagePosition,
+                                                 mfd,
+                                                 um);
+            } else {
+<span class="nc" id="L916">                return Util.newMappedByteBuffer(isize,</span>
+                                                addr + pagePosition,
+                                                mfd,
+                                                um);
+            }
+        } finally {
+<span class="nc" id="L922">            threads.remove(ti);</span>
+<span class="nc" id="L923">            end(IOStatus.checkAll(addr));</span>
+        }
+    }
+
+    /**
+     * Invoked by sun.management.ManagementFactoryHelper to create the management
+     * interface for mapped buffers.
+     */
+    public static sun.misc.JavaNioAccess.BufferPool getMappedBufferPool() {
+<span class="pc" id="L932">        return new sun.misc.JavaNioAccess.BufferPool() {</span>
+            @Override
+            public String getName() {
+<span class="fc" id="L935">                return &quot;mapped&quot;;</span>
+            }
+            @Override
+            public long getCount() {
+<span class="fc" id="L939">                return Unmapper.count;</span>
+            }
+            @Override
+            public long getTotalCapacity() {
+<span class="fc" id="L943">                return Unmapper.totalCapacity;</span>
+            }
+            @Override
+            public long getMemoryUsed() {
+<span class="fc" id="L947">                return Unmapper.totalSize;</span>
+            }
+        };
+    }
+
+    // -- Locks --
+
+
+
+    // keeps track of locks on this file
+    private volatile FileLockTable fileLockTable;
+
+    // indicates if file locks are maintained system-wide (as per spec)
+    private static boolean isSharedFileLockTable;
+
+    // indicates if the disableSystemWideOverlappingFileLockCheck property
+    // has been checked
+    private static volatile boolean propertyChecked;
+
+    // The lock list in J2SE 1.4/5.0 was local to each FileChannel instance so
+    // the overlap check wasn't system wide when there were multiple channels to
+    // the same file. This property is used to get 1.4/5.0 behavior if desired.
+    private static boolean isSharedFileLockTable() {
+<span class="nc bnc" id="L970" title="All 2 branches missed.">        if (!propertyChecked) {</span>
+<span class="nc" id="L971">            synchronized (FileChannelImpl.class) {</span>
+<span class="nc bnc" id="L972" title="All 2 branches missed.">                if (!propertyChecked) {</span>
+<span class="nc" id="L973">                    String value = AccessController.doPrivileged(</span>
+                        new GetPropertyAction(
+                            &quot;sun.nio.ch.disableSystemWideOverlappingFileLockCheck&quot;));
+<span class="nc bnc" id="L976" title="All 4 branches missed.">                    isSharedFileLockTable = ((value == null) || value.equals(&quot;false&quot;));</span>
+<span class="nc" id="L977">                    propertyChecked = true;</span>
+                }
+<span class="nc" id="L979">            }</span>
+        }
+<span class="nc" id="L981">        return isSharedFileLockTable;</span>
+    }
+
+    private FileLockTable fileLockTable() throws IOException {
+<span class="nc bnc" id="L985" title="All 2 branches missed.">        if (fileLockTable == null) {</span>
+<span class="nc" id="L986">            synchronized (this) {</span>
+<span class="nc bnc" id="L987" title="All 2 branches missed.">                if (fileLockTable == null) {</span>
+<span class="nc bnc" id="L988" title="All 2 branches missed.">                    if (isSharedFileLockTable()) {</span>
+<span class="nc" id="L989">                        int ti = threads.add();</span>
+                        try {
+<span class="nc" id="L991">                            ensureOpen();</span>
+<span class="nc" id="L992">                            fileLockTable = FileLockTable.newSharedFileLockTable(this, fd);</span>
+                        } finally {
+<span class="nc" id="L994">                            threads.remove(ti);</span>
+<span class="nc" id="L995">                        }</span>
+<span class="nc" id="L996">                    } else {</span>
+<span class="nc" id="L997">                        fileLockTable = new SimpleFileLockTable();</span>
+                    }
+                }
+<span class="nc" id="L1000">            }</span>
+        }
+<span class="nc" id="L1002">        return fileLockTable;</span>
+    }
+
+    public FileLock lock(long position, long size, boolean shared)
+        throws IOException
+    {
+<span class="nc" id="L1008">        ensureOpen();</span>
+<span class="nc bnc" id="L1009" title="All 4 branches missed.">        if (shared &amp;&amp; !readable)</span>
+<span class="nc" id="L1010">            throw new NonReadableChannelException();</span>
+<span class="nc bnc" id="L1011" title="All 4 branches missed.">        if (!shared &amp;&amp; !writable)</span>
+<span class="nc" id="L1012">            throw new NonWritableChannelException();</span>
+<span class="nc" id="L1013">        FileLockImpl fli = new FileLockImpl(this, position, size, shared);</span>
+<span class="nc" id="L1014">        FileLockTable flt = fileLockTable();</span>
+<span class="nc" id="L1015">        flt.add(fli);</span>
+<span class="nc" id="L1016">        boolean completed = false;</span>
+<span class="nc" id="L1017">        int ti = -1;</span>
+        try {
+<span class="nc" id="L1019">            begin();</span>
+<span class="nc" id="L1020">            ti = threads.add();</span>
+<span class="nc bnc" id="L1021" title="All 2 branches missed.">            if (!isOpen())</span>
+<span class="nc" id="L1022">                return null;</span>
+            int n;
+            do {
+<span class="nc" id="L1025">                n = nd.lock(fd, true, position, size, shared);</span>
+<span class="nc bnc" id="L1026" title="All 4 branches missed.">            } while ((n == FileDispatcher.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="nc bnc" id="L1027" title="All 2 branches missed.">            if (isOpen()) {</span>
+<span class="nc bnc" id="L1028" title="All 2 branches missed.">                if (n == FileDispatcher.RET_EX_LOCK) {</span>
+<span class="nc bnc" id="L1029" title="All 4 branches missed.">                    assert shared;</span>
+<span class="nc" id="L1030">                    FileLockImpl fli2 = new FileLockImpl(this, position, size,</span>
+                                                         false);
+<span class="nc" id="L1032">                    flt.replace(fli, fli2);</span>
+<span class="nc" id="L1033">                    fli = fli2;</span>
+                }
+<span class="nc" id="L1035">                completed = true;</span>
+            }
+        } finally {
+<span class="nc bnc" id="L1038" title="All 6 branches missed.">            if (!completed)</span>
+<span class="nc" id="L1039">                flt.remove(fli);</span>
+<span class="nc" id="L1040">            threads.remove(ti);</span>
+            try {
+<span class="nc" id="L1042">                end(completed);</span>
+<span class="nc" id="L1043">            } catch (ClosedByInterruptException e) {</span>
+<span class="nc" id="L1044">                throw new FileLockInterruptionException();</span>
+<span class="nc" id="L1045">            }</span>
+        }
+<span class="nc" id="L1047">        return fli;</span>
+    }
+
+    public FileLock tryLock(long position, long size, boolean shared)
+        throws IOException
+    {
+<span class="nc" id="L1053">        ensureOpen();</span>
+<span class="nc bnc" id="L1054" title="All 4 branches missed.">        if (shared &amp;&amp; !readable)</span>
+<span class="nc" id="L1055">            throw new NonReadableChannelException();</span>
+<span class="nc bnc" id="L1056" title="All 4 branches missed.">        if (!shared &amp;&amp; !writable)</span>
+<span class="nc" id="L1057">            throw new NonWritableChannelException();</span>
+<span class="nc" id="L1058">        FileLockImpl fli = new FileLockImpl(this, position, size, shared);</span>
+<span class="nc" id="L1059">        FileLockTable flt = fileLockTable();</span>
+<span class="nc" id="L1060">        flt.add(fli);</span>
+        int result;
+
+<span class="nc" id="L1063">        int ti = threads.add();</span>
+        try {
+            try {
+<span class="nc" id="L1066">                ensureOpen();</span>
+<span class="nc" id="L1067">                result = nd.lock(fd, false, position, size, shared);</span>
+<span class="nc" id="L1068">            } catch (IOException e) {</span>
+<span class="nc" id="L1069">                flt.remove(fli);</span>
+<span class="nc" id="L1070">                throw e;</span>
+<span class="nc" id="L1071">            }</span>
+<span class="nc bnc" id="L1072" title="All 2 branches missed.">            if (result == FileDispatcher.NO_LOCK) {</span>
+<span class="nc" id="L1073">                flt.remove(fli);</span>
+<span class="nc" id="L1074">                return null;</span>
+            }
+<span class="nc bnc" id="L1076" title="All 2 branches missed.">            if (result == FileDispatcher.RET_EX_LOCK) {</span>
+<span class="nc bnc" id="L1077" title="All 4 branches missed.">                assert shared;</span>
+<span class="nc" id="L1078">                FileLockImpl fli2 = new FileLockImpl(this, position, size,</span>
+                                                     false);
+<span class="nc" id="L1080">                flt.replace(fli, fli2);</span>
+<span class="nc" id="L1081">                return fli2;</span>
+            }
+<span class="nc" id="L1083">            return fli;</span>
+        } finally {
+<span class="nc" id="L1085">            threads.remove(ti);</span>
+        }
+    }
+
+    void release(FileLockImpl fli) throws IOException {
+<span class="nc" id="L1090">        int ti = threads.add();</span>
+        try {
+<span class="nc" id="L1092">            ensureOpen();</span>
+<span class="nc" id="L1093">            nd.release(fd, fli.position(), fli.size());</span>
+        } finally {
+<span class="nc" id="L1095">            threads.remove(ti);</span>
+<span class="nc" id="L1096">        }</span>
+<span class="nc bnc" id="L1097" title="All 4 branches missed.">        assert fileLockTable != null;</span>
+<span class="nc" id="L1098">        fileLockTable.remove(fli);</span>
+<span class="nc" id="L1099">    }</span>
+
+    // -- File lock support --
+
+    /**
+     * A simple file lock table that maintains a list of FileLocks obtained by a
+     * FileChannel. Use to get 1.4/5.0 behaviour.
+     */
+<span class="nc bnc" id="L1107" title="All 2 branches missed.">    private static class SimpleFileLockTable extends FileLockTable {</span>
+        // synchronize on list for access
+<span class="nc" id="L1109">        private final List&lt;FileLock&gt; lockList = new ArrayList&lt;FileLock&gt;(2);</span>
+
+<span class="nc" id="L1111">        public SimpleFileLockTable() {</span>
+<span class="nc" id="L1112">        }</span>
+
+        private void checkList(long position, long size)
+            throws OverlappingFileLockException
+        {
+<span class="nc bnc" id="L1117" title="All 4 branches missed.">            assert Thread.holdsLock(lockList);</span>
+<span class="nc bnc" id="L1118" title="All 2 branches missed.">            for (FileLock fl: lockList) {</span>
+<span class="nc bnc" id="L1119" title="All 2 branches missed.">                if (fl.overlaps(position, size)) {</span>
+<span class="nc" id="L1120">                    throw new OverlappingFileLockException();</span>
+                }
+<span class="nc" id="L1122">            }</span>
+<span class="nc" id="L1123">        }</span>
+
+        public void add(FileLock fl) throws OverlappingFileLockException {
+<span class="nc" id="L1126">            synchronized (lockList) {</span>
+<span class="nc" id="L1127">                checkList(fl.position(), fl.size());</span>
+<span class="nc" id="L1128">                lockList.add(fl);</span>
+<span class="nc" id="L1129">            }</span>
+<span class="nc" id="L1130">        }</span>
+
+        public void remove(FileLock fl) {
+<span class="nc" id="L1133">            synchronized (lockList) {</span>
+<span class="nc" id="L1134">                lockList.remove(fl);</span>
+<span class="nc" id="L1135">            }</span>
+<span class="nc" id="L1136">        }</span>
+
+        public List&lt;FileLock&gt; removeAll() {
+<span class="nc" id="L1139">            synchronized(lockList) {</span>
+<span class="nc" id="L1140">                List&lt;FileLock&gt; result = new ArrayList&lt;FileLock&gt;(lockList);</span>
+<span class="nc" id="L1141">                lockList.clear();</span>
+<span class="nc" id="L1142">                return result;</span>
+<span class="nc" id="L1143">            }</span>
+        }
+
+        public void replace(FileLock fl1, FileLock fl2) {
+<span class="nc" id="L1147">            synchronized (lockList) {</span>
+<span class="nc" id="L1148">                lockList.remove(fl1);</span>
+<span class="nc" id="L1149">                lockList.add(fl2);</span>
+<span class="nc" id="L1150">            }</span>
+<span class="nc" id="L1151">        }</span>
+    }
+
+    // -- Native methods --
+
+    // Creates a new mapping
+    private native long map0(int prot, long position, long length)
+        throws IOException;
+
+    // Removes an existing mapping
+    private static native int unmap0(long address, long length);
+
+    // Transfers from src to dst, or returns -2 if kernel can't do that
+    private native long transferTo0(int src, long position, long count, int dst);
+
+    // Sets or reports this file's position
+    // If offset is -1, the current position is returned
+    // otherwise the position is set to offset
+    private native long position0(FileDescriptor fd, long offset);
+
+    // Caches fieldIDs
+    private static native long initIDs();
+
+    static {
+<span class="nc" id="L1175">        IOUtil.load();</span>
+<span class="nc" id="L1176">        allocationGranularity = initIDs();</span>
+<span class="nc" id="L1177">    }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

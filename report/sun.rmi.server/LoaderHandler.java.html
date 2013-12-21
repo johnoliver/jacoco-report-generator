@@ -1,0 +1,1225 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>LoaderHandler.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.rmi.server</a> &gt; <span class="el_source">LoaderHandler.java</span></div><h1>LoaderHandler.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1996, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.rmi.server;
+
+import java.io.File;
+import java.io.FilePermission;
+import java.io.IOException;
+import java.lang.ref.ReferenceQueue;
+import java.lang.ref.SoftReference;
+import java.lang.ref.WeakReference;
+import java.lang.reflect.Modifier;
+import java.lang.reflect.Proxy;
+import java.net.JarURLConnection;
+import java.net.MalformedURLException;
+import java.net.SocketPermission;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.net.URLConnection;
+import java.security.AccessControlContext;
+import java.security.CodeSource;
+import java.security.Permission;
+import java.security.Permissions;
+import java.security.PermissionCollection;
+import java.security.Policy;
+import java.security.ProtectionDomain;
+import java.rmi.server.LogStream;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Enumeration;
+import java.util.HashMap;
+import java.util.IdentityHashMap;
+import java.util.Map;
+import java.util.StringTokenizer;
+import java.util.WeakHashMap;
+import sun.reflect.misc.ReflectUtil;
+import sun.rmi.runtime.Log;
+import sun.security.action.GetPropertyAction;
+
+/**
+ * &lt;code&gt;LoaderHandler&lt;/code&gt; provides the implementation of the static
+ * methods of the &lt;code&gt;java.rmi.server.RMIClassLoader&lt;/code&gt; class.
+ *
+ * @author      Ann Wollrath
+ * @author      Peter Jones
+ * @author      Laird Dornin
+ */
+@SuppressWarnings(&quot;deprecation&quot;)
+public final class LoaderHandler {
+
+    /** RMI class loader log level */
+<span class="fc" id="L74">    static final int logLevel = LogStream.parseLevel(</span>
+<span class="fc" id="L75">        java.security.AccessController.doPrivileged(</span>
+            new GetPropertyAction(&quot;sun.rmi.loader.logLevel&quot;)));
+
+    /* loader system log */
+<span class="fc" id="L79">    static final Log loaderLog =</span>
+<span class="fc" id="L80">        Log.getLog(&quot;sun.rmi.loader&quot;, &quot;loader&quot;, LoaderHandler.logLevel);</span>
+
+    /**
+     * value of &quot;java.rmi.server.codebase&quot; property, as cached at class
+     * initialization time.  It may contain malformed URLs.
+     */
+<span class="fc" id="L86">    private static String codebaseProperty = null;</span>
+    static {
+<span class="fc" id="L88">        String prop = java.security.AccessController.doPrivileged(</span>
+            new GetPropertyAction(&quot;java.rmi.server.codebase&quot;));
+<span class="pc bpc" id="L90" title="1 of 4 branches missed.">        if (prop != null &amp;&amp; prop.trim().length() &gt; 0) {</span>
+<span class="fc" id="L91">            codebaseProperty = prop;</span>
+        }
+    }
+
+    /** list of URLs represented by the codebase property, if valid */
+<span class="fc" id="L96">    private static URL[] codebaseURLs = null;</span>
+
+    /** table of class loaders that use codebase property for annotation */
+<span class="fc" id="L99">    private static final Map&lt;ClassLoader, Void&gt; codebaseLoaders =</span>
+<span class="fc" id="L100">        Collections.synchronizedMap(new IdentityHashMap&lt;ClassLoader, Void&gt;(5));</span>
+    static {
+<span class="fc" id="L102">        for (ClassLoader codebaseLoader = ClassLoader.getSystemClassLoader();</span>
+<span class="fc bfc" id="L103" title="All 2 branches covered.">             codebaseLoader != null;</span>
+<span class="fc" id="L104">             codebaseLoader = codebaseLoader.getParent())</span>
+        {
+<span class="fc" id="L106">            codebaseLoaders.put(codebaseLoader, null);</span>
+        }
+    }
+
+    /**
+     * table mapping codebase URL path and context class loader pairs
+     * to class loader instances.  Entries hold class loaders with weak
+     * references, so this table does not prevent loaders from being
+     * garbage collected.
+     */
+<span class="fc" id="L116">    private static final HashMap&lt;LoaderKey, LoaderEntry&gt; loaderTable</span>
+        = new HashMap&lt;&gt;(5);
+
+    /** reference queue for cleared class loader entries */
+<span class="fc" id="L120">    private static final ReferenceQueue&lt;Loader&gt; refQueue</span>
+        = new ReferenceQueue&lt;&gt;();
+
+    /*
+     * Disallow anyone from creating one of these.
+     */
+<span class="nc" id="L126">    private LoaderHandler() {}</span>
+
+    /**
+     * Returns an array of URLs initialized with the value of the
+     * java.rmi.server.codebase property as the URL path.
+     */
+    private static synchronized URL[] getDefaultCodebaseURLs()
+        throws MalformedURLException
+    {
+        /*
+         * If it hasn't already been done, convert the codebase property
+         * into an array of URLs; this may throw a MalformedURLException.
+         */
+<span class="fc bfc" id="L139" title="All 2 branches covered.">        if (codebaseURLs == null) {</span>
+<span class="fc bfc" id="L140" title="All 2 branches covered.">            if (codebaseProperty != null) {</span>
+<span class="fc" id="L141">                codebaseURLs = pathToURLs(codebaseProperty);</span>
+            } else {
+<span class="fc" id="L143">                codebaseURLs = new URL[0];</span>
+            }
+        }
+<span class="fc" id="L146">        return codebaseURLs;</span>
+    }
+
+    /**
+     * Load a class from a network location (one or more URLs),
+     * but first try to resolve the named class through the given
+     * &quot;default loader&quot;.
+     */
+    public static Class&lt;?&gt; loadClass(String codebase, String name,
+                                     ClassLoader defaultLoader)
+        throws MalformedURLException, ClassNotFoundException
+    {
+<span class="fc bfc" id="L158" title="All 2 branches covered.">        if (loaderLog.isLoggable(Log.BRIEF)) {</span>
+<span class="pc bpc" id="L159" title="1 of 4 branches missed.">            loaderLog.log(Log.BRIEF,</span>
+                &quot;name = \&quot;&quot; + name + &quot;\&quot;, &quot; +
+                &quot;codebase = \&quot;&quot; + (codebase != null ? codebase : &quot;&quot;) + &quot;\&quot;&quot; +
+                (defaultLoader != null ?
+                 &quot;, defaultLoader = &quot; + defaultLoader : &quot;&quot;));
+        }
+
+        URL[] urls;
+<span class="fc bfc" id="L167" title="All 2 branches covered.">        if (codebase != null) {</span>
+<span class="fc" id="L168">            urls = pathToURLs(codebase);</span>
+        } else {
+<span class="fc" id="L170">            urls = getDefaultCodebaseURLs();</span>
+        }
+
+<span class="fc bfc" id="L173" title="All 2 branches covered.">        if (defaultLoader != null) {</span>
+            try {
+<span class="fc" id="L175">                Class&lt;?&gt; c = loadClassForName(name, false, defaultLoader);</span>
+<span class="fc bfc" id="L176" title="All 2 branches covered.">                if (loaderLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="fc" id="L177">                    loaderLog.log(Log.VERBOSE,</span>
+                        &quot;class \&quot;&quot; + name + &quot;\&quot; found via defaultLoader, &quot; +
+<span class="fc" id="L179">                        &quot;defined by &quot; + c.getClassLoader());</span>
+                }
+<span class="fc" id="L181">                return c;</span>
+<span class="fc" id="L182">            } catch (ClassNotFoundException e) {</span>
+            }
+        }
+
+<span class="fc" id="L186">        return loadClass(urls, name);</span>
+    }
+
+    /**
+     * Returns the class annotation (representing the location for
+     * a class) that RMI will use to annotate the call stream when
+     * marshalling objects of the given class.
+     */
+    public static String getClassAnnotation(Class&lt;?&gt; cl) {
+<span class="fc" id="L195">        String name = cl.getName();</span>
+
+        /*
+         * Class objects for arrays of primitive types never need an
+         * annotation, because they never need to be (or can be) downloaded.
+         *
+         * REMIND: should we (not) be annotating classes that are in
+         * &quot;java.*&quot; packages?
+         */
+<span class="fc" id="L204">        int nameLength = name.length();</span>
+<span class="pc bpc" id="L205" title="1 of 4 branches missed.">        if (nameLength &gt; 0 &amp;&amp; name.charAt(0) == '[') {</span>
+            // skip past all '[' characters (see bugid 4211906)
+<span class="fc" id="L207">            int i = 1;</span>
+<span class="pc bpc" id="L208" title="1 of 4 branches missed.">            while (nameLength &gt; i &amp;&amp; name.charAt(i) == '[') {</span>
+<span class="fc" id="L209">                i++;</span>
+            }
+<span class="pc bpc" id="L211" title="1 of 4 branches missed.">            if (nameLength &gt; i &amp;&amp; name.charAt(i) != 'L') {</span>
+<span class="fc" id="L212">                return null;</span>
+            }
+        }
+
+        /*
+         * Get the class's class loader.  If it is null, the system class
+         * loader, an ancestor of the base class loader (such as the loader
+         * for installed extensions), return the value of the
+         * &quot;java.rmi.server.codebase&quot; property.
+         */
+<span class="fc" id="L222">        ClassLoader loader = cl.getClassLoader();</span>
+<span class="fc bfc" id="L223" title="All 4 branches covered.">        if (loader == null || codebaseLoaders.containsKey(loader)) {</span>
+<span class="fc" id="L224">            return codebaseProperty;</span>
+        }
+
+        /*
+         * Get the codebase URL path for the class loader, if it supports
+         * such a notion (i.e., if it is a URLClassLoader or subclass).
+         */
+<span class="fc" id="L231">        String annotation = null;</span>
+<span class="fc bfc" id="L232" title="All 2 branches covered.">        if (loader instanceof Loader) {</span>
+            /*
+             * If the class loader is one of our RMI class loaders, we have
+             * already computed the class annotation string, and no
+             * permissions are required to know the URLs.
+             */
+<span class="fc" id="L238">            annotation = ((Loader) loader).getClassAnnotation();</span>
+
+<span class="pc bpc" id="L240" title="1 of 2 branches missed.">        } else if (loader instanceof URLClassLoader) {</span>
+            try {
+<span class="fc" id="L242">                URL[] urls = ((URLClassLoader) loader).getURLs();</span>
+<span class="pc bpc" id="L243" title="1 of 2 branches missed.">                if (urls != null) {</span>
+                    /*
+                     * If the class loader is not one of our RMI class loaders,
+                     * we must verify that the current access control context
+                     * has permission to know all of these URLs.
+                     */
+<span class="fc" id="L249">                    SecurityManager sm = System.getSecurityManager();</span>
+<span class="pc bpc" id="L250" title="1 of 2 branches missed.">                    if (sm != null) {</span>
+<span class="fc" id="L251">                        Permissions perms = new Permissions();</span>
+<span class="fc bfc" id="L252" title="All 2 branches covered.">                        for (int i = 0; i &lt; urls.length; i++) {</span>
+<span class="fc" id="L253">                            Permission p =</span>
+<span class="fc" id="L254">                                urls[i].openConnection().getPermission();</span>
+<span class="pc bpc" id="L255" title="1 of 2 branches missed.">                            if (p != null) {</span>
+<span class="pc bpc" id="L256" title="1 of 2 branches missed.">                                if (!perms.implies(p)) {</span>
+<span class="fc" id="L257">                                    sm.checkPermission(p);</span>
+<span class="fc" id="L258">                                    perms.add(p);</span>
+                                }
+                            }
+                        }
+                    }
+
+<span class="fc" id="L264">                    annotation = urlsToPath(urls);</span>
+                }
+<span class="nc" id="L266">            } catch (SecurityException | IOException e) {</span>
+                /*
+                 * SecurityException: If access was denied to the knowledge of
+                 * the class loader's URLs, fall back to the default behavior.
+                 *
+                 * IOException: This shouldn't happen, although it is declared
+                 * to be thrown by openConnection() and getPermission().  If it
+                 * does happen, forget about this class loader's URLs and
+                 * fall back to the default behavior.
+                 */
+<span class="fc" id="L276">            }</span>
+        }
+
+<span class="fc bfc" id="L279" title="All 2 branches covered.">        if (annotation != null) {</span>
+<span class="fc" id="L280">            return annotation;</span>
+        } else {
+<span class="fc" id="L282">            return codebaseProperty;    // REMIND: does this make sense??</span>
+        }
+    }
+
+    /**
+     * Returns a classloader that loads classes from the given codebase URL
+     * path.  The parent classloader of the returned classloader is the
+     * context class loader.
+     */
+    public static ClassLoader getClassLoader(String codebase)
+        throws MalformedURLException
+    {
+<span class="fc" id="L294">        ClassLoader parent = getRMIContextClassLoader();</span>
+
+        URL[] urls;
+<span class="pc bpc" id="L297" title="1 of 2 branches missed.">        if (codebase != null) {</span>
+<span class="fc" id="L298">            urls = pathToURLs(codebase);</span>
+        } else {
+<span class="nc" id="L300">            urls = getDefaultCodebaseURLs();</span>
+        }
+
+        /*
+         * If there is a security manager, the current access control
+         * context must have the &quot;getClassLoader&quot; RuntimePermission.
+         */
+<span class="fc" id="L307">        SecurityManager sm = System.getSecurityManager();</span>
+<span class="fc bfc" id="L308" title="All 2 branches covered.">        if (sm != null) {</span>
+<span class="fc" id="L309">            sm.checkPermission(new RuntimePermission(&quot;getClassLoader&quot;));</span>
+        } else {
+            /*
+             * But if no security manager is set, disable access to
+             * RMI class loaders and simply return the parent loader.
+             */
+<span class="fc" id="L315">            return parent;</span>
+        }
+
+<span class="fc" id="L318">        Loader loader = lookupLoader(urls, parent);</span>
+
+        /*
+         * Verify that the caller has permission to access this loader.
+         */
+<span class="pc bpc" id="L323" title="1 of 2 branches missed.">        if (loader != null) {</span>
+<span class="fc" id="L324">            loader.checkPermissions();</span>
+        }
+
+<span class="fc" id="L327">        return loader;</span>
+    }
+
+    /**
+     * Return the security context of the given class loader.
+     */
+    public static Object getSecurityContext(ClassLoader loader) {
+        /*
+         * REMIND: This is a bogus JDK1.1-compatible implementation.
+         * This method should never be called by application code anyway
+         * (hence the deprecation), but should it do something different
+         * and perhaps more useful, like return a String or a URL[]?
+         */
+<span class="nc bnc" id="L340" title="All 2 branches missed.">        if (loader instanceof Loader) {</span>
+<span class="nc" id="L341">            URL[] urls = ((Loader) loader).getURLs();</span>
+<span class="nc bnc" id="L342" title="All 2 branches missed.">            if (urls.length &gt; 0) {</span>
+<span class="nc" id="L343">                return urls[0];</span>
+            }
+        }
+<span class="nc" id="L346">        return null;</span>
+    }
+
+    /**
+     * Register a class loader as one whose classes should always be
+     * annotated with the value of the &quot;java.rmi.server.codebase&quot; property.
+     */
+    public static void registerCodebaseLoader(ClassLoader loader) {
+<span class="fc" id="L354">        codebaseLoaders.put(loader, null);</span>
+<span class="fc" id="L355">    }</span>
+
+    /**
+     * Load a class from the RMI class loader corresponding to the given
+     * codebase URL path in the current execution context.
+     */
+    private static Class&lt;?&gt; loadClass(URL[] urls, String name)
+        throws ClassNotFoundException
+    {
+<span class="fc" id="L364">        ClassLoader parent = getRMIContextClassLoader();</span>
+<span class="fc bfc" id="L365" title="All 2 branches covered.">        if (loaderLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="fc" id="L366">            loaderLog.log(Log.VERBOSE,</span>
+                &quot;(thread context class loader: &quot; + parent + &quot;)&quot;);
+        }
+
+        /*
+         * If no security manager is set, disable access to RMI class
+         * loaders and simply delegate request to the parent loader
+         * (see bugid 4140511).
+         */
+<span class="fc" id="L375">        SecurityManager sm = System.getSecurityManager();</span>
+<span class="fc bfc" id="L376" title="All 2 branches covered.">        if (sm == null) {</span>
+            try {
+<span class="fc" id="L378">                Class&lt;?&gt; c = Class.forName(name, false, parent);</span>
+<span class="fc bfc" id="L379" title="All 2 branches covered.">                if (loaderLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="fc" id="L380">                    loaderLog.log(Log.VERBOSE,</span>
+                        &quot;class \&quot;&quot; + name + &quot;\&quot; found via &quot; +
+                        &quot;thread context class loader &quot; +
+                        &quot;(no security manager: codebase disabled), &quot; +
+<span class="fc" id="L384">                        &quot;defined by &quot; + c.getClassLoader());</span>
+                }
+<span class="fc" id="L386">                return c;</span>
+<span class="fc" id="L387">            } catch (ClassNotFoundException e) {</span>
+<span class="pc bpc" id="L388" title="1 of 2 branches missed.">                if (loaderLog.isLoggable(Log.BRIEF)) {</span>
+<span class="nc" id="L389">                    loaderLog.log(Log.BRIEF,</span>
+                        &quot;class \&quot;&quot; + name + &quot;\&quot; not found via &quot; +
+                        &quot;thread context class loader &quot; +
+                        &quot;(no security manager: codebase disabled)&quot;, e);
+                }
+<span class="fc" id="L394">                throw new ClassNotFoundException(e.getMessage() +</span>
+                    &quot; (no security manager: RMI class loader disabled)&quot;,
+<span class="fc" id="L396">                    e.getException());</span>
+            }
+        }
+
+        /*
+         * Get or create the RMI class loader for this codebase URL path
+         * and parent class loader pair.
+         */
+<span class="fc" id="L404">        Loader loader = lookupLoader(urls, parent);</span>
+
+        try {
+<span class="pc bpc" id="L407" title="1 of 2 branches missed.">            if (loader != null) {</span>
+                /*
+                 * Verify that the caller has permission to access this loader.
+                 */
+<span class="fc" id="L411">                loader.checkPermissions();</span>
+            }
+<span class="fc" id="L413">        } catch (SecurityException e) {</span>
+            /*
+             * If the current access control context does not have permission
+             * to access all of the URLs in the codebase path, wrap the
+             * resulting security exception in a ClassNotFoundException, so
+             * the caller can handle this outcome just like any other class
+             * loading failure (see bugid 4146529).
+             */
+            try {
+                /*
+                 * But first, check to see if the named class could have been
+                 * resolved without the security-offending codebase anyway;
+                 * if so, return successfully (see bugids 4191926 &amp; 4349670).
+                 */
+<span class="fc" id="L427">                Class&lt;?&gt; c = loadClassForName(name, false, parent);</span>
+<span class="pc bpc" id="L428" title="1 of 2 branches missed.">                if (loaderLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="nc" id="L429">                    loaderLog.log(Log.VERBOSE,</span>
+                        &quot;class \&quot;&quot; + name + &quot;\&quot; found via &quot; +
+                        &quot;thread context class loader &quot; +
+                        &quot;(access to codebase denied), &quot; +
+<span class="nc" id="L433">                        &quot;defined by &quot; + c.getClassLoader());</span>
+                }
+<span class="fc" id="L435">                return c;</span>
+<span class="nc" id="L436">            } catch (ClassNotFoundException unimportant) {</span>
+                /*
+                 * Presumably the security exception is the more important
+                 * exception to report in this case.
+                 */
+<span class="nc bnc" id="L441" title="All 2 branches missed.">                if (loaderLog.isLoggable(Log.BRIEF)) {</span>
+<span class="nc" id="L442">                    loaderLog.log(Log.BRIEF,</span>
+                        &quot;class \&quot;&quot; + name + &quot;\&quot; not found via &quot; +
+                        &quot;thread context class loader &quot; +
+                        &quot;(access to codebase denied)&quot;, e);
+                }
+<span class="nc" id="L447">                throw new ClassNotFoundException(</span>
+                    &quot;access to class loader denied&quot;, e);
+            }
+<span class="fc" id="L450">        }</span>
+
+        try {
+<span class="fc" id="L453">            Class&lt;?&gt; c = loadClassForName(name, false, loader);</span>
+<span class="pc bpc" id="L454" title="1 of 2 branches missed.">            if (loaderLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="nc" id="L455">                loaderLog.log(Log.VERBOSE,</span>
+                    &quot;class \&quot;&quot; + name + &quot;\&quot; &quot; + &quot;found via codebase, &quot; +
+<span class="nc" id="L457">                    &quot;defined by &quot; + c.getClassLoader());</span>
+            }
+<span class="fc" id="L459">            return c;</span>
+<span class="fc" id="L460">        } catch (ClassNotFoundException e) {</span>
+<span class="pc bpc" id="L461" title="1 of 2 branches missed.">            if (loaderLog.isLoggable(Log.BRIEF)) {</span>
+<span class="nc" id="L462">                loaderLog.log(Log.BRIEF,</span>
+                    &quot;class \&quot;&quot; + name + &quot;\&quot; not found via codebase&quot;, e);
+            }
+<span class="fc" id="L465">            throw e;</span>
+        }
+    }
+
+    /**
+     * Define and return a dynamic proxy class in a class loader with
+     * URLs supplied in the given location.  The proxy class will
+     * implement interface classes named by the given array of
+     * interface names.
+     */
+    public static Class&lt;?&gt; loadProxyClass(String codebase, String[] interfaces,
+                                          ClassLoader defaultLoader)
+        throws MalformedURLException, ClassNotFoundException
+    {
+<span class="fc bfc" id="L479" title="All 2 branches covered.">        if (loaderLog.isLoggable(Log.BRIEF)) {</span>
+<span class="fc" id="L480">            loaderLog.log(Log.BRIEF,</span>
+<span class="pc bpc" id="L481" title="1 of 4 branches missed.">                &quot;interfaces = &quot; + Arrays.asList(interfaces) + &quot;, &quot; +</span>
+                &quot;codebase = \&quot;&quot; + (codebase != null ? codebase : &quot;&quot;) + &quot;\&quot;&quot; +
+                (defaultLoader != null ?
+                 &quot;, defaultLoader = &quot; + defaultLoader : &quot;&quot;));
+        }
+
+        /*
+         * This method uses a fairly complex algorithm to load the
+         * proxy class and its interface classes in order to maximize
+         * the likelihood that the proxy's codebase annotation will be
+         * preserved.  The algorithm is (assuming that all of the
+         * proxy interface classes are public):
+         *
+         * If the default loader is not null, try to load the proxy
+         * interfaces through that loader. If the interfaces can be
+         * loaded in that loader, try to define the proxy class in an
+         * RMI class loader (child of the context class loader) before
+         * trying to define the proxy in the default loader.  If the
+         * attempt to define the proxy class succeeds, the codebase
+         * annotation is preserved.  If the attempt fails, try to
+         * define the proxy class in the default loader.
+         *
+         * If the interface classes can not be loaded from the default
+         * loader or the default loader is null, try to load them from
+         * the RMI class loader.  Then try to define the proxy class
+         * in the RMI class loader.
+         *
+         * Additionally, if any of the proxy interface classes are not
+         * public, all of the non-public interfaces must reside in the
+         * same class loader or it will be impossible to define the
+         * proxy class (an IllegalAccessError will be thrown).  An
+         * attempt to load the interfaces from the default loader is
+         * made.  If the attempt fails, a second attempt will be made
+         * to load the interfaces from the RMI loader. If all of the
+         * non-public interfaces classes do reside in the same class
+         * loader, then we attempt to define the proxy class in the
+         * class loader of the non-public interfaces.  No other
+         * attempt to define the proxy class will be made.
+         */
+<span class="fc" id="L520">        ClassLoader parent = getRMIContextClassLoader();</span>
+<span class="fc bfc" id="L521" title="All 2 branches covered.">        if (loaderLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="fc" id="L522">            loaderLog.log(Log.VERBOSE,</span>
+                &quot;(thread context class loader: &quot; + parent + &quot;)&quot;);
+        }
+
+        URL[] urls;
+<span class="fc bfc" id="L527" title="All 2 branches covered.">        if (codebase != null) {</span>
+<span class="fc" id="L528">            urls = pathToURLs(codebase);</span>
+        } else {
+<span class="fc" id="L530">            urls = getDefaultCodebaseURLs();</span>
+        }
+
+        /*
+         * If no security manager is set, disable access to RMI class
+         * loaders and use the would-de parent instead.
+         */
+<span class="fc" id="L537">        SecurityManager sm = System.getSecurityManager();</span>
+<span class="fc bfc" id="L538" title="All 2 branches covered.">        if (sm == null) {</span>
+            try {
+<span class="fc" id="L540">                Class&lt;?&gt; c = loadProxyClass(interfaces, defaultLoader, parent,</span>
+                                         false);
+<span class="fc bfc" id="L542" title="All 2 branches covered.">                if (loaderLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="fc" id="L543">                    loaderLog.log(Log.VERBOSE,</span>
+                        &quot;(no security manager: codebase disabled) &quot; +
+<span class="fc" id="L545">                        &quot;proxy class defined by &quot; + c.getClassLoader());</span>
+                }
+<span class="fc" id="L547">                return c;</span>
+<span class="nc" id="L548">            } catch (ClassNotFoundException e) {</span>
+<span class="nc bnc" id="L549" title="All 2 branches missed.">                if (loaderLog.isLoggable(Log.BRIEF)) {</span>
+<span class="nc" id="L550">                    loaderLog.log(Log.BRIEF,</span>
+                        &quot;(no security manager: codebase disabled) &quot; +
+                        &quot;proxy class resolution failed&quot;, e);
+                }
+<span class="nc" id="L554">                throw new ClassNotFoundException(e.getMessage() +</span>
+                    &quot; (no security manager: RMI class loader disabled)&quot;,
+<span class="nc" id="L556">                    e.getException());</span>
+            }
+        }
+
+        /*
+         * Get or create the RMI class loader for this codebase URL path
+         * and parent class loader pair.
+         */
+<span class="fc" id="L564">        Loader loader = lookupLoader(urls, parent);</span>
+
+        try {
+<span class="pc bpc" id="L567" title="1 of 2 branches missed.">            if (loader != null) {</span>
+                /*
+                 * Verify that the caller has permission to access this loader.
+                 */
+<span class="fc" id="L571">                loader.checkPermissions();</span>
+            }
+<span class="nc" id="L573">        } catch (SecurityException e) {</span>
+            /*
+             * If the current access control context does not have permission
+             * to access all of the URLs in the codebase path, wrap the
+             * resulting security exception in a ClassNotFoundException, so
+             * the caller can handle this outcome just like any other class
+             * loading failure (see bugid 4146529).
+             */
+            try {
+                /*
+                 * But first, check to see if the proxy class could have been
+                 * resolved without the security-offending codebase anyway;
+                 * if so, return successfully (see bugids 4191926 &amp; 4349670).
+                 */
+<span class="nc" id="L587">                Class&lt;?&gt; c = loadProxyClass(interfaces, defaultLoader, parent,</span>
+                                            false);
+<span class="nc bnc" id="L589" title="All 2 branches missed.">                if (loaderLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="nc" id="L590">                    loaderLog.log(Log.VERBOSE,</span>
+                        &quot;(access to codebase denied) &quot; +
+<span class="nc" id="L592">                        &quot;proxy class defined by &quot; + c.getClassLoader());</span>
+                }
+<span class="nc" id="L594">                return c;</span>
+<span class="nc" id="L595">            } catch (ClassNotFoundException unimportant) {</span>
+                /*
+                 * Presumably the security exception is the more important
+                 * exception to report in this case.
+                 */
+<span class="nc bnc" id="L600" title="All 2 branches missed.">                if (loaderLog.isLoggable(Log.BRIEF)) {</span>
+<span class="nc" id="L601">                    loaderLog.log(Log.BRIEF,</span>
+                        &quot;(access to codebase denied) &quot; +
+                        &quot;proxy class resolution failed&quot;, e);
+                }
+<span class="nc" id="L605">                throw new ClassNotFoundException(</span>
+                    &quot;access to class loader denied&quot;, e);
+            }
+<span class="fc" id="L608">        }</span>
+
+        try {
+<span class="fc" id="L611">            Class&lt;?&gt; c = loadProxyClass(interfaces, defaultLoader, loader, true);</span>
+<span class="pc bpc" id="L612" title="1 of 2 branches missed.">            if (loaderLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="nc" id="L613">                loaderLog.log(Log.VERBOSE,</span>
+<span class="nc" id="L614">                              &quot;proxy class defined by &quot; + c.getClassLoader());</span>
+            }
+<span class="fc" id="L616">            return c;</span>
+<span class="fc" id="L617">        } catch (ClassNotFoundException e) {</span>
+<span class="pc bpc" id="L618" title="1 of 2 branches missed.">            if (loaderLog.isLoggable(Log.BRIEF)) {</span>
+<span class="nc" id="L619">                loaderLog.log(Log.BRIEF,</span>
+                              &quot;proxy class resolution failed&quot;, e);
+            }
+<span class="fc" id="L622">            throw e;</span>
+        }
+    }
+
+    /**
+     * Define a proxy class in the default loader if appropriate.
+     * Define the class in an RMI class loader otherwise.  The proxy
+     * class will implement classes which are named in the supplied
+     * interfaceNames.
+     */
+    private static Class&lt;?&gt; loadProxyClass(String[] interfaceNames,
+                                           ClassLoader defaultLoader,
+                                           ClassLoader codebaseLoader,
+                                           boolean preferCodebase)
+        throws ClassNotFoundException
+    {
+<span class="fc" id="L638">        ClassLoader proxyLoader = null;</span>
+<span class="fc" id="L639">        Class&lt;?&gt;[] classObjs = new Class&lt;?&gt;[interfaceNames.length];</span>
+<span class="fc" id="L640">        boolean[] nonpublic = { false };</span>
+
+      defaultLoaderCase:
+<span class="fc bfc" id="L643" title="All 2 branches covered.">        if (defaultLoader != null) {</span>
+            try {
+<span class="fc" id="L645">                proxyLoader =</span>
+<span class="fc" id="L646">                    loadProxyInterfaces(interfaceNames, defaultLoader,</span>
+                                        classObjs, nonpublic);
+<span class="fc bfc" id="L648" title="All 2 branches covered.">                if (loaderLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="fc" id="L649">                    ClassLoader[] definingLoaders =</span>
+                        new ClassLoader[classObjs.length];
+<span class="fc bfc" id="L651" title="All 2 branches covered.">                    for (int i = 0; i &lt; definingLoaders.length; i++) {</span>
+<span class="fc" id="L652">                        definingLoaders[i] = classObjs[i].getClassLoader();</span>
+                    }
+<span class="fc" id="L654">                    loaderLog.log(Log.VERBOSE,</span>
+                        &quot;proxy interfaces found via defaultLoader, &quot; +
+<span class="fc" id="L656">                        &quot;defined by &quot; + Arrays.asList(definingLoaders));</span>
+                }
+<span class="fc" id="L658">            } catch (ClassNotFoundException e) {</span>
+<span class="fc" id="L659">                break defaultLoaderCase;</span>
+<span class="fc" id="L660">            }</span>
+<span class="fc bfc" id="L661" title="All 2 branches covered.">            if (!nonpublic[0]) {</span>
+<span class="fc bfc" id="L662" title="All 2 branches covered.">                if (preferCodebase) {</span>
+                    try {
+<span class="fc" id="L664">                        return Proxy.getProxyClass(codebaseLoader, classObjs);</span>
+<span class="nc" id="L665">                    } catch (IllegalArgumentException e) {</span>
+                    }
+                }
+<span class="fc" id="L668">                proxyLoader = defaultLoader;</span>
+            }
+<span class="fc" id="L670">            return loadProxyClass(proxyLoader, classObjs);</span>
+        }
+
+<span class="fc" id="L673">        nonpublic[0] = false;</span>
+<span class="fc" id="L674">        proxyLoader = loadProxyInterfaces(interfaceNames, codebaseLoader,</span>
+                                          classObjs, nonpublic);
+<span class="fc bfc" id="L676" title="All 2 branches covered.">        if (loaderLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="fc" id="L677">            ClassLoader[] definingLoaders = new ClassLoader[classObjs.length];</span>
+<span class="fc bfc" id="L678" title="All 2 branches covered.">            for (int i = 0; i &lt; definingLoaders.length; i++) {</span>
+<span class="fc" id="L679">                definingLoaders[i] = classObjs[i].getClassLoader();</span>
+            }
+<span class="fc" id="L681">            loaderLog.log(Log.VERBOSE,</span>
+                &quot;proxy interfaces found via codebase, &quot; +
+<span class="fc" id="L683">                &quot;defined by &quot; + Arrays.asList(definingLoaders));</span>
+        }
+<span class="fc bfc" id="L685" title="All 2 branches covered.">        if (!nonpublic[0]) {</span>
+<span class="fc" id="L686">            proxyLoader = codebaseLoader;</span>
+        }
+<span class="fc" id="L688">        return loadProxyClass(proxyLoader, classObjs);</span>
+    }
+
+    /**
+     * Define a proxy class in the given class loader.  The proxy
+     * class will implement the given interfaces Classes.
+     */
+    private static Class&lt;?&gt; loadProxyClass(ClassLoader loader, Class&lt;?&gt;[] interfaces)
+        throws ClassNotFoundException
+    {
+        try {
+<span class="fc" id="L699">            return Proxy.getProxyClass(loader, interfaces);</span>
+<span class="nc" id="L700">        } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L701">            throw new ClassNotFoundException(</span>
+                &quot;error creating dynamic proxy class&quot;, e);
+        }
+    }
+
+    /*
+     * Load Class objects for the names in the interfaces array fron
+     * the given class loader.
+     *
+     * We pass classObjs and nonpublic arrays to avoid needing a
+     * multi-element return value.  nonpublic is an array to enable
+     * the method to take a boolean argument by reference.
+     *
+     * nonpublic array is needed to signal when the return value of
+     * this method should be used as the proxy class loader.  Because
+     * null represents a valid class loader, that value is
+     * insufficient to signal that the return value should not be used
+     * as the proxy class loader.
+     */
+    private static ClassLoader loadProxyInterfaces(String[] interfaces,
+                                                   ClassLoader loader,
+                                                   Class&lt;?&gt;[] classObjs,
+                                                   boolean[] nonpublic)
+        throws ClassNotFoundException
+    {
+        /* loader of a non-public interface class */
+<span class="fc" id="L727">        ClassLoader nonpublicLoader = null;</span>
+
+<span class="fc bfc" id="L729" title="All 2 branches covered.">        for (int i = 0; i &lt; interfaces.length; i++) {</span>
+<span class="fc" id="L730">            Class&lt;?&gt; cl =</span>
+<span class="fc" id="L731">                (classObjs[i] = loadClassForName(interfaces[i], false, loader));</span>
+
+<span class="fc bfc" id="L733" title="All 2 branches covered.">            if (!Modifier.isPublic(cl.getModifiers())) {</span>
+<span class="fc" id="L734">                ClassLoader current = cl.getClassLoader();</span>
+<span class="fc bfc" id="L735" title="All 2 branches covered.">                if (loaderLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="fc" id="L736">                    loaderLog.log(Log.VERBOSE,</span>
+                        &quot;non-public interface \&quot;&quot; + interfaces[i] +
+                        &quot;\&quot; defined by &quot; + current);
+                }
+<span class="fc bfc" id="L740" title="All 2 branches covered.">                if (!nonpublic[0]) {</span>
+<span class="fc" id="L741">                    nonpublicLoader = current;</span>
+<span class="fc" id="L742">                    nonpublic[0] = true;</span>
+<span class="pc bpc" id="L743" title="1 of 2 branches missed.">                } else if (current != nonpublicLoader) {</span>
+<span class="fc" id="L744">                    throw new IllegalAccessError(</span>
+                        &quot;non-public interfaces defined in different &quot; +
+                        &quot;class loaders&quot;);
+                }
+            }
+        }
+<span class="fc" id="L750">        return nonpublicLoader;</span>
+    }
+
+    /**
+     * Convert a string containing a space-separated list of URLs into a
+     * corresponding array of URL objects, throwing a MalformedURLException
+     * if any of the URLs are invalid.
+     */
+    private static URL[] pathToURLs(String path)
+        throws MalformedURLException
+    {
+<span class="fc" id="L761">        synchronized (pathToURLsCache) {</span>
+<span class="fc" id="L762">            Object[] v = pathToURLsCache.get(path);</span>
+<span class="fc bfc" id="L763" title="All 2 branches covered.">            if (v != null) {</span>
+<span class="fc" id="L764">                return ((URL[])v[0]);</span>
+            }
+<span class="pc" id="L766">        }</span>
+<span class="fc" id="L767">        StringTokenizer st = new StringTokenizer(path); // divide by spaces</span>
+<span class="fc" id="L768">        URL[] urls = new URL[st.countTokens()];</span>
+<span class="fc bfc" id="L769" title="All 2 branches covered.">        for (int i = 0; st.hasMoreTokens(); i++) {</span>
+<span class="fc" id="L770">            urls[i] = new URL(st.nextToken());</span>
+        }
+<span class="fc" id="L772">        synchronized (pathToURLsCache) {</span>
+<span class="fc" id="L773">            pathToURLsCache.put(path,</span>
+                                new Object[] {urls, new SoftReference&lt;String&gt;(path)});
+<span class="pc" id="L775">        }</span>
+<span class="fc" id="L776">        return urls;</span>
+    }
+
+    /** map from weak(key=string) to [URL[], soft(key)] */
+<span class="fc" id="L780">    private static final Map&lt;String, Object[]&gt; pathToURLsCache</span>
+        = new WeakHashMap&lt;&gt;(5);
+
+    /**
+     * Convert an array of URL objects into a corresponding string
+     * containing a space-separated list of URLs.
+     *
+     * Note that if the array has zero elements, the return value is
+     * null, not the empty string.
+     */
+    private static String urlsToPath(URL[] urls) {
+<span class="fc bfc" id="L791" title="All 2 branches covered.">        if (urls.length == 0) {</span>
+<span class="fc" id="L792">            return null;</span>
+<span class="fc bfc" id="L793" title="All 2 branches covered.">        } else if (urls.length == 1) {</span>
+<span class="fc" id="L794">            return urls[0].toExternalForm();</span>
+        } else {
+<span class="fc" id="L796">            StringBuffer path = new StringBuffer(urls[0].toExternalForm());</span>
+<span class="fc bfc" id="L797" title="All 2 branches covered.">            for (int i = 1; i &lt; urls.length; i++) {</span>
+<span class="fc" id="L798">                path.append(' ');</span>
+<span class="fc" id="L799">                path.append(urls[i].toExternalForm());</span>
+            }
+<span class="fc" id="L801">            return path.toString();</span>
+        }
+    }
+
+    /**
+     * Return the class loader to be used as the parent for an RMI class
+     * loader used in the current execution context.
+     */
+    private static ClassLoader getRMIContextClassLoader() {
+        /*
+         * The current implementation simply uses the current thread's
+         * context class loader.
+         */
+<span class="fc" id="L814">        return Thread.currentThread().getContextClassLoader();</span>
+    }
+
+    /**
+     * Look up the RMI class loader for the given codebase URL path
+     * and the given parent class loader.  A new class loader instance
+     * will be created and returned if no match is found.
+     */
+    private static Loader lookupLoader(final URL[] urls,
+                                       final ClassLoader parent)
+    {
+        /*
+         * If the requested codebase URL path is empty, the supplied
+         * parent class loader will be sufficient.
+         *
+         * REMIND: To be conservative, this optimization is commented out
+         * for now so that it does not open a security hole in the future
+         * by providing untrusted code with direct access to the public
+         * loadClass() method of a class loader instance that it cannot
+         * get a reference to.  (It's an unlikely optimization anyway.)
+         *
+         * if (urls.length == 0) {
+         *     return parent;
+         * }
+         */
+
+        LoaderEntry entry;
+        Loader loader;
+
+<span class="fc" id="L843">        synchronized (LoaderHandler.class) {</span>
+            /*
+             * Take this opportunity to remove from the table entries
+             * whose weak references have been cleared.
+             */
+<span class="fc bfc" id="L848" title="All 2 branches covered.">            while ((entry = (LoaderEntry) refQueue.poll()) != null) {</span>
+<span class="pc bpc" id="L849" title="1 of 2 branches missed.">                if (!entry.removed) {   // ignore entries removed below</span>
+<span class="fc" id="L850">                    loaderTable.remove(entry.key);</span>
+                }
+            }
+
+            /*
+             * Look up the codebase URL path and parent class loader pair
+             * in the table of RMI class loaders.
+             */
+<span class="fc" id="L858">            LoaderKey key = new LoaderKey(urls, parent);</span>
+<span class="fc" id="L859">            entry = loaderTable.get(key);</span>
+
+<span class="pc bpc" id="L861" title="1 of 4 branches missed.">            if (entry == null || (loader = entry.get()) == null) {</span>
+                /*
+                 * If entry was in table but it's weak reference was cleared,
+                 * remove it from the table and mark it as explicitly cleared,
+                 * so that new matching entry that we put in the table will
+                 * not be erroneously removed when this entry is processed
+                 * from the weak reference queue.
+                 */
+<span class="pc bpc" id="L869" title="1 of 2 branches missed.">                if (entry != null) {</span>
+<span class="nc" id="L870">                    loaderTable.remove(key);</span>
+<span class="nc" id="L871">                    entry.removed = true;</span>
+                }
+
+                /*
+                 * A matching loader was not found, so create a new class
+                 * loader instance for the requested codebase URL path and
+                 * parent class loader.  The instance is created within an
+                 * access control context retricted to the permissions
+                 * necessary to load classes from its codebase URL path.
+                 */
+<span class="fc" id="L881">                AccessControlContext acc = getLoaderAccessControlContext(urls);</span>
+<span class="fc" id="L882">                loader = java.security.AccessController.doPrivileged(</span>
+<span class="fc" id="L883">                    new java.security.PrivilegedAction&lt;Loader&gt;() {</span>
+                        public Loader run() {
+<span class="fc" id="L885">                            return new Loader(urls, parent);</span>
+                        }
+                    }, acc);
+
+                /*
+                 * Finally, create an entry to hold the new loader with a
+                 * weak reference and store it in the table with the key.
+                 */
+<span class="fc" id="L893">                entry = new LoaderEntry(key, loader);</span>
+<span class="fc" id="L894">                loaderTable.put(key, entry);</span>
+            }
+<span class="pc" id="L896">        }</span>
+
+<span class="fc" id="L898">        return loader;</span>
+    }
+
+    /**
+     * LoaderKey holds a codebase URL path and parent class loader pair
+     * used to look up RMI class loader instances in its class loader cache.
+     */
+    private static class LoaderKey {
+
+        private URL[] urls;
+
+        private ClassLoader parent;
+
+        private int hashValue;
+
+<span class="fc" id="L913">        public LoaderKey(URL[] urls, ClassLoader parent) {</span>
+<span class="fc" id="L914">            this.urls = urls;</span>
+<span class="fc" id="L915">            this.parent = parent;</span>
+
+<span class="pc bpc" id="L917" title="1 of 2 branches missed.">            if (parent != null) {</span>
+<span class="fc" id="L918">                hashValue = parent.hashCode();</span>
+            }
+<span class="fc bfc" id="L920" title="All 2 branches covered.">            for (int i = 0; i &lt; urls.length; i++) {</span>
+<span class="fc" id="L921">                hashValue ^= urls[i].hashCode();</span>
+            }
+<span class="fc" id="L923">        }</span>
+
+        public int hashCode() {
+<span class="fc" id="L926">            return hashValue;</span>
+        }
+
+        public boolean equals(Object obj) {
+<span class="pc bpc" id="L930" title="1 of 2 branches missed.">            if (obj instanceof LoaderKey) {</span>
+<span class="fc" id="L931">                LoaderKey other = (LoaderKey) obj;</span>
+<span class="pc bpc" id="L932" title="1 of 2 branches missed.">                if (parent != other.parent) {</span>
+<span class="nc" id="L933">                    return false;</span>
+                }
+<span class="pc bpc" id="L935" title="1 of 2 branches missed.">                if (urls == other.urls) {</span>
+<span class="fc" id="L936">                    return true;</span>
+                }
+<span class="nc bnc" id="L938" title="All 2 branches missed.">                if (urls.length != other.urls.length) {</span>
+<span class="nc" id="L939">                    return false;</span>
+                }
+<span class="nc bnc" id="L941" title="All 2 branches missed.">                for (int i = 0; i &lt; urls.length; i++) {</span>
+<span class="nc bnc" id="L942" title="All 2 branches missed.">                    if (!urls[i].equals(other.urls[i])) {</span>
+<span class="nc" id="L943">                        return false;</span>
+                    }
+                }
+<span class="nc" id="L946">                return true;</span>
+            } else {
+<span class="nc" id="L948">                return false;</span>
+            }
+        }
+    }
+
+    /**
+     * LoaderEntry contains a weak reference to an RMIClassLoader.  The
+     * weak reference is registered with the private static &quot;refQueue&quot;
+     * queue.  The entry contains the codebase URL path and parent class
+     * loader key for the loader so that the mapping can be removed from
+     * the table efficiently when the weak reference is cleared.
+     */
+    private static class LoaderEntry extends WeakReference&lt;Loader&gt; {
+
+        public LoaderKey key;
+
+        /**
+         * set to true if the entry has been removed from the table
+         * because it has been replaced, so it should not be attempted
+         * to be removed again
+         */
+<span class="fc" id="L969">        public boolean removed = false;</span>
+
+        public LoaderEntry(LoaderKey key, Loader loader) {
+<span class="fc" id="L972">            super(loader, refQueue);</span>
+<span class="fc" id="L973">            this.key = key;</span>
+<span class="fc" id="L974">        }</span>
+    }
+
+    /**
+     * Return the access control context that a loader for the given
+     * codebase URL path should execute with.
+     */
+    private static AccessControlContext getLoaderAccessControlContext(
+        URL[] urls)
+    {
+        /*
+         * The approach used here is taken from the similar method
+         * getAccessControlContext() in the sun.applet.AppletPanel class.
+         */
+        // begin with permissions granted to all code in current policy
+<span class="fc" id="L989">        PermissionCollection perms =</span>
+<span class="fc" id="L990">            java.security.AccessController.doPrivileged(</span>
+<span class="fc" id="L991">                new java.security.PrivilegedAction&lt;PermissionCollection&gt;() {</span>
+                public PermissionCollection run() {
+<span class="fc" id="L993">                    CodeSource codesource = new CodeSource(null,</span>
+                        (java.security.cert.Certificate[]) null);
+<span class="fc" id="L995">                    Policy p = java.security.Policy.getPolicy();</span>
+<span class="pc bpc" id="L996" title="1 of 2 branches missed.">                    if (p != null) {</span>
+<span class="fc" id="L997">                        return p.getPermissions(codesource);</span>
+                    } else {
+<span class="nc" id="L999">                        return new Permissions();</span>
+                    }
+                }
+            });
+
+        // createClassLoader permission needed to create loader in context
+<span class="fc" id="L1005">        perms.add(new RuntimePermission(&quot;createClassLoader&quot;));</span>
+
+        // add permissions to read any &quot;java.*&quot; property
+<span class="fc" id="L1008">        perms.add(new java.util.PropertyPermission(&quot;java.*&quot;,&quot;read&quot;));</span>
+
+        // add permissions reuiqred to load from codebase URL path
+<span class="fc" id="L1011">        addPermissionsForURLs(urls, perms, true);</span>
+
+        /*
+         * Create an AccessControlContext that consists of a single
+         * protection domain with only the permissions calculated above.
+         */
+<span class="fc bfc" id="L1017" title="All 2 branches covered.">        ProtectionDomain pd = new ProtectionDomain(</span>
+            new CodeSource((urls.length &gt; 0 ? urls[0] : null),
+                (java.security.cert.Certificate[]) null),
+            perms);
+<span class="fc" id="L1021">        return new AccessControlContext(new ProtectionDomain[] { pd });</span>
+    }
+
+    /**
+     * Adds to the specified permission collection the permissions
+     * necessary to load classes from a loader with the specified URL
+     * path; if &quot;forLoader&quot; is true, also adds URL-specific
+     * permissions necessary for the security context that such a
+     * loader operates within, such as permissions necessary for
+     * granting automatic permissions to classes defined by the
+     * loader.  A given permission is only added to the collection if
+     * it is not already implied by the collection.
+     */
+    private static void addPermissionsForURLs(URL[] urls,
+                                             PermissionCollection perms,
+                                             boolean forLoader)
+    {
+<span class="fc bfc" id="L1038" title="All 2 branches covered.">        for (int i = 0; i &lt; urls.length; i++) {</span>
+<span class="fc" id="L1039">            URL url = urls[i];</span>
+            try {
+<span class="fc" id="L1041">                URLConnection urlConnection = url.openConnection();</span>
+<span class="fc" id="L1042">                Permission p = urlConnection.getPermission();</span>
+<span class="pc bpc" id="L1043" title="1 of 2 branches missed.">                if (p != null) {</span>
+<span class="fc bfc" id="L1044" title="All 2 branches covered.">                    if (p instanceof FilePermission) {</span>
+                        /*
+                         * If the codebase is a file, the permission required
+                         * to actually read classes from the codebase URL is
+                         * the permission to read all files beneath the last
+                         * directory in the file path, either because JAR
+                         * files can refer to other JAR files in the same
+                         * directory, or because permission to read a
+                         * directory is not implied by permission to read the
+                         * contents of a directory, which all that might be
+                         * granted.
+                         */
+<span class="fc" id="L1056">                        String path = p.getName();</span>
+<span class="fc" id="L1057">                        int endIndex = path.lastIndexOf(File.separatorChar);</span>
+<span class="pc bpc" id="L1058" title="1 of 2 branches missed.">                        if (endIndex != -1) {</span>
+<span class="fc" id="L1059">                            path = path.substring(0, endIndex+1);</span>
+<span class="pc bpc" id="L1060" title="1 of 2 branches missed.">                            if (path.endsWith(File.separator)) {</span>
+<span class="fc" id="L1061">                                path += &quot;-&quot;;</span>
+                            }
+<span class="fc" id="L1063">                            Permission p2 = new FilePermission(path, &quot;read&quot;);</span>
+<span class="fc bfc" id="L1064" title="All 2 branches covered.">                            if (!perms.implies(p2)) {</span>
+<span class="fc" id="L1065">                                perms.add(p2);</span>
+                            }
+<span class="fc" id="L1067">                            perms.add(new FilePermission(path, &quot;read&quot;));</span>
+<span class="fc" id="L1068">                        } else {</span>
+                            /*
+                             * No directory separator: use permission to
+                             * read the file.
+                             */
+<span class="nc bnc" id="L1073" title="All 2 branches missed.">                            if (!perms.implies(p)) {</span>
+<span class="nc" id="L1074">                                perms.add(p);</span>
+                            }
+                        }
+<span class="fc" id="L1077">                    } else {</span>
+<span class="pc bpc" id="L1078" title="1 of 2 branches missed.">                        if (!perms.implies(p)) {</span>
+<span class="fc" id="L1079">                            perms.add(p);</span>
+                        }
+
+                        /*
+                         * If the purpose of these permissions is to grant
+                         * them to an instance of a URLClassLoader subclass,
+                         * we must add permission to connect to and accept
+                         * from the host of non-&quot;file:&quot; URLs, otherwise the
+                         * getPermissions() method of URLClassLoader will
+                         * throw a security exception.
+                         */
+<span class="fc bfc" id="L1090" title="All 2 branches covered.">                        if (forLoader) {</span>
+                            // get URL with meaningful host component
+<span class="fc" id="L1092">                            URL hostURL = url;</span>
+<span class="fc" id="L1093">                            for (URLConnection conn = urlConnection;</span>
+<span class="pc bpc" id="L1094" title="1 of 2 branches missed.">                                 conn instanceof JarURLConnection;)</span>
+                            {
+<span class="nc" id="L1096">                                hostURL =</span>
+<span class="nc" id="L1097">                                    ((JarURLConnection) conn).getJarFileURL();</span>
+<span class="nc" id="L1098">                                conn = hostURL.openConnection();</span>
+                            }
+<span class="fc" id="L1100">                            String host = hostURL.getHost();</span>
+<span class="pc bpc" id="L1101" title="1 of 2 branches missed.">                            if (host != null &amp;&amp;</span>
+<span class="pc bpc" id="L1102" title="1 of 2 branches missed.">                                p.implies(new SocketPermission(host,</span>
+                                                               &quot;resolve&quot;)))
+                            {
+<span class="fc" id="L1105">                                Permission p2 =</span>
+                                    new SocketPermission(host,
+                                                         &quot;connect,accept&quot;);
+<span class="pc bpc" id="L1108" title="1 of 2 branches missed.">                                if (!perms.implies(p2)) {</span>
+<span class="fc" id="L1109">                                    perms.add(p2);</span>
+                                }
+                            }
+                        }
+                    }
+                }
+<span class="nc" id="L1115">            } catch (IOException e) {</span>
+                /*
+                 * This shouldn't happen, although it is declared to be
+                 * thrown by openConnection() and getPermission().  If it
+                 * does, don't bother granting or requiring any permissions
+                 * for this URL.
+                 */
+<span class="fc" id="L1122">            }</span>
+        }
+<span class="fc" id="L1124">    }</span>
+
+    /**
+     * Loader is the actual class of the RMI class loaders created
+     * by the RMIClassLoader static methods.
+     */
+    private static class Loader extends URLClassLoader {
+
+        /** parent class loader, kept here as an optimization */
+        private ClassLoader parent;
+
+        /** string form of loader's codebase URL path, also an optimization */
+        private String annotation;
+
+        /** permissions required to access loader through public API */
+        private Permissions permissions;
+
+        private Loader(URL[] urls, ClassLoader parent) {
+<span class="fc" id="L1142">            super(urls, parent);</span>
+<span class="fc" id="L1143">            this.parent = parent;</span>
+
+            /*
+             * Precompute the permissions required to access the loader.
+             */
+<span class="fc" id="L1148">            permissions = new Permissions();</span>
+<span class="fc" id="L1149">            addPermissionsForURLs(urls, permissions, false);</span>
+
+            /*
+             * Caching the value of class annotation string here assumes
+             * that the protected method addURL() is never called on this
+             * class loader.
+             */
+<span class="fc" id="L1156">            annotation = urlsToPath(urls);</span>
+<span class="fc" id="L1157">        }</span>
+
+        /**
+         * Return the string to be annotated with all classes loaded from
+         * this class loader.
+         */
+        public String getClassAnnotation() {
+<span class="fc" id="L1164">            return annotation;</span>
+        }
+
+        /**
+         * Check that the current access control context has all of the
+         * permissions necessary to load classes from this loader.
+         */
+        private void checkPermissions() {
+<span class="fc" id="L1172">            SecurityManager sm = System.getSecurityManager();</span>
+<span class="pc bpc" id="L1173" title="1 of 2 branches missed.">            if (sm != null) {           // should never be null?</span>
+<span class="fc" id="L1174">                Enumeration&lt;Permission&gt; enum_ = permissions.elements();</span>
+<span class="fc bfc" id="L1175" title="All 2 branches covered.">                while (enum_.hasMoreElements()) {</span>
+<span class="fc" id="L1176">                    sm.checkPermission(enum_.nextElement());</span>
+                }
+            }
+<span class="fc" id="L1179">        }</span>
+
+        /**
+         * Return the permissions to be granted to code loaded from the
+         * given code source.
+         */
+        protected PermissionCollection getPermissions(CodeSource codesource) {
+<span class="fc" id="L1186">            PermissionCollection perms = super.getPermissions(codesource);</span>
+            /*
+             * Grant the same permissions that URLClassLoader would grant.
+             */
+<span class="fc" id="L1190">            return perms;</span>
+        }
+
+        /**
+         * Return a string representation of this loader (useful for
+         * debugging).
+         */
+        public String toString() {
+<span class="fc" id="L1198">            return super.toString() + &quot;[\&quot;&quot; + annotation + &quot;\&quot;]&quot;;</span>
+        }
+
+        @Override
+        protected Class&lt;?&gt; loadClass(String name, boolean resolve)
+                throws ClassNotFoundException {
+<span class="pc bpc" id="L1204" title="1 of 2 branches missed.">            if (parent == null) {</span>
+<span class="nc" id="L1205">                ReflectUtil.checkPackageAccess(name);</span>
+            }
+<span class="fc" id="L1207">            return super.loadClass(name, resolve);</span>
+        }
+
+
+    }
+
+    private static Class&lt;?&gt; loadClassForName(String name,
+                                              boolean initialize,
+                                              ClassLoader loader)
+            throws ClassNotFoundException
+    {
+<span class="pc bpc" id="L1218" title="1 of 2 branches missed.">        if (loader == null) {</span>
+<span class="nc" id="L1219">            ReflectUtil.checkPackageAccess(name);</span>
+        }
+<span class="fc" id="L1221">        return Class.forName(name, initialize, loader);</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

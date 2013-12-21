@@ -1,0 +1,3013 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>CompletableFuture.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">java.util.concurrent</a> &gt; <span class="el_source">CompletableFuture.java</span></div><h1>CompletableFuture.java</h1><pre class="source lang-java linenums">/*
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+/*
+ * This file is available under and governed by the GNU General Public
+ * License version 2 only, as published by the Free Software Foundation.
+ * However, the following notice accompanied the original version of this
+ * file:
+ *
+ * Written by Doug Lea with assistance from members of JCP JSR-166
+ * Expert Group and released to the public domain, as explained at
+ * http://creativecommons.org/publicdomain/zero/1.0/
+ */
+
+package java.util.concurrent;
+import java.util.function.Supplier;
+import java.util.function.Consumer;
+import java.util.function.BiConsumer;
+import java.util.function.Function;
+import java.util.function.BiFunction;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ForkJoinTask;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.LockSupport;
+
+/**
+ * A {@link Future} that may be explicitly completed (setting its
+ * value and status), and may be used as a {@link CompletionStage},
+ * supporting dependent functions and actions that trigger upon its
+ * completion.
+ *
+ * &lt;p&gt;When two or more threads attempt to
+ * {@link #complete complete},
+ * {@link #completeExceptionally completeExceptionally}, or
+ * {@link #cancel cancel}
+ * a CompletableFuture, only one of them succeeds.
+ *
+ * &lt;p&gt;In addition to these and related methods for directly
+ * manipulating status and results, CompletableFuture implements
+ * interface {@link CompletionStage} with the following policies: &lt;ul&gt;
+ *
+ * &lt;li&gt;Actions supplied for dependent completions of
+ * &lt;em&gt;non-async&lt;/em&gt; methods may be performed by the thread that
+ * completes the current CompletableFuture, or by any other caller of
+ * a completion method.&lt;/li&gt;
+ *
+ * &lt;li&gt;All &lt;em&gt;async&lt;/em&gt; methods without an explicit Executor
+ * argument are performed using the {@link ForkJoinPool#commonPool()}
+ * (unless it does not support a parallelism level of at least two, in
+ * which case, a new Thread is used). To simplify monitoring,
+ * debugging, and tracking, all generated asynchronous tasks are
+ * instances of the marker interface {@link
+ * AsynchronousCompletionTask}. &lt;/li&gt;
+ *
+ * &lt;li&gt;All CompletionStage methods are implemented independently of
+ * other public methods, so the behavior of one method is not impacted
+ * by overrides of others in subclasses.  &lt;/li&gt; &lt;/ul&gt;
+ *
+ * &lt;p&gt;CompletableFuture also implements {@link Future} with the following
+ * policies: &lt;ul&gt;
+ *
+ * &lt;li&gt;Since (unlike {@link FutureTask}) this class has no direct
+ * control over the computation that causes it to be completed,
+ * cancellation is treated as just another form of exceptional
+ * completion.  Method {@link #cancel cancel} has the same effect as
+ * {@code completeExceptionally(new CancellationException())}. Method
+ * {@link #isCompletedExceptionally} can be used to determine if a
+ * CompletableFuture completed in any exceptional fashion.&lt;/li&gt;
+ *
+ * &lt;li&gt;In case of exceptional completion with a CompletionException,
+ * methods {@link #get()} and {@link #get(long, TimeUnit)} throw an
+ * {@link ExecutionException} with the same cause as held in the
+ * corresponding CompletionException.  To simplify usage in most
+ * contexts, this class also defines methods {@link #join()} and
+ * {@link #getNow} that instead throw the CompletionException directly
+ * in these cases.&lt;/li&gt; &lt;/ul&gt;
+ *
+ * @author Doug Lea
+ * @since 1.8
+ */
+public class CompletableFuture&lt;T&gt; implements Future&lt;T&gt;, CompletionStage&lt;T&gt; {
+
+    /*
+     * Overview:
+     *
+     * 1. Non-nullness of field result (set via CAS) indicates done.
+     * An AltResult is used to box null as a result, as well as to
+     * hold exceptions.  Using a single field makes completion fast
+     * and simple to detect and trigger, at the expense of a lot of
+     * encoding and decoding that infiltrates many methods. One minor
+     * simplification relies on the (static) NIL (to box null results)
+     * being the only AltResult with a null exception field, so we
+     * don't usually need explicit comparisons with NIL. The CF
+     * exception propagation mechanics surrounding decoding rely on
+     * unchecked casts of decoded results really being unchecked,
+     * where user type errors are caught at point of use, as is
+     * currently the case in Java. These are highlighted by using
+     * SuppressWarnings-annotated temporaries.
+     *
+     * 2. Waiters are held in a Treiber stack similar to the one used
+     * in FutureTask, Phaser, and SynchronousQueue. See their
+     * internal documentation for algorithmic details.
+     *
+     * 3. Completions are also kept in a list/stack, and pulled off
+     * and run when completion is triggered. (We could even use the
+     * same stack as for waiters, but would give up the potential
+     * parallelism obtained because woken waiters help release/run
+     * others -- see method postComplete).  Because post-processing
+     * may race with direct calls, class Completion opportunistically
+     * extends AtomicInteger so callers can claim the action via
+     * compareAndSet(0, 1).  The Completion.run methods are all
+     * written a boringly similar uniform way (that sometimes includes
+     * unnecessary-looking checks, kept to maintain uniformity).
+     * There are enough dimensions upon which they differ that
+     * attempts to factor commonalities while maintaining efficiency
+     * require more lines of code than they would save.
+     *
+     * 4. The exported then/and/or methods do support a bit of
+     * factoring (see doThenApply etc). They must cope with the
+     * intrinsic races surrounding addition of a dependent action
+     * versus performing the action directly because the task is
+     * already complete.  For example, a CF may not be complete upon
+     * entry, so a dependent completion is added, but by the time it
+     * is added, the target CF is complete, so must be directly
+     * executed. This is all done while avoiding unnecessary object
+     * construction in safe-bypass cases.
+     */
+
+    // preliminaries
+
+    static final class AltResult {
+        final Throwable ex; // null only for NIL
+<span class="fc" id="L163">        AltResult(Throwable ex) { this.ex = ex; }</span>
+    }
+
+<span class="fc" id="L166">    static final AltResult NIL = new AltResult(null);</span>
+
+    // Fields
+
+    volatile Object result;    // Either the result or boxed AltResult
+    volatile WaitNode waiters; // Treiber stack of threads blocked on get()
+    volatile CompletionNode completions; // list (Treiber stack) of completions
+
+    // Basic utilities for triggering and processing completions
+
+    /**
+     * Removes and signals all waiting threads and runs all completions.
+     */
+    final void postComplete() {
+        WaitNode q; Thread t;
+<span class="fc bfc" id="L181" title="All 2 branches covered.">        while ((q = waiters) != null) {</span>
+<span class="pc bpc" id="L182" title="2 of 4 branches missed.">            if (UNSAFE.compareAndSwapObject(this, WAITERS, q, q.next) &amp;&amp;</span>
+                (t = q.thread) != null) {
+<span class="fc" id="L184">                q.thread = null;</span>
+<span class="fc" id="L185">                LockSupport.unpark(t);</span>
+            }
+        }
+
+        CompletionNode h; Completion c;
+<span class="fc bfc" id="L190" title="All 2 branches covered.">        while ((h = completions) != null) {</span>
+<span class="pc bpc" id="L191" title="1 of 4 branches missed.">            if (UNSAFE.compareAndSwapObject(this, COMPLETIONS, h, h.next) &amp;&amp;</span>
+                (c = h.completion) != null)
+<span class="fc" id="L193">                c.run();</span>
+        }
+<span class="fc" id="L195">    }</span>
+
+    /**
+     * Triggers completion with the encoding of the given arguments:
+     * if the exception is non-null, encodes it as a wrapped
+     * CompletionException unless it is one already.  Otherwise uses
+     * the given result, boxed as NIL if null.
+     */
+    final void internalComplete(T v, Throwable ex) {
+<span class="fc bfc" id="L204" title="All 2 branches covered.">        if (result == null)</span>
+<span class="fc bfc" id="L205" title="All 6 branches covered.">            UNSAFE.compareAndSwapObject</span>
+<span class="fc" id="L206">                (this, RESULT, null,</span>
+                 (ex == null) ? (v == null) ? NIL : v :
+                 new AltResult((ex instanceof CompletionException) ? ex :
+                               new CompletionException(ex)));
+<span class="fc" id="L210">        postComplete(); // help out even if not triggered</span>
+<span class="fc" id="L211">    }</span>
+
+    /**
+     * If triggered, helps release and/or process completions.
+     */
+    final void helpPostComplete() {
+<span class="fc bfc" id="L217" title="All 2 branches covered.">        if (result != null)</span>
+<span class="fc" id="L218">            postComplete();</span>
+<span class="fc" id="L219">    }</span>
+
+    /* ------------- waiting for completions -------------- */
+
+    /** Number of processors, for spin control */
+<span class="fc" id="L224">    static final int NCPU = Runtime.getRuntime().availableProcessors();</span>
+
+    /**
+     * Heuristic spin value for waitingGet() before blocking on
+     * multiprocessors
+     */
+<span class="pc bpc" id="L230" title="1 of 2 branches missed.">    static final int SPINS = (NCPU &gt; 1) ? 1 &lt;&lt; 8 : 0;</span>
+
+    /**
+     * Linked nodes to record waiting threads in a Treiber stack.  See
+     * other classes such as Phaser and SynchronousQueue for more
+     * detailed explanation. This class implements ManagedBlocker to
+     * avoid starvation when blocking actions pile up in
+     * ForkJoinPools.
+     */
+    static final class WaitNode implements ForkJoinPool.ManagedBlocker {
+        long nanos;          // wait time if timed
+        final long deadline; // non-zero if timed
+        volatile int interruptControl; // &gt; 0: interruptible, &lt; 0: interrupted
+        volatile Thread thread;
+        volatile WaitNode next;
+<span class="fc" id="L245">        WaitNode(boolean interruptible, long nanos, long deadline) {</span>
+<span class="fc" id="L246">            this.thread = Thread.currentThread();</span>
+<span class="pc bpc" id="L247" title="1 of 2 branches missed.">            this.interruptControl = interruptible ? 1 : 0;</span>
+<span class="fc" id="L248">            this.nanos = nanos;</span>
+<span class="fc" id="L249">            this.deadline = deadline;</span>
+<span class="fc" id="L250">        }</span>
+        public boolean isReleasable() {
+<span class="fc bfc" id="L252" title="All 2 branches covered.">            if (thread == null)</span>
+<span class="fc" id="L253">                return true;</span>
+<span class="pc bpc" id="L254" title="1 of 2 branches missed.">            if (Thread.interrupted()) {</span>
+<span class="nc" id="L255">                int i = interruptControl;</span>
+<span class="nc" id="L256">                interruptControl = -1;</span>
+<span class="nc bnc" id="L257" title="All 2 branches missed.">                if (i &gt; 0)</span>
+<span class="nc" id="L258">                    return true;</span>
+            }
+<span class="pc bpc" id="L260" title="3 of 4 branches missed.">            if (deadline != 0L &amp;&amp;</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">                (nanos &lt;= 0L || (nanos = deadline - System.nanoTime()) &lt;= 0L)) {</span>
+<span class="nc" id="L262">                thread = null;</span>
+<span class="nc" id="L263">                return true;</span>
+            }
+<span class="fc" id="L265">            return false;</span>
+        }
+        public boolean block() {
+<span class="pc bpc" id="L268" title="1 of 2 branches missed.">            if (isReleasable())</span>
+<span class="nc" id="L269">                return true;</span>
+<span class="pc bpc" id="L270" title="1 of 2 branches missed.">            else if (deadline == 0L)</span>
+<span class="fc" id="L271">                LockSupport.park(this);</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">            else if (nanos &gt; 0L)</span>
+<span class="nc" id="L273">                LockSupport.parkNanos(this, nanos);</span>
+<span class="fc" id="L274">            return isReleasable();</span>
+        }
+    }
+
+    /**
+     * Returns raw result after waiting, or null if interruptible and
+     * interrupted.
+     */
+    private Object waitingGet(boolean interruptible) {
+<span class="fc" id="L283">        WaitNode q = null;</span>
+<span class="fc" id="L284">        boolean queued = false;</span>
+<span class="fc" id="L285">        int spins = SPINS;</span>
+        for (Object r;;) {
+<span class="fc bfc" id="L287" title="All 2 branches covered.">            if ((r = result) != null) {</span>
+<span class="fc bfc" id="L288" title="All 2 branches covered.">                if (q != null) { // suppress unpark</span>
+<span class="fc" id="L289">                    q.thread = null;</span>
+<span class="pc bpc" id="L290" title="1 of 2 branches missed.">                    if (q.interruptControl &lt; 0) {</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">                        if (interruptible) {</span>
+<span class="nc" id="L292">                            removeWaiter(q);</span>
+<span class="nc" id="L293">                            return null;</span>
+                        }
+<span class="nc" id="L295">                        Thread.currentThread().interrupt();</span>
+                    }
+                }
+<span class="fc" id="L298">                postComplete(); // help release others</span>
+<span class="fc" id="L299">                return r;</span>
+            }
+<span class="fc bfc" id="L301" title="All 2 branches covered.">            else if (spins &gt; 0) {</span>
+<span class="fc" id="L302">                int rnd = ThreadLocalRandom.nextSecondarySeed();</span>
+<span class="pc bpc" id="L303" title="1 of 2 branches missed.">                if (rnd == 0)</span>
+<span class="nc" id="L304">                    rnd = ThreadLocalRandom.current().nextInt();</span>
+<span class="fc bfc" id="L305" title="All 2 branches covered.">                if (rnd &gt;= 0)</span>
+<span class="fc" id="L306">                    --spins;</span>
+<span class="fc" id="L307">            }</span>
+<span class="fc bfc" id="L308" title="All 2 branches covered.">            else if (q == null)</span>
+<span class="fc" id="L309">                q = new WaitNode(interruptible, 0L, 0L);</span>
+<span class="fc bfc" id="L310" title="All 2 branches covered.">            else if (!queued)</span>
+<span class="fc" id="L311">                queued = UNSAFE.compareAndSwapObject(this, WAITERS,</span>
+                                                     q.next = waiters, q);
+<span class="pc bpc" id="L313" title="3 of 4 branches missed.">            else if (interruptible &amp;&amp; q.interruptControl &lt; 0) {</span>
+<span class="nc" id="L314">                removeWaiter(q);</span>
+<span class="nc" id="L315">                return null;</span>
+            }
+<span class="pc bpc" id="L317" title="2 of 4 branches missed.">            else if (q.thread != null &amp;&amp; result == null) {</span>
+                try {
+<span class="fc" id="L319">                    ForkJoinPool.managedBlock(q);</span>
+<span class="nc" id="L320">                } catch (InterruptedException ex) {</span>
+<span class="nc" id="L321">                    q.interruptControl = -1;</span>
+<span class="pc" id="L322">                }</span>
+            }
+        }
+    }
+
+    /**
+     * Awaits completion or aborts on interrupt or timeout.
+     *
+     * @param nanos time to wait
+     * @return raw result
+     */
+    private Object timedAwaitDone(long nanos)
+        throws InterruptedException, TimeoutException {
+<span class="nc" id="L335">        WaitNode q = null;</span>
+<span class="nc" id="L336">        boolean queued = false;</span>
+        for (Object r;;) {
+<span class="nc bnc" id="L338" title="All 2 branches missed.">            if ((r = result) != null) {</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">                if (q != null) {</span>
+<span class="nc" id="L340">                    q.thread = null;</span>
+<span class="nc bnc" id="L341" title="All 2 branches missed.">                    if (q.interruptControl &lt; 0) {</span>
+<span class="nc" id="L342">                        removeWaiter(q);</span>
+<span class="nc" id="L343">                        throw new InterruptedException();</span>
+                    }
+                }
+<span class="nc" id="L346">                postComplete();</span>
+<span class="nc" id="L347">                return r;</span>
+            }
+<span class="nc bnc" id="L349" title="All 2 branches missed.">            else if (q == null) {</span>
+<span class="nc bnc" id="L350" title="All 2 branches missed.">                if (nanos &lt;= 0L)</span>
+<span class="nc" id="L351">                    throw new TimeoutException();</span>
+<span class="nc" id="L352">                long d = System.nanoTime() + nanos;</span>
+<span class="nc bnc" id="L353" title="All 2 branches missed.">                q = new WaitNode(true, nanos, d == 0L ? 1L : d); // avoid 0</span>
+<span class="nc" id="L354">            }</span>
+<span class="nc bnc" id="L355" title="All 2 branches missed.">            else if (!queued)</span>
+<span class="nc" id="L356">                queued = UNSAFE.compareAndSwapObject(this, WAITERS,</span>
+                                                     q.next = waiters, q);
+<span class="nc bnc" id="L358" title="All 2 branches missed.">            else if (q.interruptControl &lt; 0) {</span>
+<span class="nc" id="L359">                removeWaiter(q);</span>
+<span class="nc" id="L360">                throw new InterruptedException();</span>
+            }
+<span class="nc bnc" id="L362" title="All 2 branches missed.">            else if (q.nanos &lt;= 0L) {</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">                if (result == null) {</span>
+<span class="nc" id="L364">                    removeWaiter(q);</span>
+<span class="nc" id="L365">                    throw new TimeoutException();</span>
+                }
+            }
+<span class="nc bnc" id="L368" title="All 4 branches missed.">            else if (q.thread != null &amp;&amp; result == null) {</span>
+                try {
+<span class="nc" id="L370">                    ForkJoinPool.managedBlock(q);</span>
+<span class="nc" id="L371">                } catch (InterruptedException ex) {</span>
+<span class="nc" id="L372">                    q.interruptControl = -1;</span>
+<span class="nc" id="L373">                }</span>
+            }
+        }
+    }
+
+    /**
+     * Tries to unlink a timed-out or interrupted wait node to avoid
+     * accumulating garbage.  Internal nodes are simply unspliced
+     * without CAS since it is harmless if they are traversed anyway
+     * by releasers.  To avoid effects of unsplicing from already
+     * removed nodes, the list is retraversed in case of an apparent
+     * race.  This is slow when there are a lot of nodes, but we don't
+     * expect lists to be long enough to outweigh higher-overhead
+     * schemes.
+     */
+    private void removeWaiter(WaitNode node) {
+<span class="nc bnc" id="L389" title="All 2 branches missed.">        if (node != null) {</span>
+<span class="nc" id="L390">            node.thread = null;</span>
+            retry:
+            for (;;) {          // restart on removeWaiter race
+<span class="nc bnc" id="L393" title="All 2 branches missed.">                for (WaitNode pred = null, q = waiters, s; q != null; q = s) {</span>
+<span class="nc" id="L394">                    s = q.next;</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">                    if (q.thread != null)</span>
+<span class="nc" id="L396">                        pred = q;</span>
+<span class="nc bnc" id="L397" title="All 2 branches missed.">                    else if (pred != null) {</span>
+<span class="nc" id="L398">                        pred.next = s;</span>
+<span class="nc bnc" id="L399" title="All 2 branches missed.">                        if (pred.thread == null) // check for race</span>
+<span class="nc" id="L400">                            continue retry;</span>
+                    }
+<span class="nc bnc" id="L402" title="All 2 branches missed.">                    else if (!UNSAFE.compareAndSwapObject(this, WAITERS, q, s))</span>
+<span class="nc" id="L403">                        continue retry;</span>
+                }
+<span class="nc" id="L405">                break;</span>
+            }
+        }
+<span class="nc" id="L408">    }</span>
+
+    /* ------------- Async tasks -------------- */
+
+    /**
+     * A marker interface identifying asynchronous tasks produced by
+     * {@code async} methods. This may be useful for monitoring,
+     * debugging, and tracking asynchronous activities.
+     *
+     * @since 1.8
+     */
+    public static interface AsynchronousCompletionTask {
+    }
+
+    /** Base class can act as either FJ or plain Runnable */
+    @SuppressWarnings(&quot;serial&quot;)
+<span class="fc" id="L424">    abstract static class Async extends ForkJoinTask&lt;Void&gt;</span>
+        implements Runnable, AsynchronousCompletionTask {
+<span class="nc" id="L426">        public final Void getRawResult() { return null; }</span>
+<span class="nc" id="L427">        public final void setRawResult(Void v) { }</span>
+<span class="fc" id="L428">        public final void run() { exec(); }</span>
+    }
+
+    /**
+     * Starts the given async task using the given executor, unless
+     * the executor is ForkJoinPool.commonPool and it has been
+     * disabled, in which case starts a new thread.
+     */
+    static void execAsync(Executor e, Async r) {
+<span class="fc bfc" id="L437" title="All 2 branches covered.">        if (e == ForkJoinPool.commonPool() &amp;&amp;</span>
+<span class="fc bfc" id="L438" title="All 2 branches covered.">            ForkJoinPool.getCommonPoolParallelism() &lt;= 1)</span>
+<span class="fc" id="L439">            new Thread(r).start();</span>
+        else
+<span class="fc" id="L441">            e.execute(r);</span>
+<span class="fc" id="L442">    }</span>
+
+    static final class AsyncRun extends Async {
+        final Runnable fn;
+        final CompletableFuture&lt;Void&gt; dst;
+<span class="fc" id="L447">        AsyncRun(Runnable fn, CompletableFuture&lt;Void&gt; dst) {</span>
+<span class="fc" id="L448">            this.fn = fn; this.dst = dst;</span>
+<span class="fc" id="L449">        }</span>
+        public final boolean exec() {
+            CompletableFuture&lt;Void&gt; d; Throwable ex;
+<span class="pc bpc" id="L452" title="2 of 4 branches missed.">            if ((d = this.dst) != null &amp;&amp; d.result == null) {</span>
+                try {
+<span class="fc" id="L454">                    fn.run();</span>
+<span class="fc" id="L455">                    ex = null;</span>
+<span class="fc" id="L456">                } catch (Throwable rex) {</span>
+<span class="fc" id="L457">                    ex = rex;</span>
+<span class="fc" id="L458">                }</span>
+<span class="fc" id="L459">                d.internalComplete(null, ex);</span>
+            }
+<span class="fc" id="L461">            return true;</span>
+        }
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    static final class AsyncSupply&lt;U&gt; extends Async {
+        final Supplier&lt;U&gt; fn;
+        final CompletableFuture&lt;U&gt; dst;
+<span class="fc" id="L469">        AsyncSupply(Supplier&lt;U&gt; fn, CompletableFuture&lt;U&gt; dst) {</span>
+<span class="fc" id="L470">            this.fn = fn; this.dst = dst;</span>
+<span class="fc" id="L471">        }</span>
+        public final boolean exec() {
+            CompletableFuture&lt;U&gt; d; U u; Throwable ex;
+<span class="pc bpc" id="L474" title="1 of 4 branches missed.">            if ((d = this.dst) != null &amp;&amp; d.result == null) {</span>
+                try {
+<span class="fc" id="L476">                    u = fn.get();</span>
+<span class="fc" id="L477">                    ex = null;</span>
+<span class="fc" id="L478">                } catch (Throwable rex) {</span>
+<span class="fc" id="L479">                    ex = rex;</span>
+<span class="fc" id="L480">                    u = null;</span>
+<span class="fc" id="L481">                }</span>
+<span class="fc" id="L482">                d.internalComplete(u, ex);</span>
+            }
+<span class="fc" id="L484">            return true;</span>
+        }
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    static final class AsyncApply&lt;T,U&gt; extends Async {
+        final T arg;
+        final Function&lt;? super T,? extends U&gt; fn;
+        final CompletableFuture&lt;U&gt; dst;
+        AsyncApply(T arg, Function&lt;? super T,? extends U&gt; fn,
+<span class="fc" id="L494">                   CompletableFuture&lt;U&gt; dst) {</span>
+<span class="fc" id="L495">            this.arg = arg; this.fn = fn; this.dst = dst;</span>
+<span class="fc" id="L496">        }</span>
+        public final boolean exec() {
+            CompletableFuture&lt;U&gt; d; U u; Throwable ex;
+<span class="pc bpc" id="L499" title="2 of 4 branches missed.">            if ((d = this.dst) != null &amp;&amp; d.result == null) {</span>
+                try {
+<span class="fc" id="L501">                    u = fn.apply(arg);</span>
+<span class="fc" id="L502">                    ex = null;</span>
+<span class="nc" id="L503">                } catch (Throwable rex) {</span>
+<span class="nc" id="L504">                    ex = rex;</span>
+<span class="nc" id="L505">                    u = null;</span>
+<span class="fc" id="L506">                }</span>
+<span class="fc" id="L507">                d.internalComplete(u, ex);</span>
+            }
+<span class="fc" id="L509">            return true;</span>
+        }
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    static final class AsyncCombine&lt;T,U,V&gt; extends Async {
+        final T arg1;
+        final U arg2;
+        final BiFunction&lt;? super T,? super U,? extends V&gt; fn;
+        final CompletableFuture&lt;V&gt; dst;
+        AsyncCombine(T arg1, U arg2,
+                     BiFunction&lt;? super T,? super U,? extends V&gt; fn,
+<span class="fc" id="L521">                     CompletableFuture&lt;V&gt; dst) {</span>
+<span class="fc" id="L522">            this.arg1 = arg1; this.arg2 = arg2; this.fn = fn; this.dst = dst;</span>
+<span class="fc" id="L523">        }</span>
+        public final boolean exec() {
+            CompletableFuture&lt;V&gt; d; V v; Throwable ex;
+<span class="pc bpc" id="L526" title="2 of 4 branches missed.">            if ((d = this.dst) != null &amp;&amp; d.result == null) {</span>
+                try {
+<span class="fc" id="L528">                    v = fn.apply(arg1, arg2);</span>
+<span class="fc" id="L529">                    ex = null;</span>
+<span class="nc" id="L530">                } catch (Throwable rex) {</span>
+<span class="nc" id="L531">                    ex = rex;</span>
+<span class="nc" id="L532">                    v = null;</span>
+<span class="fc" id="L533">                }</span>
+<span class="fc" id="L534">                d.internalComplete(v, ex);</span>
+            }
+<span class="fc" id="L536">            return true;</span>
+        }
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    static final class AsyncAccept&lt;T&gt; extends Async {
+        final T arg;
+        final Consumer&lt;? super T&gt; fn;
+        final CompletableFuture&lt;?&gt; dst;
+        AsyncAccept(T arg, Consumer&lt;? super T&gt; fn,
+<span class="fc" id="L546">                    CompletableFuture&lt;?&gt; dst) {</span>
+<span class="fc" id="L547">            this.arg = arg; this.fn = fn; this.dst = dst;</span>
+<span class="fc" id="L548">        }</span>
+        public final boolean exec() {
+            CompletableFuture&lt;?&gt; d; Throwable ex;
+<span class="pc bpc" id="L551" title="2 of 4 branches missed.">            if ((d = this.dst) != null &amp;&amp; d.result == null) {</span>
+                try {
+<span class="fc" id="L553">                    fn.accept(arg);</span>
+<span class="fc" id="L554">                    ex = null;</span>
+<span class="nc" id="L555">                } catch (Throwable rex) {</span>
+<span class="nc" id="L556">                    ex = rex;</span>
+<span class="fc" id="L557">                }</span>
+<span class="fc" id="L558">                d.internalComplete(null, ex);</span>
+            }
+<span class="fc" id="L560">            return true;</span>
+        }
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    static final class AsyncAcceptBoth&lt;T,U&gt; extends Async {
+        final T arg1;
+        final U arg2;
+        final BiConsumer&lt;? super T,? super U&gt; fn;
+        final CompletableFuture&lt;?&gt; dst;
+        AsyncAcceptBoth(T arg1, U arg2,
+                        BiConsumer&lt;? super T,? super U&gt; fn,
+<span class="fc" id="L572">                        CompletableFuture&lt;?&gt; dst) {</span>
+<span class="fc" id="L573">            this.arg1 = arg1; this.arg2 = arg2; this.fn = fn; this.dst = dst;</span>
+<span class="fc" id="L574">        }</span>
+        public final boolean exec() {
+            CompletableFuture&lt;?&gt; d; Throwable ex;
+<span class="pc bpc" id="L577" title="2 of 4 branches missed.">            if ((d = this.dst) != null &amp;&amp; d.result == null) {</span>
+                try {
+<span class="fc" id="L579">                    fn.accept(arg1, arg2);</span>
+<span class="fc" id="L580">                    ex = null;</span>
+<span class="nc" id="L581">                } catch (Throwable rex) {</span>
+<span class="nc" id="L582">                    ex = rex;</span>
+<span class="fc" id="L583">                }</span>
+<span class="fc" id="L584">                d.internalComplete(null, ex);</span>
+            }
+<span class="fc" id="L586">            return true;</span>
+        }
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    static final class AsyncCompose&lt;T,U&gt; extends Async {
+        final T arg;
+        final Function&lt;? super T, ? extends CompletionStage&lt;U&gt;&gt; fn;
+        final CompletableFuture&lt;U&gt; dst;
+        AsyncCompose(T arg,
+                     Function&lt;? super T, ? extends CompletionStage&lt;U&gt;&gt; fn,
+<span class="fc" id="L597">                     CompletableFuture&lt;U&gt; dst) {</span>
+<span class="fc" id="L598">            this.arg = arg; this.fn = fn; this.dst = dst;</span>
+<span class="fc" id="L599">        }</span>
+        public final boolean exec() {
+            CompletableFuture&lt;U&gt; d, fr; U u; Throwable ex;
+<span class="pc bpc" id="L602" title="2 of 4 branches missed.">            if ((d = this.dst) != null &amp;&amp; d.result == null) {</span>
+                try {
+<span class="fc" id="L604">                    CompletionStage&lt;U&gt; cs = fn.apply(arg);</span>
+<span class="pc bpc" id="L605" title="1 of 2 branches missed.">                    fr = (cs == null) ? null : cs.toCompletableFuture();</span>
+<span class="pc bpc" id="L606" title="1 of 2 branches missed.">                    ex = (fr == null) ? new NullPointerException() : null;</span>
+<span class="fc" id="L607">                } catch (Throwable rex) {</span>
+<span class="fc" id="L608">                    ex = rex;</span>
+<span class="fc" id="L609">                    fr = null;</span>
+<span class="fc" id="L610">                }</span>
+<span class="fc bfc" id="L611" title="All 2 branches covered.">                if (ex != null)</span>
+<span class="fc" id="L612">                    u = null;</span>
+                else {
+<span class="fc" id="L614">                    Object r = fr.result;</span>
+<span class="pc bpc" id="L615" title="1 of 2 branches missed.">                    if (r == null)</span>
+<span class="nc" id="L616">                        r = fr.waitingGet(false);</span>
+<span class="pc bpc" id="L617" title="1 of 2 branches missed.">                    if (r instanceof AltResult) {</span>
+<span class="nc" id="L618">                        ex = ((AltResult)r).ex;</span>
+<span class="nc" id="L619">                        u = null;</span>
+                    }
+                    else {
+<span class="fc" id="L622">                        @SuppressWarnings(&quot;unchecked&quot;) U ur = (U) r;</span>
+<span class="fc" id="L623">                        u = ur;</span>
+                    }
+                }
+<span class="fc" id="L626">                d.internalComplete(u, ex);</span>
+            }
+<span class="fc" id="L628">            return true;</span>
+        }
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    static final class AsyncWhenComplete&lt;T&gt; extends Async {
+        final T arg1;
+        final Throwable arg2;
+        final BiConsumer&lt;? super T,? super Throwable&gt; fn;
+        final CompletableFuture&lt;T&gt; dst;
+        AsyncWhenComplete(T arg1, Throwable arg2,
+                          BiConsumer&lt;? super T,? super Throwable&gt; fn,
+<span class="nc" id="L640">                          CompletableFuture&lt;T&gt; dst) {</span>
+<span class="nc" id="L641">            this.arg1 = arg1; this.arg2 = arg2; this.fn = fn; this.dst = dst;</span>
+<span class="nc" id="L642">        }</span>
+        public final boolean exec() {
+            CompletableFuture&lt;T&gt; d;
+<span class="nc bnc" id="L645" title="All 4 branches missed.">            if ((d = this.dst) != null &amp;&amp; d.result == null) {</span>
+<span class="nc" id="L646">                Throwable ex = arg2;</span>
+                try {
+<span class="nc" id="L648">                    fn.accept(arg1, ex);</span>
+<span class="nc" id="L649">                } catch (Throwable rex) {</span>
+<span class="nc bnc" id="L650" title="All 2 branches missed.">                    if (ex == null)</span>
+<span class="nc" id="L651">                        ex = rex;</span>
+<span class="nc" id="L652">                }</span>
+<span class="nc" id="L653">                d.internalComplete(arg1, ex);</span>
+            }
+<span class="nc" id="L655">            return true;</span>
+        }
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    /* ------------- Completions -------------- */
+
+    /**
+     * Simple linked list nodes to record completions, used in
+     * basically the same way as WaitNodes. (We separate nodes from
+     * the Completions themselves mainly because for the And and Or
+     * methods, the same Completion object resides in two lists.)
+     */
+    static final class CompletionNode {
+        final Completion completion;
+        volatile CompletionNode next;
+<span class="fc" id="L671">        CompletionNode(Completion completion) { this.completion = completion; }</span>
+    }
+
+    // Opportunistically subclass AtomicInteger to use compareAndSet to claim.
+    @SuppressWarnings(&quot;serial&quot;)
+<span class="fc" id="L676">    abstract static class Completion extends AtomicInteger implements Runnable {</span>
+    }
+
+    static final class ThenApply&lt;T,U&gt; extends Completion {
+        final CompletableFuture&lt;? extends T&gt; src;
+        final Function&lt;? super T,? extends U&gt; fn;
+        final CompletableFuture&lt;U&gt; dst;
+        final Executor executor;
+        ThenApply(CompletableFuture&lt;? extends T&gt; src,
+                  Function&lt;? super T,? extends U&gt; fn,
+                  CompletableFuture&lt;U&gt; dst,
+<span class="fc" id="L687">                  Executor executor) {</span>
+<span class="fc" id="L688">            this.src = src; this.fn = fn; this.dst = dst;</span>
+<span class="fc" id="L689">            this.executor = executor;</span>
+<span class="fc" id="L690">        }</span>
+        public final void run() {
+            final CompletableFuture&lt;? extends T&gt; a;
+            final Function&lt;? super T,? extends U&gt; fn;
+            final CompletableFuture&lt;U&gt; dst;
+            Object r; T t; Throwable ex;
+<span class="pc bpc" id="L696" title="4 of 8 branches missed.">            if ((dst = this.dst) != null &amp;&amp;</span>
+                (fn = this.fn) != null &amp;&amp;
+                (a = this.src) != null &amp;&amp;
+                (r = a.result) != null &amp;&amp;
+<span class="pc bpc" id="L700" title="1 of 2 branches missed.">                compareAndSet(0, 1)) {</span>
+<span class="fc bfc" id="L701" title="All 2 branches covered.">                if (r instanceof AltResult) {</span>
+<span class="fc" id="L702">                    ex = ((AltResult)r).ex;</span>
+<span class="fc" id="L703">                    t = null;</span>
+                }
+                else {
+<span class="fc" id="L706">                    ex = null;</span>
+<span class="fc" id="L707">                    @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="fc" id="L708">                    t = tr;</span>
+                }
+<span class="fc" id="L710">                Executor e = executor;</span>
+<span class="fc" id="L711">                U u = null;</span>
+<span class="fc bfc" id="L712" title="All 2 branches covered.">                if (ex == null) {</span>
+                    try {
+<span class="fc bfc" id="L714" title="All 2 branches covered.">                        if (e != null)</span>
+<span class="fc" id="L715">                            execAsync(e, new AsyncApply&lt;T,U&gt;(t, fn, dst));</span>
+                        else
+<span class="fc" id="L717">                            u = fn.apply(t);</span>
+<span class="nc" id="L718">                    } catch (Throwable rex) {</span>
+<span class="nc" id="L719">                        ex = rex;</span>
+<span class="fc" id="L720">                    }</span>
+                }
+<span class="fc bfc" id="L722" title="All 4 branches covered.">                if (e == null || ex != null)</span>
+<span class="fc" id="L723">                    dst.internalComplete(u, ex);</span>
+            }
+<span class="fc" id="L725">        }</span>
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    static final class ThenAccept&lt;T&gt; extends Completion {
+        final CompletableFuture&lt;? extends T&gt; src;
+        final Consumer&lt;? super T&gt; fn;
+        final CompletableFuture&lt;?&gt; dst;
+        final Executor executor;
+        ThenAccept(CompletableFuture&lt;? extends T&gt; src,
+                   Consumer&lt;? super T&gt; fn,
+                   CompletableFuture&lt;?&gt; dst,
+<span class="fc" id="L737">                   Executor executor) {</span>
+<span class="fc" id="L738">            this.src = src; this.fn = fn; this.dst = dst;</span>
+<span class="fc" id="L739">            this.executor = executor;</span>
+<span class="fc" id="L740">        }</span>
+        public final void run() {
+            final CompletableFuture&lt;? extends T&gt; a;
+            final Consumer&lt;? super T&gt; fn;
+            final CompletableFuture&lt;?&gt; dst;
+            Object r; T t; Throwable ex;
+<span class="pc bpc" id="L746" title="4 of 8 branches missed.">            if ((dst = this.dst) != null &amp;&amp;</span>
+                (fn = this.fn) != null &amp;&amp;
+                (a = this.src) != null &amp;&amp;
+                (r = a.result) != null &amp;&amp;
+<span class="pc bpc" id="L750" title="1 of 2 branches missed.">                compareAndSet(0, 1)) {</span>
+<span class="fc bfc" id="L751" title="All 2 branches covered.">                if (r instanceof AltResult) {</span>
+<span class="fc" id="L752">                    ex = ((AltResult)r).ex;</span>
+<span class="fc" id="L753">                    t = null;</span>
+                }
+                else {
+<span class="fc" id="L756">                    ex = null;</span>
+<span class="fc" id="L757">                    @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="fc" id="L758">                    t = tr;</span>
+                }
+<span class="fc" id="L760">                Executor e = executor;</span>
+<span class="fc bfc" id="L761" title="All 2 branches covered.">                if (ex == null) {</span>
+                    try {
+<span class="pc bpc" id="L763" title="1 of 2 branches missed.">                        if (e != null)</span>
+<span class="nc" id="L764">                            execAsync(e, new AsyncAccept&lt;T&gt;(t, fn, dst));</span>
+                        else
+<span class="fc" id="L766">                            fn.accept(t);</span>
+<span class="nc" id="L767">                    } catch (Throwable rex) {</span>
+<span class="nc" id="L768">                        ex = rex;</span>
+<span class="fc" id="L769">                    }</span>
+                }
+<span class="pc bpc" id="L771" title="1 of 4 branches missed.">                if (e == null || ex != null)</span>
+<span class="fc" id="L772">                    dst.internalComplete(null, ex);</span>
+            }
+<span class="fc" id="L774">        }</span>
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    static final class ThenRun extends Completion {
+        final CompletableFuture&lt;?&gt; src;
+        final Runnable fn;
+        final CompletableFuture&lt;Void&gt; dst;
+        final Executor executor;
+        ThenRun(CompletableFuture&lt;?&gt; src,
+                Runnable fn,
+                CompletableFuture&lt;Void&gt; dst,
+<span class="fc" id="L786">                Executor executor) {</span>
+<span class="fc" id="L787">            this.src = src; this.fn = fn; this.dst = dst;</span>
+<span class="fc" id="L788">            this.executor = executor;</span>
+<span class="fc" id="L789">        }</span>
+        public final void run() {
+            final CompletableFuture&lt;?&gt; a;
+            final Runnable fn;
+            final CompletableFuture&lt;Void&gt; dst;
+            Object r; Throwable ex;
+<span class="pc bpc" id="L795" title="4 of 8 branches missed.">            if ((dst = this.dst) != null &amp;&amp;</span>
+                (fn = this.fn) != null &amp;&amp;
+                (a = this.src) != null &amp;&amp;
+                (r = a.result) != null &amp;&amp;
+<span class="pc bpc" id="L799" title="1 of 2 branches missed.">                compareAndSet(0, 1)) {</span>
+<span class="fc bfc" id="L800" title="All 2 branches covered.">                if (r instanceof AltResult)</span>
+<span class="fc" id="L801">                    ex = ((AltResult)r).ex;</span>
+                else
+<span class="fc" id="L803">                    ex = null;</span>
+<span class="fc" id="L804">                Executor e = executor;</span>
+<span class="fc bfc" id="L805" title="All 2 branches covered.">                if (ex == null) {</span>
+                    try {
+<span class="pc bpc" id="L807" title="1 of 2 branches missed.">                        if (e != null)</span>
+<span class="fc" id="L808">                            execAsync(e, new AsyncRun(fn, dst));</span>
+                        else
+<span class="nc" id="L810">                            fn.run();</span>
+<span class="nc" id="L811">                    } catch (Throwable rex) {</span>
+<span class="nc" id="L812">                        ex = rex;</span>
+<span class="fc" id="L813">                    }</span>
+                }
+<span class="fc bfc" id="L815" title="All 4 branches covered.">                if (e == null || ex != null)</span>
+<span class="fc" id="L816">                    dst.internalComplete(null, ex);</span>
+            }
+<span class="fc" id="L818">        }</span>
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    static final class ThenCombine&lt;T,U,V&gt; extends Completion {
+        final CompletableFuture&lt;? extends T&gt; src;
+        final CompletableFuture&lt;? extends U&gt; snd;
+        final BiFunction&lt;? super T,? super U,? extends V&gt; fn;
+        final CompletableFuture&lt;V&gt; dst;
+        final Executor executor;
+        ThenCombine(CompletableFuture&lt;? extends T&gt; src,
+                    CompletableFuture&lt;? extends U&gt; snd,
+                    BiFunction&lt;? super T,? super U,? extends V&gt; fn,
+                    CompletableFuture&lt;V&gt; dst,
+<span class="fc" id="L832">                    Executor executor) {</span>
+<span class="fc" id="L833">            this.src = src; this.snd = snd;</span>
+<span class="fc" id="L834">            this.fn = fn; this.dst = dst;</span>
+<span class="fc" id="L835">            this.executor = executor;</span>
+<span class="fc" id="L836">        }</span>
+        public final void run() {
+            final CompletableFuture&lt;? extends T&gt; a;
+            final CompletableFuture&lt;? extends U&gt; b;
+            final BiFunction&lt;? super T,? super U,? extends V&gt; fn;
+            final CompletableFuture&lt;V&gt; dst;
+            Object r, s; T t; U u; Throwable ex;
+<span class="pc bpc" id="L843" title="6 of 12 branches missed.">            if ((dst = this.dst) != null &amp;&amp;</span>
+                (fn = this.fn) != null &amp;&amp;
+                (a = this.src) != null &amp;&amp;
+                (r = a.result) != null &amp;&amp;
+                (b = this.snd) != null &amp;&amp;
+                (s = b.result) != null &amp;&amp;
+<span class="pc bpc" id="L849" title="1 of 2 branches missed.">                compareAndSet(0, 1)) {</span>
+<span class="pc bpc" id="L850" title="1 of 2 branches missed.">                if (r instanceof AltResult) {</span>
+<span class="nc" id="L851">                    ex = ((AltResult)r).ex;</span>
+<span class="nc" id="L852">                    t = null;</span>
+                }
+                else {
+<span class="fc" id="L855">                    ex = null;</span>
+<span class="fc" id="L856">                    @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="fc" id="L857">                    t = tr;</span>
+                }
+<span class="pc bpc" id="L859" title="1 of 2 branches missed.">                if (ex != null)</span>
+<span class="nc" id="L860">                    u = null;</span>
+<span class="pc bpc" id="L861" title="1 of 2 branches missed.">                else if (s instanceof AltResult) {</span>
+<span class="nc" id="L862">                    ex = ((AltResult)s).ex;</span>
+<span class="nc" id="L863">                    u = null;</span>
+                }
+                else {
+<span class="fc" id="L866">                    @SuppressWarnings(&quot;unchecked&quot;) U us = (U) s;</span>
+<span class="fc" id="L867">                    u = us;</span>
+                }
+<span class="fc" id="L869">                Executor e = executor;</span>
+<span class="fc" id="L870">                V v = null;</span>
+<span class="pc bpc" id="L871" title="1 of 2 branches missed.">                if (ex == null) {</span>
+                    try {
+<span class="pc bpc" id="L873" title="1 of 2 branches missed.">                        if (e != null)</span>
+<span class="nc" id="L874">                            execAsync(e, new AsyncCombine&lt;T,U,V&gt;(t, u, fn, dst));</span>
+                        else
+<span class="fc" id="L876">                            v = fn.apply(t, u);</span>
+<span class="nc" id="L877">                    } catch (Throwable rex) {</span>
+<span class="nc" id="L878">                        ex = rex;</span>
+<span class="fc" id="L879">                    }</span>
+                }
+<span class="pc bpc" id="L881" title="3 of 4 branches missed.">                if (e == null || ex != null)</span>
+<span class="fc" id="L882">                    dst.internalComplete(v, ex);</span>
+            }
+<span class="fc" id="L884">        }</span>
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    static final class ThenAcceptBoth&lt;T,U&gt; extends Completion {
+        final CompletableFuture&lt;? extends T&gt; src;
+        final CompletableFuture&lt;? extends U&gt; snd;
+        final BiConsumer&lt;? super T,? super U&gt; fn;
+        final CompletableFuture&lt;Void&gt; dst;
+        final Executor executor;
+        ThenAcceptBoth(CompletableFuture&lt;? extends T&gt; src,
+                       CompletableFuture&lt;? extends U&gt; snd,
+                       BiConsumer&lt;? super T,? super U&gt; fn,
+                       CompletableFuture&lt;Void&gt; dst,
+<span class="fc" id="L898">                       Executor executor) {</span>
+<span class="fc" id="L899">            this.src = src; this.snd = snd;</span>
+<span class="fc" id="L900">            this.fn = fn; this.dst = dst;</span>
+<span class="fc" id="L901">            this.executor = executor;</span>
+<span class="fc" id="L902">        }</span>
+        public final void run() {
+            final CompletableFuture&lt;? extends T&gt; a;
+            final CompletableFuture&lt;? extends U&gt; b;
+            final BiConsumer&lt;? super T,? super U&gt; fn;
+            final CompletableFuture&lt;Void&gt; dst;
+            Object r, s; T t; U u; Throwable ex;
+<span class="pc bpc" id="L909" title="5 of 12 branches missed.">            if ((dst = this.dst) != null &amp;&amp;</span>
+                (fn = this.fn) != null &amp;&amp;
+                (a = this.src) != null &amp;&amp;
+                (r = a.result) != null &amp;&amp;
+                (b = this.snd) != null &amp;&amp;
+                (s = b.result) != null &amp;&amp;
+<span class="pc bpc" id="L915" title="1 of 2 branches missed.">                compareAndSet(0, 1)) {</span>
+<span class="fc bfc" id="L916" title="All 2 branches covered.">                if (r instanceof AltResult) {</span>
+<span class="fc" id="L917">                    ex = ((AltResult)r).ex;</span>
+<span class="fc" id="L918">                    t = null;</span>
+                }
+                else {
+<span class="fc" id="L921">                    ex = null;</span>
+<span class="fc" id="L922">                    @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="fc" id="L923">                    t = tr;</span>
+                }
+<span class="fc bfc" id="L925" title="All 2 branches covered.">                if (ex != null)</span>
+<span class="fc" id="L926">                    u = null;</span>
+<span class="pc bpc" id="L927" title="1 of 2 branches missed.">                else if (s instanceof AltResult) {</span>
+<span class="nc" id="L928">                    ex = ((AltResult)s).ex;</span>
+<span class="nc" id="L929">                    u = null;</span>
+                }
+                else {
+<span class="fc" id="L932">                    @SuppressWarnings(&quot;unchecked&quot;) U us = (U) s;</span>
+<span class="fc" id="L933">                    u = us;</span>
+                }
+<span class="fc" id="L935">                Executor e = executor;</span>
+<span class="fc bfc" id="L936" title="All 2 branches covered.">                if (ex == null) {</span>
+                    try {
+<span class="pc bpc" id="L938" title="1 of 2 branches missed.">                        if (e != null)</span>
+<span class="nc" id="L939">                            execAsync(e, new AsyncAcceptBoth&lt;T,U&gt;(t, u, fn, dst));</span>
+                        else
+<span class="fc" id="L941">                            fn.accept(t, u);</span>
+<span class="nc" id="L942">                    } catch (Throwable rex) {</span>
+<span class="nc" id="L943">                        ex = rex;</span>
+<span class="fc" id="L944">                    }</span>
+                }
+<span class="pc bpc" id="L946" title="1 of 4 branches missed.">                if (e == null || ex != null)</span>
+<span class="fc" id="L947">                    dst.internalComplete(null, ex);</span>
+            }
+<span class="fc" id="L949">        }</span>
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    static final class RunAfterBoth extends Completion {
+        final CompletableFuture&lt;?&gt; src;
+        final CompletableFuture&lt;?&gt; snd;
+        final Runnable fn;
+        final CompletableFuture&lt;Void&gt; dst;
+        final Executor executor;
+        RunAfterBoth(CompletableFuture&lt;?&gt; src,
+                     CompletableFuture&lt;?&gt; snd,
+                     Runnable fn,
+                     CompletableFuture&lt;Void&gt; dst,
+<span class="nc" id="L963">                     Executor executor) {</span>
+<span class="nc" id="L964">            this.src = src; this.snd = snd;</span>
+<span class="nc" id="L965">            this.fn = fn; this.dst = dst;</span>
+<span class="nc" id="L966">            this.executor = executor;</span>
+<span class="nc" id="L967">        }</span>
+        public final void run() {
+            final CompletableFuture&lt;?&gt; a;
+            final CompletableFuture&lt;?&gt; b;
+            final Runnable fn;
+            final CompletableFuture&lt;Void&gt; dst;
+            Object r, s; Throwable ex;
+<span class="nc bnc" id="L974" title="All 12 branches missed.">            if ((dst = this.dst) != null &amp;&amp;</span>
+                (fn = this.fn) != null &amp;&amp;
+                (a = this.src) != null &amp;&amp;
+                (r = a.result) != null &amp;&amp;
+                (b = this.snd) != null &amp;&amp;
+                (s = b.result) != null &amp;&amp;
+<span class="nc bnc" id="L980" title="All 2 branches missed.">                compareAndSet(0, 1)) {</span>
+<span class="nc bnc" id="L981" title="All 2 branches missed.">                if (r instanceof AltResult)</span>
+<span class="nc" id="L982">                    ex = ((AltResult)r).ex;</span>
+                else
+<span class="nc" id="L984">                    ex = null;</span>
+<span class="nc bnc" id="L985" title="All 4 branches missed.">                if (ex == null &amp;&amp; (s instanceof AltResult))</span>
+<span class="nc" id="L986">                    ex = ((AltResult)s).ex;</span>
+<span class="nc" id="L987">                Executor e = executor;</span>
+<span class="nc bnc" id="L988" title="All 2 branches missed.">                if (ex == null) {</span>
+                    try {
+<span class="nc bnc" id="L990" title="All 2 branches missed.">                        if (e != null)</span>
+<span class="nc" id="L991">                            execAsync(e, new AsyncRun(fn, dst));</span>
+                        else
+<span class="nc" id="L993">                            fn.run();</span>
+<span class="nc" id="L994">                    } catch (Throwable rex) {</span>
+<span class="nc" id="L995">                        ex = rex;</span>
+<span class="nc" id="L996">                    }</span>
+                }
+<span class="nc bnc" id="L998" title="All 4 branches missed.">                if (e == null || ex != null)</span>
+<span class="nc" id="L999">                    dst.internalComplete(null, ex);</span>
+            }
+<span class="nc" id="L1001">        }</span>
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    static final class AndCompletion extends Completion {
+        final CompletableFuture&lt;?&gt; src;
+        final CompletableFuture&lt;?&gt; snd;
+        final CompletableFuture&lt;Void&gt; dst;
+        AndCompletion(CompletableFuture&lt;?&gt; src,
+                      CompletableFuture&lt;?&gt; snd,
+<span class="fc" id="L1011">                      CompletableFuture&lt;Void&gt; dst) {</span>
+<span class="fc" id="L1012">            this.src = src; this.snd = snd; this.dst = dst;</span>
+<span class="fc" id="L1013">        }</span>
+        public final void run() {
+            final CompletableFuture&lt;?&gt; a;
+            final CompletableFuture&lt;?&gt; b;
+            final CompletableFuture&lt;Void&gt; dst;
+            Object r, s; Throwable ex;
+<span class="pc bpc" id="L1019" title="3 of 10 branches missed.">            if ((dst = this.dst) != null &amp;&amp;</span>
+                (a = this.src) != null &amp;&amp;
+                (r = a.result) != null &amp;&amp;
+                (b = this.snd) != null &amp;&amp;
+                (s = b.result) != null &amp;&amp;
+<span class="fc bfc" id="L1024" title="All 2 branches covered.">                compareAndSet(0, 1)) {</span>
+<span class="fc bfc" id="L1025" title="All 2 branches covered.">                if (r instanceof AltResult)</span>
+<span class="fc" id="L1026">                    ex = ((AltResult)r).ex;</span>
+                else
+<span class="fc" id="L1028">                    ex = null;</span>
+<span class="pc bpc" id="L1029" title="1 of 4 branches missed.">                if (ex == null &amp;&amp; (s instanceof AltResult))</span>
+<span class="fc" id="L1030">                    ex = ((AltResult)s).ex;</span>
+<span class="fc" id="L1031">                dst.internalComplete(null, ex);</span>
+            }
+<span class="fc" id="L1033">        }</span>
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    static final class ApplyToEither&lt;T,U&gt; extends Completion {
+        final CompletableFuture&lt;? extends T&gt; src;
+        final CompletableFuture&lt;? extends T&gt; snd;
+        final Function&lt;? super T,? extends U&gt; fn;
+        final CompletableFuture&lt;U&gt; dst;
+        final Executor executor;
+        ApplyToEither(CompletableFuture&lt;? extends T&gt; src,
+                      CompletableFuture&lt;? extends T&gt; snd,
+                      Function&lt;? super T,? extends U&gt; fn,
+                      CompletableFuture&lt;U&gt; dst,
+<span class="nc" id="L1047">                      Executor executor) {</span>
+<span class="nc" id="L1048">            this.src = src; this.snd = snd;</span>
+<span class="nc" id="L1049">            this.fn = fn; this.dst = dst;</span>
+<span class="nc" id="L1050">            this.executor = executor;</span>
+<span class="nc" id="L1051">        }</span>
+        public final void run() {
+            final CompletableFuture&lt;? extends T&gt; a;
+            final CompletableFuture&lt;? extends T&gt; b;
+            final Function&lt;? super T,? extends U&gt; fn;
+            final CompletableFuture&lt;U&gt; dst;
+            Object r; T t; Throwable ex;
+<span class="nc bnc" id="L1058" title="All 12 branches missed.">            if ((dst = this.dst) != null &amp;&amp;</span>
+                (fn = this.fn) != null &amp;&amp;
+                (((a = this.src) != null &amp;&amp; (r = a.result) != null) ||
+                 ((b = this.snd) != null &amp;&amp; (r = b.result) != null)) &amp;&amp;
+<span class="nc bnc" id="L1062" title="All 2 branches missed.">                compareAndSet(0, 1)) {</span>
+<span class="nc bnc" id="L1063" title="All 2 branches missed.">                if (r instanceof AltResult) {</span>
+<span class="nc" id="L1064">                    ex = ((AltResult)r).ex;</span>
+<span class="nc" id="L1065">                    t = null;</span>
+                }
+                else {
+<span class="nc" id="L1068">                    ex = null;</span>
+<span class="nc" id="L1069">                    @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="nc" id="L1070">                    t = tr;</span>
+                }
+<span class="nc" id="L1072">                Executor e = executor;</span>
+<span class="nc" id="L1073">                U u = null;</span>
+<span class="nc bnc" id="L1074" title="All 2 branches missed.">                if (ex == null) {</span>
+                    try {
+<span class="nc bnc" id="L1076" title="All 2 branches missed.">                        if (e != null)</span>
+<span class="nc" id="L1077">                            execAsync(e, new AsyncApply&lt;T,U&gt;(t, fn, dst));</span>
+                        else
+<span class="nc" id="L1079">                            u = fn.apply(t);</span>
+<span class="nc" id="L1080">                    } catch (Throwable rex) {</span>
+<span class="nc" id="L1081">                        ex = rex;</span>
+<span class="nc" id="L1082">                    }</span>
+                }
+<span class="nc bnc" id="L1084" title="All 4 branches missed.">                if (e == null || ex != null)</span>
+<span class="nc" id="L1085">                    dst.internalComplete(u, ex);</span>
+            }
+<span class="nc" id="L1087">        }</span>
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    static final class AcceptEither&lt;T&gt; extends Completion {
+        final CompletableFuture&lt;? extends T&gt; src;
+        final CompletableFuture&lt;? extends T&gt; snd;
+        final Consumer&lt;? super T&gt; fn;
+        final CompletableFuture&lt;Void&gt; dst;
+        final Executor executor;
+        AcceptEither(CompletableFuture&lt;? extends T&gt; src,
+                     CompletableFuture&lt;? extends T&gt; snd,
+                     Consumer&lt;? super T&gt; fn,
+                     CompletableFuture&lt;Void&gt; dst,
+<span class="nc" id="L1101">                     Executor executor) {</span>
+<span class="nc" id="L1102">            this.src = src; this.snd = snd;</span>
+<span class="nc" id="L1103">            this.fn = fn; this.dst = dst;</span>
+<span class="nc" id="L1104">            this.executor = executor;</span>
+<span class="nc" id="L1105">        }</span>
+        public final void run() {
+            final CompletableFuture&lt;? extends T&gt; a;
+            final CompletableFuture&lt;? extends T&gt; b;
+            final Consumer&lt;? super T&gt; fn;
+            final CompletableFuture&lt;Void&gt; dst;
+            Object r; T t; Throwable ex;
+<span class="nc bnc" id="L1112" title="All 12 branches missed.">            if ((dst = this.dst) != null &amp;&amp;</span>
+                (fn = this.fn) != null &amp;&amp;
+                (((a = this.src) != null &amp;&amp; (r = a.result) != null) ||
+                 ((b = this.snd) != null &amp;&amp; (r = b.result) != null)) &amp;&amp;
+<span class="nc bnc" id="L1116" title="All 2 branches missed.">                compareAndSet(0, 1)) {</span>
+<span class="nc bnc" id="L1117" title="All 2 branches missed.">                if (r instanceof AltResult) {</span>
+<span class="nc" id="L1118">                    ex = ((AltResult)r).ex;</span>
+<span class="nc" id="L1119">                    t = null;</span>
+                }
+                else {
+<span class="nc" id="L1122">                    ex = null;</span>
+<span class="nc" id="L1123">                    @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="nc" id="L1124">                    t = tr;</span>
+                }
+<span class="nc" id="L1126">                Executor e = executor;</span>
+<span class="nc bnc" id="L1127" title="All 2 branches missed.">                if (ex == null) {</span>
+                    try {
+<span class="nc bnc" id="L1129" title="All 2 branches missed.">                        if (e != null)</span>
+<span class="nc" id="L1130">                            execAsync(e, new AsyncAccept&lt;T&gt;(t, fn, dst));</span>
+                        else
+<span class="nc" id="L1132">                            fn.accept(t);</span>
+<span class="nc" id="L1133">                    } catch (Throwable rex) {</span>
+<span class="nc" id="L1134">                        ex = rex;</span>
+<span class="nc" id="L1135">                    }</span>
+                }
+<span class="nc bnc" id="L1137" title="All 4 branches missed.">                if (e == null || ex != null)</span>
+<span class="nc" id="L1138">                    dst.internalComplete(null, ex);</span>
+            }
+<span class="nc" id="L1140">        }</span>
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    static final class RunAfterEither extends Completion {
+        final CompletableFuture&lt;?&gt; src;
+        final CompletableFuture&lt;?&gt; snd;
+        final Runnable fn;
+        final CompletableFuture&lt;Void&gt; dst;
+        final Executor executor;
+        RunAfterEither(CompletableFuture&lt;?&gt; src,
+                       CompletableFuture&lt;?&gt; snd,
+                       Runnable fn,
+                       CompletableFuture&lt;Void&gt; dst,
+<span class="fc" id="L1154">                       Executor executor) {</span>
+<span class="fc" id="L1155">            this.src = src; this.snd = snd;</span>
+<span class="fc" id="L1156">            this.fn = fn; this.dst = dst;</span>
+<span class="fc" id="L1157">            this.executor = executor;</span>
+<span class="fc" id="L1158">        }</span>
+        public final void run() {
+            final CompletableFuture&lt;?&gt; a;
+            final CompletableFuture&lt;?&gt; b;
+            final Runnable fn;
+            final CompletableFuture&lt;Void&gt; dst;
+            Object r; Throwable ex;
+<span class="nc bnc" id="L1165" title="All 12 branches missed.">            if ((dst = this.dst) != null &amp;&amp;</span>
+                (fn = this.fn) != null &amp;&amp;
+                (((a = this.src) != null &amp;&amp; (r = a.result) != null) ||
+                 ((b = this.snd) != null &amp;&amp; (r = b.result) != null)) &amp;&amp;
+<span class="nc bnc" id="L1169" title="All 2 branches missed.">                compareAndSet(0, 1)) {</span>
+<span class="nc bnc" id="L1170" title="All 2 branches missed.">                if (r instanceof AltResult)</span>
+<span class="nc" id="L1171">                    ex = ((AltResult)r).ex;</span>
+                else
+<span class="nc" id="L1173">                    ex = null;</span>
+<span class="nc" id="L1174">                Executor e = executor;</span>
+<span class="nc bnc" id="L1175" title="All 2 branches missed.">                if (ex == null) {</span>
+                    try {
+<span class="nc bnc" id="L1177" title="All 2 branches missed.">                        if (e != null)</span>
+<span class="nc" id="L1178">                            execAsync(e, new AsyncRun(fn, dst));</span>
+                        else
+<span class="nc" id="L1180">                            fn.run();</span>
+<span class="nc" id="L1181">                    } catch (Throwable rex) {</span>
+<span class="nc" id="L1182">                        ex = rex;</span>
+<span class="nc" id="L1183">                    }</span>
+                }
+<span class="nc bnc" id="L1185" title="All 4 branches missed.">                if (e == null || ex != null)</span>
+<span class="nc" id="L1186">                    dst.internalComplete(null, ex);</span>
+            }
+<span class="nc" id="L1188">        }</span>
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    static final class OrCompletion extends Completion {
+        final CompletableFuture&lt;?&gt; src;
+        final CompletableFuture&lt;?&gt; snd;
+        final CompletableFuture&lt;Object&gt; dst;
+        OrCompletion(CompletableFuture&lt;?&gt; src,
+                     CompletableFuture&lt;?&gt; snd,
+<span class="nc" id="L1198">                     CompletableFuture&lt;Object&gt; dst) {</span>
+<span class="nc" id="L1199">            this.src = src; this.snd = snd; this.dst = dst;</span>
+<span class="nc" id="L1200">        }</span>
+        public final void run() {
+            final CompletableFuture&lt;?&gt; a;
+            final CompletableFuture&lt;?&gt; b;
+            final CompletableFuture&lt;Object&gt; dst;
+            Object r, t; Throwable ex;
+<span class="nc bnc" id="L1206" title="All 10 branches missed.">            if ((dst = this.dst) != null &amp;&amp;</span>
+                (((a = this.src) != null &amp;&amp; (r = a.result) != null) ||
+                 ((b = this.snd) != null &amp;&amp; (r = b.result) != null)) &amp;&amp;
+<span class="nc bnc" id="L1209" title="All 2 branches missed.">                compareAndSet(0, 1)) {</span>
+<span class="nc bnc" id="L1210" title="All 2 branches missed.">                if (r instanceof AltResult) {</span>
+<span class="nc" id="L1211">                    ex = ((AltResult)r).ex;</span>
+<span class="nc" id="L1212">                    t = null;</span>
+                }
+                else {
+<span class="nc" id="L1215">                    ex = null;</span>
+<span class="nc" id="L1216">                    t = r;</span>
+                }
+<span class="nc" id="L1218">                dst.internalComplete(t, ex);</span>
+            }
+<span class="nc" id="L1220">        }</span>
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    static final class ExceptionCompletion&lt;T&gt; extends Completion {
+        final CompletableFuture&lt;? extends T&gt; src;
+        final Function&lt;? super Throwable, ? extends T&gt; fn;
+        final CompletableFuture&lt;T&gt; dst;
+        ExceptionCompletion(CompletableFuture&lt;? extends T&gt; src,
+                            Function&lt;? super Throwable, ? extends T&gt; fn,
+<span class="nc" id="L1230">                            CompletableFuture&lt;T&gt; dst) {</span>
+<span class="nc" id="L1231">            this.src = src; this.fn = fn; this.dst = dst;</span>
+<span class="nc" id="L1232">        }</span>
+        public final void run() {
+            final CompletableFuture&lt;? extends T&gt; a;
+            final Function&lt;? super Throwable, ? extends T&gt; fn;
+            final CompletableFuture&lt;T&gt; dst;
+<span class="nc" id="L1237">            Object r; T t = null; Throwable ex, dx = null;</span>
+<span class="nc bnc" id="L1238" title="All 8 branches missed.">            if ((dst = this.dst) != null &amp;&amp;</span>
+                (fn = this.fn) != null &amp;&amp;
+                (a = this.src) != null &amp;&amp;
+                (r = a.result) != null &amp;&amp;
+<span class="nc bnc" id="L1242" title="All 2 branches missed.">                compareAndSet(0, 1)) {</span>
+<span class="nc bnc" id="L1243" title="All 4 branches missed.">                if ((r instanceof AltResult) &amp;&amp;</span>
+                    (ex = ((AltResult)r).ex) != null) {
+                    try {
+<span class="nc" id="L1246">                        t = fn.apply(ex);</span>
+<span class="nc" id="L1247">                    } catch (Throwable rex) {</span>
+<span class="nc" id="L1248">                        dx = rex;</span>
+<span class="nc" id="L1249">                    }</span>
+                }
+                else {
+<span class="nc" id="L1252">                    @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="nc" id="L1253">                    t = tr;</span>
+                }
+<span class="nc" id="L1255">                dst.internalComplete(t, dx);</span>
+            }
+<span class="nc" id="L1257">        }</span>
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    static final class WhenCompleteCompletion&lt;T&gt; extends Completion {
+        final CompletableFuture&lt;? extends T&gt; src;
+        final BiConsumer&lt;? super T, ? super Throwable&gt; fn;
+        final CompletableFuture&lt;T&gt; dst;
+        final Executor executor;
+        WhenCompleteCompletion(CompletableFuture&lt;? extends T&gt; src,
+                                  BiConsumer&lt;? super T, ? super Throwable&gt; fn,
+                                  CompletableFuture&lt;T&gt; dst,
+<span class="nc" id="L1269">                                  Executor executor) {</span>
+<span class="nc" id="L1270">            this.src = src; this.fn = fn; this.dst = dst;</span>
+<span class="nc" id="L1271">            this.executor = executor;</span>
+<span class="nc" id="L1272">        }</span>
+        public final void run() {
+            final CompletableFuture&lt;? extends T&gt; a;
+            final BiConsumer&lt;? super T, ? super Throwable&gt; fn;
+            final CompletableFuture&lt;T&gt; dst;
+            Object r; T t; Throwable ex;
+<span class="nc bnc" id="L1278" title="All 8 branches missed.">            if ((dst = this.dst) != null &amp;&amp;</span>
+                (fn = this.fn) != null &amp;&amp;
+                (a = this.src) != null &amp;&amp;
+                (r = a.result) != null &amp;&amp;
+<span class="nc bnc" id="L1282" title="All 2 branches missed.">                compareAndSet(0, 1)) {</span>
+<span class="nc bnc" id="L1283" title="All 2 branches missed.">                if (r instanceof AltResult) {</span>
+<span class="nc" id="L1284">                    ex = ((AltResult)r).ex;</span>
+<span class="nc" id="L1285">                    t = null;</span>
+                }
+                else {
+<span class="nc" id="L1288">                    ex = null;</span>
+<span class="nc" id="L1289">                    @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="nc" id="L1290">                    t = tr;</span>
+                }
+<span class="nc" id="L1292">                Executor e = executor;</span>
+<span class="nc" id="L1293">                Throwable dx = null;</span>
+                try {
+<span class="nc bnc" id="L1295" title="All 2 branches missed.">                    if (e != null)</span>
+<span class="nc" id="L1296">                        execAsync(e, new AsyncWhenComplete&lt;T&gt;(t, ex, fn, dst));</span>
+                    else
+<span class="nc" id="L1298">                        fn.accept(t, ex);</span>
+<span class="nc" id="L1299">                } catch (Throwable rex) {</span>
+<span class="nc" id="L1300">                    dx = rex;</span>
+<span class="nc" id="L1301">                }</span>
+<span class="nc bnc" id="L1302" title="All 4 branches missed.">                if (e == null || dx != null)</span>
+<span class="nc bnc" id="L1303" title="All 2 branches missed.">                    dst.internalComplete(t, ex != null ? ex : dx);</span>
+            }
+<span class="nc" id="L1305">        }</span>
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    static final class ThenCopy&lt;T&gt; extends Completion {
+        final CompletableFuture&lt;?&gt; src;
+        final CompletableFuture&lt;T&gt; dst;
+        ThenCopy(CompletableFuture&lt;?&gt; src,
+<span class="nc" id="L1313">                 CompletableFuture&lt;T&gt; dst) {</span>
+<span class="nc" id="L1314">            this.src = src; this.dst = dst;</span>
+<span class="nc" id="L1315">        }</span>
+        public final void run() {
+            final CompletableFuture&lt;?&gt; a;
+            final CompletableFuture&lt;T&gt; dst;
+            Object r; T t; Throwable ex;
+<span class="nc bnc" id="L1320" title="All 6 branches missed.">            if ((dst = this.dst) != null &amp;&amp;</span>
+                (a = this.src) != null &amp;&amp;
+                (r = a.result) != null &amp;&amp;
+<span class="nc bnc" id="L1323" title="All 2 branches missed.">                compareAndSet(0, 1)) {</span>
+<span class="nc bnc" id="L1324" title="All 2 branches missed.">                if (r instanceof AltResult) {</span>
+<span class="nc" id="L1325">                    ex = ((AltResult)r).ex;</span>
+<span class="nc" id="L1326">                    t = null;</span>
+                }
+                else {
+<span class="nc" id="L1329">                    ex = null;</span>
+<span class="nc" id="L1330">                    @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="nc" id="L1331">                    t = tr;</span>
+                }
+<span class="nc" id="L1333">                dst.internalComplete(t, ex);</span>
+            }
+<span class="nc" id="L1335">        }</span>
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    // version of ThenCopy for CompletableFuture&lt;Void&gt; dst
+    static final class ThenPropagate extends Completion {
+        final CompletableFuture&lt;?&gt; src;
+        final CompletableFuture&lt;Void&gt; dst;
+        ThenPropagate(CompletableFuture&lt;?&gt; src,
+<span class="nc" id="L1344">                      CompletableFuture&lt;Void&gt; dst) {</span>
+<span class="nc" id="L1345">            this.src = src; this.dst = dst;</span>
+<span class="nc" id="L1346">        }</span>
+        public final void run() {
+            final CompletableFuture&lt;?&gt; a;
+            final CompletableFuture&lt;Void&gt; dst;
+            Object r; Throwable ex;
+<span class="nc bnc" id="L1351" title="All 6 branches missed.">            if ((dst = this.dst) != null &amp;&amp;</span>
+                (a = this.src) != null &amp;&amp;
+                (r = a.result) != null &amp;&amp;
+<span class="nc bnc" id="L1354" title="All 2 branches missed.">                compareAndSet(0, 1)) {</span>
+<span class="nc bnc" id="L1355" title="All 2 branches missed.">                if (r instanceof AltResult)</span>
+<span class="nc" id="L1356">                    ex = ((AltResult)r).ex;</span>
+                else
+<span class="nc" id="L1358">                    ex = null;</span>
+<span class="nc" id="L1359">                dst.internalComplete(null, ex);</span>
+            }
+<span class="nc" id="L1361">        }</span>
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    static final class HandleCompletion&lt;T,U&gt; extends Completion {
+        final CompletableFuture&lt;? extends T&gt; src;
+        final BiFunction&lt;? super T, Throwable, ? extends U&gt; fn;
+        final CompletableFuture&lt;U&gt; dst;
+        final Executor executor;
+        HandleCompletion(CompletableFuture&lt;? extends T&gt; src,
+                         BiFunction&lt;? super T, Throwable, ? extends U&gt; fn,
+                         CompletableFuture&lt;U&gt; dst,
+<span class="nc" id="L1373">                          Executor executor) {</span>
+<span class="nc" id="L1374">            this.src = src; this.fn = fn; this.dst = dst;</span>
+<span class="nc" id="L1375">            this.executor = executor;</span>
+<span class="nc" id="L1376">        }</span>
+        public final void run() {
+            final CompletableFuture&lt;? extends T&gt; a;
+            final BiFunction&lt;? super T, Throwable, ? extends U&gt; fn;
+            final CompletableFuture&lt;U&gt; dst;
+            Object r; T t; Throwable ex;
+<span class="nc bnc" id="L1382" title="All 8 branches missed.">            if ((dst = this.dst) != null &amp;&amp;</span>
+                (fn = this.fn) != null &amp;&amp;
+                (a = this.src) != null &amp;&amp;
+                (r = a.result) != null &amp;&amp;
+<span class="nc bnc" id="L1386" title="All 2 branches missed.">                compareAndSet(0, 1)) {</span>
+<span class="nc bnc" id="L1387" title="All 2 branches missed.">                if (r instanceof AltResult) {</span>
+<span class="nc" id="L1388">                    ex = ((AltResult)r).ex;</span>
+<span class="nc" id="L1389">                    t = null;</span>
+                }
+                else {
+<span class="nc" id="L1392">                    ex = null;</span>
+<span class="nc" id="L1393">                    @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="nc" id="L1394">                    t = tr;</span>
+                }
+<span class="nc" id="L1396">                Executor e = executor;</span>
+<span class="nc" id="L1397">                U u = null;</span>
+<span class="nc" id="L1398">                Throwable dx = null;</span>
+                try {
+<span class="nc bnc" id="L1400" title="All 2 branches missed.">                    if (e != null)</span>
+<span class="nc" id="L1401">                        execAsync(e, new AsyncCombine&lt;T,Throwable,U&gt;(t, ex, fn, dst));</span>
+                    else
+<span class="nc" id="L1403">                        u = fn.apply(t, ex);</span>
+<span class="nc" id="L1404">                } catch (Throwable rex) {</span>
+<span class="nc" id="L1405">                    dx = rex;</span>
+<span class="nc" id="L1406">                }</span>
+<span class="nc bnc" id="L1407" title="All 4 branches missed.">                if (e == null || dx != null)</span>
+<span class="nc" id="L1408">                    dst.internalComplete(u, dx);</span>
+            }
+<span class="nc" id="L1410">        }</span>
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    static final class ThenCompose&lt;T,U&gt; extends Completion {
+        final CompletableFuture&lt;? extends T&gt; src;
+        final Function&lt;? super T, ? extends CompletionStage&lt;U&gt;&gt; fn;
+        final CompletableFuture&lt;U&gt; dst;
+        final Executor executor;
+        ThenCompose(CompletableFuture&lt;? extends T&gt; src,
+                    Function&lt;? super T, ? extends CompletionStage&lt;U&gt;&gt; fn,
+                    CompletableFuture&lt;U&gt; dst,
+<span class="fc" id="L1422">                    Executor executor) {</span>
+<span class="fc" id="L1423">            this.src = src; this.fn = fn; this.dst = dst;</span>
+<span class="fc" id="L1424">            this.executor = executor;</span>
+<span class="fc" id="L1425">        }</span>
+        public final void run() {
+            final CompletableFuture&lt;? extends T&gt; a;
+            final Function&lt;? super T, ? extends CompletionStage&lt;U&gt;&gt; fn;
+            final CompletableFuture&lt;U&gt; dst;
+            Object r; T t; Throwable ex; Executor e;
+<span class="pc bpc" id="L1431" title="4 of 8 branches missed.">            if ((dst = this.dst) != null &amp;&amp;</span>
+                (fn = this.fn) != null &amp;&amp;
+                (a = this.src) != null &amp;&amp;
+                (r = a.result) != null &amp;&amp;
+<span class="pc bpc" id="L1435" title="1 of 2 branches missed.">                compareAndSet(0, 1)) {</span>
+<span class="pc bpc" id="L1436" title="1 of 2 branches missed.">                if (r instanceof AltResult) {</span>
+<span class="nc" id="L1437">                    ex = ((AltResult)r).ex;</span>
+<span class="nc" id="L1438">                    t = null;</span>
+                }
+                else {
+<span class="fc" id="L1441">                    ex = null;</span>
+<span class="fc" id="L1442">                    @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="fc" id="L1443">                    t = tr;</span>
+                }
+<span class="fc" id="L1445">                CompletableFuture&lt;U&gt; c = null;</span>
+<span class="fc" id="L1446">                U u = null;</span>
+<span class="fc" id="L1447">                boolean complete = false;</span>
+<span class="pc bpc" id="L1448" title="1 of 2 branches missed.">                if (ex == null) {</span>
+<span class="pc bpc" id="L1449" title="1 of 2 branches missed.">                    if ((e = executor) != null)</span>
+<span class="nc" id="L1450">                        execAsync(e, new AsyncCompose&lt;T,U&gt;(t, fn, dst));</span>
+                    else {
+                        try {
+<span class="fc" id="L1453">                            CompletionStage&lt;U&gt; cs = fn.apply(t);</span>
+<span class="pc bpc" id="L1454" title="1 of 2 branches missed.">                            c = (cs == null) ? null : cs.toCompletableFuture();</span>
+<span class="pc bpc" id="L1455" title="1 of 2 branches missed.">                            if (c == null)</span>
+<span class="nc" id="L1456">                                ex = new NullPointerException();</span>
+<span class="nc" id="L1457">                        } catch (Throwable rex) {</span>
+<span class="nc" id="L1458">                            ex = rex;</span>
+<span class="fc" id="L1459">                        }</span>
+                    }
+                }
+<span class="pc bpc" id="L1462" title="1 of 2 branches missed.">                if (c != null) {</span>
+<span class="fc" id="L1463">                    ThenCopy&lt;U&gt; d = null;</span>
+                    Object s;
+<span class="pc bpc" id="L1465" title="1 of 2 branches missed.">                    if ((s = c.result) == null) {</span>
+<span class="nc" id="L1466">                        CompletionNode p = new CompletionNode</span>
+                            (d = new ThenCopy&lt;U&gt;(c, dst));
+<span class="nc bnc" id="L1468" title="All 2 branches missed.">                        while ((s = c.result) == null) {</span>
+<span class="nc" id="L1469">                            if (UNSAFE.compareAndSwapObject</span>
+<span class="nc bnc" id="L1470" title="All 2 branches missed.">                                (c, COMPLETIONS, p.next = c.completions, p))</span>
+<span class="nc" id="L1471">                                break;</span>
+                        }
+                    }
+<span class="pc bpc" id="L1474" title="4 of 6 branches missed.">                    if (s != null &amp;&amp; (d == null || d.compareAndSet(0, 1))) {</span>
+<span class="fc" id="L1475">                        complete = true;</span>
+<span class="pc bpc" id="L1476" title="1 of 2 branches missed.">                        if (s instanceof AltResult) {</span>
+<span class="nc" id="L1477">                            ex = ((AltResult)s).ex;  // no rewrap</span>
+<span class="nc" id="L1478">                            u = null;</span>
+                        }
+                        else {
+<span class="fc" id="L1481">                            @SuppressWarnings(&quot;unchecked&quot;) U us = (U) s;</span>
+<span class="fc" id="L1482">                            u = us;</span>
+                        }
+                    }
+                }
+<span class="pc bpc" id="L1486" title="3 of 4 branches missed.">                if (complete || ex != null)</span>
+<span class="fc" id="L1487">                    dst.internalComplete(u, ex);</span>
+<span class="pc bpc" id="L1488" title="1 of 2 branches missed.">                if (c != null)</span>
+<span class="fc" id="L1489">                    c.helpPostComplete();</span>
+            }
+<span class="fc" id="L1491">        }</span>
+        private static final long serialVersionUID = 5232453952276885070L;
+    }
+
+    // Implementations of stage methods with (plain, async, Executor) forms
+
+    private &lt;U&gt; CompletableFuture&lt;U&gt; doThenApply
+        (Function&lt;? super T,? extends U&gt; fn,
+         Executor e) {
+<span class="pc bpc" id="L1500" title="1 of 2 branches missed.">        if (fn == null) throw new NullPointerException();</span>
+<span class="fc" id="L1501">        CompletableFuture&lt;U&gt; dst = new CompletableFuture&lt;U&gt;();</span>
+<span class="fc" id="L1502">        ThenApply&lt;T,U&gt; d = null;</span>
+        Object r;
+<span class="fc bfc" id="L1504" title="All 2 branches covered.">        if ((r = result) == null) {</span>
+<span class="fc" id="L1505">            CompletionNode p = new CompletionNode</span>
+                (d = new ThenApply&lt;T,U&gt;(this, fn, dst, e));
+<span class="pc bpc" id="L1507" title="1 of 2 branches missed.">            while ((r = result) == null) {</span>
+<span class="fc" id="L1508">                if (UNSAFE.compareAndSwapObject</span>
+<span class="pc bpc" id="L1509" title="1 of 2 branches missed.">                    (this, COMPLETIONS, p.next = completions, p))</span>
+<span class="fc" id="L1510">                    break;</span>
+            }
+        }
+<span class="pc bpc" id="L1513" title="3 of 6 branches missed.">        if (r != null &amp;&amp; (d == null || d.compareAndSet(0, 1))) {</span>
+            T t; Throwable ex;
+<span class="fc bfc" id="L1515" title="All 2 branches covered.">            if (r instanceof AltResult) {</span>
+<span class="fc" id="L1516">                ex = ((AltResult)r).ex;</span>
+<span class="fc" id="L1517">                t = null;</span>
+            }
+            else {
+<span class="fc" id="L1520">                ex = null;</span>
+<span class="fc" id="L1521">                @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="fc" id="L1522">                t = tr;</span>
+            }
+<span class="fc" id="L1524">            U u = null;</span>
+<span class="fc bfc" id="L1525" title="All 2 branches covered.">            if (ex == null) {</span>
+                try {
+<span class="pc bpc" id="L1527" title="1 of 2 branches missed.">                    if (e != null)</span>
+<span class="fc" id="L1528">                        execAsync(e, new AsyncApply&lt;T,U&gt;(t, fn, dst));</span>
+                    else
+<span class="nc" id="L1530">                        u = fn.apply(t);</span>
+<span class="nc" id="L1531">                } catch (Throwable rex) {</span>
+<span class="nc" id="L1532">                    ex = rex;</span>
+<span class="fc" id="L1533">                }</span>
+            }
+<span class="pc bpc" id="L1535" title="1 of 4 branches missed.">            if (e == null || ex != null)</span>
+<span class="fc" id="L1536">                dst.internalComplete(u, ex);</span>
+        }
+<span class="fc" id="L1538">        helpPostComplete();</span>
+<span class="fc" id="L1539">        return dst;</span>
+    }
+
+    private CompletableFuture&lt;Void&gt; doThenAccept(Consumer&lt;? super T&gt; fn,
+                                                 Executor e) {
+<span class="pc bpc" id="L1544" title="1 of 2 branches missed.">        if (fn == null) throw new NullPointerException();</span>
+<span class="fc" id="L1545">        CompletableFuture&lt;Void&gt; dst = new CompletableFuture&lt;Void&gt;();</span>
+<span class="fc" id="L1546">        ThenAccept&lt;T&gt; d = null;</span>
+        Object r;
+<span class="fc bfc" id="L1548" title="All 2 branches covered.">        if ((r = result) == null) {</span>
+<span class="fc" id="L1549">            CompletionNode p = new CompletionNode</span>
+                (d = new ThenAccept&lt;T&gt;(this, fn, dst, e));
+<span class="pc bpc" id="L1551" title="1 of 2 branches missed.">            while ((r = result) == null) {</span>
+<span class="fc" id="L1552">                if (UNSAFE.compareAndSwapObject</span>
+<span class="pc bpc" id="L1553" title="1 of 2 branches missed.">                    (this, COMPLETIONS, p.next = completions, p))</span>
+<span class="fc" id="L1554">                    break;</span>
+            }
+        }
+<span class="pc bpc" id="L1557" title="3 of 6 branches missed.">        if (r != null &amp;&amp; (d == null || d.compareAndSet(0, 1))) {</span>
+            T t; Throwable ex;
+<span class="fc bfc" id="L1559" title="All 2 branches covered.">            if (r instanceof AltResult) {</span>
+<span class="fc" id="L1560">                ex = ((AltResult)r).ex;</span>
+<span class="fc" id="L1561">                t = null;</span>
+            }
+            else {
+<span class="fc" id="L1564">                ex = null;</span>
+<span class="fc" id="L1565">                @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="fc" id="L1566">                t = tr;</span>
+            }
+<span class="fc bfc" id="L1568" title="All 2 branches covered.">            if (ex == null) {</span>
+                try {
+<span class="pc bpc" id="L1570" title="1 of 2 branches missed.">                    if (e != null)</span>
+<span class="fc" id="L1571">                        execAsync(e, new AsyncAccept&lt;T&gt;(t, fn, dst));</span>
+                    else
+<span class="nc" id="L1573">                        fn.accept(t);</span>
+<span class="nc" id="L1574">                } catch (Throwable rex) {</span>
+<span class="nc" id="L1575">                    ex = rex;</span>
+<span class="fc" id="L1576">                }</span>
+            }
+<span class="fc bfc" id="L1578" title="All 4 branches covered.">            if (e == null || ex != null)</span>
+<span class="fc" id="L1579">                dst.internalComplete(null, ex);</span>
+        }
+<span class="fc" id="L1581">        helpPostComplete();</span>
+<span class="fc" id="L1582">        return dst;</span>
+    }
+
+    private CompletableFuture&lt;Void&gt; doThenRun(Runnable action,
+                                              Executor e) {
+<span class="pc bpc" id="L1587" title="1 of 2 branches missed.">        if (action == null) throw new NullPointerException();</span>
+<span class="fc" id="L1588">        CompletableFuture&lt;Void&gt; dst = new CompletableFuture&lt;Void&gt;();</span>
+<span class="fc" id="L1589">        ThenRun d = null;</span>
+        Object r;
+<span class="fc bfc" id="L1591" title="All 2 branches covered.">        if ((r = result) == null) {</span>
+<span class="fc" id="L1592">            CompletionNode p = new CompletionNode</span>
+                (d = new ThenRun(this, action, dst, e));
+<span class="pc bpc" id="L1594" title="1 of 2 branches missed.">            while ((r = result) == null) {</span>
+<span class="fc" id="L1595">                if (UNSAFE.compareAndSwapObject</span>
+<span class="pc bpc" id="L1596" title="1 of 2 branches missed.">                    (this, COMPLETIONS, p.next = completions, p))</span>
+<span class="fc" id="L1597">                    break;</span>
+            }
+        }
+<span class="pc bpc" id="L1600" title="3 of 6 branches missed.">        if (r != null &amp;&amp; (d == null || d.compareAndSet(0, 1))) {</span>
+            Throwable ex;
+<span class="pc bpc" id="L1602" title="1 of 2 branches missed.">            if (r instanceof AltResult)</span>
+<span class="nc" id="L1603">                ex = ((AltResult)r).ex;</span>
+            else
+<span class="fc" id="L1605">                ex = null;</span>
+<span class="pc bpc" id="L1606" title="1 of 2 branches missed.">            if (ex == null) {</span>
+                try {
+<span class="fc bfc" id="L1608" title="All 2 branches covered.">                    if (e != null)</span>
+<span class="fc" id="L1609">                        execAsync(e, new AsyncRun(action, dst));</span>
+                    else
+<span class="fc" id="L1611">                        action.run();</span>
+<span class="nc" id="L1612">                } catch (Throwable rex) {</span>
+<span class="nc" id="L1613">                    ex = rex;</span>
+<span class="fc" id="L1614">                }</span>
+            }
+<span class="pc bpc" id="L1616" title="1 of 4 branches missed.">            if (e == null || ex != null)</span>
+<span class="fc" id="L1617">                dst.internalComplete(null, ex);</span>
+        }
+<span class="fc" id="L1619">        helpPostComplete();</span>
+<span class="fc" id="L1620">        return dst;</span>
+    }
+
+    private &lt;U,V&gt; CompletableFuture&lt;V&gt; doThenCombine
+        (CompletableFuture&lt;? extends U&gt; other,
+         BiFunction&lt;? super T,? super U,? extends V&gt; fn,
+         Executor e) {
+<span class="pc bpc" id="L1627" title="2 of 4 branches missed.">        if (other == null || fn == null) throw new NullPointerException();</span>
+<span class="fc" id="L1628">        CompletableFuture&lt;V&gt; dst = new CompletableFuture&lt;V&gt;();</span>
+<span class="fc" id="L1629">        ThenCombine&lt;T,U,V&gt; d = null;</span>
+<span class="fc" id="L1630">        Object r, s = null;</span>
+<span class="pc bpc" id="L1631" title="1 of 4 branches missed.">        if ((r = result) == null || (s = other.result) == null) {</span>
+<span class="fc" id="L1632">            d = new ThenCombine&lt;T,U,V&gt;(this, other, fn, dst, e);</span>
+<span class="fc" id="L1633">            CompletionNode q = null, p = new CompletionNode(d);</span>
+<span class="pc bpc" id="L1634" title="5 of 8 branches missed.">            while ((r == null &amp;&amp; (r = result) == null) ||</span>
+                   (s == null &amp;&amp; (s = other.result) == null)) {
+<span class="fc bfc" id="L1636" title="All 2 branches covered.">                if (q != null) {</span>
+<span class="pc bpc" id="L1637" title="1 of 2 branches missed.">                    if (s != null ||</span>
+                        UNSAFE.compareAndSwapObject
+<span class="pc bpc" id="L1639" title="1 of 2 branches missed.">                        (other, COMPLETIONS, q.next = other.completions, q))</span>
+<span class="fc" id="L1640">                        break;</span>
+                }
+<span class="pc bpc" id="L1642" title="1 of 2 branches missed.">                else if (r != null ||</span>
+                         UNSAFE.compareAndSwapObject
+<span class="nc bnc" id="L1644" title="All 2 branches missed.">                         (this, COMPLETIONS, p.next = completions, p)) {</span>
+<span class="pc bpc" id="L1645" title="1 of 2 branches missed.">                    if (s != null)</span>
+<span class="nc" id="L1646">                        break;</span>
+<span class="fc" id="L1647">                    q = new CompletionNode(d);</span>
+                }
+            }
+        }
+<span class="pc bpc" id="L1651" title="4 of 8 branches missed.">        if (r != null &amp;&amp; s != null &amp;&amp; (d == null || d.compareAndSet(0, 1))) {</span>
+            T t; U u; Throwable ex;
+<span class="fc bfc" id="L1653" title="All 2 branches covered.">            if (r instanceof AltResult) {</span>
+<span class="fc" id="L1654">                ex = ((AltResult)r).ex;</span>
+<span class="fc" id="L1655">                t = null;</span>
+            }
+            else {
+<span class="fc" id="L1658">                ex = null;</span>
+<span class="fc" id="L1659">                @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="fc" id="L1660">                t = tr;</span>
+            }
+<span class="fc bfc" id="L1662" title="All 2 branches covered.">            if (ex != null)</span>
+<span class="fc" id="L1663">                u = null;</span>
+<span class="fc bfc" id="L1664" title="All 2 branches covered.">            else if (s instanceof AltResult) {</span>
+<span class="fc" id="L1665">                ex = ((AltResult)s).ex;</span>
+<span class="fc" id="L1666">                u = null;</span>
+            }
+            else {
+<span class="fc" id="L1669">                @SuppressWarnings(&quot;unchecked&quot;) U us = (U) s;</span>
+<span class="fc" id="L1670">                u = us;</span>
+            }
+<span class="fc" id="L1672">            V v = null;</span>
+<span class="fc bfc" id="L1673" title="All 2 branches covered.">            if (ex == null) {</span>
+                try {
+<span class="pc bpc" id="L1675" title="1 of 2 branches missed.">                    if (e != null)</span>
+<span class="fc" id="L1676">                        execAsync(e, new AsyncCombine&lt;T,U,V&gt;(t, u, fn, dst));</span>
+                    else
+<span class="nc" id="L1678">                        v = fn.apply(t, u);</span>
+<span class="nc" id="L1679">                } catch (Throwable rex) {</span>
+<span class="nc" id="L1680">                    ex = rex;</span>
+<span class="fc" id="L1681">                }</span>
+            }
+<span class="fc bfc" id="L1683" title="All 4 branches covered.">            if (e == null || ex != null)</span>
+<span class="fc" id="L1684">                dst.internalComplete(v, ex);</span>
+        }
+<span class="fc" id="L1686">        helpPostComplete();</span>
+<span class="fc" id="L1687">        other.helpPostComplete();</span>
+<span class="fc" id="L1688">        return dst;</span>
+    }
+
+    private &lt;U&gt; CompletableFuture&lt;Void&gt; doThenAcceptBoth
+        (CompletableFuture&lt;? extends U&gt; other,
+         BiConsumer&lt;? super T,? super U&gt; fn,
+         Executor e) {
+<span class="pc bpc" id="L1695" title="2 of 4 branches missed.">        if (other == null || fn == null) throw new NullPointerException();</span>
+<span class="fc" id="L1696">        CompletableFuture&lt;Void&gt; dst = new CompletableFuture&lt;Void&gt;();</span>
+<span class="fc" id="L1697">        ThenAcceptBoth&lt;T,U&gt; d = null;</span>
+<span class="fc" id="L1698">        Object r, s = null;</span>
+<span class="fc bfc" id="L1699" title="All 4 branches covered.">        if ((r = result) == null || (s = other.result) == null) {</span>
+<span class="fc" id="L1700">            d = new ThenAcceptBoth&lt;T,U&gt;(this, other, fn, dst, e);</span>
+<span class="fc" id="L1701">            CompletionNode q = null, p = new CompletionNode(d);</span>
+<span class="pc bpc" id="L1702" title="3 of 8 branches missed.">            while ((r == null &amp;&amp; (r = result) == null) ||</span>
+                   (s == null &amp;&amp; (s = other.result) == null)) {
+<span class="fc bfc" id="L1704" title="All 2 branches covered.">                if (q != null) {</span>
+<span class="pc bpc" id="L1705" title="1 of 2 branches missed.">                    if (s != null ||</span>
+                        UNSAFE.compareAndSwapObject
+<span class="pc bpc" id="L1707" title="1 of 2 branches missed.">                        (other, COMPLETIONS, q.next = other.completions, q))</span>
+<span class="fc" id="L1708">                        break;</span>
+                }
+<span class="fc bfc" id="L1710" title="All 2 branches covered.">                else if (r != null ||</span>
+                         UNSAFE.compareAndSwapObject
+<span class="pc bpc" id="L1712" title="1 of 2 branches missed.">                         (this, COMPLETIONS, p.next = completions, p)) {</span>
+<span class="pc bpc" id="L1713" title="1 of 2 branches missed.">                    if (s != null)</span>
+<span class="nc" id="L1714">                        break;</span>
+<span class="fc" id="L1715">                    q = new CompletionNode(d);</span>
+                }
+            }
+        }
+<span class="pc bpc" id="L1719" title="3 of 8 branches missed.">        if (r != null &amp;&amp; s != null &amp;&amp; (d == null || d.compareAndSet(0, 1))) {</span>
+            T t; U u; Throwable ex;
+<span class="fc bfc" id="L1721" title="All 2 branches covered.">            if (r instanceof AltResult) {</span>
+<span class="fc" id="L1722">                ex = ((AltResult)r).ex;</span>
+<span class="fc" id="L1723">                t = null;</span>
+            }
+            else {
+<span class="fc" id="L1726">                ex = null;</span>
+<span class="fc" id="L1727">                @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="fc" id="L1728">                t = tr;</span>
+            }
+<span class="fc bfc" id="L1730" title="All 2 branches covered.">            if (ex != null)</span>
+<span class="fc" id="L1731">                u = null;</span>
+<span class="fc bfc" id="L1732" title="All 2 branches covered.">            else if (s instanceof AltResult) {</span>
+<span class="fc" id="L1733">                ex = ((AltResult)s).ex;</span>
+<span class="fc" id="L1734">                u = null;</span>
+            }
+            else {
+<span class="fc" id="L1737">                @SuppressWarnings(&quot;unchecked&quot;) U us = (U) s;</span>
+<span class="fc" id="L1738">                u = us;</span>
+            }
+<span class="fc bfc" id="L1740" title="All 2 branches covered.">            if (ex == null) {</span>
+                try {
+<span class="pc bpc" id="L1742" title="1 of 2 branches missed.">                    if (e != null)</span>
+<span class="fc" id="L1743">                        execAsync(e, new AsyncAcceptBoth&lt;T,U&gt;(t, u, fn, dst));</span>
+                    else
+<span class="nc" id="L1745">                        fn.accept(t, u);</span>
+<span class="nc" id="L1746">                } catch (Throwable rex) {</span>
+<span class="nc" id="L1747">                    ex = rex;</span>
+<span class="fc" id="L1748">                }</span>
+            }
+<span class="fc bfc" id="L1750" title="All 4 branches covered.">            if (e == null || ex != null)</span>
+<span class="fc" id="L1751">                dst.internalComplete(null, ex);</span>
+        }
+<span class="fc" id="L1753">        helpPostComplete();</span>
+<span class="fc" id="L1754">        other.helpPostComplete();</span>
+<span class="fc" id="L1755">        return dst;</span>
+    }
+
+    private CompletableFuture&lt;Void&gt; doRunAfterBoth(CompletableFuture&lt;?&gt; other,
+                                                   Runnable action,
+                                                   Executor e) {
+<span class="pc bpc" id="L1761" title="2 of 4 branches missed.">        if (other == null || action == null) throw new NullPointerException();</span>
+<span class="fc" id="L1762">        CompletableFuture&lt;Void&gt; dst = new CompletableFuture&lt;Void&gt;();</span>
+<span class="fc" id="L1763">        RunAfterBoth d = null;</span>
+<span class="fc" id="L1764">        Object r, s = null;</span>
+<span class="pc bpc" id="L1765" title="2 of 4 branches missed.">        if ((r = result) == null || (s = other.result) == null) {</span>
+<span class="nc" id="L1766">            d = new RunAfterBoth(this, other, action, dst, e);</span>
+<span class="nc" id="L1767">            CompletionNode q = null, p = new CompletionNode(d);</span>
+<span class="nc bnc" id="L1768" title="All 8 branches missed.">            while ((r == null &amp;&amp; (r = result) == null) ||</span>
+                   (s == null &amp;&amp; (s = other.result) == null)) {
+<span class="nc bnc" id="L1770" title="All 2 branches missed.">                if (q != null) {</span>
+<span class="nc bnc" id="L1771" title="All 2 branches missed.">                    if (s != null ||</span>
+                        UNSAFE.compareAndSwapObject
+<span class="nc bnc" id="L1773" title="All 2 branches missed.">                        (other, COMPLETIONS, q.next = other.completions, q))</span>
+<span class="nc" id="L1774">                        break;</span>
+                }
+<span class="nc bnc" id="L1776" title="All 2 branches missed.">                else if (r != null ||</span>
+                         UNSAFE.compareAndSwapObject
+<span class="nc bnc" id="L1778" title="All 2 branches missed.">                         (this, COMPLETIONS, p.next = completions, p)) {</span>
+<span class="nc bnc" id="L1779" title="All 2 branches missed.">                    if (s != null)</span>
+<span class="nc" id="L1780">                        break;</span>
+<span class="nc" id="L1781">                    q = new CompletionNode(d);</span>
+                }
+            }
+        }
+<span class="pc bpc" id="L1785" title="5 of 8 branches missed.">        if (r != null &amp;&amp; s != null &amp;&amp; (d == null || d.compareAndSet(0, 1))) {</span>
+            Throwable ex;
+<span class="fc bfc" id="L1787" title="All 2 branches covered.">            if (r instanceof AltResult)</span>
+<span class="fc" id="L1788">                ex = ((AltResult)r).ex;</span>
+            else
+<span class="fc" id="L1790">                ex = null;</span>
+<span class="fc bfc" id="L1791" title="All 4 branches covered.">            if (ex == null &amp;&amp; (s instanceof AltResult))</span>
+<span class="fc" id="L1792">                ex = ((AltResult)s).ex;</span>
+<span class="fc bfc" id="L1793" title="All 2 branches covered.">            if (ex == null) {</span>
+                try {
+<span class="fc bfc" id="L1795" title="All 2 branches covered.">                    if (e != null)</span>
+<span class="fc" id="L1796">                        execAsync(e, new AsyncRun(action, dst));</span>
+                    else
+<span class="fc" id="L1798">                        action.run();</span>
+<span class="nc" id="L1799">                } catch (Throwable rex) {</span>
+<span class="nc" id="L1800">                    ex = rex;</span>
+<span class="fc" id="L1801">                }</span>
+            }
+<span class="fc bfc" id="L1803" title="All 4 branches covered.">            if (e == null || ex != null)</span>
+<span class="fc" id="L1804">                dst.internalComplete(null, ex);</span>
+        }
+<span class="fc" id="L1806">        helpPostComplete();</span>
+<span class="fc" id="L1807">        other.helpPostComplete();</span>
+<span class="fc" id="L1808">        return dst;</span>
+    }
+
+    private &lt;U&gt; CompletableFuture&lt;U&gt; doApplyToEither
+        (CompletableFuture&lt;? extends T&gt; other,
+         Function&lt;? super T, U&gt; fn,
+         Executor e) {
+<span class="pc bpc" id="L1815" title="2 of 4 branches missed.">        if (other == null || fn == null) throw new NullPointerException();</span>
+<span class="fc" id="L1816">        CompletableFuture&lt;U&gt; dst = new CompletableFuture&lt;U&gt;();</span>
+<span class="fc" id="L1817">        ApplyToEither&lt;T,U&gt; d = null;</span>
+        Object r;
+<span class="pc bpc" id="L1819" title="1 of 4 branches missed.">        if ((r = result) == null &amp;&amp; (r = other.result) == null) {</span>
+<span class="nc" id="L1820">            d = new ApplyToEither&lt;T,U&gt;(this, other, fn, dst, e);</span>
+<span class="nc" id="L1821">            CompletionNode q = null, p = new CompletionNode(d);</span>
+<span class="nc bnc" id="L1822" title="All 4 branches missed.">            while ((r = result) == null &amp;&amp; (r = other.result) == null) {</span>
+<span class="nc bnc" id="L1823" title="All 2 branches missed.">                if (q != null) {</span>
+<span class="nc" id="L1824">                    if (UNSAFE.compareAndSwapObject</span>
+<span class="nc bnc" id="L1825" title="All 2 branches missed.">                        (other, COMPLETIONS, q.next = other.completions, q))</span>
+<span class="nc" id="L1826">                        break;</span>
+                }
+<span class="nc" id="L1828">                else if (UNSAFE.compareAndSwapObject</span>
+<span class="nc bnc" id="L1829" title="All 2 branches missed.">                         (this, COMPLETIONS, p.next = completions, p))</span>
+<span class="nc" id="L1830">                    q = new CompletionNode(d);</span>
+            }
+        }
+<span class="pc bpc" id="L1833" title="4 of 6 branches missed.">        if (r != null &amp;&amp; (d == null || d.compareAndSet(0, 1))) {</span>
+            T t; Throwable ex;
+<span class="fc bfc" id="L1835" title="All 2 branches covered.">            if (r instanceof AltResult) {</span>
+<span class="fc" id="L1836">                ex = ((AltResult)r).ex;</span>
+<span class="fc" id="L1837">                t = null;</span>
+            }
+            else {
+<span class="fc" id="L1840">                ex = null;</span>
+<span class="fc" id="L1841">                @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="fc" id="L1842">                t = tr;</span>
+            }
+<span class="fc" id="L1844">            U u = null;</span>
+<span class="fc bfc" id="L1845" title="All 2 branches covered.">            if (ex == null) {</span>
+                try {
+<span class="fc bfc" id="L1847" title="All 2 branches covered.">                    if (e != null)</span>
+<span class="fc" id="L1848">                        execAsync(e, new AsyncApply&lt;T,U&gt;(t, fn, dst));</span>
+                    else
+<span class="fc" id="L1850">                        u = fn.apply(t);</span>
+<span class="nc" id="L1851">                } catch (Throwable rex) {</span>
+<span class="nc" id="L1852">                    ex = rex;</span>
+<span class="fc" id="L1853">                }</span>
+            }
+<span class="fc bfc" id="L1855" title="All 4 branches covered.">            if (e == null || ex != null)</span>
+<span class="fc" id="L1856">                dst.internalComplete(u, ex);</span>
+        }
+<span class="fc" id="L1858">        helpPostComplete();</span>
+<span class="fc" id="L1859">        other.helpPostComplete();</span>
+<span class="fc" id="L1860">        return dst;</span>
+    }
+
+    private CompletableFuture&lt;Void&gt; doAcceptEither
+        (CompletableFuture&lt;? extends T&gt; other,
+         Consumer&lt;? super T&gt; fn,
+         Executor e) {
+<span class="pc bpc" id="L1867" title="2 of 4 branches missed.">        if (other == null || fn == null) throw new NullPointerException();</span>
+<span class="fc" id="L1868">        CompletableFuture&lt;Void&gt; dst = new CompletableFuture&lt;Void&gt;();</span>
+<span class="fc" id="L1869">        AcceptEither&lt;T&gt; d = null;</span>
+        Object r;
+<span class="pc bpc" id="L1871" title="1 of 4 branches missed.">        if ((r = result) == null &amp;&amp; (r = other.result) == null) {</span>
+<span class="nc" id="L1872">            d = new AcceptEither&lt;T&gt;(this, other, fn, dst, e);</span>
+<span class="nc" id="L1873">            CompletionNode q = null, p = new CompletionNode(d);</span>
+<span class="nc bnc" id="L1874" title="All 4 branches missed.">            while ((r = result) == null &amp;&amp; (r = other.result) == null) {</span>
+<span class="nc bnc" id="L1875" title="All 2 branches missed.">                if (q != null) {</span>
+<span class="nc" id="L1876">                    if (UNSAFE.compareAndSwapObject</span>
+<span class="nc bnc" id="L1877" title="All 2 branches missed.">                        (other, COMPLETIONS, q.next = other.completions, q))</span>
+<span class="nc" id="L1878">                        break;</span>
+                }
+<span class="nc" id="L1880">                else if (UNSAFE.compareAndSwapObject</span>
+<span class="nc bnc" id="L1881" title="All 2 branches missed.">                         (this, COMPLETIONS, p.next = completions, p))</span>
+<span class="nc" id="L1882">                    q = new CompletionNode(d);</span>
+            }
+        }
+<span class="pc bpc" id="L1885" title="4 of 6 branches missed.">        if (r != null &amp;&amp; (d == null || d.compareAndSet(0, 1))) {</span>
+            T t; Throwable ex;
+<span class="fc bfc" id="L1887" title="All 2 branches covered.">            if (r instanceof AltResult) {</span>
+<span class="fc" id="L1888">                ex = ((AltResult)r).ex;</span>
+<span class="fc" id="L1889">                t = null;</span>
+            }
+            else {
+<span class="fc" id="L1892">                ex = null;</span>
+<span class="fc" id="L1893">                @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="fc" id="L1894">                t = tr;</span>
+            }
+<span class="fc bfc" id="L1896" title="All 2 branches covered.">            if (ex == null) {</span>
+                try {
+<span class="fc bfc" id="L1898" title="All 2 branches covered.">                    if (e != null)</span>
+<span class="fc" id="L1899">                        execAsync(e, new AsyncAccept&lt;T&gt;(t, fn, dst));</span>
+                    else
+<span class="fc" id="L1901">                        fn.accept(t);</span>
+<span class="nc" id="L1902">                } catch (Throwable rex) {</span>
+<span class="nc" id="L1903">                    ex = rex;</span>
+<span class="fc" id="L1904">                }</span>
+            }
+<span class="fc bfc" id="L1906" title="All 4 branches covered.">            if (e == null || ex != null)</span>
+<span class="fc" id="L1907">                dst.internalComplete(null, ex);</span>
+        }
+<span class="fc" id="L1909">        helpPostComplete();</span>
+<span class="fc" id="L1910">        other.helpPostComplete();</span>
+<span class="fc" id="L1911">        return dst;</span>
+    }
+
+    private CompletableFuture&lt;Void&gt; doRunAfterEither
+        (CompletableFuture&lt;?&gt; other,
+         Runnable action,
+         Executor e) {
+<span class="pc bpc" id="L1918" title="2 of 4 branches missed.">        if (other == null || action == null) throw new NullPointerException();</span>
+<span class="fc" id="L1919">        CompletableFuture&lt;Void&gt; dst = new CompletableFuture&lt;Void&gt;();</span>
+<span class="fc" id="L1920">        RunAfterEither d = null;</span>
+        Object r;
+<span class="fc bfc" id="L1922" title="All 4 branches covered.">        if ((r = result) == null &amp;&amp; (r = other.result) == null) {</span>
+<span class="fc" id="L1923">            d = new RunAfterEither(this, other, action, dst, e);</span>
+<span class="fc" id="L1924">            CompletionNode q = null, p = new CompletionNode(d);</span>
+<span class="pc bpc" id="L1925" title="3 of 4 branches missed.">            while ((r = result) == null &amp;&amp; (r = other.result) == null) {</span>
+<span class="nc bnc" id="L1926" title="All 2 branches missed.">                if (q != null) {</span>
+<span class="nc" id="L1927">                    if (UNSAFE.compareAndSwapObject</span>
+<span class="nc bnc" id="L1928" title="All 2 branches missed.">                        (other, COMPLETIONS, q.next = other.completions, q))</span>
+<span class="nc" id="L1929">                        break;</span>
+                }
+<span class="nc" id="L1931">                else if (UNSAFE.compareAndSwapObject</span>
+<span class="nc bnc" id="L1932" title="All 2 branches missed.">                         (this, COMPLETIONS, p.next = completions, p))</span>
+<span class="nc" id="L1933">                    q = new CompletionNode(d);</span>
+            }
+        }
+<span class="pc bpc" id="L1936" title="2 of 6 branches missed.">        if (r != null &amp;&amp; (d == null || d.compareAndSet(0, 1))) {</span>
+            Throwable ex;
+<span class="pc bpc" id="L1938" title="1 of 2 branches missed.">            if (r instanceof AltResult)</span>
+<span class="fc" id="L1939">                ex = ((AltResult)r).ex;</span>
+            else
+<span class="nc" id="L1941">                ex = null;</span>
+<span class="fc bfc" id="L1942" title="All 2 branches covered.">            if (ex == null) {</span>
+                try {
+<span class="fc bfc" id="L1944" title="All 2 branches covered.">                    if (e != null)</span>
+<span class="fc" id="L1945">                        execAsync(e, new AsyncRun(action, dst));</span>
+                    else
+<span class="fc" id="L1947">                        action.run();</span>
+<span class="nc" id="L1948">                } catch (Throwable rex) {</span>
+<span class="nc" id="L1949">                    ex = rex;</span>
+<span class="fc" id="L1950">                }</span>
+            }
+<span class="fc bfc" id="L1952" title="All 4 branches covered.">            if (e == null || ex != null)</span>
+<span class="fc" id="L1953">                dst.internalComplete(null, ex);</span>
+        }
+<span class="fc" id="L1955">        helpPostComplete();</span>
+<span class="fc" id="L1956">        other.helpPostComplete();</span>
+<span class="fc" id="L1957">        return dst;</span>
+    }
+
+    private &lt;U&gt; CompletableFuture&lt;U&gt; doThenCompose
+        (Function&lt;? super T, ? extends CompletionStage&lt;U&gt;&gt; fn,
+         Executor e) {
+<span class="pc bpc" id="L1963" title="1 of 2 branches missed.">        if (fn == null) throw new NullPointerException();</span>
+<span class="fc" id="L1964">        CompletableFuture&lt;U&gt; dst = null;</span>
+<span class="fc" id="L1965">        ThenCompose&lt;T,U&gt; d = null;</span>
+        Object r;
+<span class="fc bfc" id="L1967" title="All 2 branches covered.">        if ((r = result) == null) {</span>
+<span class="fc" id="L1968">            dst = new CompletableFuture&lt;U&gt;();</span>
+<span class="fc" id="L1969">            CompletionNode p = new CompletionNode</span>
+                (d = new ThenCompose&lt;T,U&gt;(this, fn, dst, e));
+<span class="pc bpc" id="L1971" title="1 of 2 branches missed.">            while ((r = result) == null) {</span>
+<span class="fc" id="L1972">                if (UNSAFE.compareAndSwapObject</span>
+<span class="pc bpc" id="L1973" title="1 of 2 branches missed.">                    (this, COMPLETIONS, p.next = completions, p))</span>
+<span class="fc" id="L1974">                    break;</span>
+            }
+        }
+<span class="pc bpc" id="L1977" title="3 of 6 branches missed.">        if (r != null &amp;&amp; (d == null || d.compareAndSet(0, 1))) {</span>
+            T t; Throwable ex;
+<span class="fc bfc" id="L1979" title="All 2 branches covered.">            if (r instanceof AltResult) {</span>
+<span class="fc" id="L1980">                ex = ((AltResult)r).ex;</span>
+<span class="fc" id="L1981">                t = null;</span>
+            }
+            else {
+<span class="fc" id="L1984">                ex = null;</span>
+<span class="fc" id="L1985">                @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="fc" id="L1986">                t = tr;</span>
+            }
+<span class="fc bfc" id="L1988" title="All 2 branches covered.">            if (ex == null) {</span>
+<span class="pc bpc" id="L1989" title="1 of 2 branches missed.">                if (e != null) {</span>
+<span class="pc bpc" id="L1990" title="1 of 2 branches missed.">                    if (dst == null)</span>
+<span class="fc" id="L1991">                        dst = new CompletableFuture&lt;U&gt;();</span>
+<span class="fc" id="L1992">                    execAsync(e, new AsyncCompose&lt;T,U&gt;(t, fn, dst));</span>
+                }
+                else {
+                    try {
+<span class="nc" id="L1996">                        CompletionStage&lt;U&gt; cs = fn.apply(t);</span>
+<span class="nc bnc" id="L1997" title="All 2 branches missed.">                        if (cs == null ||</span>
+<span class="nc bnc" id="L1998" title="All 2 branches missed.">                            (dst = cs.toCompletableFuture()) == null)</span>
+<span class="nc" id="L1999">                            ex = new NullPointerException();</span>
+<span class="nc" id="L2000">                    } catch (Throwable rex) {</span>
+<span class="nc" id="L2001">                        ex = rex;</span>
+<span class="nc" id="L2002">                    }</span>
+                }
+            }
+<span class="fc bfc" id="L2005" title="All 2 branches covered.">            if (dst == null)</span>
+<span class="fc" id="L2006">                dst = new CompletableFuture&lt;U&gt;();</span>
+<span class="fc bfc" id="L2007" title="All 4 branches covered.">            if (e == null || ex != null)</span>
+<span class="fc" id="L2008">                dst.internalComplete(null, ex);</span>
+        }
+<span class="fc" id="L2010">        helpPostComplete();</span>
+<span class="fc" id="L2011">        dst.helpPostComplete();</span>
+<span class="fc" id="L2012">        return dst;</span>
+    }
+
+    private CompletableFuture&lt;T&gt; doWhenComplete
+        (BiConsumer&lt;? super T, ? super Throwable&gt; fn,
+         Executor e) {
+<span class="nc bnc" id="L2018" title="All 2 branches missed.">        if (fn == null) throw new NullPointerException();</span>
+<span class="nc" id="L2019">        CompletableFuture&lt;T&gt; dst = new CompletableFuture&lt;T&gt;();</span>
+<span class="nc" id="L2020">        WhenCompleteCompletion&lt;T&gt; d = null;</span>
+        Object r;
+<span class="nc bnc" id="L2022" title="All 2 branches missed.">        if ((r = result) == null) {</span>
+<span class="nc" id="L2023">            CompletionNode p =</span>
+                new CompletionNode(d = new WhenCompleteCompletion&lt;T&gt;
+                                   (this, fn, dst, e));
+<span class="nc bnc" id="L2026" title="All 2 branches missed.">            while ((r = result) == null) {</span>
+<span class="nc bnc" id="L2027" title="All 2 branches missed.">                if (UNSAFE.compareAndSwapObject(this, COMPLETIONS,</span>
+                                                p.next = completions, p))
+<span class="nc" id="L2029">                    break;</span>
+            }
+        }
+<span class="nc bnc" id="L2032" title="All 6 branches missed.">        if (r != null &amp;&amp; (d == null || d.compareAndSet(0, 1))) {</span>
+            T t; Throwable ex;
+<span class="nc bnc" id="L2034" title="All 2 branches missed.">            if (r instanceof AltResult) {</span>
+<span class="nc" id="L2035">                ex = ((AltResult)r).ex;</span>
+<span class="nc" id="L2036">                t = null;</span>
+            }
+            else {
+<span class="nc" id="L2039">                ex = null;</span>
+<span class="nc" id="L2040">                @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="nc" id="L2041">                t = tr;</span>
+            }
+<span class="nc" id="L2043">            Throwable dx = null;</span>
+            try {
+<span class="nc bnc" id="L2045" title="All 2 branches missed.">                if (e != null)</span>
+<span class="nc" id="L2046">                    execAsync(e, new AsyncWhenComplete&lt;T&gt;(t, ex, fn, dst));</span>
+                else
+<span class="nc" id="L2048">                    fn.accept(t, ex);</span>
+<span class="nc" id="L2049">            } catch (Throwable rex) {</span>
+<span class="nc" id="L2050">                dx = rex;</span>
+<span class="nc" id="L2051">            }</span>
+<span class="nc bnc" id="L2052" title="All 4 branches missed.">            if (e == null || dx != null)</span>
+<span class="nc bnc" id="L2053" title="All 2 branches missed.">                dst.internalComplete(t, ex != null ? ex : dx);</span>
+        }
+<span class="nc" id="L2055">        helpPostComplete();</span>
+<span class="nc" id="L2056">        return dst;</span>
+    }
+
+    private &lt;U&gt; CompletableFuture&lt;U&gt; doHandle
+        (BiFunction&lt;? super T, Throwable, ? extends U&gt; fn,
+         Executor e) {
+<span class="pc bpc" id="L2062" title="1 of 2 branches missed.">        if (fn == null) throw new NullPointerException();</span>
+<span class="fc" id="L2063">        CompletableFuture&lt;U&gt; dst = new CompletableFuture&lt;U&gt;();</span>
+<span class="fc" id="L2064">        HandleCompletion&lt;T,U&gt; d = null;</span>
+        Object r;
+<span class="pc bpc" id="L2066" title="1 of 2 branches missed.">        if ((r = result) == null) {</span>
+<span class="nc" id="L2067">            CompletionNode p =</span>
+                new CompletionNode(d = new HandleCompletion&lt;T,U&gt;
+                                   (this, fn, dst, e));
+<span class="nc bnc" id="L2070" title="All 2 branches missed.">            while ((r = result) == null) {</span>
+<span class="nc bnc" id="L2071" title="All 2 branches missed.">                if (UNSAFE.compareAndSwapObject(this, COMPLETIONS,</span>
+                                                p.next = completions, p))
+<span class="nc" id="L2073">                    break;</span>
+            }
+        }
+<span class="pc bpc" id="L2076" title="4 of 6 branches missed.">        if (r != null &amp;&amp; (d == null || d.compareAndSet(0, 1))) {</span>
+            T t; Throwable ex;
+<span class="fc bfc" id="L2078" title="All 2 branches covered.">            if (r instanceof AltResult) {</span>
+<span class="fc" id="L2079">                ex = ((AltResult)r).ex;</span>
+<span class="fc" id="L2080">                t = null;</span>
+            }
+            else {
+<span class="fc" id="L2083">                ex = null;</span>
+<span class="fc" id="L2084">                @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="fc" id="L2085">                t = tr;</span>
+            }
+<span class="fc" id="L2087">            U u = null;</span>
+<span class="fc" id="L2088">            Throwable dx = null;</span>
+            try {
+<span class="pc bpc" id="L2090" title="1 of 2 branches missed.">                if (e != null)</span>
+<span class="nc" id="L2091">                    execAsync(e, new AsyncCombine&lt;T,Throwable,U&gt;(t, ex, fn, dst));</span>
+                else {
+<span class="fc" id="L2093">                    u = fn.apply(t, ex);</span>
+<span class="fc" id="L2094">                    dx = null;</span>
+                }
+<span class="nc" id="L2096">            } catch (Throwable rex) {</span>
+<span class="nc" id="L2097">                dx = rex;</span>
+<span class="nc" id="L2098">                u = null;</span>
+<span class="fc" id="L2099">            }</span>
+<span class="pc bpc" id="L2100" title="3 of 4 branches missed.">            if (e == null || dx != null)</span>
+<span class="fc" id="L2101">                dst.internalComplete(u, dx);</span>
+        }
+<span class="fc" id="L2103">        helpPostComplete();</span>
+<span class="fc" id="L2104">        return dst;</span>
+    }
+
+
+    // public methods
+
+    /**
+     * Creates a new incomplete CompletableFuture.
+     */
+<span class="fc" id="L2113">    public CompletableFuture() {</span>
+<span class="fc" id="L2114">    }</span>
+
+    /**
+     * Returns a new CompletableFuture that is asynchronously completed
+     * by a task running in the {@link ForkJoinPool#commonPool()} with
+     * the value obtained by calling the given Supplier.
+     *
+     * @param supplier a function returning the value to be used
+     * to complete the returned CompletableFuture
+     * @param &lt;U&gt; the function's return type
+     * @return the new CompletableFuture
+     */
+    public static &lt;U&gt; CompletableFuture&lt;U&gt; supplyAsync(Supplier&lt;U&gt; supplier) {
+<span class="pc bpc" id="L2127" title="1 of 2 branches missed.">        if (supplier == null) throw new NullPointerException();</span>
+<span class="fc" id="L2128">        CompletableFuture&lt;U&gt; f = new CompletableFuture&lt;U&gt;();</span>
+<span class="fc" id="L2129">        execAsync(ForkJoinPool.commonPool(), new AsyncSupply&lt;U&gt;(supplier, f));</span>
+<span class="fc" id="L2130">        return f;</span>
+    }
+
+    /**
+     * Returns a new CompletableFuture that is asynchronously completed
+     * by a task running in the given executor with the value obtained
+     * by calling the given Supplier.
+     *
+     * @param supplier a function returning the value to be used
+     * to complete the returned CompletableFuture
+     * @param executor the executor to use for asynchronous execution
+     * @param &lt;U&gt; the function's return type
+     * @return the new CompletableFuture
+     */
+    public static &lt;U&gt; CompletableFuture&lt;U&gt; supplyAsync(Supplier&lt;U&gt; supplier,
+                                                       Executor executor) {
+<span class="pc bpc" id="L2146" title="2 of 4 branches missed.">        if (executor == null || supplier == null)</span>
+<span class="nc" id="L2147">            throw new NullPointerException();</span>
+<span class="fc" id="L2148">        CompletableFuture&lt;U&gt; f = new CompletableFuture&lt;U&gt;();</span>
+<span class="fc" id="L2149">        execAsync(executor, new AsyncSupply&lt;U&gt;(supplier, f));</span>
+<span class="fc" id="L2150">        return f;</span>
+    }
+
+    /**
+     * Returns a new CompletableFuture that is asynchronously completed
+     * by a task running in the {@link ForkJoinPool#commonPool()} after
+     * it runs the given action.
+     *
+     * @param runnable the action to run before completing the
+     * returned CompletableFuture
+     * @return the new CompletableFuture
+     */
+    public static CompletableFuture&lt;Void&gt; runAsync(Runnable runnable) {
+<span class="pc bpc" id="L2163" title="1 of 2 branches missed.">        if (runnable == null) throw new NullPointerException();</span>
+<span class="fc" id="L2164">        CompletableFuture&lt;Void&gt; f = new CompletableFuture&lt;Void&gt;();</span>
+<span class="fc" id="L2165">        execAsync(ForkJoinPool.commonPool(), new AsyncRun(runnable, f));</span>
+<span class="fc" id="L2166">        return f;</span>
+    }
+
+    /**
+     * Returns a new CompletableFuture that is asynchronously completed
+     * by a task running in the given executor after it runs the given
+     * action.
+     *
+     * @param runnable the action to run before completing the
+     * returned CompletableFuture
+     * @param executor the executor to use for asynchronous execution
+     * @return the new CompletableFuture
+     */
+    public static CompletableFuture&lt;Void&gt; runAsync(Runnable runnable,
+                                                   Executor executor) {
+<span class="pc bpc" id="L2181" title="2 of 4 branches missed.">        if (executor == null || runnable == null)</span>
+<span class="nc" id="L2182">            throw new NullPointerException();</span>
+<span class="fc" id="L2183">        CompletableFuture&lt;Void&gt; f = new CompletableFuture&lt;Void&gt;();</span>
+<span class="fc" id="L2184">        execAsync(executor, new AsyncRun(runnable, f));</span>
+<span class="fc" id="L2185">        return f;</span>
+    }
+
+    /**
+     * Returns a new CompletableFuture that is already completed with
+     * the given value.
+     *
+     * @param value the value
+     * @param &lt;U&gt; the type of the value
+     * @return the completed CompletableFuture
+     */
+    public static &lt;U&gt; CompletableFuture&lt;U&gt; completedFuture(U value) {
+<span class="fc" id="L2197">        CompletableFuture&lt;U&gt; f = new CompletableFuture&lt;U&gt;();</span>
+<span class="pc bpc" id="L2198" title="1 of 2 branches missed.">        f.result = (value == null) ? NIL : value;</span>
+<span class="fc" id="L2199">        return f;</span>
+    }
+
+    /**
+     * Returns {@code true} if completed in any fashion: normally,
+     * exceptionally, or via cancellation.
+     *
+     * @return {@code true} if completed
+     */
+    public boolean isDone() {
+<span class="fc bfc" id="L2209" title="All 2 branches covered.">        return result != null;</span>
+    }
+
+    /**
+     * Waits if necessary for this future to complete, and then
+     * returns its result.
+     *
+     * @return the result value
+     * @throws CancellationException if this future was cancelled
+     * @throws ExecutionException if this future completed exceptionally
+     * @throws InterruptedException if the current thread was interrupted
+     * while waiting
+     */
+    public T get() throws InterruptedException, ExecutionException {
+        Object r; Throwable ex, cause;
+<span class="pc bpc" id="L2224" title="3 of 4 branches missed.">        if ((r = result) == null &amp;&amp; (r = waitingGet(true)) == null)</span>
+<span class="nc" id="L2225">            throw new InterruptedException();</span>
+<span class="fc bfc" id="L2226" title="All 2 branches covered.">        if (!(r instanceof AltResult)) {</span>
+<span class="fc" id="L2227">            @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="fc" id="L2228">            return tr;</span>
+        }
+<span class="fc bfc" id="L2230" title="All 2 branches covered.">        if ((ex = ((AltResult)r).ex) == null)</span>
+<span class="fc" id="L2231">            return null;</span>
+<span class="fc bfc" id="L2232" title="All 2 branches covered.">        if (ex instanceof CancellationException)</span>
+<span class="fc" id="L2233">            throw (CancellationException)ex;</span>
+<span class="fc bfc" id="L2234" title="All 2 branches covered.">        if ((ex instanceof CompletionException) &amp;&amp;</span>
+<span class="pc bpc" id="L2235" title="1 of 2 branches missed.">            (cause = ex.getCause()) != null)</span>
+<span class="fc" id="L2236">            ex = cause;</span>
+<span class="fc" id="L2237">        throw new ExecutionException(ex);</span>
+    }
+
+    /**
+     * Waits if necessary for at most the given time for this future
+     * to complete, and then returns its result, if available.
+     *
+     * @param timeout the maximum time to wait
+     * @param unit the time unit of the timeout argument
+     * @return the result value
+     * @throws CancellationException if this future was cancelled
+     * @throws ExecutionException if this future completed exceptionally
+     * @throws InterruptedException if the current thread was interrupted
+     * while waiting
+     * @throws TimeoutException if the wait timed out
+     */
+    public T get(long timeout, TimeUnit unit)
+        throws InterruptedException, ExecutionException, TimeoutException {
+        Object r; Throwable ex, cause;
+<span class="fc" id="L2256">        long nanos = unit.toNanos(timeout);</span>
+<span class="pc bpc" id="L2257" title="1 of 2 branches missed.">        if (Thread.interrupted())</span>
+<span class="nc" id="L2258">            throw new InterruptedException();</span>
+<span class="pc bpc" id="L2259" title="1 of 2 branches missed.">        if ((r = result) == null)</span>
+<span class="nc" id="L2260">            r = timedAwaitDone(nanos);</span>
+<span class="fc bfc" id="L2261" title="All 2 branches covered.">        if (!(r instanceof AltResult)) {</span>
+<span class="fc" id="L2262">            @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="fc" id="L2263">            return tr;</span>
+        }
+<span class="fc bfc" id="L2265" title="All 2 branches covered.">        if ((ex = ((AltResult)r).ex) == null)</span>
+<span class="fc" id="L2266">            return null;</span>
+<span class="fc bfc" id="L2267" title="All 2 branches covered.">        if (ex instanceof CancellationException)</span>
+<span class="fc" id="L2268">            throw (CancellationException)ex;</span>
+<span class="fc bfc" id="L2269" title="All 2 branches covered.">        if ((ex instanceof CompletionException) &amp;&amp;</span>
+<span class="pc bpc" id="L2270" title="1 of 2 branches missed.">            (cause = ex.getCause()) != null)</span>
+<span class="fc" id="L2271">            ex = cause;</span>
+<span class="fc" id="L2272">        throw new ExecutionException(ex);</span>
+    }
+
+    /**
+     * Returns the result value when complete, or throws an
+     * (unchecked) exception if completed exceptionally. To better
+     * conform with the use of common functional forms, if a
+     * computation involved in the completion of this
+     * CompletableFuture threw an exception, this method throws an
+     * (unchecked) {@link CompletionException} with the underlying
+     * exception as its cause.
+     *
+     * @return the result value
+     * @throws CancellationException if the computation was cancelled
+     * @throws CompletionException if this future completed
+     * exceptionally or a completion computation threw an exception
+     */
+    public T join() {
+        Object r; Throwable ex;
+<span class="fc bfc" id="L2291" title="All 2 branches covered.">        if ((r = result) == null)</span>
+<span class="fc" id="L2292">            r = waitingGet(false);</span>
+<span class="fc bfc" id="L2293" title="All 2 branches covered.">        if (!(r instanceof AltResult)) {</span>
+<span class="fc" id="L2294">            @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="fc" id="L2295">            return tr;</span>
+        }
+<span class="fc bfc" id="L2297" title="All 2 branches covered.">        if ((ex = ((AltResult)r).ex) == null)</span>
+<span class="fc" id="L2298">            return null;</span>
+<span class="fc bfc" id="L2299" title="All 2 branches covered.">        if (ex instanceof CancellationException)</span>
+<span class="fc" id="L2300">            throw (CancellationException)ex;</span>
+<span class="fc bfc" id="L2301" title="All 2 branches covered.">        if (ex instanceof CompletionException)</span>
+<span class="fc" id="L2302">            throw (CompletionException)ex;</span>
+<span class="fc" id="L2303">        throw new CompletionException(ex);</span>
+    }
+
+    /**
+     * Returns the result value (or throws any encountered exception)
+     * if completed, else returns the given valueIfAbsent.
+     *
+     * @param valueIfAbsent the value to return if not completed
+     * @return the result value, if completed, else the given valueIfAbsent
+     * @throws CancellationException if the computation was cancelled
+     * @throws CompletionException if this future completed
+     * exceptionally or a completion computation threw an exception
+     */
+    public T getNow(T valueIfAbsent) {
+        Object r; Throwable ex;
+<span class="fc bfc" id="L2318" title="All 2 branches covered.">        if ((r = result) == null)</span>
+<span class="fc" id="L2319">            return valueIfAbsent;</span>
+<span class="fc bfc" id="L2320" title="All 2 branches covered.">        if (!(r instanceof AltResult)) {</span>
+<span class="fc" id="L2321">            @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="fc" id="L2322">            return tr;</span>
+        }
+<span class="fc bfc" id="L2324" title="All 2 branches covered.">        if ((ex = ((AltResult)r).ex) == null)</span>
+<span class="fc" id="L2325">            return null;</span>
+<span class="fc bfc" id="L2326" title="All 2 branches covered.">        if (ex instanceof CancellationException)</span>
+<span class="fc" id="L2327">            throw (CancellationException)ex;</span>
+<span class="fc bfc" id="L2328" title="All 2 branches covered.">        if (ex instanceof CompletionException)</span>
+<span class="fc" id="L2329">            throw (CompletionException)ex;</span>
+<span class="fc" id="L2330">        throw new CompletionException(ex);</span>
+    }
+
+    /**
+     * If not already completed, sets the value returned by {@link
+     * #get()} and related methods to the given value.
+     *
+     * @param value the result value
+     * @return {@code true} if this invocation caused this CompletableFuture
+     * to transition to a completed state, else {@code false}
+     */
+    public boolean complete(T value) {
+<span class="pc bpc" id="L2342" title="1 of 4 branches missed.">        boolean triggered = result == null &amp;&amp;</span>
+<span class="pc bpc" id="L2343" title="1 of 2 branches missed.">            UNSAFE.compareAndSwapObject(this, RESULT, null,</span>
+                                        value == null ? NIL : value);
+<span class="fc" id="L2345">        postComplete();</span>
+<span class="fc" id="L2346">        return triggered;</span>
+    }
+
+    /**
+     * If not already completed, causes invocations of {@link #get()}
+     * and related methods to throw the given exception.
+     *
+     * @param ex the exception
+     * @return {@code true} if this invocation caused this CompletableFuture
+     * to transition to a completed state, else {@code false}
+     */
+    public boolean completeExceptionally(Throwable ex) {
+<span class="pc bpc" id="L2358" title="1 of 2 branches missed.">        if (ex == null) throw new NullPointerException();</span>
+<span class="fc bfc" id="L2359" title="All 2 branches covered.">        boolean triggered = result == null &amp;&amp;</span>
+<span class="pc bpc" id="L2360" title="1 of 2 branches missed.">            UNSAFE.compareAndSwapObject(this, RESULT, null, new AltResult(ex));</span>
+<span class="fc" id="L2361">        postComplete();</span>
+<span class="fc" id="L2362">        return triggered;</span>
+    }
+
+    // CompletionStage methods
+
+    public &lt;U&gt; CompletableFuture&lt;U&gt; thenApply
+        (Function&lt;? super T,? extends U&gt; fn) {
+<span class="fc" id="L2369">        return doThenApply(fn, null);</span>
+    }
+
+    public &lt;U&gt; CompletableFuture&lt;U&gt; thenApplyAsync
+        (Function&lt;? super T,? extends U&gt; fn) {
+<span class="fc" id="L2374">        return doThenApply(fn, ForkJoinPool.commonPool());</span>
+    }
+
+    public &lt;U&gt; CompletableFuture&lt;U&gt; thenApplyAsync
+        (Function&lt;? super T,? extends U&gt; fn,
+         Executor executor) {
+<span class="pc bpc" id="L2380" title="1 of 2 branches missed.">        if (executor == null) throw new NullPointerException();</span>
+<span class="fc" id="L2381">        return doThenApply(fn, executor);</span>
+    }
+
+    public CompletableFuture&lt;Void&gt; thenAccept
+        (Consumer&lt;? super T&gt; action) {
+<span class="fc" id="L2386">        return doThenAccept(action, null);</span>
+    }
+
+    public CompletableFuture&lt;Void&gt; thenAcceptAsync
+        (Consumer&lt;? super T&gt; action) {
+<span class="fc" id="L2391">        return doThenAccept(action, ForkJoinPool.commonPool());</span>
+    }
+
+    public CompletableFuture&lt;Void&gt; thenAcceptAsync
+        (Consumer&lt;? super T&gt; action,
+         Executor executor) {
+<span class="pc bpc" id="L2397" title="1 of 2 branches missed.">        if (executor == null) throw new NullPointerException();</span>
+<span class="fc" id="L2398">        return doThenAccept(action, executor);</span>
+    }
+
+    public CompletableFuture&lt;Void&gt; thenRun
+        (Runnable action) {
+<span class="fc" id="L2403">        return doThenRun(action, null);</span>
+    }
+
+    public CompletableFuture&lt;Void&gt; thenRunAsync
+        (Runnable action) {
+<span class="fc" id="L2408">        return doThenRun(action, ForkJoinPool.commonPool());</span>
+    }
+
+    public CompletableFuture&lt;Void&gt; thenRunAsync
+        (Runnable action,
+         Executor executor) {
+<span class="pc bpc" id="L2414" title="1 of 2 branches missed.">        if (executor == null) throw new NullPointerException();</span>
+<span class="fc" id="L2415">        return doThenRun(action, executor);</span>
+    }
+
+    public &lt;U,V&gt; CompletableFuture&lt;V&gt; thenCombine
+        (CompletionStage&lt;? extends U&gt; other,
+         BiFunction&lt;? super T,? super U,? extends V&gt; fn) {
+<span class="fc" id="L2421">        return doThenCombine(other.toCompletableFuture(), fn, null);</span>
+    }
+
+    public &lt;U,V&gt; CompletableFuture&lt;V&gt; thenCombineAsync
+        (CompletionStage&lt;? extends U&gt; other,
+         BiFunction&lt;? super T,? super U,? extends V&gt; fn) {
+<span class="fc" id="L2427">        return doThenCombine(other.toCompletableFuture(), fn,</span>
+<span class="fc" id="L2428">                             ForkJoinPool.commonPool());</span>
+    }
+
+    public &lt;U,V&gt; CompletableFuture&lt;V&gt; thenCombineAsync
+        (CompletionStage&lt;? extends U&gt; other,
+         BiFunction&lt;? super T,? super U,? extends V&gt; fn,
+         Executor executor) {
+<span class="pc bpc" id="L2435" title="1 of 2 branches missed.">        if (executor == null) throw new NullPointerException();</span>
+<span class="fc" id="L2436">        return doThenCombine(other.toCompletableFuture(), fn, executor);</span>
+    }
+
+    public &lt;U&gt; CompletableFuture&lt;Void&gt; thenAcceptBoth
+        (CompletionStage&lt;? extends U&gt; other,
+         BiConsumer&lt;? super T, ? super U&gt; action) {
+<span class="fc" id="L2442">        return doThenAcceptBoth(other.toCompletableFuture(), action, null);</span>
+    }
+
+    public &lt;U&gt; CompletableFuture&lt;Void&gt; thenAcceptBothAsync
+        (CompletionStage&lt;? extends U&gt; other,
+         BiConsumer&lt;? super T, ? super U&gt; action) {
+<span class="fc" id="L2448">        return doThenAcceptBoth(other.toCompletableFuture(), action,</span>
+<span class="fc" id="L2449">                                ForkJoinPool.commonPool());</span>
+    }
+
+    public &lt;U&gt; CompletableFuture&lt;Void&gt; thenAcceptBothAsync
+        (CompletionStage&lt;? extends U&gt; other,
+         BiConsumer&lt;? super T, ? super U&gt; action,
+         Executor executor) {
+<span class="pc bpc" id="L2456" title="1 of 2 branches missed.">        if (executor == null) throw new NullPointerException();</span>
+<span class="fc" id="L2457">        return doThenAcceptBoth(other.toCompletableFuture(), action, executor);</span>
+    }
+
+    public CompletableFuture&lt;Void&gt; runAfterBoth
+        (CompletionStage&lt;?&gt; other,
+         Runnable action) {
+<span class="fc" id="L2463">        return doRunAfterBoth(other.toCompletableFuture(), action, null);</span>
+    }
+
+    public CompletableFuture&lt;Void&gt; runAfterBothAsync
+        (CompletionStage&lt;?&gt; other,
+         Runnable action) {
+<span class="fc" id="L2469">        return doRunAfterBoth(other.toCompletableFuture(), action,</span>
+<span class="fc" id="L2470">                              ForkJoinPool.commonPool());</span>
+    }
+
+    public CompletableFuture&lt;Void&gt; runAfterBothAsync
+        (CompletionStage&lt;?&gt; other,
+         Runnable action,
+         Executor executor) {
+<span class="pc bpc" id="L2477" title="1 of 2 branches missed.">        if (executor == null) throw new NullPointerException();</span>
+<span class="fc" id="L2478">        return doRunAfterBoth(other.toCompletableFuture(), action, executor);</span>
+    }
+
+
+    public &lt;U&gt; CompletableFuture&lt;U&gt; applyToEither
+        (CompletionStage&lt;? extends T&gt; other,
+         Function&lt;? super T, U&gt; fn) {
+<span class="fc" id="L2485">        return doApplyToEither(other.toCompletableFuture(), fn, null);</span>
+    }
+
+    public &lt;U&gt; CompletableFuture&lt;U&gt; applyToEitherAsync
+        (CompletionStage&lt;? extends T&gt; other,
+         Function&lt;? super T, U&gt; fn) {
+<span class="fc" id="L2491">        return doApplyToEither(other.toCompletableFuture(), fn,</span>
+<span class="fc" id="L2492">                               ForkJoinPool.commonPool());</span>
+    }
+
+    public &lt;U&gt; CompletableFuture&lt;U&gt; applyToEitherAsync
+        (CompletionStage&lt;? extends T&gt; other,
+         Function&lt;? super T, U&gt; fn,
+         Executor executor) {
+<span class="pc bpc" id="L2499" title="1 of 2 branches missed.">        if (executor == null) throw new NullPointerException();</span>
+<span class="fc" id="L2500">        return doApplyToEither(other.toCompletableFuture(), fn, executor);</span>
+    }
+
+    public CompletableFuture&lt;Void&gt; acceptEither
+        (CompletionStage&lt;? extends T&gt; other,
+         Consumer&lt;? super T&gt; action) {
+<span class="fc" id="L2506">        return doAcceptEither(other.toCompletableFuture(), action, null);</span>
+    }
+
+    public CompletableFuture&lt;Void&gt; acceptEitherAsync
+        (CompletionStage&lt;? extends T&gt; other,
+         Consumer&lt;? super T&gt; action) {
+<span class="fc" id="L2512">        return doAcceptEither(other.toCompletableFuture(), action,</span>
+<span class="fc" id="L2513">                              ForkJoinPool.commonPool());</span>
+    }
+
+    public CompletableFuture&lt;Void&gt; acceptEitherAsync
+        (CompletionStage&lt;? extends T&gt; other,
+         Consumer&lt;? super T&gt; action,
+         Executor executor) {
+<span class="pc bpc" id="L2520" title="1 of 2 branches missed.">        if (executor == null) throw new NullPointerException();</span>
+<span class="fc" id="L2521">        return doAcceptEither(other.toCompletableFuture(), action, executor);</span>
+    }
+
+    public CompletableFuture&lt;Void&gt; runAfterEither(CompletionStage&lt;?&gt; other,
+                                                  Runnable action) {
+<span class="fc" id="L2526">        return doRunAfterEither(other.toCompletableFuture(), action, null);</span>
+    }
+
+    public CompletableFuture&lt;Void&gt; runAfterEitherAsync
+        (CompletionStage&lt;?&gt; other,
+         Runnable action) {
+<span class="fc" id="L2532">        return doRunAfterEither(other.toCompletableFuture(), action,</span>
+<span class="fc" id="L2533">                                ForkJoinPool.commonPool());</span>
+    }
+
+    public CompletableFuture&lt;Void&gt; runAfterEitherAsync
+        (CompletionStage&lt;?&gt; other,
+         Runnable action,
+         Executor executor) {
+<span class="pc bpc" id="L2540" title="1 of 2 branches missed.">        if (executor == null) throw new NullPointerException();</span>
+<span class="fc" id="L2541">        return doRunAfterEither(other.toCompletableFuture(), action, executor);</span>
+    }
+
+    public &lt;U&gt; CompletableFuture&lt;U&gt; thenCompose
+        (Function&lt;? super T, ? extends CompletionStage&lt;U&gt;&gt; fn) {
+<span class="fc" id="L2546">        return doThenCompose(fn, null);</span>
+    }
+
+    public &lt;U&gt; CompletableFuture&lt;U&gt; thenComposeAsync
+        (Function&lt;? super T, ? extends CompletionStage&lt;U&gt;&gt; fn) {
+<span class="fc" id="L2551">        return doThenCompose(fn, ForkJoinPool.commonPool());</span>
+    }
+
+    public &lt;U&gt; CompletableFuture&lt;U&gt; thenComposeAsync
+        (Function&lt;? super T, ? extends CompletionStage&lt;U&gt;&gt; fn,
+         Executor executor) {
+<span class="pc bpc" id="L2557" title="1 of 2 branches missed.">        if (executor == null) throw new NullPointerException();</span>
+<span class="fc" id="L2558">        return doThenCompose(fn, executor);</span>
+    }
+
+    public CompletableFuture&lt;T&gt; whenComplete
+        (BiConsumer&lt;? super T, ? super Throwable&gt; action) {
+<span class="nc" id="L2563">        return doWhenComplete(action, null);</span>
+    }
+
+    public CompletableFuture&lt;T&gt; whenCompleteAsync
+        (BiConsumer&lt;? super T, ? super Throwable&gt; action) {
+<span class="nc" id="L2568">        return doWhenComplete(action, ForkJoinPool.commonPool());</span>
+    }
+
+    public CompletableFuture&lt;T&gt; whenCompleteAsync
+        (BiConsumer&lt;? super T, ? super Throwable&gt; action,
+         Executor executor) {
+<span class="nc bnc" id="L2574" title="All 2 branches missed.">        if (executor == null) throw new NullPointerException();</span>
+<span class="nc" id="L2575">        return doWhenComplete(action, executor);</span>
+    }
+
+    public &lt;U&gt; CompletableFuture&lt;U&gt; handle
+        (BiFunction&lt;? super T, Throwable, ? extends U&gt; fn) {
+<span class="fc" id="L2580">        return doHandle(fn, null);</span>
+    }
+
+    public &lt;U&gt; CompletableFuture&lt;U&gt; handleAsync
+        (BiFunction&lt;? super T, Throwable, ? extends U&gt; fn) {
+<span class="nc" id="L2585">        return doHandle(fn, ForkJoinPool.commonPool());</span>
+    }
+
+    public &lt;U&gt; CompletableFuture&lt;U&gt; handleAsync
+        (BiFunction&lt;? super T, Throwable, ? extends U&gt; fn,
+         Executor executor) {
+<span class="nc bnc" id="L2591" title="All 2 branches missed.">        if (executor == null) throw new NullPointerException();</span>
+<span class="nc" id="L2592">        return doHandle(fn, executor);</span>
+    }
+
+    /**
+     * Returns this CompletableFuture
+     *
+     * @return this CompletableFuture
+     */
+    public CompletableFuture&lt;T&gt; toCompletableFuture() {
+<span class="fc" id="L2601">        return this;</span>
+    }
+
+    // not in interface CompletionStage
+
+    /**
+     * Returns a new CompletableFuture that is completed when this
+     * CompletableFuture completes, with the result of the given
+     * function of the exception triggering this CompletableFuture's
+     * completion when it completes exceptionally; otherwise, if this
+     * CompletableFuture completes normally, then the returned
+     * CompletableFuture also completes normally with the same value.
+     * Note: More flexible versions of this functionality are
+     * available using methods {@code whenComplete} and {@code handle}.
+     *
+     * @param fn the function to use to compute the value of the
+     * returned CompletableFuture if this CompletableFuture completed
+     * exceptionally
+     * @return the new CompletableFuture
+     */
+    public CompletableFuture&lt;T&gt; exceptionally
+        (Function&lt;Throwable, ? extends T&gt; fn) {
+<span class="pc bpc" id="L2623" title="1 of 2 branches missed.">        if (fn == null) throw new NullPointerException();</span>
+<span class="fc" id="L2624">        CompletableFuture&lt;T&gt; dst = new CompletableFuture&lt;T&gt;();</span>
+<span class="fc" id="L2625">        ExceptionCompletion&lt;T&gt; d = null;</span>
+        Object r;
+<span class="pc bpc" id="L2627" title="1 of 2 branches missed.">        if ((r = result) == null) {</span>
+<span class="nc" id="L2628">            CompletionNode p =</span>
+                new CompletionNode(d = new ExceptionCompletion&lt;T&gt;
+                                   (this, fn, dst));
+<span class="nc bnc" id="L2631" title="All 2 branches missed.">            while ((r = result) == null) {</span>
+<span class="nc bnc" id="L2632" title="All 2 branches missed.">                if (UNSAFE.compareAndSwapObject(this, COMPLETIONS,</span>
+                                                p.next = completions, p))
+<span class="nc" id="L2634">                    break;</span>
+            }
+        }
+<span class="pc bpc" id="L2637" title="4 of 6 branches missed.">        if (r != null &amp;&amp; (d == null || d.compareAndSet(0, 1))) {</span>
+<span class="fc" id="L2638">            T t = null; Throwable ex, dx = null;</span>
+<span class="fc bfc" id="L2639" title="All 2 branches covered.">            if (r instanceof AltResult) {</span>
+<span class="pc bpc" id="L2640" title="1 of 2 branches missed.">                if ((ex = ((AltResult)r).ex) != null) {</span>
+                    try {
+<span class="fc" id="L2642">                        t = fn.apply(ex);</span>
+<span class="nc" id="L2643">                    } catch (Throwable rex) {</span>
+<span class="nc" id="L2644">                        dx = rex;</span>
+<span class="pc" id="L2645">                    }</span>
+                }
+            }
+            else {
+<span class="fc" id="L2649">                @SuppressWarnings(&quot;unchecked&quot;) T tr = (T) r;</span>
+<span class="fc" id="L2650">                t = tr;</span>
+            }
+<span class="fc" id="L2652">            dst.internalComplete(t, dx);</span>
+        }
+<span class="fc" id="L2654">        helpPostComplete();</span>
+<span class="fc" id="L2655">        return dst;</span>
+    }
+
+    /* ------------- Arbitrary-arity constructions -------------- */
+
+    /*
+     * The basic plan of attack is to recursively form binary
+     * completion trees of elements. This can be overkill for small
+     * sets, but scales nicely. The And/All vs Or/Any forms use the
+     * same idea, but details differ.
+     */
+
+    /**
+     * Returns a new CompletableFuture that is completed when all of
+     * the given CompletableFutures complete.  If any of the given
+     * CompletableFutures complete exceptionally, then the returned
+     * CompletableFuture also does so, with a CompletionException
+     * holding this exception as its cause.  Otherwise, the results,
+     * if any, of the given CompletableFutures are not reflected in
+     * the returned CompletableFuture, but may be obtained by
+     * inspecting them individually. If no CompletableFutures are
+     * provided, returns a CompletableFuture completed with the value
+     * {@code null}.
+     *
+     * &lt;p&gt;Among the applications of this method is to await completion
+     * of a set of independent CompletableFutures before continuing a
+     * program, as in: {@code CompletableFuture.allOf(c1, c2,
+     * c3).join();}.
+     *
+     * @param cfs the CompletableFutures
+     * @return a new CompletableFuture that is completed when all of the
+     * given CompletableFutures complete
+     * @throws NullPointerException if the array or any of its elements are
+     * {@code null}
+     */
+    public static CompletableFuture&lt;Void&gt; allOf(CompletableFuture&lt;?&gt;... cfs) {
+<span class="fc" id="L2691">        int len = cfs.length; // Directly handle empty and singleton cases</span>
+<span class="pc bpc" id="L2692" title="1 of 2 branches missed.">        if (len &gt; 1)</span>
+<span class="fc" id="L2693">            return allTree(cfs, 0, len - 1);</span>
+        else {
+<span class="nc" id="L2695">            CompletableFuture&lt;Void&gt; dst = new CompletableFuture&lt;Void&gt;();</span>
+            CompletableFuture&lt;?&gt; f;
+<span class="nc bnc" id="L2697" title="All 2 branches missed.">            if (len == 0)</span>
+<span class="nc" id="L2698">                dst.result = NIL;</span>
+<span class="nc bnc" id="L2699" title="All 2 branches missed.">            else if ((f = cfs[0]) == null)</span>
+<span class="nc" id="L2700">                throw new NullPointerException();</span>
+            else {
+<span class="nc" id="L2702">                ThenPropagate d = null;</span>
+<span class="nc" id="L2703">                CompletionNode p = null;</span>
+                Object r;
+<span class="nc bnc" id="L2705" title="All 2 branches missed.">                while ((r = f.result) == null) {</span>
+<span class="nc bnc" id="L2706" title="All 2 branches missed.">                    if (d == null)</span>
+<span class="nc" id="L2707">                        d = new ThenPropagate(f, dst);</span>
+<span class="nc bnc" id="L2708" title="All 2 branches missed.">                    else if (p == null)</span>
+<span class="nc" id="L2709">                        p = new CompletionNode(d);</span>
+<span class="nc" id="L2710">                    else if (UNSAFE.compareAndSwapObject</span>
+<span class="nc bnc" id="L2711" title="All 2 branches missed.">                             (f, COMPLETIONS, p.next = f.completions, p))</span>
+<span class="nc" id="L2712">                        break;</span>
+                }
+<span class="nc bnc" id="L2714" title="All 6 branches missed.">                if (r != null &amp;&amp; (d == null || d.compareAndSet(0, 1)))</span>
+<span class="nc bnc" id="L2715" title="All 2 branches missed.">                    dst.internalComplete(null, (r instanceof AltResult) ?</span>
+                                         ((AltResult)r).ex : null);
+<span class="nc" id="L2717">                f.helpPostComplete();</span>
+            }
+<span class="nc" id="L2719">            return dst;</span>
+        }
+    }
+
+    /**
+     * Recursively constructs an And'ed tree of CompletableFutures.
+     * Called only when array known to have at least two elements.
+     */
+    private static CompletableFuture&lt;Void&gt; allTree(CompletableFuture&lt;?&gt;[] cfs,
+                                                   int lo, int hi) {
+        CompletableFuture&lt;?&gt; fst, snd;
+<span class="fc" id="L2730">        int mid = (lo + hi) &gt;&gt;&gt; 1;</span>
+<span class="pc bpc" id="L2731" title="1 of 6 branches missed.">        if ((fst = (lo == mid   ? cfs[lo] : allTree(cfs, lo,    mid))) == null ||</span>
+<span class="pc bpc" id="L2732" title="1 of 2 branches missed.">            (snd = (hi == mid+1 ? cfs[hi] : allTree(cfs, mid+1, hi))) == null)</span>
+<span class="nc" id="L2733">            throw new NullPointerException();</span>
+<span class="fc" id="L2734">        CompletableFuture&lt;Void&gt; dst = new CompletableFuture&lt;Void&gt;();</span>
+<span class="fc" id="L2735">        AndCompletion d = null;</span>
+<span class="fc" id="L2736">        CompletionNode p = null, q = null;</span>
+<span class="fc" id="L2737">        Object r = null, s = null;</span>
+<span class="fc bfc" id="L2738" title="All 4 branches covered.">        while ((r = fst.result) == null || (s = snd.result) == null) {</span>
+<span class="fc bfc" id="L2739" title="All 2 branches covered.">            if (d == null)</span>
+<span class="fc" id="L2740">                d = new AndCompletion(fst, snd, dst);</span>
+<span class="fc bfc" id="L2741" title="All 2 branches covered.">            else if (p == null)</span>
+<span class="fc" id="L2742">                p = new CompletionNode(d);</span>
+<span class="fc bfc" id="L2743" title="All 2 branches covered.">            else if (q == null) {</span>
+<span class="fc" id="L2744">                if (UNSAFE.compareAndSwapObject</span>
+<span class="pc bpc" id="L2745" title="1 of 2 branches missed.">                    (fst, COMPLETIONS, p.next = fst.completions, p))</span>
+<span class="fc" id="L2746">                    q = new CompletionNode(d);</span>
+            }
+<span class="fc" id="L2748">            else if (UNSAFE.compareAndSwapObject</span>
+<span class="pc bpc" id="L2749" title="1 of 2 branches missed.">                     (snd, COMPLETIONS, q.next = snd.completions, q))</span>
+<span class="fc" id="L2750">                break;</span>
+        }
+<span class="pc bpc" id="L2752" title="2 of 10 branches missed.">        if ((r != null || (r = fst.result) != null) &amp;&amp;</span>
+            (s != null || (s = snd.result) != null) &amp;&amp;
+<span class="pc bpc" id="L2754" title="1 of 2 branches missed.">            (d == null || d.compareAndSet(0, 1))) {</span>
+            Throwable ex;
+<span class="fc bfc" id="L2756" title="All 2 branches covered.">            if (r instanceof AltResult)</span>
+<span class="fc" id="L2757">                ex = ((AltResult)r).ex;</span>
+            else
+<span class="fc" id="L2759">                ex = null;</span>
+<span class="pc bpc" id="L2760" title="1 of 4 branches missed.">            if (ex == null &amp;&amp; (s instanceof AltResult))</span>
+<span class="fc" id="L2761">                ex = ((AltResult)s).ex;</span>
+<span class="fc" id="L2762">            dst.internalComplete(null, ex);</span>
+        }
+<span class="fc" id="L2764">        fst.helpPostComplete();</span>
+<span class="fc" id="L2765">        snd.helpPostComplete();</span>
+<span class="fc" id="L2766">        return dst;</span>
+    }
+
+    /**
+     * Returns a new CompletableFuture that is completed when any of
+     * the given CompletableFutures complete, with the same result.
+     * Otherwise, if it completed exceptionally, the returned
+     * CompletableFuture also does so, with a CompletionException
+     * holding this exception as its cause.  If no CompletableFutures
+     * are provided, returns an incomplete CompletableFuture.
+     *
+     * @param cfs the CompletableFutures
+     * @return a new CompletableFuture that is completed with the
+     * result or exception of any of the given CompletableFutures when
+     * one completes
+     * @throws NullPointerException if the array or any of its elements are
+     * {@code null}
+     */
+    public static CompletableFuture&lt;Object&gt; anyOf(CompletableFuture&lt;?&gt;... cfs) {
+<span class="fc" id="L2785">        int len = cfs.length; // Same idea as allOf</span>
+<span class="pc bpc" id="L2786" title="1 of 2 branches missed.">        if (len &gt; 1)</span>
+<span class="fc" id="L2787">            return anyTree(cfs, 0, len - 1);</span>
+        else {
+<span class="nc" id="L2789">            CompletableFuture&lt;Object&gt; dst = new CompletableFuture&lt;Object&gt;();</span>
+            CompletableFuture&lt;?&gt; f;
+<span class="nc bnc" id="L2791" title="All 2 branches missed.">            if (len == 0)</span>
+<span class="nc" id="L2792">                ; // skip</span>
+<span class="nc bnc" id="L2793" title="All 2 branches missed.">            else if ((f = cfs[0]) == null)</span>
+<span class="nc" id="L2794">                throw new NullPointerException();</span>
+            else {
+<span class="nc" id="L2796">                ThenCopy&lt;Object&gt; d = null;</span>
+<span class="nc" id="L2797">                CompletionNode p = null;</span>
+                Object r;
+<span class="nc bnc" id="L2799" title="All 2 branches missed.">                while ((r = f.result) == null) {</span>
+<span class="nc bnc" id="L2800" title="All 2 branches missed.">                    if (d == null)</span>
+<span class="nc" id="L2801">                        d = new ThenCopy&lt;Object&gt;(f, dst);</span>
+<span class="nc bnc" id="L2802" title="All 2 branches missed.">                    else if (p == null)</span>
+<span class="nc" id="L2803">                        p = new CompletionNode(d);</span>
+<span class="nc" id="L2804">                    else if (UNSAFE.compareAndSwapObject</span>
+<span class="nc bnc" id="L2805" title="All 2 branches missed.">                             (f, COMPLETIONS, p.next = f.completions, p))</span>
+<span class="nc" id="L2806">                        break;</span>
+                }
+<span class="nc bnc" id="L2808" title="All 6 branches missed.">                if (r != null &amp;&amp; (d == null || d.compareAndSet(0, 1))) {</span>
+                    Throwable ex; Object t;
+<span class="nc bnc" id="L2810" title="All 2 branches missed.">                    if (r instanceof AltResult) {</span>
+<span class="nc" id="L2811">                        ex = ((AltResult)r).ex;</span>
+<span class="nc" id="L2812">                        t = null;</span>
+                    }
+                    else {
+<span class="nc" id="L2815">                        ex = null;</span>
+<span class="nc" id="L2816">                        t = r;</span>
+                    }
+<span class="nc" id="L2818">                    dst.internalComplete(t, ex);</span>
+                }
+<span class="nc" id="L2820">                f.helpPostComplete();</span>
+            }
+<span class="nc" id="L2822">            return dst;</span>
+        }
+    }
+
+    /**
+     * Recursively constructs an Or'ed tree of CompletableFutures.
+     */
+    private static CompletableFuture&lt;Object&gt; anyTree(CompletableFuture&lt;?&gt;[] cfs,
+                                                     int lo, int hi) {
+        CompletableFuture&lt;?&gt; fst, snd;
+<span class="fc" id="L2832">        int mid = (lo + hi) &gt;&gt;&gt; 1;</span>
+<span class="pc bpc" id="L2833" title="3 of 6 branches missed.">        if ((fst = (lo == mid   ? cfs[lo] : anyTree(cfs, lo,    mid))) == null ||</span>
+<span class="pc bpc" id="L2834" title="1 of 2 branches missed.">            (snd = (hi == mid+1 ? cfs[hi] : anyTree(cfs, mid+1, hi))) == null)</span>
+<span class="nc" id="L2835">            throw new NullPointerException();</span>
+<span class="fc" id="L2836">        CompletableFuture&lt;Object&gt; dst = new CompletableFuture&lt;Object&gt;();</span>
+<span class="fc" id="L2837">        OrCompletion d = null;</span>
+<span class="fc" id="L2838">        CompletionNode p = null, q = null;</span>
+        Object r;
+<span class="pc bpc" id="L2840" title="3 of 4 branches missed.">        while ((r = fst.result) == null &amp;&amp; (r = snd.result) == null) {</span>
+<span class="nc bnc" id="L2841" title="All 2 branches missed.">            if (d == null)</span>
+<span class="nc" id="L2842">                d = new OrCompletion(fst, snd, dst);</span>
+<span class="nc bnc" id="L2843" title="All 2 branches missed.">            else if (p == null)</span>
+<span class="nc" id="L2844">                p = new CompletionNode(d);</span>
+<span class="nc bnc" id="L2845" title="All 2 branches missed.">            else if (q == null) {</span>
+<span class="nc" id="L2846">                if (UNSAFE.compareAndSwapObject</span>
+<span class="nc bnc" id="L2847" title="All 2 branches missed.">                    (fst, COMPLETIONS, p.next = fst.completions, p))</span>
+<span class="nc" id="L2848">                    q = new CompletionNode(d);</span>
+            }
+<span class="nc" id="L2850">            else if (UNSAFE.compareAndSwapObject</span>
+<span class="nc bnc" id="L2851" title="All 2 branches missed.">                     (snd, COMPLETIONS, q.next = snd.completions, q))</span>
+<span class="nc" id="L2852">                break;</span>
+        }
+<span class="pc bpc" id="L2854" title="6 of 8 branches missed.">        if ((r != null || (r = fst.result) != null ||</span>
+             (r = snd.result) != null) &amp;&amp;
+<span class="nc bnc" id="L2856" title="All 2 branches missed.">            (d == null || d.compareAndSet(0, 1))) {</span>
+            Throwable ex; Object t;
+<span class="pc bpc" id="L2858" title="1 of 2 branches missed.">            if (r instanceof AltResult) {</span>
+<span class="nc" id="L2859">                ex = ((AltResult)r).ex;</span>
+<span class="nc" id="L2860">                t = null;</span>
+            }
+            else {
+<span class="fc" id="L2863">                ex = null;</span>
+<span class="fc" id="L2864">                t = r;</span>
+            }
+<span class="fc" id="L2866">            dst.internalComplete(t, ex);</span>
+        }
+<span class="fc" id="L2868">        fst.helpPostComplete();</span>
+<span class="fc" id="L2869">        snd.helpPostComplete();</span>
+<span class="fc" id="L2870">        return dst;</span>
+    }
+
+    /* ------------- Control and status methods -------------- */
+
+    /**
+     * If not already completed, completes this CompletableFuture with
+     * a {@link CancellationException}. Dependent CompletableFutures
+     * that have not already completed will also complete
+     * exceptionally, with a {@link CompletionException} caused by
+     * this {@code CancellationException}.
+     *
+     * @param mayInterruptIfRunning this value has no effect in this
+     * implementation because interrupts are not used to control
+     * processing.
+     *
+     * @return {@code true} if this task is now cancelled
+     */
+    public boolean cancel(boolean mayInterruptIfRunning) {
+<span class="fc bfc" id="L2889" title="All 2 branches covered.">        boolean cancelled = (result == null) &amp;&amp;</span>
+            UNSAFE.compareAndSwapObject
+<span class="pc bpc" id="L2891" title="1 of 2 branches missed.">            (this, RESULT, null, new AltResult(new CancellationException()));</span>
+<span class="fc" id="L2892">        postComplete();</span>
+<span class="fc bfc" id="L2893" title="All 4 branches covered.">        return cancelled || isCancelled();</span>
+    }
+
+    /**
+     * Returns {@code true} if this CompletableFuture was cancelled
+     * before it completed normally.
+     *
+     * @return {@code true} if this CompletableFuture was cancelled
+     * before it completed normally
+     */
+    public boolean isCancelled() {
+        Object r;
+<span class="fc bfc" id="L2905" title="All 4 branches covered.">        return ((r = result) instanceof AltResult) &amp;&amp;</span>
+            (((AltResult)r).ex instanceof CancellationException);
+    }
+
+    /**
+     * Returns {@code true} if this CompletableFuture completed
+     * exceptionally, in any way. Possible causes include
+     * cancellation, explicit invocation of {@code
+     * completeExceptionally}, and abrupt termination of a
+     * CompletionStage action.
+     *
+     * @return {@code true} if this CompletableFuture completed
+     * exceptionally
+     */
+    public boolean isCompletedExceptionally() {
+        Object r;
+<span class="nc bnc" id="L2921" title="All 4 branches missed.">        return ((r = result) instanceof AltResult) &amp;&amp; r != NIL;</span>
+    }
+
+    /**
+     * Forcibly sets or resets the value subsequently returned by
+     * method {@link #get()} and related methods, whether or not
+     * already completed. This method is designed for use only in
+     * error recovery actions, and even in such situations may result
+     * in ongoing dependent completions using established versus
+     * overwritten outcomes.
+     *
+     * @param value the completion value
+     */
+    public void obtrudeValue(T value) {
+<span class="nc bnc" id="L2935" title="All 2 branches missed.">        result = (value == null) ? NIL : value;</span>
+<span class="nc" id="L2936">        postComplete();</span>
+<span class="nc" id="L2937">    }</span>
+
+    /**
+     * Forcibly causes subsequent invocations of method {@link #get()}
+     * and related methods to throw the given exception, whether or
+     * not already completed. This method is designed for use only in
+     * recovery actions, and even in such situations may result in
+     * ongoing dependent completions using established versus
+     * overwritten outcomes.
+     *
+     * @param ex the exception
+     */
+    public void obtrudeException(Throwable ex) {
+<span class="nc bnc" id="L2950" title="All 2 branches missed.">        if (ex == null) throw new NullPointerException();</span>
+<span class="nc" id="L2951">        result = new AltResult(ex);</span>
+<span class="nc" id="L2952">        postComplete();</span>
+<span class="nc" id="L2953">    }</span>
+
+    /**
+     * Returns the estimated number of CompletableFutures whose
+     * completions are awaiting completion of this CompletableFuture.
+     * This method is designed for use in monitoring system state, not
+     * for synchronization control.
+     *
+     * @return the number of dependent CompletableFutures
+     */
+    public int getNumberOfDependents() {
+<span class="nc" id="L2964">        int count = 0;</span>
+<span class="nc bnc" id="L2965" title="All 2 branches missed.">        for (CompletionNode p = completions; p != null; p = p.next)</span>
+<span class="nc" id="L2966">            ++count;</span>
+<span class="nc" id="L2967">        return count;</span>
+    }
+
+    /**
+     * Returns a string identifying this CompletableFuture, as well as
+     * its completion state.  The state, in brackets, contains the
+     * String {@code &quot;Completed Normally&quot;} or the String {@code
+     * &quot;Completed Exceptionally&quot;}, or the String {@code &quot;Not
+     * completed&quot;} followed by the number of CompletableFutures
+     * dependent upon its completion, if any.
+     *
+     * @return a string identifying this CompletableFuture, as well as its state
+     */
+    public String toString() {
+<span class="fc" id="L2981">        Object r = result;</span>
+        int count;
+<span class="pc bpc" id="L2983" title="1 of 2 branches missed.">        return super.toString() +</span>
+            ((r == null) ?
+<span class="pc bpc" id="L2985" title="2 of 6 branches missed.">             (((count = getNumberOfDependents()) == 0) ?</span>
+              &quot;[Not completed]&quot; :
+              &quot;[Not completed, &quot; + count + &quot; dependents]&quot;) :
+             (((r instanceof AltResult) &amp;&amp; ((AltResult)r).ex != null) ?
+              &quot;[Completed exceptionally]&quot; :
+              &quot;[Completed normally]&quot;));
+    }
+
+    // Unsafe mechanics
+    private static final sun.misc.Unsafe UNSAFE;
+    private static final long RESULT;
+    private static final long WAITERS;
+    private static final long COMPLETIONS;
+    static {
+        try {
+<span class="fc" id="L3000">            UNSAFE = sun.misc.Unsafe.getUnsafe();</span>
+<span class="fc" id="L3001">            Class&lt;?&gt; k = CompletableFuture.class;</span>
+<span class="fc" id="L3002">            RESULT = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L3003">                (k.getDeclaredField(&quot;result&quot;));</span>
+<span class="fc" id="L3004">            WAITERS = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L3005">                (k.getDeclaredField(&quot;waiters&quot;));</span>
+<span class="fc" id="L3006">            COMPLETIONS = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L3007">                (k.getDeclaredField(&quot;completions&quot;));</span>
+<span class="nc" id="L3008">        } catch (Exception e) {</span>
+<span class="nc" id="L3009">            throw new Error(e);</span>
+<span class="fc" id="L3010">        }</span>
+<span class="fc" id="L3011">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

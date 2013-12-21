@@ -1,0 +1,1436 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>PolicyParser.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.provider</a> &gt; <span class="el_source">PolicyParser.java</span></div><h1>PolicyParser.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1997, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.security.provider;
+
+import java.io.*;
+import java.lang.RuntimePermission;
+import java.net.SocketPermission;
+import java.net.URL;
+import java.security.GeneralSecurityException;
+import java.security.Principal;
+import java.text.MessageFormat;
+import java.util.*;
+import javax.security.auth.x500.X500Principal;
+
+import sun.security.util.Debug;
+import sun.security.util.PropertyExpander;
+import sun.security.util.ResourcesMgr;
+
+/**
+ * The policy for a Java runtime (specifying
+ * which permissions are available for code from various principals)
+ * is represented as a separate
+ * persistent configuration.  The configuration may be stored as a
+ * flat ASCII file, as a serialized binary file of
+ * the Policy class, or as a database. &lt;p&gt;
+ *
+ * &lt;p&gt;The Java runtime creates one global Policy object, which is used to
+ * represent the static policy configuration file.  It is consulted by
+ * a ProtectionDomain when the protection domain initializes its set of
+ * permissions. &lt;p&gt;
+ *
+ * &lt;p&gt;The Policy &lt;code&gt;init&lt;/code&gt; method parses the policy
+ * configuration file, and then
+ * populates the Policy object.  The Policy object is agnostic in that
+ * it is not involved in making policy decisions.  It is merely the
+ * Java runtime representation of the persistent policy configuration
+ * file. &lt;p&gt;
+ *
+ * &lt;p&gt;When a protection domain needs to initialize its set of
+ * permissions, it executes code such as the following
+ * to ask the global Policy object to populate a
+ * Permissions object with the appropriate permissions:
+ * &lt;pre&gt;
+ *  policy = Policy.getPolicy();
+ *  Permissions perms = policy.getPermissions(protectiondomain)
+ * &lt;/pre&gt;
+ *
+ * &lt;p&gt;The protection domain contains a CodeSource
+ * object, which encapsulates its codebase (URL) and public key attributes.
+ * It also contains the principals associated with the domain.
+ * The Policy object evaluates the global policy in light of who the
+ * principal is and what the code source is and returns an appropriate
+ * Permissions object.
+ *
+ * @author Roland Schemers
+ * @author Ram Marti
+ *
+ * @since 1.2
+ */
+
+public class PolicyParser {
+
+    private static final String EXTDIRS_PROPERTY = &quot;java.ext.dirs&quot;;
+    private static final String OLD_EXTDIRS_EXPANSION =
+        &quot;${&quot; + EXTDIRS_PROPERTY + &quot;}&quot;;
+
+    // package-private: used by PolicyFile for static policy
+    static final String EXTDIRS_EXPANSION = &quot;${{&quot; + EXTDIRS_PROPERTY + &quot;}}&quot;;
+
+
+    private Vector&lt;GrantEntry&gt; grantEntries;
+    private Map&lt;String, DomainEntry&gt; domainEntries;
+
+    // Convenience variables for parsing
+<span class="fc" id="L98">    private static final Debug debug = Debug.getInstance(&quot;parser&quot;,</span>
+                                                &quot;\t[Policy Parser]&quot;);
+    private StreamTokenizer st;
+    private int lookahead;
+<span class="fc" id="L102">    private boolean expandProp = false;</span>
+<span class="fc" id="L103">    private String keyStoreUrlString = null; // unexpanded</span>
+<span class="fc" id="L104">    private String keyStoreType = null;</span>
+<span class="fc" id="L105">    private String keyStoreProvider = null;</span>
+<span class="fc" id="L106">    private String storePassURL = null;</span>
+
+    private String expand(String value)
+        throws PropertyExpander.ExpandException
+    {
+<span class="fc" id="L111">        return expand(value, false);</span>
+    }
+
+    private String expand(String value, boolean encodeURL)
+        throws PropertyExpander.ExpandException
+    {
+<span class="pc bpc" id="L117" title="1 of 2 branches missed.">        if (!expandProp) {</span>
+<span class="nc" id="L118">            return value;</span>
+        } else {
+<span class="fc" id="L120">            return PropertyExpander.expand(value, encodeURL);</span>
+        }
+    }
+
+    /**
+     * Creates a PolicyParser object.
+     */
+
+<span class="fc" id="L128">    public PolicyParser() {</span>
+<span class="fc" id="L129">        grantEntries = new Vector&lt;GrantEntry&gt;();</span>
+<span class="fc" id="L130">    }</span>
+
+
+    public PolicyParser(boolean expandProp) {
+<span class="fc" id="L134">        this();</span>
+<span class="fc" id="L135">        this.expandProp = expandProp;</span>
+<span class="fc" id="L136">    }</span>
+
+    /**
+     * Reads a policy configuration into the Policy object using a
+     * Reader object. &lt;p&gt;
+     *
+     * @param policy the policy Reader object.
+     *
+     * @exception ParsingException if the policy configuration contains
+     *          a syntax error.
+     *
+     * @exception IOException if an error occurs while reading the policy
+     *          configuration.
+     */
+
+    public void read(Reader policy)
+        throws ParsingException, IOException
+    {
+<span class="pc bpc" id="L154" title="1 of 2 branches missed.">        if (!(policy instanceof BufferedReader)) {</span>
+<span class="fc" id="L155">            policy = new BufferedReader(policy);</span>
+        }
+
+        /**
+         * Configure the stream tokenizer:
+         *      Recognize strings between &quot;...&quot;
+         *      Don't convert words to lowercase
+         *      Recognize both C-style and C++-style comments
+         *      Treat end-of-line as white space, not as a token
+         */
+<span class="fc" id="L165">        st   = new StreamTokenizer(policy);</span>
+
+<span class="fc" id="L167">        st.resetSyntax();</span>
+<span class="fc" id="L168">        st.wordChars('a', 'z');</span>
+<span class="fc" id="L169">        st.wordChars('A', 'Z');</span>
+<span class="fc" id="L170">        st.wordChars('.', '.');</span>
+<span class="fc" id="L171">        st.wordChars('0', '9');</span>
+<span class="fc" id="L172">        st.wordChars('_', '_');</span>
+<span class="fc" id="L173">        st.wordChars('$', '$');</span>
+<span class="fc" id="L174">        st.wordChars(128 + 32, 255);</span>
+<span class="fc" id="L175">        st.whitespaceChars(0, ' ');</span>
+<span class="fc" id="L176">        st.commentChar('/');</span>
+<span class="fc" id="L177">        st.quoteChar('\'');</span>
+<span class="fc" id="L178">        st.quoteChar('&quot;');</span>
+<span class="fc" id="L179">        st.lowerCaseMode(false);</span>
+<span class="fc" id="L180">        st.ordinaryChar('/');</span>
+<span class="fc" id="L181">        st.slashSlashComments(true);</span>
+<span class="fc" id="L182">        st.slashStarComments(true);</span>
+
+        /**
+         * The main parsing loop.  The loop is executed once
+         * for each entry in the config file.      The entries
+         * are delimited by semicolons.   Once we've read in
+         * the information for an entry, go ahead and try to
+         * add it to the policy vector.
+         *
+         */
+
+<span class="fc" id="L193">        lookahead = st.nextToken();</span>
+<span class="fc" id="L194">        GrantEntry ge = null;</span>
+<span class="fc bfc" id="L195" title="All 2 branches covered.">        while (lookahead != StreamTokenizer.TT_EOF) {</span>
+<span class="fc bfc" id="L196" title="All 2 branches covered.">            if (peek(&quot;grant&quot;)) {</span>
+<span class="fc" id="L197">                ge = parseGrantEntry();</span>
+                // could be null if we couldn't expand a property
+<span class="fc bfc" id="L199" title="All 2 branches covered.">                if (ge != null)</span>
+<span class="fc" id="L200">                    add(ge);</span>
+<span class="pc bpc" id="L201" title="1 of 4 branches missed.">            } else if (peek(&quot;keystore&quot;) &amp;&amp; keyStoreUrlString==null) {</span>
+                // only one keystore entry per policy file, others will be
+                // ignored
+<span class="fc" id="L204">                parseKeyStoreEntry();</span>
+<span class="pc bpc" id="L205" title="3 of 4 branches missed.">            } else if (peek(&quot;keystorePasswordURL&quot;) &amp;&amp; storePassURL==null) {</span>
+                // only one keystore passwordURL per policy file, others will be
+                // ignored
+<span class="nc" id="L208">                parseStorePassURL();</span>
+<span class="pc bpc" id="L209" title="3 of 6 branches missed.">            } else if (ge == null &amp;&amp; keyStoreUrlString == null &amp;&amp;</span>
+<span class="pc bpc" id="L210" title="1 of 2 branches missed.">                storePassURL == null &amp;&amp; peek(&quot;domain&quot;)) {</span>
+<span class="fc bfc" id="L211" title="All 2 branches covered.">                if (domainEntries == null) {</span>
+<span class="fc" id="L212">                    domainEntries = new TreeMap&lt;&gt;();</span>
+                }
+<span class="fc" id="L214">                DomainEntry de = parseDomainEntry();</span>
+<span class="pc bpc" id="L215" title="1 of 2 branches missed.">                if (de != null) {</span>
+<span class="fc" id="L216">                    String domainName = de.getName();</span>
+<span class="pc bpc" id="L217" title="1 of 2 branches missed.">                    if (!domainEntries.containsKey(domainName)) {</span>
+<span class="fc" id="L218">                        domainEntries.put(domainName, de);</span>
+                    } else {
+<span class="nc" id="L220">                        MessageFormat form =</span>
+<span class="nc" id="L221">                            new MessageFormat(ResourcesMgr.getString(</span>
+                                &quot;duplicate.keystore.domain.name&quot;));
+<span class="nc" id="L223">                        Object[] source = {domainName};</span>
+<span class="nc" id="L224">                        throw new ParsingException(form.format(source));</span>
+                    }
+                }
+            } else {
+                // error?
+            }
+<span class="fc" id="L230">            match(&quot;;&quot;);</span>
+        }
+
+<span class="pc bpc" id="L233" title="1 of 4 branches missed.">        if (keyStoreUrlString == null &amp;&amp; storePassURL != null) {</span>
+<span class="nc" id="L234">            throw new ParsingException(ResourcesMgr.getString</span>
+<span class="nc" id="L235">                (&quot;keystorePasswordURL.can.not.be.specified.without.also.specifying.keystore&quot;));</span>
+        }
+<span class="fc" id="L237">    }</span>
+
+    public void add(GrantEntry ge)
+    {
+<span class="fc" id="L241">        grantEntries.addElement(ge);</span>
+<span class="fc" id="L242">    }</span>
+
+    public void replace(GrantEntry origGe, GrantEntry newGe)
+    {
+<span class="nc" id="L246">        grantEntries.setElementAt(newGe, grantEntries.indexOf(origGe));</span>
+<span class="nc" id="L247">    }</span>
+
+    public boolean remove(GrantEntry ge)
+    {
+<span class="nc" id="L251">        return grantEntries.removeElement(ge);</span>
+    }
+
+    /**
+     * Returns the (possibly expanded) keystore location, or null if the
+     * expansion fails.
+     */
+    public String getKeyStoreUrl() {
+        try {
+<span class="pc bpc" id="L260" title="1 of 4 branches missed.">            if (keyStoreUrlString!=null &amp;&amp; keyStoreUrlString.length()!=0) {</span>
+<span class="fc" id="L261">                return expand(keyStoreUrlString, true).replace</span>
+<span class="fc" id="L262">                                                (File.separatorChar, '/');</span>
+            }
+<span class="nc" id="L264">        } catch (PropertyExpander.ExpandException peee) {</span>
+<span class="nc bnc" id="L265" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L266">                debug.println(peee.toString());</span>
+            }
+<span class="nc" id="L268">            return null;</span>
+<span class="fc" id="L269">        }</span>
+<span class="fc" id="L270">        return null;</span>
+    }
+
+    public void setKeyStoreUrl(String url) {
+<span class="nc" id="L274">        keyStoreUrlString = url;</span>
+<span class="nc" id="L275">    }</span>
+
+    public String getKeyStoreType() {
+<span class="fc" id="L278">        return keyStoreType;</span>
+    }
+
+    public void setKeyStoreType(String type) {
+<span class="nc" id="L282">        keyStoreType = type;</span>
+<span class="nc" id="L283">    }</span>
+
+    public String getKeyStoreProvider() {
+<span class="fc" id="L286">        return keyStoreProvider;</span>
+    }
+
+    public void setKeyStoreProvider(String provider) {
+<span class="nc" id="L290">        keyStoreProvider = provider;</span>
+<span class="nc" id="L291">    }</span>
+
+    public String getStorePassURL() {
+        try {
+<span class="pc bpc" id="L295" title="3 of 4 branches missed.">            if (storePassURL!=null &amp;&amp; storePassURL.length()!=0) {</span>
+<span class="nc" id="L296">                return expand(storePassURL, true).replace</span>
+<span class="nc" id="L297">                                                (File.separatorChar, '/');</span>
+            }
+<span class="nc" id="L299">        } catch (PropertyExpander.ExpandException peee) {</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L301">                debug.println(peee.toString());</span>
+            }
+<span class="nc" id="L303">            return null;</span>
+<span class="fc" id="L304">        }</span>
+<span class="fc" id="L305">        return null;</span>
+    }
+
+    public void setStorePassURL(String storePassURL) {
+<span class="nc" id="L309">        this.storePassURL = storePassURL;</span>
+<span class="nc" id="L310">    }</span>
+
+    /**
+     * Enumerate all the entries in the global policy object.
+     * This method is used by policy admin tools.   The tools
+     * should use the Enumeration methods on the returned object
+     * to fetch the elements sequentially.
+     */
+    public Enumeration&lt;GrantEntry&gt; grantElements(){
+<span class="fc" id="L319">        return grantEntries.elements();</span>
+    }
+
+    public Collection&lt;DomainEntry&gt; getDomainEntries() {
+<span class="fc" id="L323">        return domainEntries.values();</span>
+    }
+
+    /**
+     * write out the policy
+     */
+
+    public void write(Writer policy)
+    {
+<span class="nc" id="L332">        PrintWriter out = new PrintWriter(new BufferedWriter(policy));</span>
+
+<span class="nc" id="L334">        Enumeration&lt;GrantEntry&gt; enum_ = grantElements();</span>
+
+<span class="nc" id="L336">        out.println(&quot;/* AUTOMATICALLY GENERATED ON &quot;+</span>
+                    (new java.util.Date()) + &quot;*/&quot;);
+<span class="nc" id="L338">        out.println(&quot;/* DO NOT EDIT */&quot;);</span>
+<span class="nc" id="L339">        out.println();</span>
+
+        // write the (unexpanded) keystore entry as the first entry of the
+        // policy file
+<span class="nc bnc" id="L343" title="All 2 branches missed.">        if (keyStoreUrlString != null) {</span>
+<span class="nc" id="L344">            writeKeyStoreEntry(out);</span>
+        }
+<span class="nc bnc" id="L346" title="All 2 branches missed.">        if (storePassURL != null) {</span>
+<span class="nc" id="L347">            writeStorePassURL(out);</span>
+        }
+
+        // write &quot;grant&quot; entries
+<span class="nc bnc" id="L351" title="All 2 branches missed.">        while (enum_.hasMoreElements()) {</span>
+<span class="nc" id="L352">            GrantEntry ge = enum_.nextElement();</span>
+<span class="nc" id="L353">            ge.write(out);</span>
+<span class="nc" id="L354">            out.println();</span>
+<span class="nc" id="L355">        }</span>
+<span class="nc" id="L356">        out.flush();</span>
+<span class="nc" id="L357">    }</span>
+
+    /**
+     * parses a keystore entry
+     */
+    private void parseKeyStoreEntry() throws ParsingException, IOException {
+<span class="fc" id="L363">        match(&quot;keystore&quot;);</span>
+<span class="fc" id="L364">        keyStoreUrlString = match(&quot;quoted string&quot;);</span>
+
+        // parse keystore type
+<span class="pc bpc" id="L367" title="1 of 2 branches missed.">        if (!peek(&quot;,&quot;)) {</span>
+<span class="fc" id="L368">            return; // default type</span>
+        }
+<span class="nc" id="L370">        match(&quot;,&quot;);</span>
+
+<span class="nc bnc" id="L372" title="All 2 branches missed.">        if (peek(&quot;\&quot;&quot;)) {</span>
+<span class="nc" id="L373">            keyStoreType = match(&quot;quoted string&quot;);</span>
+        } else {
+<span class="nc" id="L375">            throw new ParsingException(st.lineno(),</span>
+<span class="nc" id="L376">                        ResourcesMgr.getString(&quot;expected.keystore.type&quot;));</span>
+        }
+
+        // parse keystore provider
+<span class="nc bnc" id="L380" title="All 2 branches missed.">        if (!peek(&quot;,&quot;)) {</span>
+<span class="nc" id="L381">            return; // provider optional</span>
+        }
+<span class="nc" id="L383">        match(&quot;,&quot;);</span>
+
+<span class="nc bnc" id="L385" title="All 2 branches missed.">        if (peek(&quot;\&quot;&quot;)) {</span>
+<span class="nc" id="L386">            keyStoreProvider = match(&quot;quoted string&quot;);</span>
+        } else {
+<span class="nc" id="L388">            throw new ParsingException(st.lineno(),</span>
+<span class="nc" id="L389">                        ResourcesMgr.getString(&quot;expected.keystore.provider&quot;));</span>
+        }
+<span class="nc" id="L391">    }</span>
+
+    private void parseStorePassURL() throws ParsingException, IOException {
+<span class="nc" id="L394">        match(&quot;keyStorePasswordURL&quot;);</span>
+<span class="nc" id="L395">        storePassURL = match(&quot;quoted string&quot;);</span>
+<span class="nc" id="L396">    }</span>
+
+    /**
+     * writes the (unexpanded) keystore entry
+     */
+    private void writeKeyStoreEntry(PrintWriter out) {
+<span class="nc" id="L402">        out.print(&quot;keystore \&quot;&quot;);</span>
+<span class="nc" id="L403">        out.print(keyStoreUrlString);</span>
+<span class="nc" id="L404">        out.print('&quot;');</span>
+<span class="nc bnc" id="L405" title="All 4 branches missed.">        if (keyStoreType != null &amp;&amp; keyStoreType.length() &gt; 0)</span>
+<span class="nc" id="L406">            out.print(&quot;, \&quot;&quot; + keyStoreType + &quot;\&quot;&quot;);</span>
+<span class="nc bnc" id="L407" title="All 4 branches missed.">        if (keyStoreProvider != null &amp;&amp; keyStoreProvider.length() &gt; 0)</span>
+<span class="nc" id="L408">            out.print(&quot;, \&quot;&quot; + keyStoreProvider + &quot;\&quot;&quot;);</span>
+<span class="nc" id="L409">        out.println(&quot;;&quot;);</span>
+<span class="nc" id="L410">        out.println();</span>
+<span class="nc" id="L411">    }</span>
+
+    private void writeStorePassURL(PrintWriter out) {
+<span class="nc" id="L414">        out.print(&quot;keystorePasswordURL \&quot;&quot;);</span>
+<span class="nc" id="L415">        out.print(storePassURL);</span>
+<span class="nc" id="L416">        out.print('&quot;');</span>
+<span class="nc" id="L417">        out.println(&quot;;&quot;);</span>
+<span class="nc" id="L418">        out.println();</span>
+<span class="nc" id="L419">    }</span>
+
+    /**
+     * parse a Grant entry
+     */
+    private GrantEntry parseGrantEntry()
+        throws ParsingException, IOException
+    {
+<span class="fc" id="L427">        GrantEntry e = new GrantEntry();</span>
+<span class="fc" id="L428">        LinkedList&lt;PrincipalEntry&gt; principals = null;</span>
+<span class="fc" id="L429">        boolean ignoreEntry = false;</span>
+
+<span class="fc" id="L431">        match(&quot;grant&quot;);</span>
+
+<span class="fc bfc" id="L433" title="All 2 branches covered.">        while(!peek(&quot;{&quot;)) {</span>
+
+<span class="fc bfc" id="L435" title="All 2 branches covered.">            if (peekAndMatch(&quot;Codebase&quot;)) {</span>
+<span class="pc bpc" id="L436" title="1 of 2 branches missed.">                if (e.codeBase != null)</span>
+<span class="nc" id="L437">                    throw new ParsingException(</span>
+<span class="nc" id="L438">                            st.lineno(),</span>
+                            ResourcesMgr.getString
+<span class="nc" id="L440">                                (&quot;multiple.Codebase.expressions&quot;));</span>
+<span class="fc" id="L441">                e.codeBase = match(&quot;quoted string&quot;);</span>
+<span class="fc" id="L442">                peekAndMatch(&quot;,&quot;);</span>
+<span class="pc bpc" id="L443" title="1 of 2 branches missed.">            } else if (peekAndMatch(&quot;SignedBy&quot;)) {</span>
+<span class="nc bnc" id="L444" title="All 2 branches missed.">                if (e.signedBy != null)</span>
+<span class="nc" id="L445">                    throw new ParsingException(</span>
+<span class="nc" id="L446">                            st.lineno(),</span>
+<span class="nc" id="L447">                            ResourcesMgr.getString(</span>
+                                &quot;multiple.SignedBy.expressions&quot;));
+<span class="nc" id="L449">                e.signedBy = match(&quot;quoted string&quot;);</span>
+
+                // verify syntax of the aliases
+<span class="nc" id="L452">                StringTokenizer aliases = new StringTokenizer(e.signedBy,</span>
+                                                              &quot;,&quot;, true);
+<span class="nc" id="L454">                int actr = 0;</span>
+<span class="nc" id="L455">                int cctr = 0;</span>
+<span class="nc bnc" id="L456" title="All 2 branches missed.">                while (aliases.hasMoreTokens()) {</span>
+<span class="nc" id="L457">                    String alias = aliases.nextToken().trim();</span>
+<span class="nc bnc" id="L458" title="All 2 branches missed.">                    if (alias.equals(&quot;,&quot;))</span>
+<span class="nc" id="L459">                        cctr++;</span>
+<span class="nc bnc" id="L460" title="All 2 branches missed.">                    else if (alias.length() &gt; 0)</span>
+<span class="nc" id="L461">                        actr++;</span>
+<span class="nc" id="L462">                }</span>
+<span class="nc bnc" id="L463" title="All 2 branches missed.">                if (actr &lt;= cctr)</span>
+<span class="nc" id="L464">                    throw new ParsingException(</span>
+<span class="nc" id="L465">                            st.lineno(),</span>
+<span class="nc" id="L466">                            ResourcesMgr.getString(</span>
+                                &quot;SignedBy.has.empty.alias&quot;));
+
+<span class="nc" id="L469">                peekAndMatch(&quot;,&quot;);</span>
+<span class="pc bpc" id="L470" title="1 of 2 branches missed.">            } else if (peekAndMatch(&quot;Principal&quot;)) {</span>
+<span class="fc bfc" id="L471" title="All 2 branches covered.">                if (principals == null) {</span>
+<span class="fc" id="L472">                    principals = new LinkedList&lt;&gt;();</span>
+                }
+
+                String principalClass;
+                String principalName;
+
+<span class="fc bfc" id="L478" title="All 2 branches covered.">                if (peek(&quot;\&quot;&quot;)) {</span>
+                    // both the principalClass and principalName
+                    // will be replaced later
+<span class="fc" id="L481">                    principalClass = PrincipalEntry.REPLACE_NAME;</span>
+<span class="fc" id="L482">                    principalName = match(&quot;principal type&quot;);</span>
+                } else {
+                    // check for principalClass wildcard
+<span class="pc bpc" id="L485" title="1 of 2 branches missed.">                    if (peek(&quot;*&quot;)) {</span>
+<span class="nc" id="L486">                        match(&quot;*&quot;);</span>
+<span class="nc" id="L487">                        principalClass = PrincipalEntry.WILDCARD_CLASS;</span>
+                    } else {
+<span class="fc" id="L489">                        principalClass = match(&quot;principal type&quot;);</span>
+                    }
+
+                    // check for principalName wildcard
+<span class="fc bfc" id="L493" title="All 2 branches covered.">                    if (peek(&quot;*&quot;)) {</span>
+<span class="fc" id="L494">                        match(&quot;*&quot;);</span>
+<span class="fc" id="L495">                        principalName = PrincipalEntry.WILDCARD_NAME;</span>
+                    } else {
+<span class="fc" id="L497">                        principalName = match(&quot;quoted string&quot;);</span>
+                    }
+
+                    // disallow WILDCARD_CLASS &amp;&amp; actual name
+<span class="pc bpc" id="L501" title="1 of 2 branches missed.">                    if (principalClass.equals(PrincipalEntry.WILDCARD_CLASS) &amp;&amp;</span>
+<span class="nc bnc" id="L502" title="All 2 branches missed.">                        !principalName.equals(PrincipalEntry.WILDCARD_NAME)) {</span>
+<span class="nc bnc" id="L503" title="All 2 branches missed.">                        if (debug != null) {</span>
+<span class="nc" id="L504">                                debug.println(&quot;disallowing principal that &quot; +</span>
+                                    &quot;has WILDCARD class but no WILDCARD name&quot;);
+                        }
+<span class="nc" id="L507">                        throw new ParsingException</span>
+<span class="nc" id="L508">                                (st.lineno(),</span>
+                                 ResourcesMgr.getString
+<span class="nc" id="L510">                                    (&quot;can.not.specify.Principal.with.a.wildcard.class.without.a.wildcard.name&quot;));</span>
+                    }
+                }
+
+                try {
+<span class="fc" id="L515">                    principalName = expand(principalName);</span>
+
+<span class="fc" id="L517">                    if (principalClass.equals</span>
+<span class="fc bfc" id="L518" title="All 2 branches covered.">                                (&quot;javax.security.auth.x500.X500Principal&quot;) &amp;&amp;</span>
+<span class="fc bfc" id="L519" title="All 2 branches covered.">                        !principalName.equals(PrincipalEntry.WILDCARD_NAME)) {</span>
+
+                        // 4702543:  X500 names with an EmailAddress
+                        // were encoded incorrectly.  construct a new
+                        // X500Principal with correct encoding.
+
+<span class="fc" id="L525">                        X500Principal p = new X500Principal</span>
+<span class="fc" id="L526">                                ((new X500Principal(principalName)).toString());</span>
+<span class="fc" id="L527">                        principalName = p.getName();</span>
+                    }
+
+<span class="fc" id="L530">                    principals.add</span>
+<span class="fc" id="L531">                        (new PrincipalEntry(principalClass, principalName));</span>
+<span class="nc" id="L532">                } catch (PropertyExpander.ExpandException peee) {</span>
+                    // ignore the entire policy entry
+                    // but continue parsing all the info
+                    // so we can get to the next entry
+<span class="nc bnc" id="L536" title="All 2 branches missed.">                    if (debug != null) {</span>
+<span class="nc" id="L537">                        debug.println(&quot;principal name expansion failed: &quot; +</span>
+                                        principalName);
+                    }
+<span class="nc" id="L540">                    ignoreEntry = true;</span>
+<span class="fc" id="L541">                }</span>
+<span class="fc" id="L542">                peekAndMatch(&quot;,&quot;);</span>
+
+<span class="fc" id="L544">            } else {</span>
+<span class="nc" id="L545">                throw new ParsingException(st.lineno(),</span>
+<span class="nc" id="L546">                                  ResourcesMgr.getString(</span>
+                                      &quot;expected.codeBase.or.SignedBy.or.Principal&quot;));
+            }
+        }
+
+<span class="fc bfc" id="L551" title="All 2 branches covered.">        if (principals != null) e.principals = principals;</span>
+<span class="fc" id="L552">        match(&quot;{&quot;);</span>
+
+<span class="fc bfc" id="L554" title="All 2 branches covered.">        while(!peek(&quot;}&quot;)) {</span>
+<span class="pc bpc" id="L555" title="1 of 2 branches missed.">            if (peek(&quot;Permission&quot;)) {</span>
+                try {
+<span class="fc" id="L557">                    PermissionEntry pe = parsePermissionEntry();</span>
+<span class="fc" id="L558">                    e.add(pe);</span>
+<span class="fc" id="L559">                } catch (PropertyExpander.ExpandException peee) {</span>
+                    // ignore. The add never happened
+<span class="fc bfc" id="L561" title="All 2 branches covered.">                    if (debug != null) {</span>
+<span class="fc" id="L562">                        debug.println(peee.toString());</span>
+                    }
+<span class="fc" id="L564">                    skipEntry();  // BugId 4219343</span>
+<span class="fc" id="L565">                }</span>
+<span class="fc" id="L566">                match(&quot;;&quot;);</span>
+            } else {
+<span class="nc" id="L568">                throw new</span>
+<span class="nc" id="L569">                    ParsingException(st.lineno(),</span>
+<span class="nc" id="L570">                                     ResourcesMgr.getString(</span>
+                                        &quot;expected.permission.entry&quot;));
+            }
+        }
+<span class="fc" id="L574">        match(&quot;}&quot;);</span>
+
+        try {
+<span class="pc bpc" id="L577" title="1 of 2 branches missed.">            if (e.signedBy != null) e.signedBy = expand(e.signedBy);</span>
+<span class="fc bfc" id="L578" title="All 2 branches covered.">            if (e.codeBase != null) {</span>
+
+                // For backward compatibility with 1.4
+<span class="pc bpc" id="L581" title="1 of 2 branches missed.">                if (e.codeBase.equals(OLD_EXTDIRS_EXPANSION)) {</span>
+<span class="nc" id="L582">                    e.codeBase = EXTDIRS_EXPANSION;</span>
+                }
+                int es;
+<span class="fc bfc" id="L585" title="All 2 branches covered.">                if ((es=e.codeBase.indexOf(EXTDIRS_EXPANSION)) &lt; 0) {</span>
+<span class="fc" id="L586">                    e.codeBase = expand(e.codeBase, true).replace</span>
+<span class="fc" id="L587">                                        (File.separatorChar, '/');</span>
+                } else {
+                    // expand the system property &quot;java.ext.dirs&quot;,
+                    // parse it into its path components,
+                    // and then create a grant entry for each component
+<span class="fc" id="L592">                    String[] extDirs = parseExtDirs(e.codeBase, es);</span>
+<span class="pc bpc" id="L593" title="2 of 4 branches missed.">                    if (extDirs != null &amp;&amp; extDirs.length &gt; 0) {</span>
+<span class="fc bfc" id="L594" title="All 2 branches covered.">                        for (int i = 0; i &lt; extDirs.length; i++) {</span>
+<span class="fc" id="L595">                            GrantEntry newGe = (GrantEntry)e.clone();</span>
+<span class="fc" id="L596">                            newGe.codeBase = extDirs[i];</span>
+<span class="fc" id="L597">                            add(newGe);</span>
+
+<span class="pc bpc" id="L599" title="1 of 2 branches missed.">                            if (debug != null) {</span>
+<span class="nc" id="L600">                                debug.println(&quot;creating policy entry for &quot; +</span>
+                                        &quot;expanded java.ext.dirs path:\n\t\t&quot; +
+                                        extDirs[i]);
+                            }
+                        }
+                    }
+<span class="fc" id="L606">                    ignoreEntry = true;</span>
+                }
+            }
+<span class="nc" id="L609">        } catch (PropertyExpander.ExpandException peee) {</span>
+<span class="nc bnc" id="L610" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L611">                debug.println(peee.toString());</span>
+            }
+<span class="nc" id="L613">            return null;</span>
+<span class="fc" id="L614">        }</span>
+
+<span class="fc bfc" id="L616" title="All 2 branches covered.">        return (ignoreEntry == true) ? null : e;</span>
+    }
+
+    /**
+     * parse a Permission entry
+     */
+    private PermissionEntry parsePermissionEntry()
+        throws ParsingException, IOException, PropertyExpander.ExpandException
+    {
+<span class="fc" id="L625">        PermissionEntry e = new PermissionEntry();</span>
+
+        // Permission
+<span class="fc" id="L628">        match(&quot;Permission&quot;);</span>
+<span class="fc" id="L629">        e.permission = match(&quot;permission type&quot;);</span>
+
+<span class="fc bfc" id="L631" title="All 2 branches covered.">        if (peek(&quot;\&quot;&quot;)) {</span>
+            // Permission name
+<span class="fc" id="L633">            e.name = expand(match(&quot;quoted string&quot;));</span>
+        }
+
+<span class="fc bfc" id="L636" title="All 2 branches covered.">        if (!peek(&quot;,&quot;)) {</span>
+<span class="fc" id="L637">            return e;</span>
+        }
+<span class="fc" id="L639">        match(&quot;,&quot;);</span>
+
+<span class="pc bpc" id="L641" title="1 of 2 branches missed.">        if (peek(&quot;\&quot;&quot;)) {</span>
+<span class="fc" id="L642">                e.action = expand(match(&quot;quoted string&quot;));</span>
+<span class="pc bpc" id="L643" title="1 of 2 branches missed.">                if (!peek(&quot;,&quot;)) {</span>
+<span class="fc" id="L644">                    return e;</span>
+                }
+<span class="nc" id="L646">                match(&quot;,&quot;);</span>
+        }
+
+<span class="nc bnc" id="L649" title="All 2 branches missed.">        if (peekAndMatch(&quot;SignedBy&quot;)) {</span>
+<span class="nc" id="L650">            e.signedBy = expand(match(&quot;quoted string&quot;));</span>
+        }
+<span class="nc" id="L652">        return e;</span>
+    }
+
+    /**
+     * parse a domain entry
+     */
+    private DomainEntry parseDomainEntry()
+        throws ParsingException, IOException
+    {
+<span class="fc" id="L661">        boolean ignoreEntry = false;</span>
+        DomainEntry domainEntry;
+<span class="fc" id="L663">        String name = null;</span>
+<span class="fc" id="L664">        Map&lt;String, String&gt; properties = new HashMap&lt;&gt;();</span>
+
+<span class="fc" id="L666">        match(&quot;domain&quot;);</span>
+<span class="fc" id="L667">        name = match(&quot;domain name&quot;);</span>
+
+<span class="fc bfc" id="L669" title="All 2 branches covered.">        while(!peek(&quot;{&quot;)) {</span>
+            // get the domain properties
+<span class="fc" id="L671">            properties = parseProperties(&quot;{&quot;);</span>
+        }
+<span class="fc" id="L673">        match(&quot;{&quot;);</span>
+<span class="fc" id="L674">        domainEntry = new DomainEntry(name, properties);</span>
+
+<span class="fc bfc" id="L676" title="All 2 branches covered.">        while(!peek(&quot;}&quot;)) {</span>
+
+<span class="fc" id="L678">            match(&quot;keystore&quot;);</span>
+<span class="fc" id="L679">            name = match(&quot;keystore name&quot;);</span>
+            // get the keystore properties
+<span class="pc bpc" id="L681" title="1 of 2 branches missed.">            if (!peek(&quot;}&quot;)) {</span>
+<span class="fc" id="L682">                properties = parseProperties(&quot;;&quot;);</span>
+            }
+<span class="fc" id="L684">            match(&quot;;&quot;);</span>
+<span class="fc" id="L685">            domainEntry.add(new KeyStoreEntry(name, properties));</span>
+        }
+<span class="fc" id="L687">        match(&quot;}&quot;);</span>
+
+<span class="pc bpc" id="L689" title="1 of 2 branches missed.">        return (ignoreEntry == true) ? null : domainEntry;</span>
+    }
+
+    /*
+     * Return a collection of domain properties or keystore properties.
+     */
+    private Map&lt;String, String&gt; parseProperties(String terminator)
+        throws ParsingException, IOException {
+
+<span class="fc" id="L698">        Map&lt;String, String&gt; properties = new HashMap&lt;&gt;();</span>
+        String key;
+        String value;
+<span class="fc bfc" id="L701" title="All 2 branches covered.">        while (!peek(terminator)) {</span>
+<span class="fc" id="L702">            key = match(&quot;property name&quot;);</span>
+<span class="fc" id="L703">            match(&quot;=&quot;);</span>
+
+            try {
+<span class="fc" id="L706">                value = expand(match(&quot;quoted string&quot;));</span>
+<span class="nc" id="L707">            } catch (PropertyExpander.ExpandException peee) {</span>
+<span class="nc" id="L708">                throw new IOException(peee.getLocalizedMessage());</span>
+<span class="fc" id="L709">            }</span>
+<span class="fc" id="L710">            properties.put(key.toLowerCase(), value);</span>
+        }
+
+<span class="fc" id="L713">        return properties;</span>
+    }
+
+    // package-private: used by PolicyFile for static policy
+    static String[] parseExtDirs(String codebase, int start) {
+
+<span class="fc" id="L719">        String s = System.getProperty(EXTDIRS_PROPERTY);</span>
+<span class="pc bpc" id="L720" title="1 of 2 branches missed.">        String globalPrefix = (start &gt; 0 ? codebase.substring(0, start) : &quot;file:&quot;);</span>
+<span class="fc" id="L721">        int end = start + EXTDIRS_EXPANSION.length();</span>
+<span class="pc bpc" id="L722" title="1 of 2 branches missed.">        String globalSuffix = (end &lt; codebase.length() ? codebase.substring(end) :</span>
+            (String) null);
+
+<span class="fc" id="L725">        String[] dirs = null;</span>
+        String localSuffix;
+<span class="pc bpc" id="L727" title="1 of 2 branches missed.">        if (s != null) {</span>
+<span class="fc" id="L728">            StringTokenizer st =</span>
+                new StringTokenizer(s, File.pathSeparator);
+<span class="fc" id="L730">            int count = st.countTokens();</span>
+<span class="fc" id="L731">            dirs = new String[count];</span>
+<span class="fc bfc" id="L732" title="All 2 branches covered.">            for (int i = 0; i &lt; count; i++) {</span>
+<span class="fc" id="L733">                File file = new File(st.nextToken());</span>
+<span class="fc" id="L734">                dirs[i] = sun.net.www.ParseUtil.encodePath</span>
+<span class="fc" id="L735">                        (file.getAbsolutePath());</span>
+
+<span class="pc bpc" id="L737" title="1 of 2 branches missed.">                if (!dirs[i].startsWith(&quot;/&quot;)) {</span>
+<span class="nc" id="L738">                    dirs[i] = &quot;/&quot; + dirs[i];</span>
+                }
+
+<span class="pc bpc" id="L741" title="1 of 2 branches missed.">                localSuffix = (globalSuffix == null ?</span>
+<span class="pc bnc" id="L742" title="All 2 branches missed.">                    (dirs[i].endsWith(&quot;/&quot;) ? &quot;*&quot; : &quot;/*&quot;) :</span>
+                    globalSuffix);
+
+<span class="fc" id="L745">                dirs[i] = globalPrefix + dirs[i] + localSuffix;</span>
+            }
+        }
+<span class="fc" id="L748">        return dirs;</span>
+    }
+
+    private boolean peekAndMatch(String expect)
+        throws ParsingException, IOException
+    {
+<span class="fc bfc" id="L754" title="All 2 branches covered.">        if (peek(expect)) {</span>
+<span class="fc" id="L755">            match(expect);</span>
+<span class="fc" id="L756">            return true;</span>
+        } else {
+<span class="fc" id="L758">            return false;</span>
+        }
+    }
+
+    private boolean peek(String expect) {
+<span class="fc" id="L763">        boolean found = false;</span>
+
+<span class="pc bpc" id="L765" title="1 of 8 branches missed.">        switch (lookahead) {</span>
+
+        case StreamTokenizer.TT_WORD:
+<span class="fc bfc" id="L768" title="All 2 branches covered.">            if (expect.equalsIgnoreCase(st.sval))</span>
+<span class="fc" id="L769">                found = true;</span>
+            break;
+        case ',':
+<span class="pc bpc" id="L772" title="1 of 2 branches missed.">            if (expect.equalsIgnoreCase(&quot;,&quot;))</span>
+<span class="fc" id="L773">                found = true;</span>
+            break;
+        case '{':
+<span class="fc bfc" id="L776" title="All 2 branches covered.">            if (expect.equalsIgnoreCase(&quot;{&quot;))</span>
+<span class="fc" id="L777">                found = true;</span>
+            break;
+        case '}':
+<span class="pc bpc" id="L780" title="1 of 2 branches missed.">            if (expect.equalsIgnoreCase(&quot;}&quot;))</span>
+<span class="fc" id="L781">                found = true;</span>
+            break;
+        case '&quot;':
+<span class="fc bfc" id="L784" title="All 2 branches covered.">            if (expect.equalsIgnoreCase(&quot;\&quot;&quot;))</span>
+<span class="fc" id="L785">                found = true;</span>
+            break;
+        case '*':
+<span class="pc bpc" id="L788" title="1 of 2 branches missed.">            if (expect.equalsIgnoreCase(&quot;*&quot;))</span>
+<span class="fc" id="L789">                found = true;</span>
+            break;
+        case ';':
+<span class="fc bfc" id="L792" title="All 2 branches covered.">            if (expect.equalsIgnoreCase(&quot;;&quot;))</span>
+<span class="fc" id="L793">                found = true;</span>
+            break;
+        default:
+
+        }
+<span class="fc" id="L798">        return found;</span>
+    }
+
+    private String match(String expect)
+        throws ParsingException, IOException
+    {
+<span class="fc" id="L804">        String value = null;</span>
+
+<span class="pc bpc" id="L806" title="3 of 11 branches missed.">        switch (lookahead) {</span>
+        case StreamTokenizer.TT_NUMBER:
+<span class="nc" id="L808">            throw new ParsingException(st.lineno(), expect,</span>
+<span class="nc" id="L809">                                       ResourcesMgr.getString(&quot;number.&quot;) +</span>
+<span class="nc" id="L810">                                       String.valueOf(st.nval));</span>
+        case StreamTokenizer.TT_EOF:
+<span class="nc" id="L812">            MessageFormat form = new MessageFormat(</span>
+                    ResourcesMgr.getString
+<span class="nc" id="L814">                            (&quot;expected.expect.read.end.of.file.&quot;));</span>
+<span class="nc" id="L815">            Object[] source = {expect};</span>
+<span class="nc" id="L816">            throw new ParsingException(form.format(source));</span>
+        case StreamTokenizer.TT_WORD:
+<span class="fc bfc" id="L818" title="All 2 branches covered.">            if (expect.equalsIgnoreCase(st.sval)) {</span>
+<span class="fc" id="L819">                lookahead = st.nextToken();</span>
+<span class="fc bfc" id="L820" title="All 2 branches covered.">            } else if (expect.equalsIgnoreCase(&quot;permission type&quot;)) {</span>
+<span class="fc" id="L821">                value = st.sval;</span>
+<span class="fc" id="L822">                lookahead = st.nextToken();</span>
+<span class="fc bfc" id="L823" title="All 2 branches covered.">            } else if (expect.equalsIgnoreCase(&quot;principal type&quot;)) {</span>
+<span class="fc" id="L824">                value = st.sval;</span>
+<span class="fc" id="L825">                lookahead = st.nextToken();</span>
+<span class="fc bfc" id="L826" title="All 2 branches covered.">            } else if (expect.equalsIgnoreCase(&quot;domain name&quot;) ||</span>
+<span class="fc bfc" id="L827" title="All 2 branches covered.">                       expect.equalsIgnoreCase(&quot;keystore name&quot;) ||</span>
+<span class="pc bpc" id="L828" title="1 of 2 branches missed.">                       expect.equalsIgnoreCase(&quot;property name&quot;)) {</span>
+<span class="fc" id="L829">                value = st.sval;</span>
+<span class="fc" id="L830">                lookahead = st.nextToken();</span>
+            } else {
+<span class="nc" id="L832">                 throw new ParsingException(st.lineno(), expect,</span>
+                                            st.sval);
+            }
+            break;
+        case '&quot;':
+<span class="fc bfc" id="L837" title="All 2 branches covered.">            if (expect.equalsIgnoreCase(&quot;quoted string&quot;)) {</span>
+<span class="fc" id="L838">                value = st.sval;</span>
+<span class="fc" id="L839">                lookahead = st.nextToken();</span>
+<span class="fc bfc" id="L840" title="All 2 branches covered.">            } else if (expect.equalsIgnoreCase(&quot;permission type&quot;)) {</span>
+<span class="fc" id="L841">                value = st.sval;</span>
+<span class="fc" id="L842">                lookahead = st.nextToken();</span>
+<span class="pc bpc" id="L843" title="1 of 2 branches missed.">            } else if (expect.equalsIgnoreCase(&quot;principal type&quot;)) {</span>
+<span class="fc" id="L844">                value = st.sval;</span>
+<span class="fc" id="L845">                lookahead = st.nextToken();</span>
+            } else {
+<span class="nc" id="L847">                throw new ParsingException(st.lineno(), expect, st.sval);</span>
+            }
+            break;
+        case ',':
+<span class="pc bpc" id="L851" title="1 of 2 branches missed.">            if (expect.equalsIgnoreCase(&quot;,&quot;))</span>
+<span class="fc" id="L852">                lookahead = st.nextToken();</span>
+            else
+<span class="nc" id="L854">                throw new ParsingException(st.lineno(), expect, &quot;,&quot;);</span>
+            break;
+        case '{':
+<span class="pc bpc" id="L857" title="1 of 2 branches missed.">            if (expect.equalsIgnoreCase(&quot;{&quot;))</span>
+<span class="fc" id="L858">                lookahead = st.nextToken();</span>
+            else
+<span class="nc" id="L860">                throw new ParsingException(st.lineno(), expect, &quot;{&quot;);</span>
+            break;
+        case '}':
+<span class="pc bpc" id="L863" title="1 of 2 branches missed.">            if (expect.equalsIgnoreCase(&quot;}&quot;))</span>
+<span class="fc" id="L864">                lookahead = st.nextToken();</span>
+            else
+<span class="nc" id="L866">                throw new ParsingException(st.lineno(), expect, &quot;}&quot;);</span>
+            break;
+        case ';':
+<span class="pc bpc" id="L869" title="1 of 2 branches missed.">            if (expect.equalsIgnoreCase(&quot;;&quot;))</span>
+<span class="fc" id="L870">                lookahead = st.nextToken();</span>
+            else
+<span class="nc" id="L872">                throw new ParsingException(st.lineno(), expect, &quot;;&quot;);</span>
+            break;
+        case '*':
+<span class="pc bpc" id="L875" title="1 of 2 branches missed.">            if (expect.equalsIgnoreCase(&quot;*&quot;))</span>
+<span class="fc" id="L876">                lookahead = st.nextToken();</span>
+            else
+<span class="nc" id="L878">                throw new ParsingException(st.lineno(), expect, &quot;*&quot;);</span>
+            break;
+        case '=':
+<span class="pc bpc" id="L881" title="1 of 2 branches missed.">            if (expect.equalsIgnoreCase(&quot;=&quot;))</span>
+<span class="fc" id="L882">                lookahead = st.nextToken();</span>
+            else
+<span class="nc" id="L884">                throw new ParsingException(st.lineno(), expect, &quot;=&quot;);</span>
+            break;
+        default:
+<span class="nc" id="L887">            throw new ParsingException(st.lineno(), expect,</span>
+                               new String(new char[] {(char)lookahead}));
+        }
+<span class="fc" id="L890">        return value;</span>
+    }
+
+    /**
+     * skip all tokens for this entry leaving the delimiter &quot;;&quot;
+     * in the stream.
+     */
+    private void skipEntry() throws ParsingException, IOException {
+<span class="fc bfc" id="L898" title="All 2 branches covered.">        while(lookahead != ';') {</span>
+<span class="pc bpc" id="L899" title="2 of 3 branches missed.">            switch (lookahead) {</span>
+            case StreamTokenizer.TT_NUMBER:
+<span class="nc" id="L901">                throw new ParsingException(st.lineno(), &quot;;&quot;,</span>
+<span class="nc" id="L902">                                          ResourcesMgr.getString(&quot;number.&quot;) +</span>
+<span class="nc" id="L903">                                          String.valueOf(st.nval));</span>
+            case StreamTokenizer.TT_EOF:
+<span class="nc" id="L905">                throw new ParsingException(ResourcesMgr.getString</span>
+<span class="nc" id="L906">                        (&quot;expected.read.end.of.file.&quot;));</span>
+            default:
+<span class="fc" id="L908">                lookahead = st.nextToken();</span>
+            }
+        }
+<span class="fc" id="L911">    }</span>
+
+    /**
+     * Each grant entry in the policy configuration file is
+     * represented by a
+     * GrantEntry object.  &lt;p&gt;
+     *
+     * &lt;p&gt;
+     * For example, the entry
+     * &lt;pre&gt;
+     *      grant signedBy &quot;Duke&quot; {
+     *          permission java.io.FilePermission &quot;/tmp&quot;, &quot;read,write&quot;;
+     *      };
+     *
+     * &lt;/pre&gt;
+     * is represented internally
+     * &lt;pre&gt;
+     *
+     * pe = new PermissionEntry(&quot;java.io.FilePermission&quot;,
+     *                           &quot;/tmp&quot;, &quot;read,write&quot;);
+     *
+     * ge = new GrantEntry(&quot;Duke&quot;, null);
+     *
+     * ge.add(pe);
+     *
+     * &lt;/pre&gt;
+     *
+     * @author Roland Schemers
+     *
+     * version 1.19, 05/21/98
+     */
+
+    public static class GrantEntry {
+
+        public String signedBy;
+        public String codeBase;
+        public LinkedList&lt;PrincipalEntry&gt; principals;
+        public Vector&lt;PermissionEntry&gt; permissionEntries;
+
+<span class="fc" id="L950">        public GrantEntry() {</span>
+<span class="fc" id="L951">            principals = new LinkedList&lt;PrincipalEntry&gt;();</span>
+<span class="fc" id="L952">            permissionEntries = new Vector&lt;PermissionEntry&gt;();</span>
+<span class="fc" id="L953">        }</span>
+
+<span class="nc" id="L955">        public GrantEntry(String signedBy, String codeBase) {</span>
+<span class="nc" id="L956">            this.codeBase = codeBase;</span>
+<span class="nc" id="L957">            this.signedBy = signedBy;</span>
+<span class="nc" id="L958">            principals = new LinkedList&lt;PrincipalEntry&gt;();</span>
+<span class="nc" id="L959">            permissionEntries = new Vector&lt;PermissionEntry&gt;();</span>
+<span class="nc" id="L960">        }</span>
+
+        public void add(PermissionEntry pe)
+        {
+<span class="fc" id="L964">            permissionEntries.addElement(pe);</span>
+<span class="fc" id="L965">        }</span>
+
+        public boolean remove(PrincipalEntry pe)
+        {
+<span class="nc" id="L969">            return principals.remove(pe);</span>
+        }
+
+        public boolean remove(PermissionEntry pe)
+        {
+<span class="nc" id="L974">            return permissionEntries.removeElement(pe);</span>
+        }
+
+        public boolean contains(PrincipalEntry pe)
+        {
+<span class="nc" id="L979">            return principals.contains(pe);</span>
+        }
+
+        public boolean contains(PermissionEntry pe)
+        {
+<span class="nc" id="L984">            return permissionEntries.contains(pe);</span>
+        }
+
+        /**
+         * Enumerate all the permission entries in this GrantEntry.
+         */
+        public Enumeration&lt;PermissionEntry&gt; permissionElements(){
+<span class="fc" id="L991">            return permissionEntries.elements();</span>
+        }
+
+
+        public void write(PrintWriter out) {
+<span class="nc" id="L996">            out.print(&quot;grant&quot;);</span>
+<span class="nc bnc" id="L997" title="All 2 branches missed.">            if (signedBy != null) {</span>
+<span class="nc" id="L998">                out.print(&quot; signedBy \&quot;&quot;);</span>
+<span class="nc" id="L999">                out.print(signedBy);</span>
+<span class="nc" id="L1000">                out.print('&quot;');</span>
+<span class="nc bnc" id="L1001" title="All 2 branches missed.">                if (codeBase != null)</span>
+<span class="nc" id="L1002">                    out.print(&quot;, &quot;);</span>
+            }
+<span class="nc bnc" id="L1004" title="All 2 branches missed.">            if (codeBase != null) {</span>
+<span class="nc" id="L1005">                out.print(&quot; codeBase \&quot;&quot;);</span>
+<span class="nc" id="L1006">                out.print(codeBase);</span>
+<span class="nc" id="L1007">                out.print('&quot;');</span>
+<span class="nc bnc" id="L1008" title="All 4 branches missed.">                if (principals != null &amp;&amp; principals.size() &gt; 0)</span>
+<span class="nc" id="L1009">                    out.print(&quot;,\n&quot;);</span>
+            }
+<span class="nc bnc" id="L1011" title="All 4 branches missed.">            if (principals != null &amp;&amp; principals.size() &gt; 0) {</span>
+<span class="nc" id="L1012">                Iterator&lt;PrincipalEntry&gt; pli = principals.iterator();</span>
+<span class="nc bnc" id="L1013" title="All 2 branches missed.">                while (pli.hasNext()) {</span>
+<span class="nc" id="L1014">                    out.print(&quot;      &quot;);</span>
+<span class="nc" id="L1015">                    PrincipalEntry pe = pli.next();</span>
+<span class="nc" id="L1016">                    pe.write(out);</span>
+<span class="nc bnc" id="L1017" title="All 2 branches missed.">                    if (pli.hasNext())</span>
+<span class="nc" id="L1018">                        out.print(&quot;,\n&quot;);</span>
+<span class="nc" id="L1019">                }</span>
+            }
+<span class="nc" id="L1021">            out.println(&quot; {&quot;);</span>
+<span class="nc" id="L1022">            Enumeration&lt;PermissionEntry&gt; enum_ = permissionEntries.elements();</span>
+<span class="nc bnc" id="L1023" title="All 2 branches missed.">            while (enum_.hasMoreElements()) {</span>
+<span class="nc" id="L1024">                PermissionEntry pe = enum_.nextElement();</span>
+<span class="nc" id="L1025">                out.write(&quot;  &quot;);</span>
+<span class="nc" id="L1026">                pe.write(out);</span>
+<span class="nc" id="L1027">            }</span>
+<span class="nc" id="L1028">            out.println(&quot;};&quot;);</span>
+<span class="nc" id="L1029">        }</span>
+
+        public Object clone() {
+<span class="fc" id="L1032">            GrantEntry ge = new GrantEntry();</span>
+<span class="fc" id="L1033">            ge.codeBase = this.codeBase;</span>
+<span class="fc" id="L1034">            ge.signedBy = this.signedBy;</span>
+<span class="fc" id="L1035">            ge.principals = new LinkedList&lt;PrincipalEntry&gt;(this.principals);</span>
+<span class="fc" id="L1036">            ge.permissionEntries =</span>
+                        new Vector&lt;PermissionEntry&gt;(this.permissionEntries);
+<span class="fc" id="L1038">            return ge;</span>
+        }
+    }
+
+    /**
+     * Principal info (class and name) in a grant entry
+     */
+    public static class PrincipalEntry implements Principal {
+
+        public static final String WILDCARD_CLASS = &quot;WILDCARD_PRINCIPAL_CLASS&quot;;
+        public static final String WILDCARD_NAME = &quot;WILDCARD_PRINCIPAL_NAME&quot;;
+        public static final String REPLACE_NAME = &quot;PolicyParser.REPLACE_NAME&quot;;
+
+        String principalClass;
+        String principalName;
+
+        /**
+         * A PrincipalEntry consists of the Principal class and Principal name.
+         *
+         * @param principalClass the Principal class
+         * @param principalName the Principal name
+         * @throws NullPointerException if principalClass or principalName
+         *                              are null
+         */
+<span class="fc" id="L1062">        public PrincipalEntry(String principalClass, String principalName) {</span>
+<span class="pc bpc" id="L1063" title="2 of 4 branches missed.">            if (principalClass == null || principalName == null)</span>
+<span class="nc" id="L1064">                throw new NullPointerException(ResourcesMgr.getString(</span>
+                                  &quot;null.principalClass.or.principalName&quot;));
+<span class="fc" id="L1066">            this.principalClass = principalClass;</span>
+<span class="fc" id="L1067">            this.principalName = principalName;</span>
+<span class="fc" id="L1068">        }</span>
+
+        boolean isWildcardName() {
+<span class="fc" id="L1071">            return principalName.equals(WILDCARD_NAME);</span>
+        }
+
+        boolean isWildcardClass() {
+<span class="fc" id="L1075">            return principalClass.equals(WILDCARD_CLASS);</span>
+        }
+
+        boolean isReplaceName() {
+<span class="fc" id="L1079">            return principalClass.equals(REPLACE_NAME);</span>
+        }
+
+        public String getPrincipalClass() {
+<span class="nc" id="L1083">            return principalClass;</span>
+        }
+
+        public String getPrincipalName() {
+<span class="nc" id="L1087">            return principalName;</span>
+        }
+
+        public String getDisplayClass() {
+<span class="pc bpc" id="L1091" title="1 of 2 branches missed.">            if (isWildcardClass()) {</span>
+<span class="nc" id="L1092">                return &quot;*&quot;;</span>
+<span class="pc bpc" id="L1093" title="1 of 2 branches missed.">            } else if (isReplaceName()) {</span>
+<span class="nc" id="L1094">                return &quot;&quot;;</span>
+            }
+<span class="fc" id="L1096">            else return principalClass;</span>
+        }
+
+        public String getDisplayName() {
+<span class="fc" id="L1100">            return getDisplayName(false);</span>
+        }
+
+        public String getDisplayName(boolean addQuote) {
+<span class="pc bpc" id="L1104" title="1 of 2 branches missed.">            if (isWildcardName()) {</span>
+<span class="nc" id="L1105">                return &quot;*&quot;;</span>
+            }
+            else {
+<span class="pc bpc" id="L1108" title="1 of 2 branches missed.">                if (addQuote) return &quot;\&quot;&quot; + principalName + &quot;\&quot;&quot;;</span>
+<span class="fc" id="L1109">                else return principalName;</span>
+            }
+        }
+
+        @Override
+        public String getName() {
+<span class="nc" id="L1115">            return principalName;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="pc bpc" id="L1120" title="1 of 2 branches missed.">            if (!isReplaceName()) {</span>
+<span class="fc" id="L1121">                return getDisplayClass() + &quot;/&quot; + getDisplayName();</span>
+            } else {
+<span class="nc" id="L1123">                return getDisplayName();</span>
+            }
+        }
+
+        /**
+         * Test for equality between the specified object and this object.
+         * Two PrincipalEntries are equal if their class and name values
+         * are equal.
+         *
+         * @param obj the object to test for equality with this object
+         * @return true if the objects are equal, false otherwise
+         */
+        @Override
+        public boolean equals(Object obj) {
+<span class="nc bnc" id="L1137" title="All 2 branches missed.">            if (this == obj)</span>
+<span class="nc" id="L1138">                return true;</span>
+
+<span class="nc bnc" id="L1140" title="All 2 branches missed.">            if (!(obj instanceof PrincipalEntry))</span>
+<span class="nc" id="L1141">                return false;</span>
+
+<span class="nc" id="L1143">            PrincipalEntry that = (PrincipalEntry)obj;</span>
+<span class="nc bnc" id="L1144" title="All 2 branches missed.">            return (principalClass.equals(that.principalClass) &amp;&amp;</span>
+<span class="nc bnc" id="L1145" title="All 2 branches missed.">                    principalName.equals(that.principalName));</span>
+        }
+
+        /**
+         * Return a hashcode for this PrincipalEntry.
+         *
+         * @return a hashcode for this PrincipalEntry
+         */
+        @Override
+        public int hashCode() {
+<span class="nc" id="L1155">            return principalClass.hashCode();</span>
+        }
+
+        public void write(PrintWriter out) {
+<span class="nc" id="L1159">            out.print(&quot;principal &quot; + getDisplayClass() + &quot; &quot; +</span>
+<span class="nc" id="L1160">                      getDisplayName(true));</span>
+<span class="nc" id="L1161">        }</span>
+    }
+
+    /**
+     * Each permission entry in the policy configuration file is
+     * represented by a
+     * PermissionEntry object.  &lt;p&gt;
+     *
+     * &lt;p&gt;
+     * For example, the entry
+     * &lt;pre&gt;
+     *          permission java.io.FilePermission &quot;/tmp&quot;, &quot;read,write&quot;;
+     * &lt;/pre&gt;
+     * is represented internally
+     * &lt;pre&gt;
+     *
+     * pe = new PermissionEntry(&quot;java.io.FilePermission&quot;,
+     *                           &quot;/tmp&quot;, &quot;read,write&quot;);
+     * &lt;/pre&gt;
+     *
+     * @author Roland Schemers
+     *
+     * version 1.19, 05/21/98
+     */
+
+    public static class PermissionEntry {
+
+        public String permission;
+        public String name;
+        public String action;
+        public String signedBy;
+
+<span class="fc" id="L1193">        public PermissionEntry() {</span>
+<span class="fc" id="L1194">        }</span>
+
+        public PermissionEntry(String permission,
+                        String name,
+<span class="nc" id="L1198">                        String action) {</span>
+<span class="nc" id="L1199">            this.permission = permission;</span>
+<span class="nc" id="L1200">            this.name = name;</span>
+<span class="nc" id="L1201">            this.action = action;</span>
+<span class="nc" id="L1202">        }</span>
+
+        /**
+         * Calculates a hash code value for the object.  Objects
+         * which are equal will also have the same hashcode.
+         */
+        @Override
+        public int hashCode() {
+<span class="nc" id="L1210">            int retval = permission.hashCode();</span>
+<span class="nc bnc" id="L1211" title="All 2 branches missed.">            if (name != null) retval ^= name.hashCode();</span>
+<span class="nc bnc" id="L1212" title="All 2 branches missed.">            if (action != null) retval ^= action.hashCode();</span>
+<span class="nc" id="L1213">            return retval;</span>
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+<span class="nc bnc" id="L1218" title="All 2 branches missed.">            if (obj == this)</span>
+<span class="nc" id="L1219">                return true;</span>
+
+<span class="nc bnc" id="L1221" title="All 2 branches missed.">            if (! (obj instanceof PermissionEntry))</span>
+<span class="nc" id="L1222">                return false;</span>
+
+<span class="nc" id="L1224">            PermissionEntry that = (PermissionEntry) obj;</span>
+
+<span class="nc bnc" id="L1226" title="All 2 branches missed.">            if (this.permission == null) {</span>
+<span class="nc bnc" id="L1227" title="All 2 branches missed.">                if (that.permission != null) return false;</span>
+            } else {
+<span class="nc bnc" id="L1229" title="All 2 branches missed.">                if (!this.permission.equals(that.permission)) return false;</span>
+            }
+
+<span class="nc bnc" id="L1232" title="All 2 branches missed.">            if (this.name == null) {</span>
+<span class="nc bnc" id="L1233" title="All 2 branches missed.">                if (that.name != null) return false;</span>
+            } else {
+<span class="nc bnc" id="L1235" title="All 2 branches missed.">                if (!this.name.equals(that.name)) return false;</span>
+            }
+
+<span class="nc bnc" id="L1238" title="All 2 branches missed.">            if (this.action == null) {</span>
+<span class="nc bnc" id="L1239" title="All 2 branches missed.">                if (that.action != null) return false;</span>
+            } else {
+<span class="nc bnc" id="L1241" title="All 2 branches missed.">                if (!this.action.equals(that.action)) return false;</span>
+            }
+
+<span class="nc bnc" id="L1244" title="All 2 branches missed.">            if (this.signedBy == null) {</span>
+<span class="nc bnc" id="L1245" title="All 2 branches missed.">                if (that.signedBy != null) return false;</span>
+            } else {
+<span class="nc bnc" id="L1247" title="All 2 branches missed.">                if (!this.signedBy.equals(that.signedBy)) return false;</span>
+            }
+
+            // everything matched -- the 2 objects are equal
+<span class="nc" id="L1251">            return true;</span>
+        }
+
+        public void write(PrintWriter out) {
+<span class="nc" id="L1255">            out.print(&quot;permission &quot;);</span>
+<span class="nc" id="L1256">            out.print(permission);</span>
+<span class="nc bnc" id="L1257" title="All 2 branches missed.">            if (name != null) {</span>
+<span class="nc" id="L1258">                out.print(&quot; \&quot;&quot;);</span>
+
+                // ATTENTION: regex with double escaping,
+                // the normal forms look like:
+                // $name =~ s/\\/\\\\/g; and
+                // $name =~ s/\&quot;/\\\&quot;/g;
+                // and then in a java string, it's escaped again
+
+<span class="nc" id="L1266">                out.print(name.replaceAll(&quot;\\\\&quot;, &quot;\\\\\\\\&quot;).replaceAll(&quot;\\\&quot;&quot;, &quot;\\\\\\\&quot;&quot;));</span>
+<span class="nc" id="L1267">                out.print('&quot;');</span>
+            }
+<span class="nc bnc" id="L1269" title="All 2 branches missed.">            if (action != null) {</span>
+<span class="nc" id="L1270">                out.print(&quot;, \&quot;&quot;);</span>
+<span class="nc" id="L1271">                out.print(action);</span>
+<span class="nc" id="L1272">                out.print('&quot;');</span>
+            }
+<span class="nc bnc" id="L1274" title="All 2 branches missed.">            if (signedBy != null) {</span>
+<span class="nc" id="L1275">                out.print(&quot;, signedBy \&quot;&quot;);</span>
+<span class="nc" id="L1276">                out.print(signedBy);</span>
+<span class="nc" id="L1277">                out.print('&quot;');</span>
+            }
+<span class="nc" id="L1279">            out.println(&quot;;&quot;);</span>
+<span class="nc" id="L1280">        }</span>
+    }
+
+    /**
+     * Each domain entry in the keystore domain configuration file is
+     * represented by a DomainEntry object.
+     */
+    static class DomainEntry {
+        private final String name;
+        private final Map&lt;String, String&gt; properties;
+        private final Map&lt;String, KeyStoreEntry&gt; entries;
+
+<span class="fc" id="L1292">        DomainEntry(String name, Map&lt;String, String&gt; properties) {</span>
+<span class="fc" id="L1293">            this.name = name;</span>
+<span class="fc" id="L1294">            this.properties = properties;</span>
+<span class="fc" id="L1295">            entries = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L1296">        }</span>
+
+        String getName() {
+<span class="fc" id="L1299">            return name;</span>
+        }
+
+        Map&lt;String, String&gt; getProperties() {
+<span class="fc" id="L1303">            return properties;</span>
+        }
+
+        Collection&lt;KeyStoreEntry&gt; getEntries() {
+<span class="fc" id="L1307">            return entries.values();</span>
+        }
+
+        void add(KeyStoreEntry entry) throws ParsingException {
+<span class="fc" id="L1311">            String keystoreName = entry.getName();</span>
+<span class="pc bpc" id="L1312" title="1 of 2 branches missed.">            if (!entries.containsKey(keystoreName)) {</span>
+<span class="fc" id="L1313">                entries.put(keystoreName, entry);</span>
+            } else {
+<span class="nc" id="L1315">                MessageFormat form = new MessageFormat(ResourcesMgr.getString(</span>
+                    &quot;duplicate.keystore.name&quot;));
+<span class="nc" id="L1317">                Object[] source = {keystoreName};</span>
+<span class="nc" id="L1318">                throw new ParsingException(form.format(source));</span>
+            }
+<span class="fc" id="L1320">        }</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1324">            StringBuilder s =</span>
+<span class="nc" id="L1325">                new StringBuilder(&quot;\ndomain &quot;).append(name);</span>
+
+<span class="nc bnc" id="L1327" title="All 2 branches missed.">            if (properties != null) {</span>
+                for (Map.Entry&lt;String, String&gt; property :
+<span class="nc bnc" id="L1329" title="All 2 branches missed.">                    properties.entrySet()) {</span>
+<span class="nc" id="L1330">                    s.append(&quot;\n        &quot;).append(property.getKey()).append('=')</span>
+<span class="nc" id="L1331">                        .append(property.getValue());</span>
+<span class="nc" id="L1332">                }</span>
+            }
+<span class="nc" id="L1334">            s.append(&quot; {\n&quot;);</span>
+
+<span class="nc bnc" id="L1336" title="All 2 branches missed.">            if (entries != null) {</span>
+<span class="nc bnc" id="L1337" title="All 2 branches missed.">                for (KeyStoreEntry entry : entries.values()) {</span>
+<span class="nc" id="L1338">                    s.append(entry).append(&quot;\n&quot;);</span>
+<span class="nc" id="L1339">                }</span>
+            }
+<span class="nc" id="L1341">            s.append(&quot;}&quot;);</span>
+
+<span class="nc" id="L1343">            return s.toString();</span>
+        }
+    }
+
+    /**
+     * Each keystore entry in the keystore domain configuration file is
+     * represented by a KeyStoreEntry object.
+     */
+
+    static class KeyStoreEntry {
+        private final String name;
+        private final Map&lt;String, String&gt; properties;
+
+<span class="fc" id="L1356">        KeyStoreEntry(String name, Map&lt;String, String&gt; properties) {</span>
+<span class="fc" id="L1357">            this.name = name;</span>
+<span class="fc" id="L1358">            this.properties = properties;</span>
+<span class="fc" id="L1359">        }</span>
+
+        String getName() {
+<span class="fc" id="L1362">            return name;</span>
+        }
+
+        Map&lt;String, String&gt;  getProperties() {
+<span class="fc" id="L1366">            return properties;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1371">            StringBuilder s = new StringBuilder(&quot;\n    keystore &quot;).append(name);</span>
+<span class="nc bnc" id="L1372" title="All 2 branches missed.">            if (properties != null) {</span>
+                for (Map.Entry&lt;String, String&gt; property :
+<span class="nc bnc" id="L1374" title="All 2 branches missed.">                    properties.entrySet()) {</span>
+<span class="nc" id="L1375">                    s.append(&quot;\n        &quot;).append(property.getKey()).append('=')</span>
+<span class="nc" id="L1376">                        .append(property.getValue());</span>
+<span class="nc" id="L1377">                }</span>
+            }
+<span class="nc" id="L1379">            s.append(&quot;;&quot;);</span>
+
+<span class="nc" id="L1381">            return s.toString();</span>
+        }
+    }
+
+    public static class ParsingException extends GeneralSecurityException {
+
+        private static final long serialVersionUID = -4330692689482574072L;
+
+        private String i18nMessage;
+
+        /**
+         * Constructs a ParsingException with the specified
+         * detail message. A detail message is a String that describes
+         * this particular exception, which may, for example, specify which
+         * algorithm is not available.
+         *
+         * @param msg the detail message.
+         */
+        public ParsingException(String msg) {
+<span class="nc" id="L1400">            super(msg);</span>
+<span class="nc" id="L1401">            i18nMessage = msg;</span>
+<span class="nc" id="L1402">        }</span>
+
+        public ParsingException(int line, String msg) {
+<span class="nc" id="L1405">            super(&quot;line &quot; + line + &quot;: &quot; + msg);</span>
+<span class="nc" id="L1406">            MessageFormat form = new MessageFormat</span>
+<span class="nc" id="L1407">                (ResourcesMgr.getString(&quot;line.number.msg&quot;));</span>
+<span class="nc" id="L1408">            Object[] source = {new Integer(line), msg};</span>
+<span class="nc" id="L1409">            i18nMessage = form.format(source);</span>
+<span class="nc" id="L1410">        }</span>
+
+        public ParsingException(int line, String expect, String actual) {
+<span class="nc" id="L1413">            super(&quot;line &quot; + line + &quot;: expected [&quot; + expect +</span>
+                &quot;], found [&quot; + actual + &quot;]&quot;);
+<span class="nc" id="L1415">            MessageFormat form = new MessageFormat(ResourcesMgr.getString</span>
+<span class="nc" id="L1416">                (&quot;line.number.expected.expect.found.actual.&quot;));</span>
+<span class="nc" id="L1417">            Object[] source = {new Integer(line), expect, actual};</span>
+<span class="nc" id="L1418">            i18nMessage = form.format(source);</span>
+<span class="nc" id="L1419">        }</span>
+
+        @Override
+        public String getLocalizedMessage() {
+<span class="nc" id="L1423">            return i18nMessage;</span>
+        }
+    }
+
+    public static void main(String arg[]) throws Exception {
+<span class="nc" id="L1428">        try (FileReader fr = new FileReader(arg[0]);</span>
+<span class="nc" id="L1429">             FileWriter fw = new FileWriter(arg[1])) {</span>
+<span class="nc" id="L1430">            PolicyParser pp = new PolicyParser(true);</span>
+<span class="nc" id="L1431">            pp.read(fr);</span>
+<span class="nc" id="L1432">            pp.write(fw);</span>
+<span class="nc bnc" id="L1433" title="All 16 branches missed.">        }</span>
+<span class="nc" id="L1434">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

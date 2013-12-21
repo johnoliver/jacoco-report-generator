@@ -1,0 +1,1478 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>LinkedTransferQueue.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">java.util.concurrent</a> &gt; <span class="el_source">LinkedTransferQueue.java</span></div><h1>LinkedTransferQueue.java</h1><pre class="source lang-java linenums">/*
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+/*
+ * This file is available under and governed by the GNU General Public
+ * License version 2 only, as published by the Free Software Foundation.
+ * However, the following notice accompanied the original version of this
+ * file:
+ *
+ * Written by Doug Lea with assistance from members of JCP JSR-166
+ * Expert Group and released to the public domain, as explained at
+ * http://creativecommons.org/publicdomain/zero/1.0/
+ */
+
+package java.util.concurrent;
+
+import java.util.AbstractQueue;
+import java.util.Collection;
+import java.util.Iterator;
+import java.util.NoSuchElementException;
+import java.util.Queue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
+import java.util.Spliterator;
+import java.util.Spliterators;
+import java.util.function.Consumer;
+
+/**
+ * An unbounded {@link TransferQueue} based on linked nodes.
+ * This queue orders elements FIFO (first-in-first-out) with respect
+ * to any given producer.  The &lt;em&gt;head&lt;/em&gt; of the queue is that
+ * element that has been on the queue the longest time for some
+ * producer.  The &lt;em&gt;tail&lt;/em&gt; of the queue is that element that has
+ * been on the queue the shortest time for some producer.
+ *
+ * &lt;p&gt;Beware that, unlike in most collections, the {@code size} method
+ * is &lt;em&gt;NOT&lt;/em&gt; a constant-time operation. Because of the
+ * asynchronous nature of these queues, determining the current number
+ * of elements requires a traversal of the elements, and so may report
+ * inaccurate results if this collection is modified during traversal.
+ * Additionally, the bulk operations {@code addAll},
+ * {@code removeAll}, {@code retainAll}, {@code containsAll},
+ * {@code equals}, and {@code toArray} are &lt;em&gt;not&lt;/em&gt; guaranteed
+ * to be performed atomically. For example, an iterator operating
+ * concurrently with an {@code addAll} operation might view only some
+ * of the added elements.
+ *
+ * &lt;p&gt;This class and its iterator implement all of the
+ * &lt;em&gt;optional&lt;/em&gt; methods of the {@link Collection} and {@link
+ * Iterator} interfaces.
+ *
+ * &lt;p&gt;Memory consistency effects: As with other concurrent
+ * collections, actions in a thread prior to placing an object into a
+ * {@code LinkedTransferQueue}
+ * &lt;a href=&quot;package-summary.html#MemoryVisibility&quot;&gt;&lt;i&gt;happen-before&lt;/i&gt;&lt;/a&gt;
+ * actions subsequent to the access or removal of that element from
+ * the {@code LinkedTransferQueue} in another thread.
+ *
+ * &lt;p&gt;This class is a member of the
+ * &lt;a href=&quot;{@docRoot}/../technotes/guides/collections/index.html&quot;&gt;
+ * Java Collections Framework&lt;/a&gt;.
+ *
+ * @since 1.7
+ * @author Doug Lea
+ * @param &lt;E&gt; the type of elements held in this collection
+ */
+public class LinkedTransferQueue&lt;E&gt; extends AbstractQueue&lt;E&gt;
+    implements TransferQueue&lt;E&gt;, java.io.Serializable {
+    private static final long serialVersionUID = -3223113410248163686L;
+
+    /*
+     * *** Overview of Dual Queues with Slack ***
+     *
+     * Dual Queues, introduced by Scherer and Scott
+     * (http://www.cs.rice.edu/~wns1/papers/2004-DISC-DDS.pdf) are
+     * (linked) queues in which nodes may represent either data or
+     * requests.  When a thread tries to enqueue a data node, but
+     * encounters a request node, it instead &quot;matches&quot; and removes it;
+     * and vice versa for enqueuing requests. Blocking Dual Queues
+     * arrange that threads enqueuing unmatched requests block until
+     * other threads provide the match. Dual Synchronous Queues (see
+     * Scherer, Lea, &amp; Scott
+     * http://www.cs.rochester.edu/u/scott/papers/2009_Scherer_CACM_SSQ.pdf)
+     * additionally arrange that threads enqueuing unmatched data also
+     * block.  Dual Transfer Queues support all of these modes, as
+     * dictated by callers.
+     *
+     * A FIFO dual queue may be implemented using a variation of the
+     * Michael &amp; Scott (M&amp;S) lock-free queue algorithm
+     * (http://www.cs.rochester.edu/u/scott/papers/1996_PODC_queues.pdf).
+     * It maintains two pointer fields, &quot;head&quot;, pointing to a
+     * (matched) node that in turn points to the first actual
+     * (unmatched) queue node (or null if empty); and &quot;tail&quot; that
+     * points to the last node on the queue (or again null if
+     * empty). For example, here is a possible queue with four data
+     * elements:
+     *
+     *  head                tail
+     *    |                   |
+     *    v                   v
+     *    M -&gt; U -&gt; U -&gt; U -&gt; U
+     *
+     * The M&amp;S queue algorithm is known to be prone to scalability and
+     * overhead limitations when maintaining (via CAS) these head and
+     * tail pointers. This has led to the development of
+     * contention-reducing variants such as elimination arrays (see
+     * Moir et al http://portal.acm.org/citation.cfm?id=1074013) and
+     * optimistic back pointers (see Ladan-Mozes &amp; Shavit
+     * http://people.csail.mit.edu/edya/publications/OptimisticFIFOQueue-journal.pdf).
+     * However, the nature of dual queues enables a simpler tactic for
+     * improving M&amp;S-style implementations when dual-ness is needed.
+     *
+     * In a dual queue, each node must atomically maintain its match
+     * status. While there are other possible variants, we implement
+     * this here as: for a data-mode node, matching entails CASing an
+     * &quot;item&quot; field from a non-null data value to null upon match, and
+     * vice-versa for request nodes, CASing from null to a data
+     * value. (Note that the linearization properties of this style of
+     * queue are easy to verify -- elements are made available by
+     * linking, and unavailable by matching.) Compared to plain M&amp;S
+     * queues, this property of dual queues requires one additional
+     * successful atomic operation per enq/deq pair. But it also
+     * enables lower cost variants of queue maintenance mechanics. (A
+     * variation of this idea applies even for non-dual queues that
+     * support deletion of interior elements, such as
+     * j.u.c.ConcurrentLinkedQueue.)
+     *
+     * Once a node is matched, its match status can never again
+     * change.  We may thus arrange that the linked list of them
+     * contain a prefix of zero or more matched nodes, followed by a
+     * suffix of zero or more unmatched nodes. (Note that we allow
+     * both the prefix and suffix to be zero length, which in turn
+     * means that we do not use a dummy header.)  If we were not
+     * concerned with either time or space efficiency, we could
+     * correctly perform enqueue and dequeue operations by traversing
+     * from a pointer to the initial node; CASing the item of the
+     * first unmatched node on match and CASing the next field of the
+     * trailing node on appends. (Plus some special-casing when
+     * initially empty).  While this would be a terrible idea in
+     * itself, it does have the benefit of not requiring ANY atomic
+     * updates on head/tail fields.
+     *
+     * We introduce here an approach that lies between the extremes of
+     * never versus always updating queue (head and tail) pointers.
+     * This offers a tradeoff between sometimes requiring extra
+     * traversal steps to locate the first and/or last unmatched
+     * nodes, versus the reduced overhead and contention of fewer
+     * updates to queue pointers. For example, a possible snapshot of
+     * a queue is:
+     *
+     *  head           tail
+     *    |              |
+     *    v              v
+     *    M -&gt; M -&gt; U -&gt; U -&gt; U -&gt; U
+     *
+     * The best value for this &quot;slack&quot; (the targeted maximum distance
+     * between the value of &quot;head&quot; and the first unmatched node, and
+     * similarly for &quot;tail&quot;) is an empirical matter. We have found
+     * that using very small constants in the range of 1-3 work best
+     * over a range of platforms. Larger values introduce increasing
+     * costs of cache misses and risks of long traversal chains, while
+     * smaller values increase CAS contention and overhead.
+     *
+     * Dual queues with slack differ from plain M&amp;S dual queues by
+     * virtue of only sometimes updating head or tail pointers when
+     * matching, appending, or even traversing nodes; in order to
+     * maintain a targeted slack.  The idea of &quot;sometimes&quot; may be
+     * operationalized in several ways. The simplest is to use a
+     * per-operation counter incremented on each traversal step, and
+     * to try (via CAS) to update the associated queue pointer
+     * whenever the count exceeds a threshold. Another, that requires
+     * more overhead, is to use random number generators to update
+     * with a given probability per traversal step.
+     *
+     * In any strategy along these lines, because CASes updating
+     * fields may fail, the actual slack may exceed targeted
+     * slack. However, they may be retried at any time to maintain
+     * targets.  Even when using very small slack values, this
+     * approach works well for dual queues because it allows all
+     * operations up to the point of matching or appending an item
+     * (hence potentially allowing progress by another thread) to be
+     * read-only, thus not introducing any further contention. As
+     * described below, we implement this by performing slack
+     * maintenance retries only after these points.
+     *
+     * As an accompaniment to such techniques, traversal overhead can
+     * be further reduced without increasing contention of head
+     * pointer updates: Threads may sometimes shortcut the &quot;next&quot; link
+     * path from the current &quot;head&quot; node to be closer to the currently
+     * known first unmatched node, and similarly for tail. Again, this
+     * may be triggered with using thresholds or randomization.
+     *
+     * These ideas must be further extended to avoid unbounded amounts
+     * of costly-to-reclaim garbage caused by the sequential &quot;next&quot;
+     * links of nodes starting at old forgotten head nodes: As first
+     * described in detail by Boehm
+     * (http://portal.acm.org/citation.cfm?doid=503272.503282) if a GC
+     * delays noticing that any arbitrarily old node has become
+     * garbage, all newer dead nodes will also be unreclaimed.
+     * (Similar issues arise in non-GC environments.)  To cope with
+     * this in our implementation, upon CASing to advance the head
+     * pointer, we set the &quot;next&quot; link of the previous head to point
+     * only to itself; thus limiting the length of connected dead lists.
+     * (We also take similar care to wipe out possibly garbage
+     * retaining values held in other Node fields.)  However, doing so
+     * adds some further complexity to traversal: If any &quot;next&quot;
+     * pointer links to itself, it indicates that the current thread
+     * has lagged behind a head-update, and so the traversal must
+     * continue from the &quot;head&quot;.  Traversals trying to find the
+     * current tail starting from &quot;tail&quot; may also encounter
+     * self-links, in which case they also continue at &quot;head&quot;.
+     *
+     * It is tempting in slack-based scheme to not even use CAS for
+     * updates (similarly to Ladan-Mozes &amp; Shavit). However, this
+     * cannot be done for head updates under the above link-forgetting
+     * mechanics because an update may leave head at a detached node.
+     * And while direct writes are possible for tail updates, they
+     * increase the risk of long retraversals, and hence long garbage
+     * chains, which can be much more costly than is worthwhile
+     * considering that the cost difference of performing a CAS vs
+     * write is smaller when they are not triggered on each operation
+     * (especially considering that writes and CASes equally require
+     * additional GC bookkeeping (&quot;write barriers&quot;) that are sometimes
+     * more costly than the writes themselves because of contention).
+     *
+     * *** Overview of implementation ***
+     *
+     * We use a threshold-based approach to updates, with a slack
+     * threshold of two -- that is, we update head/tail when the
+     * current pointer appears to be two or more steps away from the
+     * first/last node. The slack value is hard-wired: a path greater
+     * than one is naturally implemented by checking equality of
+     * traversal pointers except when the list has only one element,
+     * in which case we keep slack threshold at one. Avoiding tracking
+     * explicit counts across method calls slightly simplifies an
+     * already-messy implementation. Using randomization would
+     * probably work better if there were a low-quality dirt-cheap
+     * per-thread one available, but even ThreadLocalRandom is too
+     * heavy for these purposes.
+     *
+     * With such a small slack threshold value, it is not worthwhile
+     * to augment this with path short-circuiting (i.e., unsplicing
+     * interior nodes) except in the case of cancellation/removal (see
+     * below).
+     *
+     * We allow both the head and tail fields to be null before any
+     * nodes are enqueued; initializing upon first append.  This
+     * simplifies some other logic, as well as providing more
+     * efficient explicit control paths instead of letting JVMs insert
+     * implicit NullPointerExceptions when they are null.  While not
+     * currently fully implemented, we also leave open the possibility
+     * of re-nulling these fields when empty (which is complicated to
+     * arrange, for little benefit.)
+     *
+     * All enqueue/dequeue operations are handled by the single method
+     * &quot;xfer&quot; with parameters indicating whether to act as some form
+     * of offer, put, poll, take, or transfer (each possibly with
+     * timeout). The relative complexity of using one monolithic
+     * method outweighs the code bulk and maintenance problems of
+     * using separate methods for each case.
+     *
+     * Operation consists of up to three phases. The first is
+     * implemented within method xfer, the second in tryAppend, and
+     * the third in method awaitMatch.
+     *
+     * 1. Try to match an existing node
+     *
+     *    Starting at head, skip already-matched nodes until finding
+     *    an unmatched node of opposite mode, if one exists, in which
+     *    case matching it and returning, also if necessary updating
+     *    head to one past the matched node (or the node itself if the
+     *    list has no other unmatched nodes). If the CAS misses, then
+     *    a loop retries advancing head by two steps until either
+     *    success or the slack is at most two. By requiring that each
+     *    attempt advances head by two (if applicable), we ensure that
+     *    the slack does not grow without bound. Traversals also check
+     *    if the initial head is now off-list, in which case they
+     *    start at the new head.
+     *
+     *    If no candidates are found and the call was untimed
+     *    poll/offer, (argument &quot;how&quot; is NOW) return.
+     *
+     * 2. Try to append a new node (method tryAppend)
+     *
+     *    Starting at current tail pointer, find the actual last node
+     *    and try to append a new node (or if head was null, establish
+     *    the first node). Nodes can be appended only if their
+     *    predecessors are either already matched or are of the same
+     *    mode. If we detect otherwise, then a new node with opposite
+     *    mode must have been appended during traversal, so we must
+     *    restart at phase 1. The traversal and update steps are
+     *    otherwise similar to phase 1: Retrying upon CAS misses and
+     *    checking for staleness.  In particular, if a self-link is
+     *    encountered, then we can safely jump to a node on the list
+     *    by continuing the traversal at current head.
+     *
+     *    On successful append, if the call was ASYNC, return.
+     *
+     * 3. Await match or cancellation (method awaitMatch)
+     *
+     *    Wait for another thread to match node; instead cancelling if
+     *    the current thread was interrupted or the wait timed out. On
+     *    multiprocessors, we use front-of-queue spinning: If a node
+     *    appears to be the first unmatched node in the queue, it
+     *    spins a bit before blocking. In either case, before blocking
+     *    it tries to unsplice any nodes between the current &quot;head&quot;
+     *    and the first unmatched node.
+     *
+     *    Front-of-queue spinning vastly improves performance of
+     *    heavily contended queues. And so long as it is relatively
+     *    brief and &quot;quiet&quot;, spinning does not much impact performance
+     *    of less-contended queues.  During spins threads check their
+     *    interrupt status and generate a thread-local random number
+     *    to decide to occasionally perform a Thread.yield. While
+     *    yield has underdefined specs, we assume that it might help,
+     *    and will not hurt, in limiting impact of spinning on busy
+     *    systems.  We also use smaller (1/2) spins for nodes that are
+     *    not known to be front but whose predecessors have not
+     *    blocked -- these &quot;chained&quot; spins avoid artifacts of
+     *    front-of-queue rules which otherwise lead to alternating
+     *    nodes spinning vs blocking. Further, front threads that
+     *    represent phase changes (from data to request node or vice
+     *    versa) compared to their predecessors receive additional
+     *    chained spins, reflecting longer paths typically required to
+     *    unblock threads during phase changes.
+     *
+     *
+     * ** Unlinking removed interior nodes **
+     *
+     * In addition to minimizing garbage retention via self-linking
+     * described above, we also unlink removed interior nodes. These
+     * may arise due to timed out or interrupted waits, or calls to
+     * remove(x) or Iterator.remove.  Normally, given a node that was
+     * at one time known to be the predecessor of some node s that is
+     * to be removed, we can unsplice s by CASing the next field of
+     * its predecessor if it still points to s (otherwise s must
+     * already have been removed or is now offlist). But there are two
+     * situations in which we cannot guarantee to make node s
+     * unreachable in this way: (1) If s is the trailing node of list
+     * (i.e., with null next), then it is pinned as the target node
+     * for appends, so can only be removed later after other nodes are
+     * appended. (2) We cannot necessarily unlink s given a
+     * predecessor node that is matched (including the case of being
+     * cancelled): the predecessor may already be unspliced, in which
+     * case some previous reachable node may still point to s.
+     * (For further explanation see Herlihy &amp; Shavit &quot;The Art of
+     * Multiprocessor Programming&quot; chapter 9).  Although, in both
+     * cases, we can rule out the need for further action if either s
+     * or its predecessor are (or can be made to be) at, or fall off
+     * from, the head of list.
+     *
+     * Without taking these into account, it would be possible for an
+     * unbounded number of supposedly removed nodes to remain
+     * reachable.  Situations leading to such buildup are uncommon but
+     * can occur in practice; for example when a series of short timed
+     * calls to poll repeatedly time out but never otherwise fall off
+     * the list because of an untimed call to take at the front of the
+     * queue.
+     *
+     * When these cases arise, rather than always retraversing the
+     * entire list to find an actual predecessor to unlink (which
+     * won't help for case (1) anyway), we record a conservative
+     * estimate of possible unsplice failures (in &quot;sweepVotes&quot;).
+     * We trigger a full sweep when the estimate exceeds a threshold
+     * (&quot;SWEEP_THRESHOLD&quot;) indicating the maximum number of estimated
+     * removal failures to tolerate before sweeping through, unlinking
+     * cancelled nodes that were not unlinked upon initial removal.
+     * We perform sweeps by the thread hitting threshold (rather than
+     * background threads or by spreading work to other threads)
+     * because in the main contexts in which removal occurs, the
+     * caller is already timed-out, cancelled, or performing a
+     * potentially O(n) operation (e.g. remove(x)), none of which are
+     * time-critical enough to warrant the overhead that alternatives
+     * would impose on other threads.
+     *
+     * Because the sweepVotes estimate is conservative, and because
+     * nodes become unlinked &quot;naturally&quot; as they fall off the head of
+     * the queue, and because we allow votes to accumulate even while
+     * sweeps are in progress, there are typically significantly fewer
+     * such nodes than estimated.  Choice of a threshold value
+     * balances the likelihood of wasted effort and contention, versus
+     * providing a worst-case bound on retention of interior nodes in
+     * quiescent queues. The value defined below was chosen
+     * empirically to balance these under various timeout scenarios.
+     *
+     * Note that we cannot self-link unlinked interior nodes during
+     * sweeps. However, the associated garbage chains terminate when
+     * some successor ultimately falls off the head of the list and is
+     * self-linked.
+     */
+
+    /** True if on multiprocessor */
+    private static final boolean MP =
+<span class="pc bpc" id="L415" title="1 of 2 branches missed.">        Runtime.getRuntime().availableProcessors() &gt; 1;</span>
+
+    /**
+     * The number of times to spin (with randomly interspersed calls
+     * to Thread.yield) on multiprocessor before blocking when a node
+     * is apparently the first waiter in the queue.  See above for
+     * explanation. Must be a power of two. The value is empirically
+     * derived -- it works pretty well across a variety of processors,
+     * numbers of CPUs, and OSes.
+     */
+    private static final int FRONT_SPINS   = 1 &lt;&lt; 7;
+
+    /**
+     * The number of times to spin before blocking when a node is
+     * preceded by another node that is apparently spinning.  Also
+     * serves as an increment to FRONT_SPINS on phase changes, and as
+     * base average frequency for yielding during spins. Must be a
+     * power of two.
+     */
+    private static final int CHAINED_SPINS = FRONT_SPINS &gt;&gt;&gt; 1;
+
+    /**
+     * The maximum number of estimated removal failures (sweepVotes)
+     * to tolerate before sweeping through the queue unlinking
+     * cancelled nodes that were not unlinked upon initial
+     * removal. See above for explanation. The value must be at least
+     * two to avoid useless sweeps when removing trailing nodes.
+     */
+    static final int SWEEP_THRESHOLD = 32;
+
+    /**
+     * Queue nodes. Uses Object, not E, for items to allow forgetting
+     * them after use.  Relies heavily on Unsafe mechanics to minimize
+     * unnecessary ordering constraints: Writes that are intrinsically
+     * ordered wrt other accesses or CASes use simple relaxed forms.
+     */
+    static final class Node {
+        final boolean isData;   // false if this is a request node
+        volatile Object item;   // initially non-null if isData; CASed to match
+        volatile Node next;
+        volatile Thread waiter; // null until waiting
+
+        // CAS methods for fields
+        final boolean casNext(Node cmp, Node val) {
+<span class="fc" id="L459">            return UNSAFE.compareAndSwapObject(this, nextOffset, cmp, val);</span>
+        }
+
+        final boolean casItem(Object cmp, Object val) {
+            // assert cmp == null || cmp.getClass() != Node.class;
+<span class="fc" id="L464">            return UNSAFE.compareAndSwapObject(this, itemOffset, cmp, val);</span>
+        }
+
+        /**
+         * Constructs a new node.  Uses relaxed write because item can
+         * only be seen after publication via casNext.
+         */
+<span class="fc" id="L471">        Node(Object item, boolean isData) {</span>
+<span class="fc" id="L472">            UNSAFE.putObject(this, itemOffset, item); // relaxed write</span>
+<span class="fc" id="L473">            this.isData = isData;</span>
+<span class="fc" id="L474">        }</span>
+
+        /**
+         * Links node to itself to avoid garbage retention.  Called
+         * only after CASing head field, so uses relaxed write.
+         */
+        final void forgetNext() {
+<span class="fc" id="L481">            UNSAFE.putObject(this, nextOffset, this);</span>
+<span class="fc" id="L482">        }</span>
+
+        /**
+         * Sets item to self and waiter to null, to avoid garbage
+         * retention after matching or cancelling. Uses relaxed writes
+         * because order is already constrained in the only calling
+         * contexts: item is forgotten only after volatile/atomic
+         * mechanics that extract items.  Similarly, clearing waiter
+         * follows either CAS or return from park (if ever parked;
+         * else we don't care).
+         */
+        final void forgetContents() {
+<span class="fc" id="L494">            UNSAFE.putObject(this, itemOffset, this);</span>
+<span class="fc" id="L495">            UNSAFE.putObject(this, waiterOffset, null);</span>
+<span class="fc" id="L496">        }</span>
+
+        /**
+         * Returns true if this node has been matched, including the
+         * case of artificial matches due to cancellation.
+         */
+        final boolean isMatched() {
+<span class="fc" id="L503">            Object x = item;</span>
+<span class="fc bfc" id="L504" title="All 6 branches covered.">            return (x == this) || ((x == null) == isData);</span>
+        }
+
+        /**
+         * Returns true if this is an unmatched request node.
+         */
+        final boolean isUnmatchedRequest() {
+<span class="nc bnc" id="L511" title="All 4 branches missed.">            return !isData &amp;&amp; item == null;</span>
+        }
+
+        /**
+         * Returns true if a node with the given mode cannot be
+         * appended to this node because this node is unmatched and
+         * has opposite data mode.
+         */
+        final boolean cannotPrecede(boolean haveData) {
+<span class="fc" id="L520">            boolean d = isData;</span>
+            Object x;
+<span class="fc bfc" id="L522" title="All 8 branches covered.">            return d != haveData &amp;&amp; (x = item) != this &amp;&amp; (x != null) == d;</span>
+        }
+
+        /**
+         * Tries to artificially match a data node -- used by remove.
+         */
+        final boolean tryMatchData() {
+            // assert isData;
+<span class="fc" id="L530">            Object x = item;</span>
+<span class="fc bfc" id="L531" title="All 6 branches covered.">            if (x != null &amp;&amp; x != this &amp;&amp; casItem(x, null)) {</span>
+<span class="fc" id="L532">                LockSupport.unpark(waiter);</span>
+<span class="fc" id="L533">                return true;</span>
+            }
+<span class="fc" id="L535">            return false;</span>
+        }
+
+        private static final long serialVersionUID = -3375979862319811754L;
+
+        // Unsafe mechanics
+        private static final sun.misc.Unsafe UNSAFE;
+        private static final long itemOffset;
+        private static final long nextOffset;
+        private static final long waiterOffset;
+        static {
+            try {
+<span class="fc" id="L547">                UNSAFE = sun.misc.Unsafe.getUnsafe();</span>
+<span class="fc" id="L548">                Class&lt;?&gt; k = Node.class;</span>
+<span class="fc" id="L549">                itemOffset = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L550">                    (k.getDeclaredField(&quot;item&quot;));</span>
+<span class="fc" id="L551">                nextOffset = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L552">                    (k.getDeclaredField(&quot;next&quot;));</span>
+<span class="fc" id="L553">                waiterOffset = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L554">                    (k.getDeclaredField(&quot;waiter&quot;));</span>
+<span class="nc" id="L555">            } catch (Exception e) {</span>
+<span class="nc" id="L556">                throw new Error(e);</span>
+<span class="fc" id="L557">            }</span>
+<span class="fc" id="L558">        }</span>
+    }
+
+    /** head of the queue; null until first enqueue */
+    transient volatile Node head;
+
+    /** tail of the queue; null until first append */
+    private transient volatile Node tail;
+
+    /** The number of apparent failures to unsplice removed nodes */
+    private transient volatile int sweepVotes;
+
+    // CAS methods for fields
+    private boolean casTail(Node cmp, Node val) {
+<span class="fc" id="L572">        return UNSAFE.compareAndSwapObject(this, tailOffset, cmp, val);</span>
+    }
+
+    private boolean casHead(Node cmp, Node val) {
+<span class="fc" id="L576">        return UNSAFE.compareAndSwapObject(this, headOffset, cmp, val);</span>
+    }
+
+    private boolean casSweepVotes(int cmp, int val) {
+<span class="fc" id="L580">        return UNSAFE.compareAndSwapInt(this, sweepVotesOffset, cmp, val);</span>
+    }
+
+    /*
+     * Possible values for &quot;how&quot; argument in xfer method.
+     */
+    private static final int NOW   = 0; // for untimed poll, tryTransfer
+    private static final int ASYNC = 1; // for offer, put, add
+    private static final int SYNC  = 2; // for transfer, take
+    private static final int TIMED = 3; // for timed poll, tryTransfer
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    static &lt;E&gt; E cast(Object item) {
+        // assert item == null || item.getClass() != Node.class;
+<span class="fc" id="L594">        return (E) item;</span>
+    }
+
+    /**
+     * Implements all queuing methods. See above for explanation.
+     *
+     * @param e the item or null for take
+     * @param haveData true if this is a put, else a take
+     * @param how NOW, ASYNC, SYNC, or TIMED
+     * @param nanos timeout in nanosecs, used only if mode is TIMED
+     * @return an item if matched, else e
+     * @throws NullPointerException if haveData mode but e is null
+     */
+    private E xfer(E e, boolean haveData, int how, long nanos) {
+<span class="fc bfc" id="L608" title="All 4 branches covered.">        if (haveData &amp;&amp; (e == null))</span>
+<span class="fc" id="L609">            throw new NullPointerException();</span>
+<span class="fc" id="L610">        Node s = null;                        // the node to append, if needed</span>
+
+        retry:
+        for (;;) {                            // restart on append race
+
+<span class="fc bfc" id="L615" title="All 2 branches covered.">            for (Node h = head, p = h; p != null;) { // find &amp; match first node</span>
+<span class="fc" id="L616">                boolean isData = p.isData;</span>
+<span class="fc" id="L617">                Object item = p.item;</span>
+<span class="fc bfc" id="L618" title="All 6 branches covered.">                if (item != p &amp;&amp; (item != null) == isData) { // unmatched</span>
+<span class="fc bfc" id="L619" title="All 2 branches covered.">                    if (isData == haveData)   // can't match</span>
+<span class="fc" id="L620">                        break;</span>
+<span class="fc bfc" id="L621" title="All 2 branches covered.">                    if (p.casItem(item, e)) { // match</span>
+<span class="fc bfc" id="L622" title="All 2 branches covered.">                        for (Node q = p; q != h;) {</span>
+<span class="fc" id="L623">                            Node n = q.next;  // update by 2 unless singleton</span>
+<span class="fc bfc" id="L624" title="All 6 branches covered.">                            if (head == h &amp;&amp; casHead(h, n == null ? q : n)) {</span>
+<span class="fc" id="L625">                                h.forgetNext();</span>
+<span class="fc" id="L626">                                break;</span>
+                            }                 // advance and retry
+<span class="pc bpc" id="L628" title="1 of 4 branches missed.">                            if ((h = head)   == null ||</span>
+<span class="fc bfc" id="L629" title="All 2 branches covered.">                                (q = h.next) == null || !q.isMatched())</span>
+<span class="fc" id="L630">                                break;        // unless slack &lt; 2</span>
+<span class="fc" id="L631">                        }</span>
+<span class="fc" id="L632">                        LockSupport.unpark(p.waiter);</span>
+<span class="fc" id="L633">                        return LinkedTransferQueue.&lt;E&gt;cast(item);</span>
+                    }
+                }
+<span class="fc" id="L636">                Node n = p.next;</span>
+<span class="fc bfc" id="L637" title="All 2 branches covered.">                p = (p != n) ? n : (h = head); // Use head if p offlist</span>
+<span class="fc" id="L638">            }</span>
+
+<span class="fc bfc" id="L640" title="All 2 branches covered.">            if (how != NOW) {                 // No matches available</span>
+<span class="fc bfc" id="L641" title="All 2 branches covered.">                if (s == null)</span>
+<span class="fc" id="L642">                    s = new Node(e, haveData);</span>
+<span class="fc" id="L643">                Node pred = tryAppend(s, haveData);</span>
+<span class="fc bfc" id="L644" title="All 2 branches covered.">                if (pred == null)</span>
+<span class="fc" id="L645">                    continue retry;           // lost race vs opposite mode</span>
+<span class="fc bfc" id="L646" title="All 2 branches covered.">                if (how != ASYNC)</span>
+<span class="pc bpc" id="L647" title="1 of 2 branches missed.">                    return awaitMatch(s, pred, e, (how == TIMED), nanos);</span>
+            }
+<span class="fc" id="L649">            return e; // not waiting</span>
+        }
+    }
+
+    /**
+     * Tries to append node s as tail.
+     *
+     * @param s the node to append
+     * @param haveData true if appending in data mode
+     * @return null on failure due to losing race with append in
+     * different mode, else s's predecessor, or s itself if no
+     * predecessor
+     */
+    private Node tryAppend(Node s, boolean haveData) {
+<span class="fc" id="L663">        for (Node t = tail, p = t;;) {        // move p to last node and append</span>
+            Node n, u;                        // temps for reads of next &amp; tail
+<span class="fc bfc" id="L665" title="All 4 branches covered.">            if (p == null &amp;&amp; (p = head) == null) {</span>
+<span class="fc bfc" id="L666" title="All 2 branches covered.">                if (casHead(null, s))</span>
+<span class="fc" id="L667">                    return s;                 // initialize</span>
+            }
+<span class="fc bfc" id="L669" title="All 2 branches covered.">            else if (p.cannotPrecede(haveData))</span>
+<span class="fc" id="L670">                return null;                  // lost race vs opposite mode</span>
+<span class="fc bfc" id="L671" title="All 2 branches covered.">            else if ((n = p.next) != null)    // not last; keep traversing</span>
+<span class="fc bfc" id="L672" title="All 6 branches covered.">                p = p != t &amp;&amp; t != (u = tail) ? (t = u) : // stale tail</span>
+                    (p != n) ? n : null;      // restart if off list
+<span class="fc bfc" id="L674" title="All 2 branches covered.">            else if (!p.casNext(null, s))</span>
+<span class="fc" id="L675">                p = p.next;                   // re-read on CAS failure</span>
+            else {
+<span class="fc bfc" id="L677" title="All 2 branches covered.">                if (p != t) {                 // update if slack now &gt;= 2</span>
+<span class="pc bpc" id="L678" title="1 of 12 branches missed.">                    while ((tail != t || !casTail(t, s)) &amp;&amp;</span>
+                           (t = tail)   != null &amp;&amp;
+                           (s = t.next) != null &amp;&amp; // advance and retry
+<span class="fc" id="L681">                           (s = s.next) != null &amp;&amp; s != t);</span>
+                }
+<span class="fc" id="L683">                return p;</span>
+            }
+<span class="fc" id="L685">        }</span>
+    }
+
+    /**
+     * Spins/yields/blocks until node s is matched or caller gives up.
+     *
+     * @param s the waiting node
+     * @param pred the predecessor of s, or s itself if it has no
+     * predecessor, or null if unknown (the null case does not occur
+     * in any current calls but may in possible future extensions)
+     * @param e the comparison value for checking match
+     * @param timed if true, wait only until timeout elapses
+     * @param nanos timeout in nanosecs, used only if timed is true
+     * @return matched item, or e if unmatched on interrupt or timeout
+     */
+    private E awaitMatch(Node s, Node pred, E e, boolean timed, long nanos) {
+<span class="pc bpc" id="L701" title="1 of 2 branches missed.">        final long deadline = timed ? System.nanoTime() + nanos : 0L;</span>
+<span class="fc" id="L702">        Thread w = Thread.currentThread();</span>
+<span class="fc" id="L703">        int spins = -1; // initialized after first item and cancel checks</span>
+<span class="fc" id="L704">        ThreadLocalRandom randomYields = null; // bound if needed</span>
+
+        for (;;) {
+<span class="fc" id="L707">            Object item = s.item;</span>
+<span class="fc bfc" id="L708" title="All 2 branches covered.">            if (item != e) {                  // matched</span>
+                // assert item != s;
+<span class="fc" id="L710">                s.forgetContents();           // avoid garbage</span>
+<span class="fc" id="L711">                return LinkedTransferQueue.&lt;E&gt;cast(item);</span>
+            }
+<span class="pc bpc" id="L713" title="4 of 6 branches missed.">            if ((w.isInterrupted() || (timed &amp;&amp; nanos &lt;= 0)) &amp;&amp;</span>
+<span class="nc bnc" id="L714" title="All 2 branches missed.">                    s.casItem(e, s)) {        // cancel</span>
+<span class="nc" id="L715">                unsplice(pred, s);</span>
+<span class="nc" id="L716">                return e;</span>
+            }
+
+<span class="fc bfc" id="L719" title="All 2 branches covered.">            if (spins &lt; 0) {                  // establish spins at/near front</span>
+<span class="fc bfc" id="L720" title="All 2 branches covered.">                if ((spins = spinsFor(pred, s.isData)) &gt; 0)</span>
+<span class="fc" id="L721">                    randomYields = ThreadLocalRandom.current();</span>
+            }
+<span class="fc bfc" id="L723" title="All 2 branches covered.">            else if (spins &gt; 0) {             // spin</span>
+<span class="fc" id="L724">                --spins;</span>
+<span class="fc bfc" id="L725" title="All 2 branches covered.">                if (randomYields.nextInt(CHAINED_SPINS) == 0)</span>
+<span class="fc" id="L726">                    Thread.yield();           // occasionally yield</span>
+            }
+<span class="fc bfc" id="L728" title="All 2 branches covered.">            else if (s.waiter == null) {</span>
+<span class="fc" id="L729">                s.waiter = w;                 // request unpark then recheck</span>
+            }
+<span class="pc bpc" id="L731" title="1 of 2 branches missed.">            else if (timed) {</span>
+<span class="nc" id="L732">                nanos = deadline - System.nanoTime();</span>
+<span class="nc bnc" id="L733" title="All 2 branches missed.">                if (nanos &gt; 0L)</span>
+<span class="nc" id="L734">                    LockSupport.parkNanos(this, nanos);</span>
+            }
+            else {
+<span class="fc" id="L737">                LockSupport.park(this);</span>
+            }
+<span class="fc" id="L739">        }</span>
+    }
+
+    /**
+     * Returns spin/yield value for a node with given predecessor and
+     * data mode. See above for explanation.
+     */
+    private static int spinsFor(Node pred, boolean haveData) {
+<span class="pc bpc" id="L747" title="2 of 4 branches missed.">        if (MP &amp;&amp; pred != null) {</span>
+<span class="fc bfc" id="L748" title="All 2 branches covered.">            if (pred.isData != haveData)      // phase change</span>
+<span class="fc" id="L749">                return FRONT_SPINS + CHAINED_SPINS;</span>
+<span class="fc bfc" id="L750" title="All 2 branches covered.">            if (pred.isMatched())             // probably at front</span>
+<span class="fc" id="L751">                return FRONT_SPINS;</span>
+<span class="fc bfc" id="L752" title="All 2 branches covered.">            if (pred.waiter == null)          // pred apparently spinning</span>
+<span class="fc" id="L753">                return CHAINED_SPINS;</span>
+        }
+<span class="fc" id="L755">        return 0;</span>
+    }
+
+    /* -------------- Traversal methods -------------- */
+
+    /**
+     * Returns the successor of p, or the head node if p.next has been
+     * linked to self, which will only be true if traversing with a
+     * stale pointer that is now off the list.
+     */
+    final Node succ(Node p) {
+<span class="fc" id="L766">        Node next = p.next;</span>
+<span class="pc bpc" id="L767" title="1 of 2 branches missed.">        return (p == next) ? head : next;</span>
+    }
+
+    /**
+     * Returns the first unmatched node of the given mode, or null if
+     * none.  Used by methods isEmpty, hasWaitingConsumer.
+     */
+    private Node firstOfMode(boolean isData) {
+<span class="nc bnc" id="L775" title="All 2 branches missed.">        for (Node p = head; p != null; p = succ(p)) {</span>
+<span class="nc bnc" id="L776" title="All 2 branches missed.">            if (!p.isMatched())</span>
+<span class="nc bnc" id="L777" title="All 2 branches missed.">                return (p.isData == isData) ? p : null;</span>
+        }
+<span class="nc" id="L779">        return null;</span>
+    }
+
+    /**
+     * Version of firstOfMode used by Spliterator
+     */
+    final Node firstDataNode() {
+<span class="nc bnc" id="L786" title="All 2 branches missed.">        for (Node p = head; p != null;) {</span>
+<span class="nc" id="L787">            Object item = p.item;</span>
+<span class="nc bnc" id="L788" title="All 2 branches missed.">            if (p.isData) {</span>
+<span class="nc bnc" id="L789" title="All 4 branches missed.">                if (item != null &amp;&amp; item != p)</span>
+<span class="nc" id="L790">                    return p;</span>
+            }
+<span class="nc bnc" id="L792" title="All 2 branches missed.">            else if (item == null)</span>
+<span class="nc" id="L793">                break;</span>
+<span class="nc bnc" id="L794" title="All 2 branches missed.">            if (p == (p = p.next))</span>
+<span class="nc" id="L795">                p = head;</span>
+<span class="nc" id="L796">        }</span>
+<span class="nc" id="L797">        return null;</span>
+    }
+
+    /**
+     * Returns the item in the first unmatched node with isData; or
+     * null if none.  Used by peek.
+     */
+    private E firstDataItem() {
+<span class="nc bnc" id="L805" title="All 2 branches missed.">        for (Node p = head; p != null; p = succ(p)) {</span>
+<span class="nc" id="L806">            Object item = p.item;</span>
+<span class="nc bnc" id="L807" title="All 2 branches missed.">            if (p.isData) {</span>
+<span class="nc bnc" id="L808" title="All 4 branches missed.">                if (item != null &amp;&amp; item != p)</span>
+<span class="nc" id="L809">                    return LinkedTransferQueue.&lt;E&gt;cast(item);</span>
+            }
+<span class="nc bnc" id="L811" title="All 2 branches missed.">            else if (item == null)</span>
+<span class="nc" id="L812">                return null;</span>
+        }
+<span class="nc" id="L814">        return null;</span>
+    }
+
+    /**
+     * Traverses and counts unmatched nodes of the given mode.
+     * Used by methods size and getWaitingConsumerCount.
+     */
+    private int countOfMode(boolean data) {
+<span class="fc" id="L822">        int count = 0;</span>
+<span class="fc bfc" id="L823" title="All 2 branches covered.">        for (Node p = head; p != null; ) {</span>
+<span class="fc bfc" id="L824" title="All 2 branches covered.">            if (!p.isMatched()) {</span>
+<span class="pc bpc" id="L825" title="1 of 2 branches missed.">                if (p.isData != data)</span>
+<span class="nc" id="L826">                    return 0;</span>
+<span class="pc bpc" id="L827" title="1 of 2 branches missed.">                if (++count == Integer.MAX_VALUE) // saturated</span>
+<span class="nc" id="L828">                    break;</span>
+            }
+<span class="fc" id="L830">            Node n = p.next;</span>
+<span class="pc bpc" id="L831" title="1 of 2 branches missed.">            if (n != p)</span>
+<span class="fc" id="L832">                p = n;</span>
+            else {
+<span class="nc" id="L834">                count = 0;</span>
+<span class="nc" id="L835">                p = head;</span>
+            }
+<span class="fc" id="L837">        }</span>
+<span class="fc" id="L838">        return count;</span>
+    }
+
+    final class Itr implements Iterator&lt;E&gt; {
+        private Node nextNode;   // next node to return item for
+        private E nextItem;      // the corresponding item
+        private Node lastRet;    // last returned node, to support remove
+        private Node lastPred;   // predecessor to unlink lastRet
+
+        /**
+         * Moves to next node after prev, or first node if prev null.
+         */
+        private void advance(Node prev) {
+            /*
+             * To track and avoid buildup of deleted nodes in the face
+             * of calls to both Queue.remove and Itr.remove, we must
+             * include variants of unsplice and sweep upon each
+             * advance: Upon Itr.remove, we may need to catch up links
+             * from lastPred, and upon other removes, we might need to
+             * skip ahead from stale nodes and unsplice deleted ones
+             * found while advancing.
+             */
+
+            Node r, b; // reset lastPred upon possible deletion of lastRet
+<span class="pc bpc" id="L862" title="1 of 4 branches missed.">            if ((r = lastRet) != null &amp;&amp; !r.isMatched())</span>
+<span class="fc" id="L863">                lastPred = r;    // next lastPred is old lastRet</span>
+<span class="pc bpc" id="L864" title="3 of 4 branches missed.">            else if ((b = lastPred) == null || b.isMatched())</span>
+<span class="fc" id="L865">                lastPred = null; // at start of list</span>
+            else {
+                Node s, n;       // help with removal of lastPred.next
+<span class="nc bnc" id="L868" title="All 4 branches missed.">                while ((s = b.next) != null &amp;&amp;</span>
+<span class="nc bnc" id="L869" title="All 6 branches missed.">                       s != b &amp;&amp; s.isMatched() &amp;&amp;</span>
+                       (n = s.next) != null &amp;&amp; n != s)
+<span class="nc" id="L871">                    b.casNext(s, n);</span>
+            }
+
+<span class="fc" id="L874">            this.lastRet = prev;</span>
+
+<span class="fc" id="L876">            for (Node p = prev, s, n;;) {</span>
+<span class="fc bfc" id="L877" title="All 2 branches covered.">                s = (p == null) ? head : p.next;</span>
+<span class="fc bfc" id="L878" title="All 2 branches covered.">                if (s == null)</span>
+<span class="fc" id="L879">                    break;</span>
+<span class="fc bfc" id="L880" title="All 2 branches covered.">                else if (s == p) {</span>
+<span class="fc" id="L881">                    p = null;</span>
+<span class="fc" id="L882">                    continue;</span>
+                }
+<span class="fc" id="L884">                Object item = s.item;</span>
+<span class="pc bpc" id="L885" title="1 of 2 branches missed.">                if (s.isData) {</span>
+<span class="fc bfc" id="L886" title="All 4 branches covered.">                    if (item != null &amp;&amp; item != s) {</span>
+<span class="fc" id="L887">                        nextItem = LinkedTransferQueue.&lt;E&gt;cast(item);</span>
+<span class="fc" id="L888">                        nextNode = s;</span>
+<span class="fc" id="L889">                        return;</span>
+                    }
+                }
+<span class="nc bnc" id="L892" title="All 2 branches missed.">                else if (item == null)</span>
+<span class="nc" id="L893">                    break;</span>
+                // assert s.isMatched();
+<span class="fc bfc" id="L895" title="All 2 branches covered.">                if (p == null)</span>
+<span class="fc" id="L896">                    p = s;</span>
+<span class="fc bfc" id="L897" title="All 2 branches covered.">                else if ((n = s.next) == null)</span>
+<span class="fc" id="L898">                    break;</span>
+<span class="pc bpc" id="L899" title="1 of 2 branches missed.">                else if (s == n)</span>
+<span class="nc" id="L900">                    p = null;</span>
+                else
+<span class="fc" id="L902">                    p.casNext(s, n);</span>
+<span class="fc" id="L903">            }</span>
+<span class="fc" id="L904">            nextNode = null;</span>
+<span class="fc" id="L905">            nextItem = null;</span>
+<span class="fc" id="L906">        }</span>
+
+<span class="fc" id="L908">        Itr() {</span>
+<span class="fc" id="L909">            advance(null);</span>
+<span class="fc" id="L910">        }</span>
+
+        public final boolean hasNext() {
+<span class="fc bfc" id="L913" title="All 2 branches covered.">            return nextNode != null;</span>
+        }
+
+        public final E next() {
+<span class="fc" id="L917">            Node p = nextNode;</span>
+<span class="fc bfc" id="L918" title="All 2 branches covered.">            if (p == null) throw new NoSuchElementException();</span>
+<span class="fc" id="L919">            E e = nextItem;</span>
+<span class="fc" id="L920">            advance(p);</span>
+<span class="fc" id="L921">            return e;</span>
+        }
+
+        public final void remove() {
+<span class="fc" id="L925">            final Node lastRet = this.lastRet;</span>
+<span class="fc bfc" id="L926" title="All 2 branches covered.">            if (lastRet == null)</span>
+<span class="fc" id="L927">                throw new IllegalStateException();</span>
+<span class="fc" id="L928">            this.lastRet = null;</span>
+<span class="pc bpc" id="L929" title="1 of 2 branches missed.">            if (lastRet.tryMatchData())</span>
+<span class="fc" id="L930">                unsplice(lastPred, lastRet);</span>
+<span class="fc" id="L931">        }</span>
+    }
+
+    /** A customized variant of Spliterators.IteratorSpliterator */
+    static final class LTQSpliterator&lt;E&gt; implements Spliterator&lt;E&gt; {
+        static final int MAX_BATCH = 1 &lt;&lt; 25;  // max batch array size;
+        final LinkedTransferQueue&lt;E&gt; queue;
+        Node current;    // current node; null until initialized
+        int batch;          // batch size for splits
+        boolean exhausted;  // true when no more nodes
+<span class="fc" id="L941">        LTQSpliterator(LinkedTransferQueue&lt;E&gt; queue) {</span>
+<span class="fc" id="L942">            this.queue = queue;</span>
+<span class="fc" id="L943">        }</span>
+
+        public Spliterator&lt;E&gt; trySplit() {
+            Node p;
+<span class="nc" id="L947">            final LinkedTransferQueue&lt;E&gt; q = this.queue;</span>
+<span class="nc" id="L948">            int b = batch;</span>
+<span class="nc bnc" id="L949" title="All 4 branches missed.">            int n = (b &lt;= 0) ? 1 : (b &gt;= MAX_BATCH) ? MAX_BATCH : b + 1;</span>
+<span class="nc bnc" id="L950" title="All 4 branches missed.">            if (!exhausted &amp;&amp;</span>
+<span class="nc bnc" id="L951" title="All 4 branches missed.">                ((p = current) != null || (p = q.firstDataNode()) != null) &amp;&amp;</span>
+                p.next != null) {
+<span class="nc" id="L953">                Object[] a = new Object[n];</span>
+<span class="nc" id="L954">                int i = 0;</span>
+                do {
+<span class="nc bnc" id="L956" title="All 2 branches missed.">                    if ((a[i] = p.item) != null)</span>
+<span class="nc" id="L957">                        ++i;</span>
+<span class="nc bnc" id="L958" title="All 2 branches missed.">                    if (p == (p = p.next))</span>
+<span class="nc" id="L959">                        p = q.firstDataNode();</span>
+<span class="nc bnc" id="L960" title="All 4 branches missed.">                } while (p != null &amp;&amp; i &lt; n);</span>
+<span class="nc bnc" id="L961" title="All 2 branches missed.">                if ((current = p) == null)</span>
+<span class="nc" id="L962">                    exhausted = true;</span>
+<span class="nc bnc" id="L963" title="All 2 branches missed.">                if (i &gt; 0) {</span>
+<span class="nc" id="L964">                    batch = i;</span>
+<span class="nc" id="L965">                    return Spliterators.spliterator</span>
+<span class="nc" id="L966">                        (a, 0, i, Spliterator.ORDERED | Spliterator.NONNULL |</span>
+                         Spliterator.CONCURRENT);
+                }
+            }
+<span class="nc" id="L970">            return null;</span>
+        }
+
+        @SuppressWarnings(&quot;unchecked&quot;)
+        public void forEachRemaining(Consumer&lt;? super E&gt; action) {
+            Node p;
+<span class="nc bnc" id="L976" title="All 2 branches missed.">            if (action == null) throw new NullPointerException();</span>
+<span class="nc" id="L977">            final LinkedTransferQueue&lt;E&gt; q = this.queue;</span>
+<span class="nc bnc" id="L978" title="All 4 branches missed.">            if (!exhausted &amp;&amp;</span>
+<span class="nc bnc" id="L979" title="All 2 branches missed.">                ((p = current) != null || (p = q.firstDataNode()) != null)) {</span>
+<span class="nc" id="L980">                exhausted = true;</span>
+                do {
+<span class="nc" id="L982">                    Object e = p.item;</span>
+<span class="nc bnc" id="L983" title="All 2 branches missed.">                    if (p == (p = p.next))</span>
+<span class="nc" id="L984">                        p = q.firstDataNode();</span>
+<span class="nc bnc" id="L985" title="All 2 branches missed.">                    if (e != null)</span>
+<span class="nc" id="L986">                        action.accept((E)e);</span>
+<span class="nc bnc" id="L987" title="All 2 branches missed.">                } while (p != null);</span>
+            }
+<span class="nc" id="L989">        }</span>
+
+        @SuppressWarnings(&quot;unchecked&quot;)
+        public boolean tryAdvance(Consumer&lt;? super E&gt; action) {
+            Node p;
+<span class="nc bnc" id="L994" title="All 2 branches missed.">            if (action == null) throw new NullPointerException();</span>
+<span class="nc" id="L995">            final LinkedTransferQueue&lt;E&gt; q = this.queue;</span>
+<span class="nc bnc" id="L996" title="All 4 branches missed.">            if (!exhausted &amp;&amp;</span>
+<span class="nc bnc" id="L997" title="All 2 branches missed.">                ((p = current) != null || (p = q.firstDataNode()) != null)) {</span>
+                Object e;
+                do {
+<span class="nc" id="L1000">                    e = p.item;</span>
+<span class="nc bnc" id="L1001" title="All 2 branches missed.">                    if (p == (p = p.next))</span>
+<span class="nc" id="L1002">                        p = q.firstDataNode();</span>
+<span class="nc bnc" id="L1003" title="All 4 branches missed.">                } while (e == null &amp;&amp; p != null);</span>
+<span class="nc bnc" id="L1004" title="All 2 branches missed.">                if ((current = p) == null)</span>
+<span class="nc" id="L1005">                    exhausted = true;</span>
+<span class="nc bnc" id="L1006" title="All 2 branches missed.">                if (e != null) {</span>
+<span class="nc" id="L1007">                    action.accept((E)e);</span>
+<span class="nc" id="L1008">                    return true;</span>
+                }
+            }
+<span class="nc" id="L1011">            return false;</span>
+        }
+
+<span class="nc" id="L1014">        public long estimateSize() { return Long.MAX_VALUE; }</span>
+
+        public int characteristics() {
+<span class="fc" id="L1017">            return Spliterator.ORDERED | Spliterator.NONNULL |</span>
+                Spliterator.CONCURRENT;
+        }
+    }
+
+    /**
+     * Returns a {@link Spliterator} over the elements in this queue.
+     *
+     * &lt;p&gt;The returned spliterator is
+     * &lt;a href=&quot;package-summary.html#Weakly&quot;&gt;&lt;i&gt;weakly consistent&lt;/i&gt;&lt;/a&gt;.
+     *
+     * &lt;p&gt;The {@code Spliterator} reports {@link Spliterator#CONCURRENT},
+     * {@link Spliterator#ORDERED}, and {@link Spliterator#NONNULL}.
+     *
+     * @implNote
+     * The {@code Spliterator} implements {@code trySplit} to permit limited
+     * parallelism.
+     *
+     * @return a {@code Spliterator} over the elements in this queue
+     * @since 1.8
+     */
+    public Spliterator&lt;E&gt; spliterator() {
+<span class="fc" id="L1039">        return new LTQSpliterator&lt;E&gt;(this);</span>
+    }
+
+    /* -------------- Removal methods -------------- */
+
+    /**
+     * Unsplices (now or later) the given deleted/cancelled node with
+     * the given predecessor.
+     *
+     * @param pred a node that was at one time known to be the
+     * predecessor of s, or null or s itself if s is/was at head
+     * @param s the node to be unspliced
+     */
+    final void unsplice(Node pred, Node s) {
+<span class="fc" id="L1053">        s.forgetContents(); // forget unneeded fields</span>
+        /*
+         * See above for rationale. Briefly: if pred still points to
+         * s, try to unlink s.  If s cannot be unlinked, because it is
+         * trailing node or pred might be unlinked, and neither pred
+         * nor s are head or offlist, add to sweepVotes, and if enough
+         * votes have accumulated, sweep.
+         */
+<span class="pc bpc" id="L1061" title="1 of 6 branches missed.">        if (pred != null &amp;&amp; pred != s &amp;&amp; pred.next == s) {</span>
+<span class="fc" id="L1062">            Node n = s.next;</span>
+<span class="fc bfc" id="L1063" title="All 4 branches covered.">            if (n == null ||</span>
+<span class="pc bpc" id="L1064" title="1 of 4 branches missed.">                (n != s &amp;&amp; pred.casNext(s, n) &amp;&amp; pred.isMatched())) {</span>
+                for (;;) {               // check if at, or could be, head
+<span class="fc" id="L1066">                    Node h = head;</span>
+<span class="pc bpc" id="L1067" title="1 of 6 branches missed.">                    if (h == pred || h == s || h == null)</span>
+<span class="fc" id="L1068">                        return;          // at head or list empty</span>
+<span class="fc bfc" id="L1069" title="All 2 branches covered.">                    if (!h.isMatched())</span>
+<span class="fc" id="L1070">                        break;</span>
+<span class="fc" id="L1071">                    Node hn = h.next;</span>
+<span class="fc bfc" id="L1072" title="All 2 branches covered.">                    if (hn == null)</span>
+<span class="fc" id="L1073">                        return;          // now empty</span>
+<span class="fc bfc" id="L1074" title="All 4 branches covered.">                    if (hn != h &amp;&amp; casHead(h, hn))</span>
+<span class="fc" id="L1075">                        h.forgetNext();  // advance head</span>
+<span class="fc" id="L1076">                }</span>
+<span class="fc bfc" id="L1077" title="All 4 branches covered.">                if (pred.next != pred &amp;&amp; s.next != s) { // recheck if offlist</span>
+                    for (;;) {           // sweep now if enough votes
+<span class="fc" id="L1079">                        int v = sweepVotes;</span>
+<span class="pc bpc" id="L1080" title="1 of 2 branches missed.">                        if (v &lt; SWEEP_THRESHOLD) {</span>
+<span class="pc bpc" id="L1081" title="1 of 2 branches missed.">                            if (casSweepVotes(v, v + 1))</span>
+<span class="fc" id="L1082">                                break;</span>
+                        }
+<span class="nc bnc" id="L1084" title="All 2 branches missed.">                        else if (casSweepVotes(v, 0)) {</span>
+<span class="nc" id="L1085">                            sweep();</span>
+<span class="nc" id="L1086">                            break;</span>
+                        }
+<span class="nc" id="L1088">                    }</span>
+                }
+            }
+        }
+<span class="fc" id="L1092">    }</span>
+
+    /**
+     * Unlinks matched (typically cancelled) nodes encountered in a
+     * traversal from head.
+     */
+    private void sweep() {
+<span class="nc bnc" id="L1099" title="All 4 branches missed.">        for (Node p = head, s, n; p != null &amp;&amp; (s = p.next) != null; ) {</span>
+<span class="nc bnc" id="L1100" title="All 2 branches missed.">            if (!s.isMatched())</span>
+                // Unmatched nodes are never self-linked
+<span class="nc" id="L1102">                p = s;</span>
+<span class="nc bnc" id="L1103" title="All 2 branches missed.">            else if ((n = s.next) == null) // trailing node is pinned</span>
+<span class="nc" id="L1104">                break;</span>
+<span class="nc bnc" id="L1105" title="All 2 branches missed.">            else if (s == n)    // stale</span>
+                // No need to also check for p == s, since that implies s == n
+<span class="nc" id="L1107">                p = head;</span>
+            else
+<span class="nc" id="L1109">                p.casNext(s, n);</span>
+        }
+<span class="nc" id="L1111">    }</span>
+
+    /**
+     * Main implementation of remove(Object)
+     */
+    private boolean findAndRemove(Object e) {
+<span class="pc bpc" id="L1117" title="1 of 2 branches missed.">        if (e != null) {</span>
+<span class="fc bfc" id="L1118" title="All 2 branches covered.">            for (Node pred = null, p = head; p != null; ) {</span>
+<span class="fc" id="L1119">                Object item = p.item;</span>
+<span class="pc bpc" id="L1120" title="1 of 2 branches missed.">                if (p.isData) {</span>
+<span class="fc bfc" id="L1121" title="All 6 branches covered.">                    if (item != null &amp;&amp; item != p &amp;&amp; e.equals(item) &amp;&amp;</span>
+<span class="fc bfc" id="L1122" title="All 2 branches covered.">                        p.tryMatchData()) {</span>
+<span class="fc" id="L1123">                        unsplice(pred, p);</span>
+<span class="fc" id="L1124">                        return true;</span>
+                    }
+                }
+<span class="nc bnc" id="L1127" title="All 2 branches missed.">                else if (item == null)</span>
+<span class="nc" id="L1128">                    break;</span>
+<span class="fc" id="L1129">                pred = p;</span>
+<span class="fc bfc" id="L1130" title="All 2 branches covered.">                if ((p = p.next) == pred) { // stale</span>
+<span class="fc" id="L1131">                    pred = null;</span>
+<span class="fc" id="L1132">                    p = head;</span>
+                }
+<span class="fc" id="L1134">            }</span>
+        }
+<span class="fc" id="L1136">        return false;</span>
+    }
+
+    /**
+     * Creates an initially empty {@code LinkedTransferQueue}.
+     */
+<span class="fc" id="L1142">    public LinkedTransferQueue() {</span>
+<span class="fc" id="L1143">    }</span>
+
+    /**
+     * Creates a {@code LinkedTransferQueue}
+     * initially containing the elements of the given collection,
+     * added in traversal order of the collection's iterator.
+     *
+     * @param c the collection of elements to initially contain
+     * @throws NullPointerException if the specified collection or any
+     *         of its elements are null
+     */
+    public LinkedTransferQueue(Collection&lt;? extends E&gt; c) {
+<span class="fc" id="L1155">        this();</span>
+<span class="fc" id="L1156">        addAll(c);</span>
+<span class="fc" id="L1157">    }</span>
+
+    /**
+     * Inserts the specified element at the tail of this queue.
+     * As the queue is unbounded, this method will never block.
+     *
+     * @throws NullPointerException if the specified element is null
+     */
+    public void put(E e) {
+<span class="fc" id="L1166">        xfer(e, true, ASYNC, 0);</span>
+<span class="fc" id="L1167">    }</span>
+
+    /**
+     * Inserts the specified element at the tail of this queue.
+     * As the queue is unbounded, this method will never block or
+     * return {@code false}.
+     *
+     * @return {@code true} (as specified by
+     *  {@link java.util.concurrent.BlockingQueue#offer(Object,long,TimeUnit)
+     *  BlockingQueue.offer})
+     * @throws NullPointerException if the specified element is null
+     */
+    public boolean offer(E e, long timeout, TimeUnit unit) {
+<span class="nc" id="L1180">        xfer(e, true, ASYNC, 0);</span>
+<span class="nc" id="L1181">        return true;</span>
+    }
+
+    /**
+     * Inserts the specified element at the tail of this queue.
+     * As the queue is unbounded, this method will never return {@code false}.
+     *
+     * @return {@code true} (as specified by {@link Queue#offer})
+     * @throws NullPointerException if the specified element is null
+     */
+    public boolean offer(E e) {
+<span class="fc" id="L1192">        xfer(e, true, ASYNC, 0);</span>
+<span class="fc" id="L1193">        return true;</span>
+    }
+
+    /**
+     * Inserts the specified element at the tail of this queue.
+     * As the queue is unbounded, this method will never throw
+     * {@link IllegalStateException} or return {@code false}.
+     *
+     * @return {@code true} (as specified by {@link Collection#add})
+     * @throws NullPointerException if the specified element is null
+     */
+    public boolean add(E e) {
+<span class="fc" id="L1205">        xfer(e, true, ASYNC, 0);</span>
+<span class="fc" id="L1206">        return true;</span>
+    }
+
+    /**
+     * Transfers the element to a waiting consumer immediately, if possible.
+     *
+     * &lt;p&gt;More precisely, transfers the specified element immediately
+     * if there exists a consumer already waiting to receive it (in
+     * {@link #take} or timed {@link #poll(long,TimeUnit) poll}),
+     * otherwise returning {@code false} without enqueuing the element.
+     *
+     * @throws NullPointerException if the specified element is null
+     */
+    public boolean tryTransfer(E e) {
+<span class="nc bnc" id="L1220" title="All 2 branches missed.">        return xfer(e, true, NOW, 0) == null;</span>
+    }
+
+    /**
+     * Transfers the element to a consumer, waiting if necessary to do so.
+     *
+     * &lt;p&gt;More precisely, transfers the specified element immediately
+     * if there exists a consumer already waiting to receive it (in
+     * {@link #take} or timed {@link #poll(long,TimeUnit) poll}),
+     * else inserts the specified element at the tail of this queue
+     * and waits until the element is received by a consumer.
+     *
+     * @throws NullPointerException if the specified element is null
+     */
+    public void transfer(E e) throws InterruptedException {
+<span class="nc bnc" id="L1235" title="All 2 branches missed.">        if (xfer(e, true, SYNC, 0) != null) {</span>
+<span class="nc" id="L1236">            Thread.interrupted(); // failure possible only due to interrupt</span>
+<span class="nc" id="L1237">            throw new InterruptedException();</span>
+        }
+<span class="nc" id="L1239">    }</span>
+
+    /**
+     * Transfers the element to a consumer if it is possible to do so
+     * before the timeout elapses.
+     *
+     * &lt;p&gt;More precisely, transfers the specified element immediately
+     * if there exists a consumer already waiting to receive it (in
+     * {@link #take} or timed {@link #poll(long,TimeUnit) poll}),
+     * else inserts the specified element at the tail of this queue
+     * and waits until the element is received by a consumer,
+     * returning {@code false} if the specified wait time elapses
+     * before the element can be transferred.
+     *
+     * @throws NullPointerException if the specified element is null
+     */
+    public boolean tryTransfer(E e, long timeout, TimeUnit unit)
+        throws InterruptedException {
+<span class="nc bnc" id="L1257" title="All 2 branches missed.">        if (xfer(e, true, TIMED, unit.toNanos(timeout)) == null)</span>
+<span class="nc" id="L1258">            return true;</span>
+<span class="nc bnc" id="L1259" title="All 2 branches missed.">        if (!Thread.interrupted())</span>
+<span class="nc" id="L1260">            return false;</span>
+<span class="nc" id="L1261">        throw new InterruptedException();</span>
+    }
+
+    public E take() throws InterruptedException {
+<span class="fc" id="L1265">        E e = xfer(null, false, SYNC, 0);</span>
+<span class="pc bpc" id="L1266" title="1 of 2 branches missed.">        if (e != null)</span>
+<span class="fc" id="L1267">            return e;</span>
+<span class="nc" id="L1268">        Thread.interrupted();</span>
+<span class="nc" id="L1269">        throw new InterruptedException();</span>
+    }
+
+    public E poll(long timeout, TimeUnit unit) throws InterruptedException {
+<span class="nc" id="L1273">        E e = xfer(null, false, TIMED, unit.toNanos(timeout));</span>
+<span class="nc bnc" id="L1274" title="All 4 branches missed.">        if (e != null || !Thread.interrupted())</span>
+<span class="nc" id="L1275">            return e;</span>
+<span class="nc" id="L1276">        throw new InterruptedException();</span>
+    }
+
+    public E poll() {
+<span class="fc" id="L1280">        return xfer(null, false, NOW, 0);</span>
+    }
+
+    /**
+     * @throws NullPointerException     {@inheritDoc}
+     * @throws IllegalArgumentException {@inheritDoc}
+     */
+    public int drainTo(Collection&lt;? super E&gt; c) {
+<span class="nc bnc" id="L1288" title="All 2 branches missed.">        if (c == null)</span>
+<span class="nc" id="L1289">            throw new NullPointerException();</span>
+<span class="nc bnc" id="L1290" title="All 2 branches missed.">        if (c == this)</span>
+<span class="nc" id="L1291">            throw new IllegalArgumentException();</span>
+<span class="nc" id="L1292">        int n = 0;</span>
+<span class="nc bnc" id="L1293" title="All 2 branches missed.">        for (E e; (e = poll()) != null;) {</span>
+<span class="nc" id="L1294">            c.add(e);</span>
+<span class="nc" id="L1295">            ++n;</span>
+        }
+<span class="nc" id="L1297">        return n;</span>
+    }
+
+    /**
+     * @throws NullPointerException     {@inheritDoc}
+     * @throws IllegalArgumentException {@inheritDoc}
+     */
+    public int drainTo(Collection&lt;? super E&gt; c, int maxElements) {
+<span class="nc bnc" id="L1305" title="All 2 branches missed.">        if (c == null)</span>
+<span class="nc" id="L1306">            throw new NullPointerException();</span>
+<span class="nc bnc" id="L1307" title="All 2 branches missed.">        if (c == this)</span>
+<span class="nc" id="L1308">            throw new IllegalArgumentException();</span>
+<span class="nc" id="L1309">        int n = 0;</span>
+<span class="nc bnc" id="L1310" title="All 4 branches missed.">        for (E e; n &lt; maxElements &amp;&amp; (e = poll()) != null;) {</span>
+<span class="nc" id="L1311">            c.add(e);</span>
+<span class="nc" id="L1312">            ++n;</span>
+        }
+<span class="nc" id="L1314">        return n;</span>
+    }
+
+    /**
+     * Returns an iterator over the elements in this queue in proper sequence.
+     * The elements will be returned in order from first (head) to last (tail).
+     *
+     * &lt;p&gt;The returned iterator is
+     * &lt;a href=&quot;package-summary.html#Weakly&quot;&gt;&lt;i&gt;weakly consistent&lt;/i&gt;&lt;/a&gt;.
+     *
+     * @return an iterator over the elements in this queue in proper sequence
+     */
+    public Iterator&lt;E&gt; iterator() {
+<span class="fc" id="L1327">        return new Itr();</span>
+    }
+
+    public E peek() {
+<span class="nc" id="L1331">        return firstDataItem();</span>
+    }
+
+    /**
+     * Returns {@code true} if this queue contains no elements.
+     *
+     * @return {@code true} if this queue contains no elements
+     */
+    public boolean isEmpty() {
+<span class="fc bfc" id="L1340" title="All 2 branches covered.">        for (Node p = head; p != null; p = succ(p)) {</span>
+<span class="fc bfc" id="L1341" title="All 2 branches covered.">            if (!p.isMatched())</span>
+<span class="pc bpc" id="L1342" title="1 of 2 branches missed.">                return !p.isData;</span>
+        }
+<span class="fc" id="L1344">        return true;</span>
+    }
+
+    public boolean hasWaitingConsumer() {
+<span class="nc bnc" id="L1348" title="All 2 branches missed.">        return firstOfMode(false) != null;</span>
+    }
+
+    /**
+     * Returns the number of elements in this queue.  If this queue
+     * contains more than {@code Integer.MAX_VALUE} elements, returns
+     * {@code Integer.MAX_VALUE}.
+     *
+     * &lt;p&gt;Beware that, unlike in most collections, this method is
+     * &lt;em&gt;NOT&lt;/em&gt; a constant-time operation. Because of the
+     * asynchronous nature of these queues, determining the current
+     * number of elements requires an O(n) traversal.
+     *
+     * @return the number of elements in this queue
+     */
+    public int size() {
+<span class="fc" id="L1364">        return countOfMode(true);</span>
+    }
+
+    public int getWaitingConsumerCount() {
+<span class="nc" id="L1368">        return countOfMode(false);</span>
+    }
+
+    /**
+     * Removes a single instance of the specified element from this queue,
+     * if it is present.  More formally, removes an element {@code e} such
+     * that {@code o.equals(e)}, if this queue contains one or more such
+     * elements.
+     * Returns {@code true} if this queue contained the specified element
+     * (or equivalently, if this queue changed as a result of the call).
+     *
+     * @param o element to be removed from this queue, if present
+     * @return {@code true} if this queue changed as a result of the call
+     */
+    public boolean remove(Object o) {
+<span class="fc" id="L1383">        return findAndRemove(o);</span>
+    }
+
+    /**
+     * Returns {@code true} if this queue contains the specified element.
+     * More formally, returns {@code true} if and only if this queue contains
+     * at least one element {@code e} such that {@code o.equals(e)}.
+     *
+     * @param o object to be checked for containment in this queue
+     * @return {@code true} if this queue contains the specified element
+     */
+    public boolean contains(Object o) {
+<span class="fc bfc" id="L1395" title="All 2 branches covered.">        if (o == null) return false;</span>
+<span class="fc bfc" id="L1396" title="All 2 branches covered.">        for (Node p = head; p != null; p = succ(p)) {</span>
+<span class="fc" id="L1397">            Object item = p.item;</span>
+<span class="pc bpc" id="L1398" title="1 of 2 branches missed.">            if (p.isData) {</span>
+<span class="fc bfc" id="L1399" title="All 6 branches covered.">                if (item != null &amp;&amp; item != p &amp;&amp; o.equals(item))</span>
+<span class="fc" id="L1400">                    return true;</span>
+            }
+<span class="nc bnc" id="L1402" title="All 2 branches missed.">            else if (item == null)</span>
+<span class="nc" id="L1403">                break;</span>
+        }
+<span class="fc" id="L1405">        return false;</span>
+    }
+
+    /**
+     * Always returns {@code Integer.MAX_VALUE} because a
+     * {@code LinkedTransferQueue} is not capacity constrained.
+     *
+     * @return {@code Integer.MAX_VALUE} (as specified by
+     *         {@link java.util.concurrent.BlockingQueue#remainingCapacity()
+     *         BlockingQueue.remainingCapacity})
+     */
+    public int remainingCapacity() {
+<span class="nc" id="L1417">        return Integer.MAX_VALUE;</span>
+    }
+
+    /**
+     * Saves this queue to a stream (that is, serializes it).
+     *
+     * @param s the stream
+     * @throws java.io.IOException if an I/O error occurs
+     * @serialData All of the elements (each an {@code E}) in
+     * the proper order, followed by a null
+     */
+    private void writeObject(java.io.ObjectOutputStream s)
+        throws java.io.IOException {
+<span class="fc" id="L1430">        s.defaultWriteObject();</span>
+<span class="fc bfc" id="L1431" title="All 2 branches covered.">        for (E e : this)</span>
+<span class="fc" id="L1432">            s.writeObject(e);</span>
+        // Use trailing null as sentinel
+<span class="fc" id="L1434">        s.writeObject(null);</span>
+<span class="fc" id="L1435">    }</span>
+
+    /**
+     * Reconstitutes this queue from a stream (that is, deserializes it).
+     * @param s the stream
+     * @throws ClassNotFoundException if the class of a serialized object
+     *         could not be found
+     * @throws java.io.IOException if an I/O error occurs
+     */
+    private void readObject(java.io.ObjectInputStream s)
+        throws java.io.IOException, ClassNotFoundException {
+<span class="fc" id="L1446">        s.defaultReadObject();</span>
+        for (;;) {
+            @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L1449">            E item = (E) s.readObject();</span>
+<span class="fc bfc" id="L1450" title="All 2 branches covered.">            if (item == null)</span>
+<span class="fc" id="L1451">                break;</span>
+            else
+<span class="fc" id="L1453">                offer(item);</span>
+<span class="fc" id="L1454">        }</span>
+<span class="fc" id="L1455">    }</span>
+
+    // Unsafe mechanics
+
+    private static final sun.misc.Unsafe UNSAFE;
+    private static final long headOffset;
+    private static final long tailOffset;
+    private static final long sweepVotesOffset;
+    static {
+        try {
+<span class="fc" id="L1465">            UNSAFE = sun.misc.Unsafe.getUnsafe();</span>
+<span class="fc" id="L1466">            Class&lt;?&gt; k = LinkedTransferQueue.class;</span>
+<span class="fc" id="L1467">            headOffset = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L1468">                (k.getDeclaredField(&quot;head&quot;));</span>
+<span class="fc" id="L1469">            tailOffset = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L1470">                (k.getDeclaredField(&quot;tail&quot;));</span>
+<span class="fc" id="L1471">            sweepVotesOffset = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L1472">                (k.getDeclaredField(&quot;sweepVotes&quot;));</span>
+<span class="nc" id="L1473">        } catch (Exception e) {</span>
+<span class="nc" id="L1474">            throw new Error(e);</span>
+<span class="fc" id="L1475">        }</span>
+<span class="fc" id="L1476">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

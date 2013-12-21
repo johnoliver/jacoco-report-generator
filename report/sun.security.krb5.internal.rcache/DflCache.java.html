@@ -1,0 +1,366 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>DflCache.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.krb5.internal.rcache</a> &gt; <span class="el_source">DflCache.java</span></div><h1>DflCache.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+
+package sun.security.krb5.internal.rcache;
+
+import java.io.*;
+import java.nio.BufferUnderflowException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.channels.SeekableByteChannel;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.PosixFilePermission;
+import java.security.AccessController;
+import java.util.*;
+
+import sun.security.action.GetPropertyAction;
+import sun.security.krb5.internal.KerberosTime;
+import sun.security.krb5.internal.Krb5;
+import sun.security.krb5.internal.KrbApErrException;
+import sun.security.krb5.internal.ReplayCache;
+
+
+/**
+ * A dfl file is used to sustores AuthTime entries when the system property
+ * sun.security.krb5.rcache is set to
+ *
+ *    dfl(|:path/|:path/name|:name)
+ *
+ * The file will be path/name. If path is not given, it will be
+ *
+ *    System.getProperty(&quot;java.io.tmpdir&quot;)
+ *
+ * If name is not given, it will be
+ *
+ *    service_euid
+ *
+ * Java does not have a method to get euid, so uid is used instead. This
+ * should normally to be since a Java program is seldom used as a setuid app.
+ *
+ * The file has a header:
+ *
+ *    i16 0x0501 (KRB5_RC_VNO) in network order
+ *    i32 number of seconds for lifespan (in native order, same below)
+ *
+ * followed by cache entries concatenated, which can be encoded in
+ * 2 styles:
+ *
+ * The traditional style is:
+ *
+ *    LC of client principal
+ *    LC of server principal
+ *    i32 cusec of Authenticator
+ *    i32 ctime of Authenticator
+ *
+ * The new style has a hash:
+ *
+ *    LC of &quot;&quot;
+ *    LC of &quot;HASH:%s %lu:%s %lu:%s&quot; of (hash, clientlen, client, serverlen,
+ *          server) where msghash is 32 char (lower case) text mode md5sum
+ *          of the ciphertext of authenticator.
+ *    i32 cusec of Authenticator
+ *    i32 ctime of Authenticator
+ *
+ * where LC of a string means
+ *
+ *    i32 strlen(string) + 1
+ *    octets of string, with the \0x00 ending
+ *
+ * The old style block is always created by MIT krb5 used even if a new style
+ * is available, which means there can be 2 entries for a single Authenticator.
+ * Java also does this way.
+ *
+ * See src/lib/krb5/rcache/rc_io.c and src/lib/krb5/rcache/rc_dfl.c.
+ */
+public class DflCache extends ReplayCache {
+
+    private static final int KRB5_RV_VNO = 0x501;
+    private static final int EXCESSREPS = 30;   // if missed-hit&gt;this, recreate
+
+    private final String source;
+
+    private static int uid;
+    static {
+        try {
+            // Available on Solaris, Linux and Mac. Otherwise, no _euid suffix
+<span class="fc" id="L112">            Class&lt;?&gt; clazz = Class.forName(&quot;com.sun.security.auth.module.UnixSystem&quot;);</span>
+<span class="fc" id="L113">            uid = (int)(long)(Long)</span>
+<span class="fc" id="L114">                    clazz.getMethod(&quot;getUid&quot;).invoke(clazz.newInstance());</span>
+<span class="nc" id="L115">        } catch (Exception e) {</span>
+<span class="nc" id="L116">            uid = -1;</span>
+<span class="fc" id="L117">        }</span>
+<span class="fc" id="L118">    }</span>
+
+<span class="fc" id="L120">    public DflCache (String source) {</span>
+<span class="fc" id="L121">        this.source = source;</span>
+<span class="fc" id="L122">    }</span>
+
+    private static String defaultPath() {
+<span class="fc" id="L125">        return AccessController.doPrivileged(</span>
+                new GetPropertyAction(&quot;java.io.tmpdir&quot;));
+    }
+
+    private static String defaultFile(String server) {
+        // service/host@REALM -&gt; service
+<span class="fc" id="L131">        int slash = server.indexOf('/');</span>
+<span class="pc bpc" id="L132" title="1 of 2 branches missed.">        if (slash == -1) {</span>
+            // A normal principal? say, dummy@REALM
+<span class="nc" id="L134">            slash = server.indexOf('@');</span>
+        }
+<span class="pc bpc" id="L136" title="1 of 2 branches missed.">        if (slash != -1) {</span>
+            // Should not happen, but be careful
+<span class="fc" id="L138">            server= server.substring(0, slash);</span>
+        }
+<span class="pc bpc" id="L140" title="1 of 2 branches missed.">        if (uid != -1) {</span>
+<span class="fc" id="L141">            server += &quot;_&quot; + uid;</span>
+        }
+<span class="fc" id="L143">        return server;</span>
+    }
+
+    private static Path getFileName(String source, String server) {
+        String path, file;
+<span class="fc bfc" id="L148" title="All 2 branches covered.">        if (source.equals(&quot;dfl&quot;)) {</span>
+<span class="fc" id="L149">            path = defaultPath();</span>
+<span class="fc" id="L150">            file = defaultFile(server);</span>
+<span class="pc bpc" id="L151" title="1 of 2 branches missed.">        } else if (source.startsWith(&quot;dfl:&quot;)) {</span>
+<span class="fc" id="L152">            source = source.substring(4);</span>
+<span class="fc" id="L153">            int pos = source.lastIndexOf('/');</span>
+<span class="fc" id="L154">            int pos1 = source.lastIndexOf('\\');</span>
+<span class="pc bpc" id="L155" title="1 of 2 branches missed.">            if (pos1 &gt; pos) pos = pos1;</span>
+<span class="pc bpc" id="L156" title="1 of 2 branches missed.">            if (pos == -1) {</span>
+                // Only file name
+<span class="nc" id="L158">                path = defaultPath();</span>
+<span class="nc" id="L159">                file = source;</span>
+<span class="fc bfc" id="L160" title="All 2 branches covered.">            } else if (new File(source).isDirectory()) {</span>
+                // Only path
+<span class="fc" id="L162">                path = source;</span>
+<span class="fc" id="L163">                file = defaultFile(server);</span>
+            } else {
+                // Full pathname
+<span class="fc" id="L166">                path = null;</span>
+<span class="fc" id="L167">                file = source;</span>
+            }
+<span class="fc" id="L169">        } else {</span>
+<span class="nc" id="L170">            throw new IllegalArgumentException();</span>
+        }
+<span class="fc" id="L172">        return new File(path, file).toPath();</span>
+    }
+
+    @Override
+    public void checkAndStore(KerberosTime currTime, AuthTimeWithHash time)
+            throws KrbApErrException {
+        try {
+<span class="fc" id="L179">            checkAndStore0(currTime, time);</span>
+<span class="nc" id="L180">        } catch (IOException ioe) {</span>
+<span class="nc" id="L181">            KrbApErrException ke = new KrbApErrException(Krb5.KRB_ERR_GENERIC);</span>
+<span class="nc" id="L182">            ke.initCause(ioe);</span>
+<span class="nc" id="L183">            throw ke;</span>
+<span class="fc" id="L184">        }</span>
+<span class="fc" id="L185">    }</span>
+
+    private synchronized void checkAndStore0(KerberosTime currTime, AuthTimeWithHash time)
+            throws IOException, KrbApErrException {
+<span class="fc" id="L189">        Path p = getFileName(source, time.server);</span>
+<span class="fc" id="L190">        int missed = 0;</span>
+<span class="fc" id="L191">        try (Storage s = new Storage()) {</span>
+            try {
+<span class="fc" id="L193">                missed = s.loadAndCheck(p, time, currTime);</span>
+<span class="fc" id="L194">            } catch (IOException ioe) {</span>
+                // Non-existing or invalid file
+<span class="fc" id="L196">                Storage.create(p);</span>
+<span class="fc" id="L197">                missed = s.loadAndCheck(p, time, currTime);</span>
+<span class="fc" id="L198">            }</span>
+<span class="fc" id="L199">            s.append(time);</span>
+<span class="pc bpc" id="L200" title="4 of 8 branches missed.">        }</span>
+<span class="fc bfc" id="L201" title="All 2 branches covered.">        if (missed &gt; EXCESSREPS) {</span>
+<span class="fc" id="L202">            Storage.expunge(p, currTime);</span>
+        }
+<span class="fc" id="L204">    }</span>
+
+
+<span class="fc" id="L207">    private static class Storage implements Closeable {</span>
+        // Static methods
+        @SuppressWarnings(&quot;try&quot;)
+        private static void create(Path p) throws IOException {
+<span class="fc" id="L211">            try (SeekableByteChannel newChan = createNoClose(p)) {</span>
+                // Do nothing, wait for close
+<span class="pc bpc" id="L213" title="2 of 4 branches missed.">            }</span>
+<span class="fc" id="L214">            makeMine(p);</span>
+<span class="fc" id="L215">        }</span>
+
+        private static void makeMine(Path p) throws IOException {
+            // chmod to owner-rw only, otherwise MIT krb5 rejects
+            try {
+<span class="fc" id="L220">                Set&lt;PosixFilePermission&gt; attrs = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L221">                attrs.add(PosixFilePermission.OWNER_READ);</span>
+<span class="fc" id="L222">                attrs.add(PosixFilePermission.OWNER_WRITE);</span>
+<span class="fc" id="L223">                Files.setPosixFilePermissions(p, attrs);</span>
+<span class="nc" id="L224">            } catch (UnsupportedOperationException uoe) {</span>
+                // No POSIX permission. That's OK.
+<span class="fc" id="L226">            }</span>
+<span class="fc" id="L227">        }</span>
+
+        private static SeekableByteChannel createNoClose(Path p)
+                throws IOException {
+<span class="fc" id="L231">            SeekableByteChannel newChan = Files.newByteChannel(</span>
+                    p, StandardOpenOption.CREATE,
+                        StandardOpenOption.TRUNCATE_EXISTING,
+                        StandardOpenOption.WRITE);
+<span class="fc" id="L235">            ByteBuffer buffer = ByteBuffer.allocate(6);</span>
+<span class="fc" id="L236">            buffer.putShort((short)KRB5_RV_VNO);</span>
+<span class="fc" id="L237">            buffer.order(ByteOrder.nativeOrder());</span>
+<span class="fc" id="L238">            buffer.putInt(KerberosTime.getDefaultSkew());</span>
+<span class="fc" id="L239">            buffer.flip();</span>
+<span class="fc" id="L240">            newChan.write(buffer);</span>
+<span class="fc" id="L241">            return newChan;</span>
+        }
+
+        private static void expunge(Path p, KerberosTime currTime)
+                throws IOException {
+<span class="fc" id="L246">            Path p2 = Files.createTempFile(p.getParent(), &quot;rcache&quot;, null);</span>
+<span class="pc" id="L247">            try (SeekableByteChannel oldChan = Files.newByteChannel(p);</span>
+<span class="fc" id="L248">                    SeekableByteChannel newChan = createNoClose(p2)) {</span>
+<span class="fc" id="L249">                long timeLimit = currTime.getSeconds() - readHeader(oldChan);</span>
+                while (true) {
+                    try {
+<span class="fc" id="L252">                        AuthTime at = AuthTime.readFrom(oldChan);</span>
+<span class="fc bfc" id="L253" title="All 2 branches covered.">                        if (at.ctime &gt; timeLimit) {</span>
+<span class="fc" id="L254">                            ByteBuffer bb = ByteBuffer.wrap(at.encode(true));</span>
+<span class="fc" id="L255">                            newChan.write(bb);</span>
+                        }
+<span class="fc" id="L257">                    } catch (BufferUnderflowException e) {</span>
+<span class="fc" id="L258">                        break;</span>
+<span class="fc" id="L259">                    }</span>
+                }
+<span class="pc bpc" id="L261" title="12 of 16 branches missed.">            }</span>
+<span class="fc" id="L262">            makeMine(p2);</span>
+<span class="fc" id="L263">            Files.move(p2, p,</span>
+                    StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE);
+<span class="fc" id="L266">        }</span>
+
+        // Instance methods
+        SeekableByteChannel chan;
+        private int loadAndCheck(Path p, AuthTimeWithHash time,
+                KerberosTime currTime)
+                throws IOException, KrbApErrException {
+<span class="fc" id="L273">            int missed = 0;</span>
+<span class="pc bpc" id="L274" title="1 of 2 branches missed.">            if (Files.isSymbolicLink(p)) {</span>
+<span class="nc" id="L275">                throw new IOException(&quot;Symlink not accepted&quot;);</span>
+            }
+            try {
+<span class="fc" id="L278">                Set&lt;PosixFilePermission&gt; perms =</span>
+<span class="fc" id="L279">                        Files.getPosixFilePermissions(p);</span>
+<span class="pc bpc" id="L280" title="1 of 2 branches missed.">                if (uid != -1 &amp;&amp;</span>
+<span class="pc bpc" id="L281" title="1 of 2 branches missed.">                        (Integer)Files.getAttribute(p, &quot;unix:uid&quot;) != uid) {</span>
+<span class="nc" id="L282">                    throw new IOException(&quot;Not mine&quot;);</span>
+                }
+<span class="pc bpc" id="L284" title="1 of 2 branches missed.">                if (perms.contains(PosixFilePermission.GROUP_READ) ||</span>
+<span class="pc bpc" id="L285" title="1 of 2 branches missed.">                        perms.contains(PosixFilePermission.GROUP_WRITE) ||</span>
+<span class="pc bpc" id="L286" title="1 of 2 branches missed.">                        perms.contains(PosixFilePermission.GROUP_EXECUTE) ||</span>
+<span class="pc bpc" id="L287" title="1 of 2 branches missed.">                        perms.contains(PosixFilePermission.OTHERS_READ) ||</span>
+<span class="pc bpc" id="L288" title="1 of 2 branches missed.">                        perms.contains(PosixFilePermission.OTHERS_WRITE) ||</span>
+<span class="pc bpc" id="L289" title="1 of 2 branches missed.">                        perms.contains(PosixFilePermission.OTHERS_EXECUTE)) {</span>
+<span class="nc" id="L290">                    throw new IOException(&quot;Accessible by someone else&quot;);</span>
+                }
+<span class="nc" id="L292">            } catch (UnsupportedOperationException uoe) {</span>
+                // No POSIX permissions? Ignore it.
+<span class="fc" id="L294">            }</span>
+<span class="fc" id="L295">            chan = Files.newByteChannel(p, StandardOpenOption.WRITE,</span>
+                    StandardOpenOption.READ);
+
+<span class="fc" id="L298">            long timeLimit = currTime.getSeconds() - readHeader(chan);</span>
+
+<span class="fc" id="L300">            long pos = 0;</span>
+<span class="fc" id="L301">            boolean seeNewButNotSame = false;</span>
+            while (true) {
+                try {
+<span class="fc" id="L304">                    pos = chan.position();</span>
+<span class="fc" id="L305">                    AuthTime a = AuthTime.readFrom(chan);</span>
+<span class="fc bfc" id="L306" title="All 2 branches covered.">                    if (a instanceof AuthTimeWithHash) {</span>
+<span class="fc bfc" id="L307" title="All 2 branches covered.">                        if (time.equals(a)) {</span>
+                            // Exact match, must be a replay
+<span class="fc" id="L309">                            throw new KrbApErrException(Krb5.KRB_AP_ERR_REPEAT);</span>
+<span class="fc bfc" id="L310" title="All 2 branches covered.">                        } else if (time.isSameIgnoresHash(a)) {</span>
+                            // Two different authenticators in the same second.
+                            // Remember it
+<span class="fc" id="L313">                            seeNewButNotSame = true;</span>
+                        }
+                    } else {
+<span class="fc bfc" id="L316" title="All 2 branches covered.">                        if (time.isSameIgnoresHash(a)) {</span>
+                            // Two authenticators in the same second. Considered
+                            // same if we haven't seen a new style version of it
+<span class="fc bfc" id="L319" title="All 2 branches covered.">                            if (!seeNewButNotSame) {</span>
+<span class="fc" id="L320">                                throw new KrbApErrException(Krb5.KRB_AP_ERR_REPEAT);</span>
+                            }
+                        }
+                    }
+<span class="fc bfc" id="L324" title="All 2 branches covered.">                    if (a.ctime &lt; timeLimit) {</span>
+<span class="fc" id="L325">                        missed++;</span>
+                    } else {
+<span class="fc" id="L327">                        missed--;</span>
+                    }
+<span class="fc" id="L329">                } catch (BufferUnderflowException e) {</span>
+                    // Half-written file?
+<span class="fc" id="L331">                    chan.position(pos);</span>
+<span class="fc" id="L332">                    break;</span>
+<span class="fc" id="L333">                }</span>
+            }
+<span class="fc" id="L335">            return missed;</span>
+        }
+
+        private static int readHeader(SeekableByteChannel chan)
+                throws IOException {
+<span class="fc" id="L340">            ByteBuffer bb = ByteBuffer.allocate(6);</span>
+<span class="fc" id="L341">            chan.read(bb);</span>
+<span class="pc bpc" id="L342" title="1 of 2 branches missed.">            if (bb.getShort(0) != KRB5_RV_VNO) {</span>
+<span class="nc" id="L343">                throw new IOException(&quot;Not correct rcache version&quot;);</span>
+            }
+<span class="fc" id="L345">            bb.order(ByteOrder.nativeOrder());</span>
+<span class="fc" id="L346">            return bb.getInt(2);</span>
+        }
+
+        private void append(AuthTimeWithHash at) throws IOException {
+            // Write an entry with hash, to be followed by one without it,
+            // for the benefit of old implementations.
+            ByteBuffer bb;
+<span class="fc" id="L353">            bb = ByteBuffer.wrap(at.encode(true));</span>
+<span class="fc" id="L354">            chan.write(bb);</span>
+<span class="fc" id="L355">            bb = ByteBuffer.wrap(at.encode(false));</span>
+<span class="fc" id="L356">            chan.write(bb);</span>
+<span class="fc" id="L357">        }</span>
+
+        @Override
+        public void close() throws IOException {
+<span class="pc bpc" id="L361" title="1 of 2 branches missed.">            if (chan != null) chan.close();</span>
+<span class="fc" id="L362">            chan = null;</span>
+<span class="fc" id="L363">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

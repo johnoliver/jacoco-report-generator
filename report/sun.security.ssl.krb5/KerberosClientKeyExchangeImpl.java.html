@@ -1,0 +1,464 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>KerberosClientKeyExchangeImpl.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.ssl.krb5</a> &gt; <span class="el_source">KerberosClientKeyExchangeImpl.java</span></div><h1>KerberosClientKeyExchangeImpl.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2003, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.security.ssl.krb5;
+
+import java.io.IOException;
+import java.io.PrintStream;
+import java.security.AccessController;
+import java.security.AccessControlContext;
+import java.security.PrivilegedExceptionAction;
+import java.security.PrivilegedActionException;
+import java.security.SecureRandom;
+import java.net.InetAddress;
+import java.security.PrivilegedAction;
+
+import javax.security.auth.kerberos.KerberosTicket;
+import javax.security.auth.kerberos.KerberosKey;
+import javax.security.auth.kerberos.KerberosPrincipal;
+import javax.security.auth.kerberos.ServicePermission;
+import sun.security.jgss.GSSCaller;
+
+import sun.security.krb5.EncryptionKey;
+import sun.security.krb5.EncryptedData;
+import sun.security.krb5.PrincipalName;
+import sun.security.krb5.internal.Ticket;
+import sun.security.krb5.internal.EncTicketPart;
+import sun.security.krb5.internal.crypto.KeyUsage;
+
+import sun.security.jgss.krb5.Krb5Util;
+import sun.security.jgss.krb5.ServiceCreds;
+import sun.security.krb5.KrbException;
+import sun.security.krb5.internal.Krb5;
+
+import sun.security.ssl.Debug;
+import sun.security.ssl.HandshakeInStream;
+import sun.security.ssl.HandshakeOutStream;
+import sun.security.ssl.Krb5Helper;
+import sun.security.ssl.ProtocolVersion;
+
+/**
+ * This is Kerberos option in the client key exchange message
+ * (CLIENT -&gt; SERVER). It holds the Kerberos ticket and the encrypted
+ * premaster secret encrypted with the session key sealed in the ticket.
+ * From RFC 2712:
+ *  struct
+ *  {
+ *    opaque Ticket;
+ *    opaque authenticator;            // optional
+ *    opaque EncryptedPreMasterSecret; // encrypted with the session key
+ *                                     // which is sealed in the ticket
+ *  } KerberosWrapper;
+ *
+ *
+ * Ticket and authenticator are encrypted as per RFC 1510 (in ASN.1)
+ * Encrypted pre-master secret has the same structure as it does for RSA
+ * except for Kerberos, the encryption key is the session key instead of
+ * the RSA public key.
+ *
+ * XXX authenticator currently ignored
+ *
+ */
+public final class KerberosClientKeyExchangeImpl
+    extends sun.security.ssl.KerberosClientKeyExchange {
+
+    private KerberosPreMasterSecret preMaster;
+    private byte[] encodedTicket;
+    private KerberosPrincipal peerPrincipal;
+    private KerberosPrincipal localPrincipal;
+
+<span class="nc" id="L92">    public KerberosClientKeyExchangeImpl() {</span>
+<span class="nc" id="L93">    }</span>
+
+    /**
+     * Creates an instance of KerberosClientKeyExchange consisting of the
+     * Kerberos service ticket, authenticator and encrypted premaster secret.
+     * Called by client handshaker.
+     *
+     * @param serverName name of server with which to do handshake;
+     *             this is used to get the Kerberos service ticket
+     * @param protocolVersion Maximum version supported by client (i.e,
+     *          version it requested in client hello)
+     * @param rand random number generator to use for generating pre-master
+     *          secret
+     */
+    @Override
+    public void init(String serverName,
+        AccessControlContext acc, ProtocolVersion protocolVersion,
+        SecureRandom rand) throws IOException {
+
+         // Get service ticket
+<span class="nc" id="L113">         KerberosTicket ticket = getServiceTicket(serverName, acc);</span>
+<span class="nc" id="L114">         encodedTicket = ticket.getEncoded();</span>
+
+         // Record the Kerberos principals
+<span class="nc" id="L117">         peerPrincipal = ticket.getServer();</span>
+<span class="nc" id="L118">         localPrincipal = ticket.getClient();</span>
+
+         // Optional authenticator, encrypted using session key,
+         // currently ignored
+
+         // Generate premaster secret and encrypt it using session key
+<span class="nc" id="L124">         EncryptionKey sessionKey = new EncryptionKey(</span>
+<span class="nc" id="L125">                                        ticket.getSessionKeyType(),</span>
+<span class="nc" id="L126">                                        ticket.getSessionKey().getEncoded());</span>
+
+<span class="nc" id="L128">         preMaster = new KerberosPreMasterSecret(protocolVersion,</span>
+             rand, sessionKey);
+<span class="nc" id="L130">    }</span>
+
+    /**
+     * Creates an instance of KerberosClientKeyExchange from its ASN.1 encoding.
+     * Used by ServerHandshaker to verify and obtain premaster secret.
+     *
+     * @param protocolVersion current protocol version
+     * @param clientVersion version requested by client in its ClientHello;
+     *          used by premaster secret version check
+     * @param rand random number generator used for generating random
+     *          premaster secret if ticket and/or premaster verification fails
+     * @param input inputstream from which to get ASN.1-encoded KerberosWrapper
+     * @param acc the AccessControlContext of the handshaker
+     * @param serviceCreds server's creds
+     */
+    @Override
+    public void init(ProtocolVersion protocolVersion,
+        ProtocolVersion clientVersion,
+        SecureRandom rand, HandshakeInStream input, AccessControlContext acc, Object serviceCreds)
+        throws IOException {
+
+        // Read ticket
+<span class="nc" id="L152">        encodedTicket = input.getBytes16();</span>
+
+<span class="nc bnc" id="L154" title="All 4 branches missed.">        if (debug != null &amp;&amp; Debug.isOn(&quot;verbose&quot;)) {</span>
+<span class="nc" id="L155">            Debug.println(System.out,</span>
+                &quot;encoded Kerberos service ticket&quot;, encodedTicket);
+        }
+
+<span class="nc" id="L159">        EncryptionKey sessionKey = null;</span>
+
+        try {
+<span class="nc" id="L162">            Ticket t = new Ticket(encodedTicket);</span>
+
+<span class="nc" id="L164">            EncryptedData encPart = t.encPart;</span>
+<span class="nc" id="L165">            PrincipalName ticketSname = t.sname;</span>
+
+<span class="nc" id="L167">            final ServiceCreds creds = (ServiceCreds)serviceCreds;</span>
+<span class="nc" id="L168">            final KerberosPrincipal princ =</span>
+<span class="nc" id="L169">                    new KerberosPrincipal(ticketSname.toString());</span>
+
+            // For bound service, permission already checked at setup
+<span class="nc bnc" id="L172" title="All 2 branches missed.">            if (creds.getName() == null) {</span>
+<span class="nc" id="L173">                SecurityManager sm = System.getSecurityManager();</span>
+                try {
+<span class="nc bnc" id="L175" title="All 2 branches missed.">                    if (sm != null) {</span>
+                        // Eliminate dependency on ServicePermission
+<span class="nc" id="L177">                        sm.checkPermission(Krb5Helper.getServicePermission(</span>
+<span class="nc" id="L178">                                ticketSname.toString(), &quot;accept&quot;), acc);</span>
+                    }
+<span class="nc" id="L180">                } catch (SecurityException se) {</span>
+<span class="nc" id="L181">                    serviceCreds = null;</span>
+                    // Do not destroy keys. Will affect Subject
+<span class="nc bnc" id="L183" title="All 4 branches missed.">                    if (debug != null &amp;&amp; Debug.isOn(&quot;handshake&quot;)) {</span>
+<span class="nc" id="L184">                        System.out.println(&quot;Permission to access Kerberos&quot;</span>
+                                + &quot; secret key denied&quot;);
+                    }
+<span class="nc" id="L187">                    throw new IOException(&quot;Kerberos service not allowedy&quot;);</span>
+<span class="nc" id="L188">                }</span>
+            }
+<span class="nc" id="L190">            KerberosKey[] serverKeys = AccessController.doPrivileged(</span>
+<span class="nc" id="L191">                    new PrivilegedAction&lt;KerberosKey[]&gt;() {</span>
+                        @Override
+                        public KerberosKey[] run() {
+<span class="nc" id="L194">                            return creds.getKKeys(princ);</span>
+                        }
+                    });
+<span class="nc bnc" id="L197" title="All 2 branches missed.">            if (serverKeys.length == 0) {</span>
+<span class="nc" id="L198">                throw new IOException(&quot;Found no key for &quot; + princ +</span>
+<span class="nc bnc" id="L199" title="All 2 branches missed.">                        (creds.getName() == null ? &quot;&quot; :</span>
+<span class="nc" id="L200">                        (&quot;, this keytab is for &quot; + creds.getName() + &quot; only&quot;)));</span>
+            }
+
+            /*
+             * permission to access and use the secret key of the Kerberized
+             * &quot;host&quot; service is done in ServerHandshaker.getKerberosKeys()
+             * to ensure server has the permission to use the secret key
+             * before promising the client
+             */
+
+            // See if we have the right key to decrypt the ticket to get
+            // the session key.
+<span class="nc" id="L212">            int encPartKeyType = encPart.getEType();</span>
+<span class="nc" id="L213">            Integer encPartKeyVersion = encPart.getKeyVersionNumber();</span>
+<span class="nc" id="L214">            KerberosKey dkey = null;</span>
+            try {
+<span class="nc" id="L216">                dkey = findKey(encPartKeyType, encPartKeyVersion, serverKeys);</span>
+<span class="nc" id="L217">            } catch (KrbException ke) { // a kvno mismatch</span>
+<span class="nc" id="L218">                throw new IOException(</span>
+                        &quot;Cannot find key matching version number&quot;, ke);
+<span class="nc" id="L220">            }</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">            if (dkey == null) {</span>
+                // %%% Should print string repr of etype
+<span class="nc" id="L223">                throw new IOException(&quot;Cannot find key of appropriate type&quot; +</span>
+                        &quot; to decrypt ticket - need etype &quot; + encPartKeyType);
+            }
+
+<span class="nc" id="L227">            EncryptionKey secretKey = new EncryptionKey(</span>
+                encPartKeyType,
+<span class="nc" id="L229">                dkey.getEncoded());</span>
+
+            // Decrypt encPart using server's secret key
+<span class="nc" id="L232">            byte[] bytes = encPart.decrypt(secretKey, KeyUsage.KU_TICKET);</span>
+
+            // Reset data stream after decryption, remove redundant bytes
+<span class="nc" id="L235">            byte[] temp = encPart.reset(bytes);</span>
+<span class="nc" id="L236">            EncTicketPart encTicketPart = new EncTicketPart(temp);</span>
+
+            // Record the Kerberos Principals
+<span class="nc" id="L239">            peerPrincipal =</span>
+<span class="nc" id="L240">                new KerberosPrincipal(encTicketPart.cname.getName());</span>
+<span class="nc" id="L241">            localPrincipal = new KerberosPrincipal(ticketSname.getName());</span>
+
+<span class="nc" id="L243">            sessionKey = encTicketPart.key;</span>
+
+<span class="nc bnc" id="L245" title="All 4 branches missed.">            if (debug != null &amp;&amp; Debug.isOn(&quot;handshake&quot;)) {</span>
+<span class="nc" id="L246">                System.out.println(&quot;server principal: &quot; + ticketSname);</span>
+<span class="nc" id="L247">                System.out.println(&quot;cname: &quot; + encTicketPart.cname.toString());</span>
+            }
+<span class="nc" id="L249">        } catch (IOException e) {</span>
+<span class="nc" id="L250">            throw e;</span>
+<span class="nc" id="L251">        } catch (Exception e) {</span>
+<span class="nc bnc" id="L252" title="All 4 branches missed.">            if (debug != null &amp;&amp; Debug.isOn(&quot;handshake&quot;)) {</span>
+<span class="nc" id="L253">                System.out.println(&quot;KerberosWrapper error getting session key,&quot;</span>
+<span class="nc" id="L254">                        + &quot; generating random secret (&quot; + e.getMessage() + &quot;)&quot;);</span>
+            }
+<span class="nc" id="L256">            sessionKey = null;</span>
+<span class="nc" id="L257">        }</span>
+
+<span class="nc" id="L259">        input.getBytes16();   // XXX Read and ignore authenticator</span>
+
+<span class="nc bnc" id="L261" title="All 2 branches missed.">        if (sessionKey != null) {</span>
+<span class="nc" id="L262">            preMaster = new KerberosPreMasterSecret(protocolVersion,</span>
+                clientVersion, rand, input, sessionKey);
+        } else {
+            // Generate bogus premaster secret
+<span class="nc" id="L266">            preMaster = new KerberosPreMasterSecret(clientVersion, rand);</span>
+        }
+<span class="nc" id="L268">    }</span>
+
+    @Override
+    public int messageLength() {
+<span class="nc" id="L272">        return (6 + encodedTicket.length + preMaster.getEncrypted().length);</span>
+    }
+
+    @Override
+    public void send(HandshakeOutStream s) throws IOException {
+<span class="nc" id="L277">        s.putBytes16(encodedTicket);</span>
+<span class="nc" id="L278">        s.putBytes16(null); // XXX no authenticator</span>
+<span class="nc" id="L279">        s.putBytes16(preMaster.getEncrypted());</span>
+<span class="nc" id="L280">    }</span>
+
+    @Override
+    public void print(PrintStream s) throws IOException {
+<span class="nc" id="L284">        s.println(&quot;*** ClientKeyExchange, Kerberos&quot;);</span>
+
+<span class="nc bnc" id="L286" title="All 4 branches missed.">        if (debug != null &amp;&amp; Debug.isOn(&quot;verbose&quot;)) {</span>
+<span class="nc" id="L287">            Debug.println(s, &quot;Kerberos service ticket&quot;, encodedTicket);</span>
+<span class="nc" id="L288">            Debug.println(s, &quot;Random Secret&quot;, preMaster.getUnencrypted());</span>
+<span class="nc" id="L289">            Debug.println(s, &quot;Encrypted random Secret&quot;,</span>
+<span class="nc" id="L290">                preMaster.getEncrypted());</span>
+        }
+<span class="nc" id="L292">    }</span>
+
+    // Similar to sun.security.jgss.krb5.Krb5InitCredenetial/Krb5Context
+    private static KerberosTicket getServiceTicket(String serverName,
+        final AccessControlContext acc) throws IOException {
+
+<span class="nc bnc" id="L298" title="All 2 branches missed.">        if (&quot;localhost&quot;.equals(serverName) ||</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">                &quot;localhost.localdomain&quot;.equals(serverName)) {</span>
+
+<span class="nc bnc" id="L301" title="All 4 branches missed.">            if (debug != null &amp;&amp; Debug.isOn(&quot;handshake&quot;)) {</span>
+<span class="nc" id="L302">                System.out.println(&quot;Get the local hostname&quot;);</span>
+            }
+<span class="nc" id="L304">            String localHost = java.security.AccessController.doPrivileged(</span>
+<span class="nc" id="L305">                new java.security.PrivilegedAction&lt;String&gt;() {</span>
+                public String run() {
+                    try {
+<span class="nc" id="L308">                        return InetAddress.getLocalHost().getHostName();</span>
+<span class="nc" id="L309">                    } catch (java.net.UnknownHostException e) {</span>
+<span class="nc bnc" id="L310" title="All 4 branches missed.">                        if (debug != null &amp;&amp; Debug.isOn(&quot;handshake&quot;)) {</span>
+<span class="nc" id="L311">                            System.out.println(&quot;Warning,&quot;</span>
+                                + &quot; cannot get the local hostname: &quot;
+<span class="nc" id="L313">                                + e.getMessage());</span>
+                        }
+<span class="nc" id="L315">                        return null;</span>
+                    }
+                }
+            });
+<span class="nc bnc" id="L319" title="All 2 branches missed.">            if (localHost != null) {</span>
+<span class="nc" id="L320">                serverName = localHost;</span>
+            }
+        }
+
+        // Resolve serverName (possibly in IP addr form) to Kerberos principal
+        // name for service with hostname
+<span class="nc" id="L326">        String serviceName = &quot;host/&quot; + serverName;</span>
+        PrincipalName principal;
+        try {
+<span class="nc" id="L329">            principal = new PrincipalName(serviceName,</span>
+                                PrincipalName.KRB_NT_SRV_HST);
+<span class="nc" id="L331">        } catch (SecurityException se) {</span>
+<span class="nc" id="L332">            throw se;</span>
+<span class="nc" id="L333">        } catch (Exception e) {</span>
+<span class="nc" id="L334">            IOException ioe = new IOException(&quot;Invalid service principal&quot; +</span>
+                                &quot; name: &quot; + serviceName);
+<span class="nc" id="L336">            ioe.initCause(e);</span>
+<span class="nc" id="L337">            throw ioe;</span>
+<span class="nc" id="L338">        }</span>
+<span class="nc" id="L339">        String realm = principal.getRealmAsString();</span>
+
+<span class="nc" id="L341">        final String serverPrincipal = principal.toString();</span>
+<span class="nc" id="L342">        final String tgsPrincipal = &quot;krbtgt/&quot; + realm + &quot;@&quot; + realm;</span>
+<span class="nc" id="L343">        final String clientPrincipal = null;  // use default</span>
+
+
+        // check permission to obtain a service ticket to initiate a
+        // context with the &quot;host&quot; service
+<span class="nc" id="L348">        SecurityManager sm = System.getSecurityManager();</span>
+<span class="nc bnc" id="L349" title="All 2 branches missed.">        if (sm != null) {</span>
+<span class="nc" id="L350">           sm.checkPermission(new ServicePermission(serverPrincipal,</span>
+                                &quot;initiate&quot;), acc);
+        }
+
+        try {
+<span class="nc" id="L355">            KerberosTicket ticket = AccessController.doPrivileged(</span>
+<span class="nc" id="L356">                new PrivilegedExceptionAction&lt;KerberosTicket&gt;() {</span>
+                public KerberosTicket run() throws Exception {
+<span class="nc" id="L358">                    return Krb5Util.getTicketFromSubjectAndTgs(</span>
+                        GSSCaller.CALLER_SSL_CLIENT,
+                        clientPrincipal, serverPrincipal,
+                        tgsPrincipal, acc);
+                        }});
+
+<span class="nc bnc" id="L364" title="All 2 branches missed.">            if (ticket == null) {</span>
+<span class="nc" id="L365">                throw new IOException(&quot;Failed to find any kerberos service&quot; +</span>
+                        &quot; ticket for &quot; + serverPrincipal);
+            }
+<span class="nc" id="L368">            return ticket;</span>
+<span class="nc" id="L369">        } catch (PrivilegedActionException e) {</span>
+<span class="nc" id="L370">            IOException ioe = new IOException(</span>
+                &quot;Attempt to obtain kerberos service ticket for &quot; +
+                        serverPrincipal + &quot; failed!&quot;);
+<span class="nc" id="L373">            ioe.initCause(e);</span>
+<span class="nc" id="L374">            throw ioe;</span>
+        }
+    }
+
+    @Override
+    public byte[] getUnencryptedPreMasterSecret() {
+<span class="nc" id="L380">        return preMaster.getUnencrypted();</span>
+    }
+
+    @Override
+    public KerberosPrincipal getPeerPrincipal() {
+<span class="nc" id="L385">        return peerPrincipal;</span>
+    }
+
+    @Override
+    public KerberosPrincipal getLocalPrincipal() {
+<span class="nc" id="L390">        return localPrincipal;</span>
+    }
+
+    /**
+     * Determines if a kvno matches another kvno. Used in the method
+     * findKey(etype, version, keys). Always returns true if either input
+     * is null or zero, in case any side does not have kvno info available.
+     *
+     * Note: zero is included because N/A is not a legal value for kvno
+     * in javax.security.auth.kerberos.KerberosKey. Therefore, the info
+     * that the kvno is N/A might be lost when converting between
+     * EncryptionKey and KerberosKey.
+     */
+    private static boolean versionMatches(Integer v1, int v2) {
+<span class="nc bnc" id="L404" title="All 6 branches missed.">        if (v1 == null || v1 == 0 || v2 == 0) {</span>
+<span class="nc" id="L405">            return true;</span>
+        }
+<span class="nc" id="L407">        return v1.equals(v2);</span>
+    }
+
+    private static KerberosKey findKey(int etype, Integer version,
+            KerberosKey[] keys) throws KrbException {
+        int ktype;
+<span class="nc" id="L413">        boolean etypeFound = false;</span>
+
+        // When no matched kvno is found, returns tke key of the same
+        // etype with the highest kvno
+<span class="nc" id="L417">        int kvno_found = 0;</span>
+<span class="nc" id="L418">        KerberosKey key_found = null;</span>
+
+<span class="nc bnc" id="L420" title="All 2 branches missed.">        for (int i = 0; i &lt; keys.length; i++) {</span>
+<span class="nc" id="L421">            ktype = keys[i].getKeyType();</span>
+<span class="nc bnc" id="L422" title="All 2 branches missed.">            if (etype == ktype) {</span>
+<span class="nc" id="L423">                int kv = keys[i].getVersionNumber();</span>
+<span class="nc" id="L424">                etypeFound = true;</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">                if (versionMatches(version, kv)) {</span>
+<span class="nc" id="L426">                    return keys[i];</span>
+<span class="nc bnc" id="L427" title="All 2 branches missed.">                } else if (kv &gt; kvno_found) {</span>
+<span class="nc" id="L428">                    key_found = keys[i];</span>
+<span class="nc" id="L429">                    kvno_found = kv;</span>
+                }
+            }
+        }
+        // Key not found.
+        // %%% kludge to allow DES keys to be used for diff etypes
+<span class="nc bnc" id="L435" title="All 4 branches missed.">        if ((etype == EncryptedData.ETYPE_DES_CBC_CRC ||</span>
+            etype == EncryptedData.ETYPE_DES_CBC_MD5)) {
+<span class="nc bnc" id="L437" title="All 2 branches missed.">            for (int i = 0; i &lt; keys.length; i++) {</span>
+<span class="nc" id="L438">                ktype = keys[i].getKeyType();</span>
+<span class="nc bnc" id="L439" title="All 4 branches missed.">                if (ktype == EncryptedData.ETYPE_DES_CBC_CRC ||</span>
+                        ktype == EncryptedData.ETYPE_DES_CBC_MD5) {
+<span class="nc" id="L441">                    int kv = keys[i].getVersionNumber();</span>
+<span class="nc" id="L442">                    etypeFound = true;</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">                    if (versionMatches(version, kv)) {</span>
+<span class="nc" id="L444">                        return new KerberosKey(keys[i].getPrincipal(),</span>
+<span class="nc" id="L445">                            keys[i].getEncoded(),</span>
+                            etype,
+                            kv);
+<span class="nc bnc" id="L448" title="All 2 branches missed.">                    } else if (kv &gt; kvno_found) {</span>
+<span class="nc" id="L449">                        key_found = new KerberosKey(keys[i].getPrincipal(),</span>
+<span class="nc" id="L450">                                keys[i].getEncoded(),</span>
+                                etype,
+                                kv);
+<span class="nc" id="L453">                        kvno_found = kv;</span>
+                    }
+                }
+            }
+        }
+<span class="nc bnc" id="L458" title="All 2 branches missed.">        if (etypeFound) {</span>
+<span class="nc" id="L459">            return key_found;</span>
+        }
+<span class="nc" id="L461">        return null;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

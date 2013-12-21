@@ -1,0 +1,380 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>WeakCache.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">java.lang.reflect</a> &gt; <span class="el_source">WeakCache.java</span></div><h1>WeakCache.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package java.lang.reflect;
+
+import java.lang.ref.ReferenceQueue;
+import java.lang.ref.WeakReference;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.function.BiFunction;
+import java.util.function.Supplier;
+
+/**
+ * Cache mapping pairs of {@code (key, sub-key) -&gt; value}. Keys and values are
+ * weakly but sub-keys are strongly referenced.  Keys are passed directly to
+ * {@link #get} method which also takes a {@code parameter}. Sub-keys are
+ * calculated from keys and parameters using the {@code subKeyFactory} function
+ * passed to the constructor. Values are calculated from keys and parameters
+ * using the {@code valueFactory} function passed to the constructor.
+ * Keys can be {@code null} and are compared by identity while sub-keys returned by
+ * {@code subKeyFactory} or values returned by {@code valueFactory}
+ * can not be null. Sub-keys are compared using their {@link #equals} method.
+ * Entries are expunged from cache lazily on each invocation to {@link #get},
+ * {@link #containsValue} or {@link #size} methods when the WeakReferences to
+ * keys are cleared. Cleared WeakReferences to individual values don't cause
+ * expunging, but such entries are logically treated as non-existent and
+ * trigger re-evaluation of {@code valueFactory} on request for their
+ * key/subKey.
+ *
+ * @author Peter Levart
+ * @param &lt;K&gt; type of keys
+ * @param &lt;P&gt; type of parameters
+ * @param &lt;V&gt; type of values
+ */
+final class WeakCache&lt;K, P, V&gt; {
+
+<span class="fc" id="L59">    private final ReferenceQueue&lt;K&gt; refQueue</span>
+        = new ReferenceQueue&lt;&gt;();
+    // the key type is Object for supporting null key
+<span class="fc" id="L62">    private final ConcurrentMap&lt;Object, ConcurrentMap&lt;Object, Supplier&lt;V&gt;&gt;&gt; map</span>
+        = new ConcurrentHashMap&lt;&gt;();
+<span class="fc" id="L64">    private final ConcurrentMap&lt;Supplier&lt;V&gt;, Boolean&gt; reverseMap</span>
+        = new ConcurrentHashMap&lt;&gt;();
+    private final BiFunction&lt;K, P, ?&gt; subKeyFactory;
+    private final BiFunction&lt;K, P, V&gt; valueFactory;
+
+    /**
+     * Construct an instance of {@code WeakCache}
+     *
+     * @param subKeyFactory a function mapping a pair of
+     *                      {@code (key, parameter) -&gt; sub-key}
+     * @param valueFactory  a function mapping a pair of
+     *                      {@code (key, parameter) -&gt; value}
+     * @throws NullPointerException if {@code subKeyFactory} or
+     *                              {@code valueFactory} is null.
+     */
+    public WeakCache(BiFunction&lt;K, P, ?&gt; subKeyFactory,
+<span class="fc" id="L80">                     BiFunction&lt;K, P, V&gt; valueFactory) {</span>
+<span class="fc" id="L81">        this.subKeyFactory = Objects.requireNonNull(subKeyFactory);</span>
+<span class="fc" id="L82">        this.valueFactory = Objects.requireNonNull(valueFactory);</span>
+<span class="fc" id="L83">    }</span>
+
+    /**
+     * Look-up the value through the cache. This always evaluates the
+     * {@code subKeyFactory} function and optionally evaluates
+     * {@code valueFactory} function if there is no entry in the cache for given
+     * pair of (key, subKey) or the entry has already been cleared.
+     *
+     * @param key       possibly null key
+     * @param parameter parameter used together with key to create sub-key and
+     *                  value (should not be null)
+     * @return the cached value (never null)
+     * @throws NullPointerException if {@code parameter} passed in or
+     *                              {@code sub-key} calculated by
+     *                              {@code subKeyFactory} or {@code value}
+     *                              calculated by {@code valueFactory} is null.
+     */
+    public V get(K key, P parameter) {
+<span class="fc" id="L101">        Objects.requireNonNull(parameter);</span>
+
+<span class="fc" id="L103">        expungeStaleEntries();</span>
+
+<span class="fc" id="L105">        Object cacheKey = CacheKey.valueOf(key, refQueue);</span>
+
+        // lazily install the 2nd level valuesMap for the particular cacheKey
+<span class="fc" id="L108">        ConcurrentMap&lt;Object, Supplier&lt;V&gt;&gt; valuesMap = map.get(cacheKey);</span>
+<span class="fc bfc" id="L109" title="All 2 branches covered.">        if (valuesMap == null) {</span>
+<span class="fc" id="L110">            ConcurrentMap&lt;Object, Supplier&lt;V&gt;&gt; oldValuesMap</span>
+<span class="fc" id="L111">                = map.putIfAbsent(cacheKey,</span>
+                                  valuesMap = new ConcurrentHashMap&lt;&gt;());
+<span class="pc bpc" id="L113" title="1 of 2 branches missed.">            if (oldValuesMap != null) {</span>
+<span class="nc" id="L114">                valuesMap = oldValuesMap;</span>
+            }
+        }
+
+        // create subKey and retrieve the possible Supplier&lt;V&gt; stored by that
+        // subKey from valuesMap
+<span class="fc" id="L120">        Object subKey = Objects.requireNonNull(subKeyFactory.apply(key, parameter));</span>
+<span class="fc" id="L121">        Supplier&lt;V&gt; supplier = valuesMap.get(subKey);</span>
+<span class="fc" id="L122">        Factory factory = null;</span>
+
+        while (true) {
+<span class="fc bfc" id="L125" title="All 2 branches covered.">            if (supplier != null) {</span>
+                // supplier might be a Factory or a CacheValue&lt;V&gt; instance
+<span class="fc" id="L127">                V value = supplier.get();</span>
+<span class="fc bfc" id="L128" title="All 2 branches covered.">                if (value != null) {</span>
+<span class="fc" id="L129">                    return value;</span>
+                }
+            }
+            // else no supplier in cache
+            // or a supplier that returned null (could be a cleared CacheValue
+            // or a Factory that wasn't successful in installing the CacheValue)
+
+            // lazily construct a Factory
+<span class="pc bpc" id="L137" title="1 of 2 branches missed.">            if (factory == null) {</span>
+<span class="fc" id="L138">                factory = new Factory(key, parameter, subKey, valuesMap);</span>
+            }
+
+<span class="fc bfc" id="L141" title="All 2 branches covered.">            if (supplier == null) {</span>
+<span class="fc" id="L142">                supplier = valuesMap.putIfAbsent(subKey, factory);</span>
+<span class="pc bpc" id="L143" title="1 of 2 branches missed.">                if (supplier == null) {</span>
+                    // successfully installed Factory
+<span class="fc" id="L145">                    supplier = factory;</span>
+                }
+                // else retry with winning supplier
+            } else {
+<span class="pc bpc" id="L149" title="1 of 2 branches missed.">                if (valuesMap.replace(subKey, supplier, factory)) {</span>
+                    // successfully replaced
+                    // cleared CacheEntry / unsuccessful Factory
+                    // with our Factory
+<span class="nc" id="L153">                    supplier = factory;</span>
+                } else {
+                    // retry with current supplier
+<span class="fc" id="L156">                    supplier = valuesMap.get(subKey);</span>
+                }
+            }
+        }
+    }
+
+    /**
+     * Checks whether the specified non-null value is already present in this
+     * {@code WeakCache}. The check is made using identity comparison regardless
+     * of whether value's class overrides {@link Object#equals} or not.
+     *
+     * @param value the non-null value to check
+     * @return true if given {@code value} is already cached
+     * @throws NullPointerException if value is null
+     */
+    public boolean containsValue(V value) {
+<span class="fc" id="L172">        Objects.requireNonNull(value);</span>
+
+<span class="fc" id="L174">        expungeStaleEntries();</span>
+<span class="fc" id="L175">        return reverseMap.containsKey(new LookupValue&lt;&gt;(value));</span>
+    }
+
+    /**
+     * Returns the current number of cached entries that
+     * can decrease over time when keys/values are GC-ed.
+     */
+    public int size() {
+<span class="nc" id="L183">        expungeStaleEntries();</span>
+<span class="nc" id="L184">        return reverseMap.size();</span>
+    }
+
+    private void expungeStaleEntries() {
+        CacheKey&lt;K&gt; cacheKey;
+<span class="fc bfc" id="L189" title="All 2 branches covered.">        while ((cacheKey = (CacheKey&lt;K&gt;)refQueue.poll()) != null) {</span>
+<span class="fc" id="L190">            cacheKey.expungeFrom(map, reverseMap);</span>
+        }
+<span class="fc" id="L192">    }</span>
+
+    /**
+     * A factory {@link Supplier} that implements the lazy synchronized
+     * construction of the value and installment of it into the cache.
+     */
+<span class="fc bfc" id="L198" title="All 2 branches covered.">    private final class Factory implements Supplier&lt;V&gt; {</span>
+
+        private final K key;
+        private final P parameter;
+        private final Object subKey;
+        private final ConcurrentMap&lt;Object, Supplier&lt;V&gt;&gt; valuesMap;
+
+        Factory(K key, P parameter, Object subKey,
+<span class="fc" id="L206">                ConcurrentMap&lt;Object, Supplier&lt;V&gt;&gt; valuesMap) {</span>
+<span class="fc" id="L207">            this.key = key;</span>
+<span class="fc" id="L208">            this.parameter = parameter;</span>
+<span class="fc" id="L209">            this.subKey = subKey;</span>
+<span class="fc" id="L210">            this.valuesMap = valuesMap;</span>
+<span class="fc" id="L211">        }</span>
+
+        @Override
+        public synchronized V get() { // serialize access
+            // re-check
+<span class="fc" id="L216">            Supplier&lt;V&gt; supplier = valuesMap.get(subKey);</span>
+<span class="fc bfc" id="L217" title="All 2 branches covered.">            if (supplier != this) {</span>
+                // something changed while we were waiting:
+                // might be that we were replaced by a CacheValue
+                // or were removed because of failure -&gt;
+                // return null to signal WeakCache.get() to retry
+                // the loop
+<span class="fc" id="L223">                return null;</span>
+            }
+            // else still us (supplier == this)
+
+            // create new value
+<span class="fc" id="L228">            V value = null;</span>
+            try {
+<span class="fc" id="L230">                value = Objects.requireNonNull(valueFactory.apply(key, parameter));</span>
+            } finally {
+<span class="pc bpc" id="L232" title="3 of 4 branches missed.">                if (value == null) { // remove us on failure</span>
+<span class="nc" id="L233">                    valuesMap.remove(subKey, this);</span>
+                }
+            }
+            // the only path to reach here is with non-null value
+<span class="pc bpc" id="L237" title="1 of 4 branches missed.">            assert value != null;</span>
+
+            // wrap value with CacheValue (WeakReference)
+<span class="fc" id="L240">            CacheValue&lt;V&gt; cacheValue = new CacheValue&lt;&gt;(value);</span>
+
+            // try replacing us with CacheValue (this should always succeed)
+<span class="pc bpc" id="L243" title="1 of 2 branches missed.">            if (valuesMap.replace(subKey, this, cacheValue)) {</span>
+                // put also in reverseMap
+<span class="fc" id="L245">                reverseMap.put(cacheValue, Boolean.TRUE);</span>
+            } else {
+<span class="nc" id="L247">                throw new AssertionError(&quot;Should not reach here&quot;);</span>
+            }
+
+            // successfully replaced us with new CacheValue -&gt; return the value
+            // wrapped by it
+<span class="fc" id="L252">            return value;</span>
+        }
+    }
+
+    /**
+     * Common type of value suppliers that are holding a referent.
+     * The {@link #equals} and {@link #hashCode} of implementations is defined
+     * to compare the referent by identity.
+     */
+    private interface Value&lt;V&gt; extends Supplier&lt;V&gt; {}
+
+    /**
+     * An optimized {@link Value} used to look-up the value in
+     * {@link WeakCache#containsValue} method so that we are not
+     * constructing the whole {@link CacheValue} just to look-up the referent.
+     */
+    private static final class LookupValue&lt;V&gt; implements Value&lt;V&gt; {
+        private final V value;
+
+<span class="fc" id="L271">        LookupValue(V value) {</span>
+<span class="fc" id="L272">            this.value = value;</span>
+<span class="fc" id="L273">        }</span>
+
+        @Override
+        public V get() {
+<span class="nc" id="L277">            return value;</span>
+        }
+
+        @Override
+        public int hashCode() {
+<span class="fc" id="L282">            return System.identityHashCode(value); // compare by identity</span>
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+<span class="pc bpc" id="L287" title="2 of 4 branches missed.">            return obj == this ||</span>
+                   obj instanceof Value &amp;&amp;
+<span class="pc bpc" id="L289" title="1 of 2 branches missed.">                   this.value == ((Value&lt;?&gt;) obj).get();  // compare by identity</span>
+        }
+    }
+
+    /**
+     * A {@link Value} that weakly references the referent.
+     */
+    private static final class CacheValue&lt;V&gt;
+        extends WeakReference&lt;V&gt; implements Value&lt;V&gt;
+    {
+        private final int hash;
+
+        CacheValue(V value) {
+<span class="fc" id="L302">            super(value);</span>
+<span class="fc" id="L303">            this.hash = System.identityHashCode(value); // compare by identity</span>
+<span class="fc" id="L304">        }</span>
+
+        @Override
+        public int hashCode() {
+<span class="fc" id="L308">            return hash;</span>
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            V value;
+<span class="nc bnc" id="L314" title="All 4 branches missed.">            return obj == this ||</span>
+                   obj instanceof Value &amp;&amp;
+                   // cleared CacheValue is only equal to itself
+<span class="nc bnc" id="L317" title="All 2 branches missed.">                   (value = get()) != null &amp;&amp;</span>
+<span class="nc bnc" id="L318" title="All 2 branches missed.">                   value == ((Value&lt;?&gt;) obj).get(); // compare by identity</span>
+        }
+    }
+
+    /**
+     * CacheKey containing a weakly referenced {@code key}. It registers
+     * itself with the {@code refQueue} so that it can be used to expunge
+     * the entry when the {@link WeakReference} is cleared.
+     */
+    private static final class CacheKey&lt;K&gt; extends WeakReference&lt;K&gt; {
+
+        // a replacement for null keys
+<span class="fc" id="L330">        private static final Object NULL_KEY = new Object();</span>
+
+        static &lt;K&gt; Object valueOf(K key, ReferenceQueue&lt;K&gt; refQueue) {
+<span class="fc bfc" id="L333" title="All 2 branches covered.">            return key == null</span>
+                   // null key means we can't weakly reference it,
+                   // so we use a NULL_KEY singleton as cache key
+                   ? NULL_KEY
+                   // non-null key requires wrapping with a WeakReference
+                   : new CacheKey&lt;&gt;(key, refQueue);
+        }
+
+        private final int hash;
+
+        private CacheKey(K key, ReferenceQueue&lt;K&gt; refQueue) {
+<span class="fc" id="L344">            super(key, refQueue);</span>
+<span class="fc" id="L345">            this.hash = System.identityHashCode(key);  // compare by identity</span>
+<span class="fc" id="L346">        }</span>
+
+        @Override
+        public int hashCode() {
+<span class="fc" id="L350">            return hash;</span>
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            K key;
+<span class="pc bpc" id="L356" title="2 of 4 branches missed.">            return obj == this ||</span>
+                   obj != null &amp;&amp;
+<span class="pc bpc" id="L358" title="1 of 2 branches missed.">                   obj.getClass() == this.getClass() &amp;&amp;</span>
+                   // cleared CacheKey is only equal to itself
+<span class="pc bpc" id="L360" title="1 of 2 branches missed.">                   (key = this.get()) != null &amp;&amp;</span>
+                   // compare key by identity
+<span class="pc bpc" id="L362" title="1 of 2 branches missed.">                   key == ((CacheKey&lt;K&gt;) obj).get();</span>
+        }
+
+        void expungeFrom(ConcurrentMap&lt;?, ? extends ConcurrentMap&lt;?, ?&gt;&gt; map,
+                         ConcurrentMap&lt;?, Boolean&gt; reverseMap) {
+            // removing just by key is always safe here because after a CacheKey
+            // is cleared and enqueue-ed it is only equal to itself
+            // (see equals method)...
+<span class="fc" id="L370">            ConcurrentMap&lt;?, ?&gt; valuesMap = map.remove(this);</span>
+            // remove also from reverseMap if needed
+<span class="pc bpc" id="L372" title="1 of 2 branches missed.">            if (valuesMap != null) {</span>
+<span class="fc bfc" id="L373" title="All 2 branches covered.">                for (Object cacheValue : valuesMap.values()) {</span>
+<span class="fc" id="L374">                    reverseMap.remove(cacheValue);</span>
+<span class="fc" id="L375">                }</span>
+            }
+<span class="fc" id="L377">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

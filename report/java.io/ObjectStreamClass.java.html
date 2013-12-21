@@ -1,0 +1,2338 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ObjectStreamClass.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">java.io</a> &gt; <span class="el_source">ObjectStreamClass.java</span></div><h1>ObjectStreamClass.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1996, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package java.io;
+
+import java.lang.ref.Reference;
+import java.lang.ref.ReferenceQueue;
+import java.lang.ref.SoftReference;
+import java.lang.ref.WeakReference;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Member;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.lang.reflect.Proxy;
+import java.security.AccessController;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.security.PrivilegedAction;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import sun.misc.Unsafe;
+import sun.reflect.CallerSensitive;
+import sun.reflect.Reflection;
+import sun.reflect.ReflectionFactory;
+import sun.reflect.misc.ReflectUtil;
+
+/**
+ * Serialization's descriptor for classes.  It contains the name and
+ * serialVersionUID of the class.  The ObjectStreamClass for a specific class
+ * loaded in this Java VM can be found/created using the lookup method.
+ *
+ * &lt;p&gt;The algorithm to compute the SerialVersionUID is described in
+ * &lt;a href=&quot;../../../platform/serialization/spec/class.html#4100&quot;&gt;Object
+ * Serialization Specification, Section 4.6, Stream Unique Identifiers&lt;/a&gt;.
+ *
+ * @author      Mike Warres
+ * @author      Roger Riggs
+ * @see ObjectStreamField
+ * @see &lt;a href=&quot;../../../platform/serialization/spec/class.html&quot;&gt;Object Serialization Specification, Section 4, Class Descriptors&lt;/a&gt;
+ * @since   JDK1.1
+ */
+public class ObjectStreamClass implements Serializable {
+
+    /** serialPersistentFields value indicating no serializable fields */
+<span class="fc" id="L75">    public static final ObjectStreamField[] NO_FIELDS =</span>
+        new ObjectStreamField[0];
+
+    private static final long serialVersionUID = -6120832682080437368L;
+<span class="fc" id="L79">    private static final ObjectStreamField[] serialPersistentFields =</span>
+        NO_FIELDS;
+
+    /** reflection factory for obtaining serialization constructors */
+<span class="fc" id="L83">    private static final ReflectionFactory reflFactory =</span>
+<span class="fc" id="L84">        AccessController.doPrivileged(</span>
+            new ReflectionFactory.GetReflectionFactoryAction());
+
+<span class="nc" id="L87">    private static class Caches {</span>
+        /** cache mapping local classes -&gt; descriptors */
+<span class="fc" id="L89">        static final ConcurrentMap&lt;WeakClassKey,Reference&lt;?&gt;&gt; localDescs =</span>
+            new ConcurrentHashMap&lt;&gt;();
+
+        /** cache mapping field group/local desc pairs -&gt; field reflectors */
+<span class="fc" id="L93">        static final ConcurrentMap&lt;FieldReflectorKey,Reference&lt;?&gt;&gt; reflectors =</span>
+            new ConcurrentHashMap&lt;&gt;();
+
+        /** queue for WeakReferences to local classes */
+<span class="fc" id="L97">        private static final ReferenceQueue&lt;Class&lt;?&gt;&gt; localDescsQueue =</span>
+            new ReferenceQueue&lt;&gt;();
+        /** queue for WeakReferences to field reflectors keys */
+<span class="fc" id="L100">        private static final ReferenceQueue&lt;Class&lt;?&gt;&gt; reflectorsQueue =</span>
+            new ReferenceQueue&lt;&gt;();
+    }
+
+    /** class associated with this descriptor (if any) */
+    private Class&lt;?&gt; cl;
+    /** name of class represented by this descriptor */
+    private String name;
+    /** serialVersionUID of represented class (null if not computed yet) */
+    private volatile Long suid;
+
+    /** true if represents dynamic proxy class */
+    private boolean isProxy;
+    /** true if represents enum type */
+    private boolean isEnum;
+    /** true if represented class implements Serializable */
+    private boolean serializable;
+    /** true if represented class implements Externalizable */
+    private boolean externalizable;
+    /** true if desc has data written by class-defined writeObject method */
+    private boolean hasWriteObjectData;
+    /**
+     * true if desc has externalizable data written in block data format; this
+     * must be true by default to accommodate ObjectInputStream subclasses which
+     * override readClassDescriptor() to return class descriptors obtained from
+     * ObjectStreamClass.lookup() (see 4461737)
+     */
+<span class="fc" id="L127">    private boolean hasBlockExternalData = true;</span>
+
+    /**
+     * Contains information about InvalidClassException instances to be thrown
+     * when attempting operations on an invalid class. Note that instances of
+     * this class are immutable and are potentially shared among
+     * ObjectStreamClass instances.
+     */
+    private static class ExceptionInfo {
+        private final String className;
+        private final String message;
+
+<span class="fc" id="L139">        ExceptionInfo(String cn, String msg) {</span>
+<span class="fc" id="L140">            className = cn;</span>
+<span class="fc" id="L141">            message = msg;</span>
+<span class="fc" id="L142">        }</span>
+
+        /**
+         * Returns (does not throw) an InvalidClassException instance created
+         * from the information in this object, suitable for being thrown by
+         * the caller.
+         */
+        InvalidClassException newInvalidClassException() {
+<span class="fc" id="L150">            return new InvalidClassException(className, message);</span>
+        }
+    }
+
+    /** exception (if any) thrown while attempting to resolve class */
+    private ClassNotFoundException resolveEx;
+    /** exception (if any) to throw if non-enum deserialization attempted */
+    private ExceptionInfo deserializeEx;
+    /** exception (if any) to throw if non-enum serialization attempted */
+    private ExceptionInfo serializeEx;
+    /** exception (if any) to throw if default serialization attempted */
+    private ExceptionInfo defaultSerializeEx;
+
+    /** serializable fields */
+    private ObjectStreamField[] fields;
+    /** aggregate marshalled size of primitive fields */
+    private int primDataSize;
+    /** number of non-primitive fields */
+    private int numObjFields;
+    /** reflector for setting/getting serializable field values */
+    private FieldReflector fieldRefl;
+    /** data layout of serialized objects described by this class desc */
+    private volatile ClassDataSlot[] dataLayout;
+
+    /** serialization-appropriate constructor, or null if none */
+    private Constructor&lt;?&gt; cons;
+    /** class-defined writeObject method, or null if none */
+    private Method writeObjectMethod;
+    /** class-defined readObject method, or null if none */
+    private Method readObjectMethod;
+    /** class-defined readObjectNoData method, or null if none */
+    private Method readObjectNoDataMethod;
+    /** class-defined writeReplace method, or null if none */
+    private Method writeReplaceMethod;
+    /** class-defined readResolve method, or null if none */
+    private Method readResolveMethod;
+
+    /** local class descriptor for represented class (may point to self) */
+    private ObjectStreamClass localDesc;
+    /** superclass descriptor appearing in stream */
+    private ObjectStreamClass superDesc;
+
+    /**
+     * Initializes native code.
+     */
+    private static native void initNative();
+    static {
+<span class="fc" id="L197">        initNative();</span>
+<span class="fc" id="L198">    }</span>
+
+    /**
+     * Find the descriptor for a class that can be serialized.  Creates an
+     * ObjectStreamClass instance if one does not exist yet for class. Null is
+     * returned if the specified class does not implement java.io.Serializable
+     * or java.io.Externalizable.
+     *
+     * @param   cl class for which to get the descriptor
+     * @return  the class descriptor for the specified class
+     */
+    public static ObjectStreamClass lookup(Class&lt;?&gt; cl) {
+<span class="fc" id="L210">        return lookup(cl, false);</span>
+    }
+
+    /**
+     * Returns the descriptor for any class, regardless of whether it
+     * implements {@link Serializable}.
+     *
+     * @param        cl class for which to get the descriptor
+     * @return       the class descriptor for the specified class
+     * @since 1.6
+     */
+    public static ObjectStreamClass lookupAny(Class&lt;?&gt; cl) {
+<span class="fc" id="L222">        return lookup(cl, true);</span>
+    }
+
+    /**
+     * Returns the name of the class described by this descriptor.
+     * This method returns the name of the class in the format that
+     * is used by the {@link Class#getName} method.
+     *
+     * @return a string representing the name of the class
+     */
+    public String getName() {
+<span class="fc" id="L233">        return name;</span>
+    }
+
+    /**
+     * Return the serialVersionUID for this class.  The serialVersionUID
+     * defines a set of classes all with the same name that have evolved from a
+     * common root class and agree to be serialized and deserialized using a
+     * common format.  NonSerializable classes have a serialVersionUID of 0L.
+     *
+     * @return  the SUID of the class described by this descriptor
+     */
+    public long getSerialVersionUID() {
+        // REMIND: synchronize instead of relying on volatile?
+<span class="fc bfc" id="L246" title="All 2 branches covered.">        if (suid == null) {</span>
+<span class="fc" id="L247">            suid = AccessController.doPrivileged(</span>
+<span class="fc" id="L248">                new PrivilegedAction&lt;Long&gt;() {</span>
+                    public Long run() {
+<span class="fc" id="L250">                        return computeDefaultSUID(cl);</span>
+                    }
+                }
+            );
+        }
+<span class="fc" id="L255">        return suid.longValue();</span>
+    }
+
+    /**
+     * Return the class in the local VM that this version is mapped to.  Null
+     * is returned if there is no corresponding local class.
+     *
+     * @return  the &lt;code&gt;Class&lt;/code&gt; instance that this descriptor represents
+     */
+    @CallerSensitive
+    public Class&lt;?&gt; forClass() {
+<span class="fc bfc" id="L266" title="All 2 branches covered.">        if (cl == null) {</span>
+<span class="fc" id="L267">            return null;</span>
+        }
+<span class="fc bfc" id="L269" title="All 2 branches covered.">        if (System.getSecurityManager() != null) {</span>
+<span class="fc" id="L270">            Class&lt;?&gt; caller = Reflection.getCallerClass();</span>
+<span class="pc bpc" id="L271" title="1 of 2 branches missed.">            if (ReflectUtil.needsPackageAccessCheck(caller.getClassLoader(), cl.getClassLoader())) {</span>
+<span class="nc" id="L272">                ReflectUtil.checkPackageAccess(cl);</span>
+            }
+        }
+<span class="fc" id="L275">        return cl;</span>
+    }
+
+    /**
+     * Return an array of the fields of this serializable class.
+     *
+     * @return  an array containing an element for each persistent field of
+     *          this class. Returns an array of length zero if there are no
+     *          fields.
+     * @since 1.2
+     */
+    public ObjectStreamField[] getFields() {
+<span class="nc" id="L287">        return getFields(true);</span>
+    }
+
+    /**
+     * Get the field of this class by name.
+     *
+     * @param   name the name of the data field to look for
+     * @return  The ObjectStreamField object of the named field or null if
+     *          there is no such named field.
+     */
+    public ObjectStreamField getField(String name) {
+<span class="fc" id="L298">        return getField(name, null);</span>
+    }
+
+    /**
+     * Return a string describing this ObjectStreamClass.
+     */
+    public String toString() {
+<span class="nc" id="L305">        return name + &quot;: static final long serialVersionUID = &quot; +</span>
+<span class="nc" id="L306">            getSerialVersionUID() + &quot;L;&quot;;</span>
+    }
+
+    /**
+     * Looks up and returns class descriptor for given class, or null if class
+     * is non-serializable and &quot;all&quot; is set to false.
+     *
+     * @param   cl class to look up
+     * @param   all if true, return descriptors for all classes; if false, only
+     *          return descriptors for serializable classes
+     */
+    static ObjectStreamClass lookup(Class&lt;?&gt; cl, boolean all) {
+<span class="fc bfc" id="L318" title="All 4 branches covered.">        if (!(all || Serializable.class.isAssignableFrom(cl))) {</span>
+<span class="fc" id="L319">            return null;</span>
+        }
+<span class="fc" id="L321">        processQueue(Caches.localDescsQueue, Caches.localDescs);</span>
+<span class="fc" id="L322">        WeakClassKey key = new WeakClassKey(cl, Caches.localDescsQueue);</span>
+<span class="fc" id="L323">        Reference&lt;?&gt; ref = Caches.localDescs.get(key);</span>
+<span class="fc" id="L324">        Object entry = null;</span>
+<span class="fc bfc" id="L325" title="All 2 branches covered.">        if (ref != null) {</span>
+<span class="fc" id="L326">            entry = ref.get();</span>
+        }
+<span class="fc" id="L328">        EntryFuture future = null;</span>
+<span class="fc bfc" id="L329" title="All 2 branches covered.">        if (entry == null) {</span>
+<span class="fc" id="L330">            EntryFuture newEntry = new EntryFuture();</span>
+<span class="fc" id="L331">            Reference&lt;?&gt; newRef = new SoftReference&lt;&gt;(newEntry);</span>
+            do {
+<span class="pc bpc" id="L333" title="1 of 2 branches missed.">                if (ref != null) {</span>
+<span class="nc" id="L334">                    Caches.localDescs.remove(key, ref);</span>
+                }
+<span class="fc" id="L336">                ref = Caches.localDescs.putIfAbsent(key, newRef);</span>
+<span class="fc bfc" id="L337" title="All 2 branches covered.">                if (ref != null) {</span>
+<span class="fc" id="L338">                    entry = ref.get();</span>
+                }
+<span class="pc bpc" id="L340" title="1 of 4 branches missed.">            } while (ref != null &amp;&amp; entry == null);</span>
+<span class="fc bfc" id="L341" title="All 2 branches covered.">            if (entry == null) {</span>
+<span class="fc" id="L342">                future = newEntry;</span>
+            }
+        }
+
+<span class="fc bfc" id="L346" title="All 2 branches covered.">        if (entry instanceof ObjectStreamClass) {  // check common case first</span>
+<span class="fc" id="L347">            return (ObjectStreamClass) entry;</span>
+        }
+<span class="fc bfc" id="L349" title="All 2 branches covered.">        if (entry instanceof EntryFuture) {</span>
+<span class="fc" id="L350">            future = (EntryFuture) entry;</span>
+<span class="pc bpc" id="L351" title="1 of 2 branches missed.">            if (future.getOwner() == Thread.currentThread()) {</span>
+                /*
+                 * Handle nested call situation described by 4803747: waiting
+                 * for future value to be set by a lookup() call further up the
+                 * stack will result in deadlock, so calculate and set the
+                 * future value here instead.
+                 */
+<span class="nc" id="L358">                entry = null;</span>
+            } else {
+<span class="fc" id="L360">                entry = future.get();</span>
+            }
+        }
+<span class="fc bfc" id="L363" title="All 2 branches covered.">        if (entry == null) {</span>
+            try {
+<span class="fc" id="L365">                entry = new ObjectStreamClass(cl);</span>
+<span class="fc" id="L366">            } catch (Throwable th) {</span>
+<span class="fc" id="L367">                entry = th;</span>
+<span class="fc" id="L368">            }</span>
+<span class="pc bpc" id="L369" title="1 of 2 branches missed.">            if (future.set(entry)) {</span>
+<span class="fc" id="L370">                Caches.localDescs.put(key, new SoftReference&lt;Object&gt;(entry));</span>
+            } else {
+                // nested lookup call already set future
+<span class="nc" id="L373">                entry = future.get();</span>
+            }
+        }
+
+<span class="fc bfc" id="L377" title="All 2 branches covered.">        if (entry instanceof ObjectStreamClass) {</span>
+<span class="fc" id="L378">            return (ObjectStreamClass) entry;</span>
+<span class="pc bpc" id="L379" title="1 of 2 branches missed.">        } else if (entry instanceof RuntimeException) {</span>
+<span class="nc" id="L380">            throw (RuntimeException) entry;</span>
+<span class="pc bpc" id="L381" title="1 of 2 branches missed.">        } else if (entry instanceof Error) {</span>
+<span class="fc" id="L382">            throw (Error) entry;</span>
+        } else {
+<span class="nc" id="L384">            throw new InternalError(&quot;unexpected entry: &quot; + entry);</span>
+        }
+    }
+
+    /**
+     * Placeholder used in class descriptor and field reflector lookup tables
+     * for an entry in the process of being initialized.  (Internal) callers
+     * which receive an EntryFuture belonging to another thread as the result
+     * of a lookup should call the get() method of the EntryFuture; this will
+     * return the actual entry once it is ready for use and has been set().  To
+     * conserve objects, EntryFutures synchronize on themselves.
+     */
+<span class="fc" id="L396">    private static class EntryFuture {</span>
+
+<span class="fc" id="L398">        private static final Object unset = new Object();</span>
+<span class="fc" id="L399">        private final Thread owner = Thread.currentThread();</span>
+<span class="fc" id="L400">        private Object entry = unset;</span>
+
+        /**
+         * Attempts to set the value contained by this EntryFuture.  If the
+         * EntryFuture's value has not been set already, then the value is
+         * saved, any callers blocked in the get() method are notified, and
+         * true is returned.  If the value has already been set, then no saving
+         * or notification occurs, and false is returned.
+         */
+        synchronized boolean set(Object entry) {
+<span class="pc bpc" id="L410" title="1 of 2 branches missed.">            if (this.entry != unset) {</span>
+<span class="nc" id="L411">                return false;</span>
+            }
+<span class="fc" id="L413">            this.entry = entry;</span>
+<span class="fc" id="L414">            notifyAll();</span>
+<span class="fc" id="L415">            return true;</span>
+        }
+
+        /**
+         * Returns the value contained by this EntryFuture, blocking if
+         * necessary until a value is set.
+         */
+        synchronized Object get() {
+<span class="fc" id="L423">            boolean interrupted = false;</span>
+<span class="fc bfc" id="L424" title="All 2 branches covered.">            while (entry == unset) {</span>
+                try {
+<span class="fc" id="L426">                    wait();</span>
+<span class="nc" id="L427">                } catch (InterruptedException ex) {</span>
+<span class="nc" id="L428">                    interrupted = true;</span>
+<span class="pc" id="L429">                }</span>
+            }
+<span class="pc bpc" id="L431" title="1 of 2 branches missed.">            if (interrupted) {</span>
+<span class="nc" id="L432">                AccessController.doPrivileged(</span>
+<span class="nc" id="L433">                    new PrivilegedAction&lt;Void&gt;() {</span>
+                        public Void run() {
+<span class="nc" id="L435">                            Thread.currentThread().interrupt();</span>
+<span class="nc" id="L436">                            return null;</span>
+                        }
+                    }
+                );
+            }
+<span class="fc" id="L441">            return entry;</span>
+        }
+
+        /**
+         * Returns the thread that created this EntryFuture.
+         */
+        Thread getOwner() {
+<span class="fc" id="L448">            return owner;</span>
+        }
+    }
+
+    /**
+     * Creates local class descriptor representing given class.
+     */
+<span class="fc" id="L455">    private ObjectStreamClass(final Class&lt;?&gt; cl) {</span>
+<span class="fc" id="L456">        this.cl = cl;</span>
+<span class="fc" id="L457">        name = cl.getName();</span>
+<span class="fc" id="L458">        isProxy = Proxy.isProxyClass(cl);</span>
+<span class="fc" id="L459">        isEnum = Enum.class.isAssignableFrom(cl);</span>
+<span class="fc" id="L460">        serializable = Serializable.class.isAssignableFrom(cl);</span>
+<span class="fc" id="L461">        externalizable = Externalizable.class.isAssignableFrom(cl);</span>
+
+<span class="fc" id="L463">        Class&lt;?&gt; superCl = cl.getSuperclass();</span>
+<span class="fc bfc" id="L464" title="All 2 branches covered.">        superDesc = (superCl != null) ? lookup(superCl, false) : null;</span>
+<span class="fc" id="L465">        localDesc = this;</span>
+
+<span class="fc bfc" id="L467" title="All 2 branches covered.">        if (serializable) {</span>
+<span class="fc" id="L468">            AccessController.doPrivileged(new PrivilegedAction&lt;Void&gt;() {</span>
+                public Void run() {
+<span class="fc bfc" id="L470" title="All 2 branches covered.">                    if (isEnum) {</span>
+<span class="fc" id="L471">                        suid = Long.valueOf(0);</span>
+<span class="fc" id="L472">                        fields = NO_FIELDS;</span>
+<span class="fc" id="L473">                        return null;</span>
+                    }
+<span class="fc bfc" id="L475" title="All 2 branches covered.">                    if (cl.isArray()) {</span>
+<span class="fc" id="L476">                        fields = NO_FIELDS;</span>
+<span class="fc" id="L477">                        return null;</span>
+                    }
+
+<span class="fc" id="L480">                    suid = getDeclaredSUID(cl);</span>
+                    try {
+<span class="fc" id="L482">                        fields = getSerialFields(cl);</span>
+<span class="fc" id="L483">                        computeFieldOffsets();</span>
+<span class="fc" id="L484">                    } catch (InvalidClassException e) {</span>
+<span class="fc" id="L485">                        serializeEx = deserializeEx =</span>
+<span class="fc" id="L486">                            new ExceptionInfo(e.classname, e.getMessage());</span>
+<span class="fc" id="L487">                        fields = NO_FIELDS;</span>
+<span class="fc" id="L488">                    }</span>
+
+<span class="fc bfc" id="L490" title="All 2 branches covered.">                    if (externalizable) {</span>
+<span class="fc" id="L491">                        cons = getExternalizableConstructor(cl);</span>
+                    } else {
+<span class="fc" id="L493">                        cons = getSerializableConstructor(cl);</span>
+<span class="fc" id="L494">                        writeObjectMethod = getPrivateMethod(cl, &quot;writeObject&quot;,</span>
+                            new Class&lt;?&gt;[] { ObjectOutputStream.class },
+                            Void.TYPE);
+<span class="fc" id="L497">                        readObjectMethod = getPrivateMethod(cl, &quot;readObject&quot;,</span>
+                            new Class&lt;?&gt;[] { ObjectInputStream.class },
+                            Void.TYPE);
+<span class="fc" id="L500">                        readObjectNoDataMethod = getPrivateMethod(</span>
+                            cl, &quot;readObjectNoData&quot;, null, Void.TYPE);
+<span class="fc bfc" id="L502" title="All 2 branches covered.">                        hasWriteObjectData = (writeObjectMethod != null);</span>
+                    }
+<span class="fc" id="L504">                    writeReplaceMethod = getInheritableMethod(</span>
+                        cl, &quot;writeReplace&quot;, null, Object.class);
+<span class="fc" id="L506">                    readResolveMethod = getInheritableMethod(</span>
+                        cl, &quot;readResolve&quot;, null, Object.class);
+<span class="fc" id="L508">                    return null;</span>
+                }
+            });
+        } else {
+<span class="fc" id="L512">            suid = Long.valueOf(0);</span>
+<span class="fc" id="L513">            fields = NO_FIELDS;</span>
+        }
+
+        try {
+<span class="fc" id="L517">            fieldRefl = getReflector(fields, this);</span>
+<span class="nc" id="L518">        } catch (InvalidClassException ex) {</span>
+            // field mismatches impossible when matching local fields vs. self
+<span class="nc" id="L520">            throw new InternalError(ex);</span>
+<span class="fc" id="L521">        }</span>
+
+<span class="fc bfc" id="L523" title="All 2 branches covered.">        if (deserializeEx == null) {</span>
+<span class="fc bfc" id="L524" title="All 2 branches covered.">            if (isEnum) {</span>
+<span class="fc" id="L525">                deserializeEx = new ExceptionInfo(name, &quot;enum type&quot;);</span>
+<span class="fc bfc" id="L526" title="All 2 branches covered.">            } else if (cons == null) {</span>
+<span class="fc" id="L527">                deserializeEx = new ExceptionInfo(name, &quot;no valid constructor&quot;);</span>
+            }
+        }
+<span class="fc bfc" id="L530" title="All 2 branches covered.">        for (int i = 0; i &lt; fields.length; i++) {</span>
+<span class="fc bfc" id="L531" title="All 2 branches covered.">            if (fields[i].getField() == null) {</span>
+<span class="fc" id="L532">                defaultSerializeEx = new ExceptionInfo(</span>
+                    name, &quot;unmatched serializable field(s) declared&quot;);
+            }
+        }
+<span class="fc" id="L536">    }</span>
+
+    /**
+     * Creates blank class descriptor which should be initialized via a
+     * subsequent call to initProxy(), initNonProxy() or readNonProxy().
+     */
+<span class="fc" id="L542">    ObjectStreamClass() {</span>
+<span class="fc" id="L543">    }</span>
+
+    /**
+     * Initializes class descriptor representing a proxy class.
+     */
+    void initProxy(Class&lt;?&gt; cl,
+                   ClassNotFoundException resolveEx,
+                   ObjectStreamClass superDesc)
+        throws InvalidClassException
+    {
+<span class="fc" id="L553">        this.cl = cl;</span>
+<span class="fc" id="L554">        this.resolveEx = resolveEx;</span>
+<span class="fc" id="L555">        this.superDesc = superDesc;</span>
+<span class="fc" id="L556">        isProxy = true;</span>
+<span class="fc" id="L557">        serializable = true;</span>
+<span class="fc" id="L558">        suid = Long.valueOf(0);</span>
+<span class="fc" id="L559">        fields = NO_FIELDS;</span>
+
+<span class="fc bfc" id="L561" title="All 2 branches covered.">        if (cl != null) {</span>
+<span class="fc" id="L562">            localDesc = lookup(cl, true);</span>
+<span class="pc bpc" id="L563" title="1 of 2 branches missed.">            if (!localDesc.isProxy) {</span>
+<span class="nc" id="L564">                throw new InvalidClassException(</span>
+                    &quot;cannot bind proxy descriptor to a non-proxy class&quot;);
+            }
+<span class="fc" id="L567">            name = localDesc.name;</span>
+<span class="fc" id="L568">            externalizable = localDesc.externalizable;</span>
+<span class="fc" id="L569">            cons = localDesc.cons;</span>
+<span class="fc" id="L570">            writeReplaceMethod = localDesc.writeReplaceMethod;</span>
+<span class="fc" id="L571">            readResolveMethod = localDesc.readResolveMethod;</span>
+<span class="fc" id="L572">            deserializeEx = localDesc.deserializeEx;</span>
+        }
+<span class="fc" id="L574">        fieldRefl = getReflector(fields, localDesc);</span>
+<span class="fc" id="L575">    }</span>
+
+    /**
+     * Initializes class descriptor representing a non-proxy class.
+     */
+    void initNonProxy(ObjectStreamClass model,
+                      Class&lt;?&gt; cl,
+                      ClassNotFoundException resolveEx,
+                      ObjectStreamClass superDesc)
+        throws InvalidClassException
+    {
+<span class="fc" id="L586">        this.cl = cl;</span>
+<span class="fc" id="L587">        this.resolveEx = resolveEx;</span>
+<span class="fc" id="L588">        this.superDesc = superDesc;</span>
+<span class="fc" id="L589">        name = model.name;</span>
+<span class="fc" id="L590">        suid = Long.valueOf(model.getSerialVersionUID());</span>
+<span class="fc" id="L591">        isProxy = false;</span>
+<span class="fc" id="L592">        isEnum = model.isEnum;</span>
+<span class="fc" id="L593">        serializable = model.serializable;</span>
+<span class="fc" id="L594">        externalizable = model.externalizable;</span>
+<span class="fc" id="L595">        hasBlockExternalData = model.hasBlockExternalData;</span>
+<span class="fc" id="L596">        hasWriteObjectData = model.hasWriteObjectData;</span>
+<span class="fc" id="L597">        fields = model.fields;</span>
+<span class="fc" id="L598">        primDataSize = model.primDataSize;</span>
+<span class="fc" id="L599">        numObjFields = model.numObjFields;</span>
+
+<span class="fc bfc" id="L601" title="All 2 branches covered.">        if (cl != null) {</span>
+<span class="fc" id="L602">            localDesc = lookup(cl, true);</span>
+<span class="pc bpc" id="L603" title="1 of 2 branches missed.">            if (localDesc.isProxy) {</span>
+<span class="nc" id="L604">                throw new InvalidClassException(</span>
+                    &quot;cannot bind non-proxy descriptor to a proxy class&quot;);
+            }
+<span class="pc bpc" id="L607" title="1 of 2 branches missed.">            if (isEnum != localDesc.isEnum) {</span>
+<span class="nc bnc" id="L608" title="All 2 branches missed.">                throw new InvalidClassException(isEnum ?</span>
+                    &quot;cannot bind enum descriptor to a non-enum class&quot; :
+                    &quot;cannot bind non-enum descriptor to an enum class&quot;);
+            }
+
+<span class="fc bfc" id="L613" title="All 2 branches covered.">            if (serializable == localDesc.serializable &amp;&amp;</span>
+<span class="fc bfc" id="L614" title="All 2 branches covered.">                !cl.isArray() &amp;&amp;</span>
+<span class="fc bfc" id="L615" title="All 2 branches covered.">                suid.longValue() != localDesc.getSerialVersionUID())</span>
+            {
+<span class="fc" id="L617">                throw new InvalidClassException(localDesc.name,</span>
+                    &quot;local class incompatible: &quot; +
+                    &quot;stream classdesc serialVersionUID = &quot; + suid +
+                    &quot;, local class serialVersionUID = &quot; +
+<span class="fc" id="L621">                    localDesc.getSerialVersionUID());</span>
+            }
+
+<span class="pc bpc" id="L624" title="1 of 2 branches missed.">            if (!classNamesEqual(name, localDesc.name)) {</span>
+<span class="nc" id="L625">                throw new InvalidClassException(localDesc.name,</span>
+                    &quot;local class name incompatible with stream class &quot; +
+                    &quot;name \&quot;&quot; + name + &quot;\&quot;&quot;);
+            }
+
+<span class="fc bfc" id="L630" title="All 2 branches covered.">            if (!isEnum) {</span>
+<span class="pc bpc" id="L631" title="1 of 4 branches missed.">                if ((serializable == localDesc.serializable) &amp;&amp;</span>
+                    (externalizable != localDesc.externalizable))
+                {
+<span class="nc" id="L634">                    throw new InvalidClassException(localDesc.name,</span>
+                        &quot;Serializable incompatible with Externalizable&quot;);
+                }
+
+<span class="pc bpc" id="L638" title="2 of 8 branches missed.">                if ((serializable != localDesc.serializable) ||</span>
+                    (externalizable != localDesc.externalizable) ||
+                    !(serializable || externalizable))
+                {
+<span class="fc" id="L642">                    deserializeEx = new ExceptionInfo(</span>
+                        localDesc.name, &quot;class invalid for deserialization&quot;);
+                }
+            }
+
+<span class="fc" id="L647">            cons = localDesc.cons;</span>
+<span class="fc" id="L648">            writeObjectMethod = localDesc.writeObjectMethod;</span>
+<span class="fc" id="L649">            readObjectMethod = localDesc.readObjectMethod;</span>
+<span class="fc" id="L650">            readObjectNoDataMethod = localDesc.readObjectNoDataMethod;</span>
+<span class="fc" id="L651">            writeReplaceMethod = localDesc.writeReplaceMethod;</span>
+<span class="fc" id="L652">            readResolveMethod = localDesc.readResolveMethod;</span>
+<span class="fc bfc" id="L653" title="All 2 branches covered.">            if (deserializeEx == null) {</span>
+<span class="fc" id="L654">                deserializeEx = localDesc.deserializeEx;</span>
+            }
+        }
+<span class="fc" id="L657">        fieldRefl = getReflector(fields, localDesc);</span>
+        // reassign to matched fields so as to reflect local unshared settings
+<span class="fc" id="L659">        fields = fieldRefl.getFields();</span>
+<span class="fc" id="L660">    }</span>
+
+    /**
+     * Reads non-proxy class descriptor information from given input stream.
+     * The resulting class descriptor is not fully functional; it can only be
+     * used as input to the ObjectInputStream.resolveClass() and
+     * ObjectStreamClass.initNonProxy() methods.
+     */
+    void readNonProxy(ObjectInputStream in)
+        throws IOException, ClassNotFoundException
+    {
+<span class="fc" id="L671">        name = in.readUTF();</span>
+<span class="fc" id="L672">        suid = Long.valueOf(in.readLong());</span>
+<span class="fc" id="L673">        isProxy = false;</span>
+
+<span class="fc" id="L675">        byte flags = in.readByte();</span>
+<span class="fc bfc" id="L676" title="All 2 branches covered.">        hasWriteObjectData =</span>
+            ((flags &amp; ObjectStreamConstants.SC_WRITE_METHOD) != 0);
+<span class="fc bfc" id="L678" title="All 2 branches covered.">        hasBlockExternalData =</span>
+            ((flags &amp; ObjectStreamConstants.SC_BLOCK_DATA) != 0);
+<span class="fc bfc" id="L680" title="All 2 branches covered.">        externalizable =</span>
+            ((flags &amp; ObjectStreamConstants.SC_EXTERNALIZABLE) != 0);
+<span class="fc bfc" id="L682" title="All 2 branches covered.">        boolean sflag =</span>
+            ((flags &amp; ObjectStreamConstants.SC_SERIALIZABLE) != 0);
+<span class="fc bfc" id="L684" title="All 4 branches covered.">        if (externalizable &amp;&amp; sflag) {</span>
+<span class="fc" id="L685">            throw new InvalidClassException(</span>
+                name, &quot;serializable and externalizable flags conflict&quot;);
+        }
+<span class="fc bfc" id="L688" title="All 4 branches covered.">        serializable = externalizable || sflag;</span>
+<span class="fc bfc" id="L689" title="All 2 branches covered.">        isEnum = ((flags &amp; ObjectStreamConstants.SC_ENUM) != 0);</span>
+<span class="pc bpc" id="L690" title="1 of 4 branches missed.">        if (isEnum &amp;&amp; suid.longValue() != 0L) {</span>
+<span class="nc" id="L691">            throw new InvalidClassException(name,</span>
+                &quot;enum descriptor has non-zero serialVersionUID: &quot; + suid);
+        }
+
+<span class="fc" id="L695">        int numFields = in.readShort();</span>
+<span class="pc bpc" id="L696" title="1 of 4 branches missed.">        if (isEnum &amp;&amp; numFields != 0) {</span>
+<span class="nc" id="L697">            throw new InvalidClassException(name,</span>
+                &quot;enum descriptor has non-zero field count: &quot; + numFields);
+        }
+<span class="fc bfc" id="L700" title="All 2 branches covered.">        fields = (numFields &gt; 0) ?</span>
+            new ObjectStreamField[numFields] : NO_FIELDS;
+<span class="fc bfc" id="L702" title="All 2 branches covered.">        for (int i = 0; i &lt; numFields; i++) {</span>
+<span class="fc" id="L703">            char tcode = (char) in.readByte();</span>
+<span class="fc" id="L704">            String fname = in.readUTF();</span>
+<span class="fc bfc" id="L705" title="All 4 branches covered.">            String signature = ((tcode == 'L') || (tcode == '[')) ?</span>
+<span class="fc" id="L706">                in.readTypeString() : new String(new char[] { tcode });</span>
+            try {
+<span class="fc" id="L708">                fields[i] = new ObjectStreamField(fname, signature, false);</span>
+<span class="nc" id="L709">            } catch (RuntimeException e) {</span>
+<span class="nc" id="L710">                throw (IOException) new InvalidClassException(name,</span>
+<span class="nc" id="L711">                    &quot;invalid descriptor for field &quot; + fname).initCause(e);</span>
+<span class="fc" id="L712">            }</span>
+        }
+<span class="fc" id="L714">        computeFieldOffsets();</span>
+<span class="fc" id="L715">    }</span>
+
+    /**
+     * Writes non-proxy class descriptor information to given output stream.
+     */
+    void writeNonProxy(ObjectOutputStream out) throws IOException {
+<span class="fc" id="L721">        out.writeUTF(name);</span>
+<span class="fc" id="L722">        out.writeLong(getSerialVersionUID());</span>
+
+<span class="fc" id="L724">        byte flags = 0;</span>
+<span class="fc bfc" id="L725" title="All 2 branches covered.">        if (externalizable) {</span>
+<span class="fc" id="L726">            flags |= ObjectStreamConstants.SC_EXTERNALIZABLE;</span>
+<span class="fc" id="L727">            int protocol = out.getProtocolVersion();</span>
+<span class="fc bfc" id="L728" title="All 2 branches covered.">            if (protocol != ObjectStreamConstants.PROTOCOL_VERSION_1) {</span>
+<span class="fc" id="L729">                flags |= ObjectStreamConstants.SC_BLOCK_DATA;</span>
+            }
+<span class="fc bfc" id="L731" title="All 2 branches covered.">        } else if (serializable) {</span>
+<span class="fc" id="L732">            flags |= ObjectStreamConstants.SC_SERIALIZABLE;</span>
+        }
+<span class="fc bfc" id="L734" title="All 2 branches covered.">        if (hasWriteObjectData) {</span>
+<span class="fc" id="L735">            flags |= ObjectStreamConstants.SC_WRITE_METHOD;</span>
+        }
+<span class="fc bfc" id="L737" title="All 2 branches covered.">        if (isEnum) {</span>
+<span class="fc" id="L738">            flags |= ObjectStreamConstants.SC_ENUM;</span>
+        }
+<span class="fc" id="L740">        out.writeByte(flags);</span>
+
+<span class="fc" id="L742">        out.writeShort(fields.length);</span>
+<span class="fc bfc" id="L743" title="All 2 branches covered.">        for (int i = 0; i &lt; fields.length; i++) {</span>
+<span class="fc" id="L744">            ObjectStreamField f = fields[i];</span>
+<span class="fc" id="L745">            out.writeByte(f.getTypeCode());</span>
+<span class="fc" id="L746">            out.writeUTF(f.getName());</span>
+<span class="fc bfc" id="L747" title="All 2 branches covered.">            if (!f.isPrimitive()) {</span>
+<span class="fc" id="L748">                out.writeTypeString(f.getTypeString());</span>
+            }
+        }
+<span class="fc" id="L751">    }</span>
+
+    /**
+     * Returns ClassNotFoundException (if any) thrown while attempting to
+     * resolve local class corresponding to this class descriptor.
+     */
+    ClassNotFoundException getResolveException() {
+<span class="fc" id="L758">        return resolveEx;</span>
+    }
+
+    /**
+     * Throws an InvalidClassException if object instances referencing this
+     * class descriptor should not be allowed to deserialize.  This method does
+     * not apply to deserialization of enum constants.
+     */
+    void checkDeserialize() throws InvalidClassException {
+<span class="fc bfc" id="L767" title="All 2 branches covered.">        if (deserializeEx != null) {</span>
+<span class="fc" id="L768">            throw deserializeEx.newInvalidClassException();</span>
+        }
+<span class="fc" id="L770">    }</span>
+
+    /**
+     * Throws an InvalidClassException if objects whose class is represented by
+     * this descriptor should not be allowed to serialize.  This method does
+     * not apply to serialization of enum constants.
+     */
+    void checkSerialize() throws InvalidClassException {
+<span class="fc bfc" id="L778" title="All 2 branches covered.">        if (serializeEx != null) {</span>
+<span class="fc" id="L779">            throw serializeEx.newInvalidClassException();</span>
+        }
+<span class="fc" id="L781">    }</span>
+
+    /**
+     * Throws an InvalidClassException if objects whose class is represented by
+     * this descriptor should not be permitted to use default serialization
+     * (e.g., if the class declares serializable fields that do not correspond
+     * to actual fields, and hence must use the GetField API).  This method
+     * does not apply to deserialization of enum constants.
+     */
+    void checkDefaultSerialize() throws InvalidClassException {
+<span class="pc bpc" id="L791" title="1 of 2 branches missed.">        if (defaultSerializeEx != null) {</span>
+<span class="nc" id="L792">            throw defaultSerializeEx.newInvalidClassException();</span>
+        }
+<span class="fc" id="L794">    }</span>
+
+    /**
+     * Returns superclass descriptor.  Note that on the receiving side, the
+     * superclass descriptor may be bound to a class that is not a superclass
+     * of the subclass descriptor's bound class.
+     */
+    ObjectStreamClass getSuperDesc() {
+<span class="fc" id="L802">        return superDesc;</span>
+    }
+
+    /**
+     * Returns the &quot;local&quot; class descriptor for the class associated with this
+     * class descriptor (i.e., the result of
+     * ObjectStreamClass.lookup(this.forClass())) or null if there is no class
+     * associated with this descriptor.
+     */
+    ObjectStreamClass getLocalDesc() {
+<span class="fc" id="L812">        return localDesc;</span>
+    }
+
+    /**
+     * Returns arrays of ObjectStreamFields representing the serializable
+     * fields of the represented class.  If copy is true, a clone of this class
+     * descriptor's field array is returned, otherwise the array itself is
+     * returned.
+     */
+    ObjectStreamField[] getFields(boolean copy) {
+<span class="pc bpc" id="L822" title="1 of 2 branches missed.">        return copy ? fields.clone() : fields;</span>
+    }
+
+    /**
+     * Looks up a serializable field of the represented class by name and type.
+     * A specified type of null matches all types, Object.class matches all
+     * non-primitive types, and any other non-null type matches assignable
+     * types only.  Returns matching field, or null if no match found.
+     */
+    ObjectStreamField getField(String name, Class&lt;?&gt; type) {
+<span class="fc bfc" id="L832" title="All 2 branches covered.">        for (int i = 0; i &lt; fields.length; i++) {</span>
+<span class="fc" id="L833">            ObjectStreamField f = fields[i];</span>
+<span class="fc bfc" id="L834" title="All 2 branches covered.">            if (f.getName().equals(name)) {</span>
+<span class="fc bfc" id="L835" title="All 4 branches covered.">                if (type == null ||</span>
+<span class="pc bpc" id="L836" title="1 of 2 branches missed.">                    (type == Object.class &amp;&amp; !f.isPrimitive()))</span>
+                {
+<span class="fc" id="L838">                    return f;</span>
+                }
+<span class="fc" id="L840">                Class&lt;?&gt; ftype = f.getType();</span>
+<span class="pc bpc" id="L841" title="2 of 4 branches missed.">                if (ftype != null &amp;&amp; type.isAssignableFrom(ftype)) {</span>
+<span class="fc" id="L842">                    return f;</span>
+                }
+            }
+        }
+<span class="fc" id="L846">        return null;</span>
+    }
+
+    /**
+     * Returns true if class descriptor represents a dynamic proxy class, false
+     * otherwise.
+     */
+    boolean isProxy() {
+<span class="fc" id="L854">        return isProxy;</span>
+    }
+
+    /**
+     * Returns true if class descriptor represents an enum type, false
+     * otherwise.
+     */
+    boolean isEnum() {
+<span class="fc" id="L862">        return isEnum;</span>
+    }
+
+    /**
+     * Returns true if represented class implements Externalizable, false
+     * otherwise.
+     */
+    boolean isExternalizable() {
+<span class="fc" id="L870">        return externalizable;</span>
+    }
+
+    /**
+     * Returns true if represented class implements Serializable, false
+     * otherwise.
+     */
+    boolean isSerializable() {
+<span class="nc" id="L878">        return serializable;</span>
+    }
+
+    /**
+     * Returns true if class descriptor represents externalizable class that
+     * has written its data in 1.2 (block data) format, false otherwise.
+     */
+    boolean hasBlockExternalData() {
+<span class="fc" id="L886">        return hasBlockExternalData;</span>
+    }
+
+    /**
+     * Returns true if class descriptor represents serializable (but not
+     * externalizable) class which has written its data via a custom
+     * writeObject() method, false otherwise.
+     */
+    boolean hasWriteObjectData() {
+<span class="fc" id="L895">        return hasWriteObjectData;</span>
+    }
+
+    /**
+     * Returns true if represented class is serializable/externalizable and can
+     * be instantiated by the serialization runtime--i.e., if it is
+     * externalizable and defines a public no-arg constructor, or if it is
+     * non-externalizable and its first non-serializable superclass defines an
+     * accessible no-arg constructor.  Otherwise, returns false.
+     */
+    boolean isInstantiable() {
+<span class="fc bfc" id="L906" title="All 2 branches covered.">        return (cons != null);</span>
+    }
+
+    /**
+     * Returns true if represented class is serializable (but not
+     * externalizable) and defines a conformant writeObject method.  Otherwise,
+     * returns false.
+     */
+    boolean hasWriteObjectMethod() {
+<span class="fc bfc" id="L915" title="All 2 branches covered.">        return (writeObjectMethod != null);</span>
+    }
+
+    /**
+     * Returns true if represented class is serializable (but not
+     * externalizable) and defines a conformant readObject method.  Otherwise,
+     * returns false.
+     */
+    boolean hasReadObjectMethod() {
+<span class="fc bfc" id="L924" title="All 2 branches covered.">        return (readObjectMethod != null);</span>
+    }
+
+    /**
+     * Returns true if represented class is serializable (but not
+     * externalizable) and defines a conformant readObjectNoData method.
+     * Otherwise, returns false.
+     */
+    boolean hasReadObjectNoDataMethod() {
+<span class="fc bfc" id="L933" title="All 2 branches covered.">        return (readObjectNoDataMethod != null);</span>
+    }
+
+    /**
+     * Returns true if represented class is serializable or externalizable and
+     * defines a conformant writeReplace method.  Otherwise, returns false.
+     */
+    boolean hasWriteReplaceMethod() {
+<span class="fc bfc" id="L941" title="All 2 branches covered.">        return (writeReplaceMethod != null);</span>
+    }
+
+    /**
+     * Returns true if represented class is serializable or externalizable and
+     * defines a conformant readResolve method.  Otherwise, returns false.
+     */
+    boolean hasReadResolveMethod() {
+<span class="fc bfc" id="L949" title="All 2 branches covered.">        return (readResolveMethod != null);</span>
+    }
+
+    /**
+     * Creates a new instance of the represented class.  If the class is
+     * externalizable, invokes its public no-arg constructor; otherwise, if the
+     * class is serializable, invokes the no-arg constructor of the first
+     * non-serializable superclass.  Throws UnsupportedOperationException if
+     * this class descriptor is not associated with a class, if the associated
+     * class is non-serializable or if the appropriate no-arg constructor is
+     * inaccessible/unavailable.
+     */
+    Object newInstance()
+        throws InstantiationException, InvocationTargetException,
+               UnsupportedOperationException
+    {
+<span class="pc bpc" id="L965" title="1 of 2 branches missed.">        if (cons != null) {</span>
+            try {
+<span class="fc" id="L967">                return cons.newInstance();</span>
+<span class="nc" id="L968">            } catch (IllegalAccessException ex) {</span>
+                // should not occur, as access checks have been suppressed
+<span class="nc" id="L970">                throw new InternalError(ex);</span>
+            }
+        } else {
+<span class="nc" id="L973">            throw new UnsupportedOperationException();</span>
+        }
+    }
+
+    /**
+     * Invokes the writeObject method of the represented serializable class.
+     * Throws UnsupportedOperationException if this class descriptor is not
+     * associated with a class, or if the class is externalizable,
+     * non-serializable or does not define writeObject.
+     */
+    void invokeWriteObject(Object obj, ObjectOutputStream out)
+        throws IOException, UnsupportedOperationException
+    {
+<span class="pc bpc" id="L986" title="1 of 2 branches missed.">        if (writeObjectMethod != null) {</span>
+            try {
+<span class="fc" id="L988">                writeObjectMethod.invoke(obj, new Object[]{ out });</span>
+<span class="fc" id="L989">            } catch (InvocationTargetException ex) {</span>
+<span class="fc" id="L990">                Throwable th = ex.getTargetException();</span>
+<span class="pc bpc" id="L991" title="1 of 2 branches missed.">                if (th instanceof IOException) {</span>
+<span class="fc" id="L992">                    throw (IOException) th;</span>
+                } else {
+<span class="nc" id="L994">                    throwMiscException(th);</span>
+                }
+<span class="nc" id="L996">            } catch (IllegalAccessException ex) {</span>
+                // should not occur, as access checks have been suppressed
+<span class="nc" id="L998">                throw new InternalError(ex);</span>
+<span class="pc" id="L999">            }</span>
+        } else {
+<span class="nc" id="L1001">            throw new UnsupportedOperationException();</span>
+        }
+<span class="fc" id="L1003">    }</span>
+
+    /**
+     * Invokes the readObject method of the represented serializable class.
+     * Throws UnsupportedOperationException if this class descriptor is not
+     * associated with a class, or if the class is externalizable,
+     * non-serializable or does not define readObject.
+     */
+    void invokeReadObject(Object obj, ObjectInputStream in)
+        throws ClassNotFoundException, IOException,
+               UnsupportedOperationException
+    {
+<span class="pc bpc" id="L1015" title="1 of 2 branches missed.">        if (readObjectMethod != null) {</span>
+            try {
+<span class="fc" id="L1017">                readObjectMethod.invoke(obj, new Object[]{ in });</span>
+<span class="fc" id="L1018">            } catch (InvocationTargetException ex) {</span>
+<span class="fc" id="L1019">                Throwable th = ex.getTargetException();</span>
+<span class="pc bpc" id="L1020" title="1 of 2 branches missed.">                if (th instanceof ClassNotFoundException) {</span>
+<span class="fc" id="L1021">                    throw (ClassNotFoundException) th;</span>
+<span class="nc bnc" id="L1022" title="All 2 branches missed.">                } else if (th instanceof IOException) {</span>
+<span class="nc" id="L1023">                    throw (IOException) th;</span>
+                } else {
+<span class="nc" id="L1025">                    throwMiscException(th);</span>
+                }
+<span class="nc" id="L1027">            } catch (IllegalAccessException ex) {</span>
+                // should not occur, as access checks have been suppressed
+<span class="nc" id="L1029">                throw new InternalError(ex);</span>
+<span class="pc" id="L1030">            }</span>
+        } else {
+<span class="nc" id="L1032">            throw new UnsupportedOperationException();</span>
+        }
+<span class="fc" id="L1034">    }</span>
+
+    /**
+     * Invokes the readObjectNoData method of the represented serializable
+     * class.  Throws UnsupportedOperationException if this class descriptor is
+     * not associated with a class, or if the class is externalizable,
+     * non-serializable or does not define readObjectNoData.
+     */
+    void invokeReadObjectNoData(Object obj)
+        throws IOException, UnsupportedOperationException
+    {
+<span class="nc bnc" id="L1045" title="All 2 branches missed.">        if (readObjectNoDataMethod != null) {</span>
+            try {
+<span class="nc" id="L1047">                readObjectNoDataMethod.invoke(obj, (Object[]) null);</span>
+<span class="nc" id="L1048">            } catch (InvocationTargetException ex) {</span>
+<span class="nc" id="L1049">                Throwable th = ex.getTargetException();</span>
+<span class="nc bnc" id="L1050" title="All 2 branches missed.">                if (th instanceof ObjectStreamException) {</span>
+<span class="nc" id="L1051">                    throw (ObjectStreamException) th;</span>
+                } else {
+<span class="nc" id="L1053">                    throwMiscException(th);</span>
+                }
+<span class="nc" id="L1055">            } catch (IllegalAccessException ex) {</span>
+                // should not occur, as access checks have been suppressed
+<span class="nc" id="L1057">                throw new InternalError(ex);</span>
+<span class="nc" id="L1058">            }</span>
+        } else {
+<span class="nc" id="L1060">            throw new UnsupportedOperationException();</span>
+        }
+<span class="nc" id="L1062">    }</span>
+
+    /**
+     * Invokes the writeReplace method of the represented serializable class and
+     * returns the result.  Throws UnsupportedOperationException if this class
+     * descriptor is not associated with a class, or if the class is
+     * non-serializable or does not define writeReplace.
+     */
+    Object invokeWriteReplace(Object obj)
+        throws IOException, UnsupportedOperationException
+    {
+<span class="pc bpc" id="L1073" title="1 of 2 branches missed.">        if (writeReplaceMethod != null) {</span>
+            try {
+<span class="fc" id="L1075">                return writeReplaceMethod.invoke(obj, (Object[]) null);</span>
+<span class="nc" id="L1076">            } catch (InvocationTargetException ex) {</span>
+<span class="nc" id="L1077">                Throwable th = ex.getTargetException();</span>
+<span class="nc bnc" id="L1078" title="All 2 branches missed.">                if (th instanceof ObjectStreamException) {</span>
+<span class="nc" id="L1079">                    throw (ObjectStreamException) th;</span>
+                } else {
+<span class="nc" id="L1081">                    throwMiscException(th);</span>
+<span class="nc" id="L1082">                    throw new InternalError(th);  // never reached</span>
+                }
+<span class="nc" id="L1084">            } catch (IllegalAccessException ex) {</span>
+                // should not occur, as access checks have been suppressed
+<span class="nc" id="L1086">                throw new InternalError(ex);</span>
+            }
+        } else {
+<span class="nc" id="L1089">            throw new UnsupportedOperationException();</span>
+        }
+    }
+
+    /**
+     * Invokes the readResolve method of the represented serializable class and
+     * returns the result.  Throws UnsupportedOperationException if this class
+     * descriptor is not associated with a class, or if the class is
+     * non-serializable or does not define readResolve.
+     */
+    Object invokeReadResolve(Object obj)
+        throws IOException, UnsupportedOperationException
+    {
+<span class="pc bpc" id="L1102" title="1 of 2 branches missed.">        if (readResolveMethod != null) {</span>
+            try {
+<span class="fc" id="L1104">                return readResolveMethod.invoke(obj, (Object[]) null);</span>
+<span class="nc" id="L1105">            } catch (InvocationTargetException ex) {</span>
+<span class="nc" id="L1106">                Throwable th = ex.getTargetException();</span>
+<span class="nc bnc" id="L1107" title="All 2 branches missed.">                if (th instanceof ObjectStreamException) {</span>
+<span class="nc" id="L1108">                    throw (ObjectStreamException) th;</span>
+                } else {
+<span class="nc" id="L1110">                    throwMiscException(th);</span>
+<span class="nc" id="L1111">                    throw new InternalError(th);  // never reached</span>
+                }
+<span class="nc" id="L1113">            } catch (IllegalAccessException ex) {</span>
+                // should not occur, as access checks have been suppressed
+<span class="nc" id="L1115">                throw new InternalError(ex);</span>
+            }
+        } else {
+<span class="nc" id="L1118">            throw new UnsupportedOperationException();</span>
+        }
+    }
+
+    /**
+     * Class representing the portion of an object's serialized form allotted
+     * to data described by a given class descriptor.  If &quot;hasData&quot; is false,
+     * the object's serialized form does not contain data associated with the
+     * class descriptor.
+     */
+    static class ClassDataSlot {
+
+        /** class descriptor &quot;occupying&quot; this slot */
+        final ObjectStreamClass desc;
+        /** true if serialized form includes data for this slot's descriptor */
+        final boolean hasData;
+
+<span class="fc" id="L1135">        ClassDataSlot(ObjectStreamClass desc, boolean hasData) {</span>
+<span class="fc" id="L1136">            this.desc = desc;</span>
+<span class="fc" id="L1137">            this.hasData = hasData;</span>
+<span class="fc" id="L1138">        }</span>
+    }
+
+    /**
+     * Returns array of ClassDataSlot instances representing the data layout
+     * (including superclass data) for serialized objects described by this
+     * class descriptor.  ClassDataSlots are ordered by inheritance with those
+     * containing &quot;higher&quot; superclasses appearing first.  The final
+     * ClassDataSlot contains a reference to this descriptor.
+     */
+    ClassDataSlot[] getClassDataLayout() throws InvalidClassException {
+        // REMIND: synchronize instead of relying on volatile?
+<span class="fc bfc" id="L1150" title="All 2 branches covered.">        if (dataLayout == null) {</span>
+<span class="fc" id="L1151">            dataLayout = getClassDataLayout0();</span>
+        }
+<span class="fc" id="L1153">        return dataLayout;</span>
+    }
+
+    private ClassDataSlot[] getClassDataLayout0()
+        throws InvalidClassException
+    {
+<span class="fc" id="L1159">        ArrayList&lt;ClassDataSlot&gt; slots = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L1160">        Class&lt;?&gt; start = cl, end = cl;</span>
+
+        // locate closest non-serializable superclass
+<span class="fc bfc" id="L1163" title="All 4 branches covered.">        while (end != null &amp;&amp; Serializable.class.isAssignableFrom(end)) {</span>
+<span class="fc" id="L1164">            end = end.getSuperclass();</span>
+        }
+
+<span class="fc" id="L1167">        HashSet&lt;String&gt; oscNames = new HashSet&lt;&gt;(3);</span>
+
+<span class="fc bfc" id="L1169" title="All 2 branches covered.">        for (ObjectStreamClass d = this; d != null; d = d.superDesc) {</span>
+<span class="pc bpc" id="L1170" title="1 of 2 branches missed.">            if (oscNames.contains(d.name)) {</span>
+<span class="nc" id="L1171">                throw new InvalidClassException(&quot;Circular reference.&quot;);</span>
+            } else {
+<span class="fc" id="L1173">                oscNames.add(d.name);</span>
+            }
+
+            // search up inheritance hierarchy for class with matching name
+<span class="fc bfc" id="L1177" title="All 2 branches covered.">            String searchName = (d.cl != null) ? d.cl.getName() : d.name;</span>
+<span class="fc" id="L1178">            Class&lt;?&gt; match = null;</span>
+<span class="fc bfc" id="L1179" title="All 2 branches covered.">            for (Class&lt;?&gt; c = start; c != end; c = c.getSuperclass()) {</span>
+<span class="fc bfc" id="L1180" title="All 2 branches covered.">                if (searchName.equals(c.getName())) {</span>
+<span class="fc" id="L1181">                    match = c;</span>
+<span class="fc" id="L1182">                    break;</span>
+                }
+            }
+
+            // add &quot;no data&quot; slot for each unmatched class below match
+<span class="fc bfc" id="L1187" title="All 2 branches covered.">            if (match != null) {</span>
+<span class="fc bfc" id="L1188" title="All 2 branches covered.">                for (Class&lt;?&gt; c = start; c != match; c = c.getSuperclass()) {</span>
+<span class="fc" id="L1189">                    slots.add(new ClassDataSlot(</span>
+<span class="fc" id="L1190">                        ObjectStreamClass.lookup(c, true), false));</span>
+                }
+<span class="fc" id="L1192">                start = match.getSuperclass();</span>
+            }
+
+            // record descriptor/class pairing
+<span class="fc" id="L1196">            slots.add(new ClassDataSlot(d.getVariantFor(match), true));</span>
+        }
+
+        // add &quot;no data&quot; slot for any leftover unmatched classes
+<span class="fc bfc" id="L1200" title="All 2 branches covered.">        for (Class&lt;?&gt; c = start; c != end; c = c.getSuperclass()) {</span>
+<span class="fc" id="L1201">            slots.add(new ClassDataSlot(</span>
+<span class="fc" id="L1202">                ObjectStreamClass.lookup(c, true), false));</span>
+        }
+
+        // order slots from superclass -&gt; subclass
+<span class="fc" id="L1206">        Collections.reverse(slots);</span>
+<span class="fc" id="L1207">        return slots.toArray(new ClassDataSlot[slots.size()]);</span>
+    }
+
+    /**
+     * Returns aggregate size (in bytes) of marshalled primitive field values
+     * for represented class.
+     */
+    int getPrimDataSize() {
+<span class="fc" id="L1215">        return primDataSize;</span>
+    }
+
+    /**
+     * Returns number of non-primitive serializable fields of represented
+     * class.
+     */
+    int getNumObjFields() {
+<span class="fc" id="L1223">        return numObjFields;</span>
+    }
+
+    /**
+     * Fetches the serializable primitive field values of object obj and
+     * marshals them into byte array buf starting at offset 0.  It is the
+     * responsibility of the caller to ensure that obj is of the proper type if
+     * non-null.
+     */
+    void getPrimFieldValues(Object obj, byte[] buf) {
+<span class="fc" id="L1233">        fieldRefl.getPrimFieldValues(obj, buf);</span>
+<span class="fc" id="L1234">    }</span>
+
+    /**
+     * Sets the serializable primitive fields of object obj using values
+     * unmarshalled from byte array buf starting at offset 0.  It is the
+     * responsibility of the caller to ensure that obj is of the proper type if
+     * non-null.
+     */
+    void setPrimFieldValues(Object obj, byte[] buf) {
+<span class="fc" id="L1243">        fieldRefl.setPrimFieldValues(obj, buf);</span>
+<span class="fc" id="L1244">    }</span>
+
+    /**
+     * Fetches the serializable object field values of object obj and stores
+     * them in array vals starting at offset 0.  It is the responsibility of
+     * the caller to ensure that obj is of the proper type if non-null.
+     */
+    void getObjFieldValues(Object obj, Object[] vals) {
+<span class="fc" id="L1252">        fieldRefl.getObjFieldValues(obj, vals);</span>
+<span class="fc" id="L1253">    }</span>
+
+    /**
+     * Sets the serializable object fields of object obj using values from
+     * array vals starting at offset 0.  It is the responsibility of the caller
+     * to ensure that obj is of the proper type if non-null.
+     */
+    void setObjFieldValues(Object obj, Object[] vals) {
+<span class="fc" id="L1261">        fieldRefl.setObjFieldValues(obj, vals);</span>
+<span class="fc" id="L1262">    }</span>
+
+    /**
+     * Calculates and sets serializable field offsets, as well as primitive
+     * data size and object field count totals.  Throws InvalidClassException
+     * if fields are illegally ordered.
+     */
+    private void computeFieldOffsets() throws InvalidClassException {
+<span class="fc" id="L1270">        primDataSize = 0;</span>
+<span class="fc" id="L1271">        numObjFields = 0;</span>
+<span class="fc" id="L1272">        int firstObjIndex = -1;</span>
+
+<span class="fc bfc" id="L1274" title="All 2 branches covered.">        for (int i = 0; i &lt; fields.length; i++) {</span>
+<span class="fc" id="L1275">            ObjectStreamField f = fields[i];</span>
+<span class="pc bpc" id="L1276" title="1 of 6 branches missed.">            switch (f.getTypeCode()) {</span>
+                case 'Z':
+                case 'B':
+<span class="fc" id="L1279">                    f.setOffset(primDataSize++);</span>
+<span class="fc" id="L1280">                    break;</span>
+
+                case 'C':
+                case 'S':
+<span class="fc" id="L1284">                    f.setOffset(primDataSize);</span>
+<span class="fc" id="L1285">                    primDataSize += 2;</span>
+<span class="fc" id="L1286">                    break;</span>
+
+                case 'I':
+                case 'F':
+<span class="fc" id="L1290">                    f.setOffset(primDataSize);</span>
+<span class="fc" id="L1291">                    primDataSize += 4;</span>
+<span class="fc" id="L1292">                    break;</span>
+
+                case 'J':
+                case 'D':
+<span class="fc" id="L1296">                    f.setOffset(primDataSize);</span>
+<span class="fc" id="L1297">                    primDataSize += 8;</span>
+<span class="fc" id="L1298">                    break;</span>
+
+                case '[':
+                case 'L':
+<span class="fc" id="L1302">                    f.setOffset(numObjFields++);</span>
+<span class="fc bfc" id="L1303" title="All 2 branches covered.">                    if (firstObjIndex == -1) {</span>
+<span class="fc" id="L1304">                        firstObjIndex = i;</span>
+                    }
+                    break;
+
+                default:
+<span class="nc" id="L1309">                    throw new InternalError();</span>
+            }
+        }
+<span class="pc bpc" id="L1312" title="1 of 4 branches missed.">        if (firstObjIndex != -1 &amp;&amp;</span>
+            firstObjIndex + numObjFields != fields.length)
+        {
+<span class="nc" id="L1315">            throw new InvalidClassException(name, &quot;illegal field order&quot;);</span>
+        }
+<span class="fc" id="L1317">    }</span>
+
+    /**
+     * If given class is the same as the class associated with this class
+     * descriptor, returns reference to this class descriptor.  Otherwise,
+     * returns variant of this class descriptor bound to given class.
+     */
+    private ObjectStreamClass getVariantFor(Class&lt;?&gt; cl)
+        throws InvalidClassException
+    {
+<span class="fc bfc" id="L1327" title="All 2 branches covered.">        if (this.cl == cl) {</span>
+<span class="fc" id="L1328">            return this;</span>
+        }
+<span class="fc" id="L1330">        ObjectStreamClass desc = new ObjectStreamClass();</span>
+<span class="pc bpc" id="L1331" title="1 of 2 branches missed.">        if (isProxy) {</span>
+<span class="nc" id="L1332">            desc.initProxy(cl, null, superDesc);</span>
+        } else {
+<span class="fc" id="L1334">            desc.initNonProxy(this, cl, null, superDesc);</span>
+        }
+<span class="fc" id="L1336">        return desc;</span>
+    }
+
+    /**
+     * Returns public no-arg constructor of given class, or null if none found.
+     * Access checks are disabled on the returned constructor (if any), since
+     * the defining class may still be non-public.
+     */
+    private static Constructor&lt;?&gt; getExternalizableConstructor(Class&lt;?&gt; cl) {
+        try {
+<span class="fc" id="L1346">            Constructor&lt;?&gt; cons = cl.getDeclaredConstructor((Class&lt;?&gt;[]) null);</span>
+<span class="fc" id="L1347">            cons.setAccessible(true);</span>
+<span class="pc bpc" id="L1348" title="1 of 2 branches missed.">            return ((cons.getModifiers() &amp; Modifier.PUBLIC) != 0) ?</span>
+                cons : null;
+<span class="nc" id="L1350">        } catch (NoSuchMethodException ex) {</span>
+<span class="nc" id="L1351">            return null;</span>
+        }
+    }
+
+    /**
+     * Returns subclass-accessible no-arg constructor of first non-serializable
+     * superclass, or null if none found.  Access checks are disabled on the
+     * returned constructor (if any).
+     */
+    private static Constructor&lt;?&gt; getSerializableConstructor(Class&lt;?&gt; cl) {
+<span class="fc" id="L1361">        Class&lt;?&gt; initCl = cl;</span>
+<span class="fc bfc" id="L1362" title="All 2 branches covered.">        while (Serializable.class.isAssignableFrom(initCl)) {</span>
+<span class="pc bpc" id="L1363" title="1 of 2 branches missed.">            if ((initCl = initCl.getSuperclass()) == null) {</span>
+<span class="nc" id="L1364">                return null;</span>
+            }
+        }
+        try {
+<span class="fc" id="L1368">            Constructor&lt;?&gt; cons = initCl.getDeclaredConstructor((Class&lt;?&gt;[]) null);</span>
+<span class="fc" id="L1369">            int mods = cons.getModifiers();</span>
+<span class="pc bpc" id="L1370" title="1 of 4 branches missed.">            if ((mods &amp; Modifier.PRIVATE) != 0 ||</span>
+                ((mods &amp; (Modifier.PUBLIC | Modifier.PROTECTED)) == 0 &amp;&amp;
+<span class="pc bpc" id="L1372" title="1 of 2 branches missed.">                 !packageEquals(cl, initCl)))</span>
+            {
+<span class="fc" id="L1374">                return null;</span>
+            }
+<span class="fc" id="L1376">            cons = reflFactory.newConstructorForSerialization(cl, cons);</span>
+<span class="fc" id="L1377">            cons.setAccessible(true);</span>
+<span class="fc" id="L1378">            return cons;</span>
+<span class="fc" id="L1379">        } catch (NoSuchMethodException ex) {</span>
+<span class="fc" id="L1380">            return null;</span>
+        }
+    }
+
+    /**
+     * Returns non-static, non-abstract method with given signature provided it
+     * is defined by or accessible (via inheritance) by the given class, or
+     * null if no match found.  Access checks are disabled on the returned
+     * method (if any).
+     */
+    private static Method getInheritableMethod(Class&lt;?&gt; cl, String name,
+                                               Class&lt;?&gt;[] argTypes,
+                                               Class&lt;?&gt; returnType)
+    {
+<span class="fc" id="L1394">        Method meth = null;</span>
+<span class="fc" id="L1395">        Class&lt;?&gt; defCl = cl;</span>
+<span class="fc bfc" id="L1396" title="All 2 branches covered.">        while (defCl != null) {</span>
+            try {
+<span class="fc" id="L1398">                meth = defCl.getDeclaredMethod(name, argTypes);</span>
+<span class="fc" id="L1399">                break;</span>
+<span class="fc" id="L1400">            } catch (NoSuchMethodException ex) {</span>
+<span class="fc" id="L1401">                defCl = defCl.getSuperclass();</span>
+<span class="fc" id="L1402">            }</span>
+        }
+
+<span class="fc bfc" id="L1405" title="All 4 branches covered.">        if ((meth == null) || (meth.getReturnType() != returnType)) {</span>
+<span class="fc" id="L1406">            return null;</span>
+        }
+<span class="fc" id="L1408">        meth.setAccessible(true);</span>
+<span class="fc" id="L1409">        int mods = meth.getModifiers();</span>
+<span class="pc bpc" id="L1410" title="1 of 2 branches missed.">        if ((mods &amp; (Modifier.STATIC | Modifier.ABSTRACT)) != 0) {</span>
+<span class="nc" id="L1411">            return null;</span>
+<span class="fc bfc" id="L1412" title="All 2 branches covered.">        } else if ((mods &amp; (Modifier.PUBLIC | Modifier.PROTECTED)) != 0) {</span>
+<span class="fc" id="L1413">            return meth;</span>
+<span class="fc bfc" id="L1414" title="All 2 branches covered.">        } else if ((mods &amp; Modifier.PRIVATE) != 0) {</span>
+<span class="fc bfc" id="L1415" title="All 2 branches covered.">            return (cl == defCl) ? meth : null;</span>
+        } else {
+<span class="fc bfc" id="L1417" title="All 2 branches covered.">            return packageEquals(cl, defCl) ? meth : null;</span>
+        }
+    }
+
+    /**
+     * Returns non-static private method with given signature defined by given
+     * class, or null if none found.  Access checks are disabled on the
+     * returned method (if any).
+     */
+    private static Method getPrivateMethod(Class&lt;?&gt; cl, String name,
+                                           Class&lt;?&gt;[] argTypes,
+                                           Class&lt;?&gt; returnType)
+    {
+        try {
+<span class="fc" id="L1431">            Method meth = cl.getDeclaredMethod(name, argTypes);</span>
+<span class="fc" id="L1432">            meth.setAccessible(true);</span>
+<span class="fc" id="L1433">            int mods = meth.getModifiers();</span>
+<span class="pc bpc" id="L1434" title="2 of 6 branches missed.">            return ((meth.getReturnType() == returnType) &amp;&amp;</span>
+                    ((mods &amp; Modifier.STATIC) == 0) &amp;&amp;
+                    ((mods &amp; Modifier.PRIVATE) != 0)) ? meth : null;
+<span class="fc" id="L1437">        } catch (NoSuchMethodException ex) {</span>
+<span class="fc" id="L1438">            return null;</span>
+        }
+    }
+
+    /**
+     * Returns true if classes are defined in the same runtime package, false
+     * otherwise.
+     */
+    private static boolean packageEquals(Class&lt;?&gt; cl1, Class&lt;?&gt; cl2) {
+<span class="fc bfc" id="L1447" title="All 2 branches covered.">        return (cl1.getClassLoader() == cl2.getClassLoader() &amp;&amp;</span>
+<span class="pc bpc" id="L1448" title="1 of 2 branches missed.">                getPackageName(cl1).equals(getPackageName(cl2)));</span>
+    }
+
+    /**
+     * Returns package name of given class.
+     */
+    private static String getPackageName(Class&lt;?&gt; cl) {
+<span class="fc" id="L1455">        String s = cl.getName();</span>
+<span class="fc" id="L1456">        int i = s.lastIndexOf('[');</span>
+<span class="pc bpc" id="L1457" title="1 of 2 branches missed.">        if (i &gt;= 0) {</span>
+<span class="nc" id="L1458">            s = s.substring(i + 2);</span>
+        }
+<span class="fc" id="L1460">        i = s.lastIndexOf('.');</span>
+<span class="fc bfc" id="L1461" title="All 2 branches covered.">        return (i &gt;= 0) ? s.substring(0, i) : &quot;&quot;;</span>
+    }
+
+    /**
+     * Compares class names for equality, ignoring package names.  Returns true
+     * if class names equal, false otherwise.
+     */
+    private static boolean classNamesEqual(String name1, String name2) {
+<span class="fc" id="L1469">        name1 = name1.substring(name1.lastIndexOf('.') + 1);</span>
+<span class="fc" id="L1470">        name2 = name2.substring(name2.lastIndexOf('.') + 1);</span>
+<span class="fc" id="L1471">        return name1.equals(name2);</span>
+    }
+
+    /**
+     * Returns JVM type signature for given class.
+     */
+    private static String getClassSignature(Class&lt;?&gt; cl) {
+<span class="fc" id="L1478">        StringBuilder sbuf = new StringBuilder();</span>
+<span class="fc bfc" id="L1479" title="All 2 branches covered.">        while (cl.isArray()) {</span>
+<span class="fc" id="L1480">            sbuf.append('[');</span>
+<span class="fc" id="L1481">            cl = cl.getComponentType();</span>
+        }
+<span class="fc bfc" id="L1483" title="All 2 branches covered.">        if (cl.isPrimitive()) {</span>
+<span class="fc bfc" id="L1484" title="All 2 branches covered.">            if (cl == Integer.TYPE) {</span>
+<span class="fc" id="L1485">                sbuf.append('I');</span>
+<span class="fc bfc" id="L1486" title="All 2 branches covered.">            } else if (cl == Byte.TYPE) {</span>
+<span class="fc" id="L1487">                sbuf.append('B');</span>
+<span class="fc bfc" id="L1488" title="All 2 branches covered.">            } else if (cl == Long.TYPE) {</span>
+<span class="fc" id="L1489">                sbuf.append('J');</span>
+<span class="fc bfc" id="L1490" title="All 2 branches covered.">            } else if (cl == Float.TYPE) {</span>
+<span class="fc" id="L1491">                sbuf.append('F');</span>
+<span class="fc bfc" id="L1492" title="All 2 branches covered.">            } else if (cl == Double.TYPE) {</span>
+<span class="fc" id="L1493">                sbuf.append('D');</span>
+<span class="fc bfc" id="L1494" title="All 2 branches covered.">            } else if (cl == Short.TYPE) {</span>
+<span class="fc" id="L1495">                sbuf.append('S');</span>
+<span class="fc bfc" id="L1496" title="All 2 branches covered.">            } else if (cl == Character.TYPE) {</span>
+<span class="fc" id="L1497">                sbuf.append('C');</span>
+<span class="fc bfc" id="L1498" title="All 2 branches covered.">            } else if (cl == Boolean.TYPE) {</span>
+<span class="fc" id="L1499">                sbuf.append('Z');</span>
+<span class="pc bpc" id="L1500" title="1 of 2 branches missed.">            } else if (cl == Void.TYPE) {</span>
+<span class="fc" id="L1501">                sbuf.append('V');</span>
+            } else {
+<span class="nc" id="L1503">                throw new InternalError();</span>
+            }
+        } else {
+<span class="fc" id="L1506">            sbuf.append('L' + cl.getName().replace('.', '/') + ';');</span>
+        }
+<span class="fc" id="L1508">        return sbuf.toString();</span>
+    }
+
+    /**
+     * Returns JVM type signature for given list of parameters and return type.
+     */
+    private static String getMethodSignature(Class&lt;?&gt;[] paramTypes,
+                                             Class&lt;?&gt; retType)
+    {
+<span class="fc" id="L1517">        StringBuilder sbuf = new StringBuilder();</span>
+<span class="fc" id="L1518">        sbuf.append('(');</span>
+<span class="fc bfc" id="L1519" title="All 2 branches covered.">        for (int i = 0; i &lt; paramTypes.length; i++) {</span>
+<span class="fc" id="L1520">            sbuf.append(getClassSignature(paramTypes[i]));</span>
+        }
+<span class="fc" id="L1522">        sbuf.append(')');</span>
+<span class="fc" id="L1523">        sbuf.append(getClassSignature(retType));</span>
+<span class="fc" id="L1524">        return sbuf.toString();</span>
+    }
+
+    /**
+     * Convenience method for throwing an exception that is either a
+     * RuntimeException, Error, or of some unexpected type (in which case it is
+     * wrapped inside an IOException).
+     */
+    private static void throwMiscException(Throwable th) throws IOException {
+<span class="fc bfc" id="L1533" title="All 2 branches covered.">        if (th instanceof RuntimeException) {</span>
+<span class="fc" id="L1534">            throw (RuntimeException) th;</span>
+<span class="pc bpc" id="L1535" title="1 of 2 branches missed.">        } else if (th instanceof Error) {</span>
+<span class="fc" id="L1536">            throw (Error) th;</span>
+        } else {
+<span class="nc" id="L1538">            IOException ex = new IOException(&quot;unexpected exception type&quot;);</span>
+<span class="nc" id="L1539">            ex.initCause(th);</span>
+<span class="nc" id="L1540">            throw ex;</span>
+        }
+    }
+
+    /**
+     * Returns ObjectStreamField array describing the serializable fields of
+     * the given class.  Serializable fields backed by an actual field of the
+     * class are represented by ObjectStreamFields with corresponding non-null
+     * Field objects.  Throws InvalidClassException if the (explicitly
+     * declared) serializable fields are invalid.
+     */
+    private static ObjectStreamField[] getSerialFields(Class&lt;?&gt; cl)
+        throws InvalidClassException
+    {
+        ObjectStreamField[] fields;
+<span class="pc bpc" id="L1555" title="1 of 2 branches missed.">        if (Serializable.class.isAssignableFrom(cl) &amp;&amp;</span>
+<span class="fc bfc" id="L1556" title="All 2 branches covered.">            !Externalizable.class.isAssignableFrom(cl) &amp;&amp;</span>
+<span class="fc bfc" id="L1557" title="All 2 branches covered.">            !Proxy.isProxyClass(cl) &amp;&amp;</span>
+<span class="pc bpc" id="L1558" title="1 of 2 branches missed.">            !cl.isInterface())</span>
+        {
+<span class="fc bfc" id="L1560" title="All 2 branches covered.">            if ((fields = getDeclaredSerialFields(cl)) == null) {</span>
+<span class="fc" id="L1561">                fields = getDefaultSerialFields(cl);</span>
+            }
+<span class="fc" id="L1563">            Arrays.sort(fields);</span>
+        } else {
+<span class="fc" id="L1565">            fields = NO_FIELDS;</span>
+        }
+<span class="fc" id="L1567">        return fields;</span>
+    }
+
+    /**
+     * Returns serializable fields of given class as defined explicitly by a
+     * &quot;serialPersistentFields&quot; field, or null if no appropriate
+     * &quot;serialPersistentFields&quot; field is defined.  Serializable fields backed
+     * by an actual field of the class are represented by ObjectStreamFields
+     * with corresponding non-null Field objects.  For compatibility with past
+     * releases, a &quot;serialPersistentFields&quot; field with a null value is
+     * considered equivalent to not declaring &quot;serialPersistentFields&quot;.  Throws
+     * InvalidClassException if the declared serializable fields are
+     * invalid--e.g., if multiple fields share the same name.
+     */
+    private static ObjectStreamField[] getDeclaredSerialFields(Class&lt;?&gt; cl)
+        throws InvalidClassException
+    {
+<span class="fc" id="L1584">        ObjectStreamField[] serialPersistentFields = null;</span>
+        try {
+<span class="fc" id="L1586">            Field f = cl.getDeclaredField(&quot;serialPersistentFields&quot;);</span>
+<span class="fc" id="L1587">            int mask = Modifier.PRIVATE | Modifier.STATIC | Modifier.FINAL;</span>
+<span class="fc bfc" id="L1588" title="All 2 branches covered.">            if ((f.getModifiers() &amp; mask) == mask) {</span>
+<span class="fc" id="L1589">                f.setAccessible(true);</span>
+<span class="fc" id="L1590">                serialPersistentFields = (ObjectStreamField[]) f.get(null);</span>
+            }
+<span class="fc" id="L1592">        } catch (Exception ex) {</span>
+<span class="fc" id="L1593">        }</span>
+<span class="fc bfc" id="L1594" title="All 2 branches covered.">        if (serialPersistentFields == null) {</span>
+<span class="fc" id="L1595">            return null;</span>
+<span class="fc bfc" id="L1596" title="All 2 branches covered.">        } else if (serialPersistentFields.length == 0) {</span>
+<span class="fc" id="L1597">            return NO_FIELDS;</span>
+        }
+
+<span class="fc" id="L1600">        ObjectStreamField[] boundFields =</span>
+            new ObjectStreamField[serialPersistentFields.length];
+<span class="fc" id="L1602">        Set&lt;String&gt; fieldNames = new HashSet&lt;&gt;(serialPersistentFields.length);</span>
+
+<span class="fc bfc" id="L1604" title="All 2 branches covered.">        for (int i = 0; i &lt; serialPersistentFields.length; i++) {</span>
+<span class="fc" id="L1605">            ObjectStreamField spf = serialPersistentFields[i];</span>
+
+<span class="fc" id="L1607">            String fname = spf.getName();</span>
+<span class="fc bfc" id="L1608" title="All 2 branches covered.">            if (fieldNames.contains(fname)) {</span>
+<span class="fc" id="L1609">                throw new InvalidClassException(</span>
+                    &quot;multiple serializable fields named &quot; + fname);
+            }
+<span class="fc" id="L1612">            fieldNames.add(fname);</span>
+
+            try {
+<span class="fc" id="L1615">                Field f = cl.getDeclaredField(fname);</span>
+<span class="pc bpc" id="L1616" title="1 of 2 branches missed.">                if ((f.getType() == spf.getType()) &amp;&amp;</span>
+<span class="pc bpc" id="L1617" title="1 of 2 branches missed.">                    ((f.getModifiers() &amp; Modifier.STATIC) == 0))</span>
+                {
+<span class="fc" id="L1619">                    boundFields[i] =</span>
+<span class="fc" id="L1620">                        new ObjectStreamField(f, spf.isUnshared(), true);</span>
+                }
+<span class="fc" id="L1622">            } catch (NoSuchFieldException ex) {</span>
+<span class="fc" id="L1623">            }</span>
+<span class="fc bfc" id="L1624" title="All 2 branches covered.">            if (boundFields[i] == null) {</span>
+<span class="fc" id="L1625">                boundFields[i] = new ObjectStreamField(</span>
+<span class="fc" id="L1626">                    fname, spf.getType(), spf.isUnshared());</span>
+            }
+        }
+<span class="fc" id="L1629">        return boundFields;</span>
+    }
+
+    /**
+     * Returns array of ObjectStreamFields corresponding to all non-static
+     * non-transient fields declared by given class.  Each ObjectStreamField
+     * contains a Field object for the field it represents.  If no default
+     * serializable fields exist, NO_FIELDS is returned.
+     */
+    private static ObjectStreamField[] getDefaultSerialFields(Class&lt;?&gt; cl) {
+<span class="fc" id="L1639">        Field[] clFields = cl.getDeclaredFields();</span>
+<span class="fc" id="L1640">        ArrayList&lt;ObjectStreamField&gt; list = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L1641">        int mask = Modifier.STATIC | Modifier.TRANSIENT;</span>
+
+<span class="fc bfc" id="L1643" title="All 2 branches covered.">        for (int i = 0; i &lt; clFields.length; i++) {</span>
+<span class="fc bfc" id="L1644" title="All 2 branches covered.">            if ((clFields[i].getModifiers() &amp; mask) == 0) {</span>
+<span class="fc" id="L1645">                list.add(new ObjectStreamField(clFields[i], false, true));</span>
+            }
+        }
+<span class="fc" id="L1648">        int size = list.size();</span>
+<span class="fc bfc" id="L1649" title="All 2 branches covered.">        return (size == 0) ? NO_FIELDS :</span>
+<span class="fc" id="L1650">            list.toArray(new ObjectStreamField[size]);</span>
+    }
+
+    /**
+     * Returns explicit serial version UID value declared by given class, or
+     * null if none.
+     */
+    private static Long getDeclaredSUID(Class&lt;?&gt; cl) {
+        try {
+<span class="fc" id="L1659">            Field f = cl.getDeclaredField(&quot;serialVersionUID&quot;);</span>
+<span class="fc" id="L1660">            int mask = Modifier.STATIC | Modifier.FINAL;</span>
+<span class="fc bfc" id="L1661" title="All 2 branches covered.">            if ((f.getModifiers() &amp; mask) == mask) {</span>
+<span class="fc" id="L1662">                f.setAccessible(true);</span>
+<span class="fc" id="L1663">                return Long.valueOf(f.getLong(null));</span>
+            }
+<span class="fc" id="L1665">        } catch (Exception ex) {</span>
+<span class="fc" id="L1666">        }</span>
+<span class="fc" id="L1667">        return null;</span>
+    }
+
+    /**
+     * Computes the default serial version UID value for the given class.
+     */
+    private static long computeDefaultSUID(Class&lt;?&gt; cl) {
+<span class="pc bpc" id="L1674" title="2 of 4 branches missed.">        if (!Serializable.class.isAssignableFrom(cl) || Proxy.isProxyClass(cl))</span>
+        {
+<span class="nc" id="L1676">            return 0L;</span>
+        }
+
+        try {
+<span class="fc" id="L1680">            ByteArrayOutputStream bout = new ByteArrayOutputStream();</span>
+<span class="fc" id="L1681">            DataOutputStream dout = new DataOutputStream(bout);</span>
+
+<span class="fc" id="L1683">            dout.writeUTF(cl.getName());</span>
+
+<span class="fc" id="L1685">            int classMods = cl.getModifiers() &amp;</span>
+                (Modifier.PUBLIC | Modifier.FINAL |
+                 Modifier.INTERFACE | Modifier.ABSTRACT);
+
+            /*
+             * compensate for javac bug in which ABSTRACT bit was set for an
+             * interface only if the interface declared methods
+             */
+<span class="fc" id="L1693">            Method[] methods = cl.getDeclaredMethods();</span>
+<span class="pc bpc" id="L1694" title="1 of 2 branches missed.">            if ((classMods &amp; Modifier.INTERFACE) != 0) {</span>
+<span class="nc bnc" id="L1695" title="All 2 branches missed.">                classMods = (methods.length &gt; 0) ?</span>
+                    (classMods | Modifier.ABSTRACT) :
+                    (classMods &amp; ~Modifier.ABSTRACT);
+            }
+<span class="fc" id="L1699">            dout.writeInt(classMods);</span>
+
+<span class="fc bfc" id="L1701" title="All 2 branches covered.">            if (!cl.isArray()) {</span>
+                /*
+                 * compensate for change in 1.2FCS in which
+                 * Class.getInterfaces() was modified to return Cloneable and
+                 * Serializable for array classes.
+                 */
+<span class="fc" id="L1707">                Class&lt;?&gt;[] interfaces = cl.getInterfaces();</span>
+<span class="fc" id="L1708">                String[] ifaceNames = new String[interfaces.length];</span>
+<span class="fc bfc" id="L1709" title="All 2 branches covered.">                for (int i = 0; i &lt; interfaces.length; i++) {</span>
+<span class="fc" id="L1710">                    ifaceNames[i] = interfaces[i].getName();</span>
+                }
+<span class="fc" id="L1712">                Arrays.sort(ifaceNames);</span>
+<span class="fc bfc" id="L1713" title="All 2 branches covered.">                for (int i = 0; i &lt; ifaceNames.length; i++) {</span>
+<span class="fc" id="L1714">                    dout.writeUTF(ifaceNames[i]);</span>
+                }
+            }
+
+<span class="fc" id="L1718">            Field[] fields = cl.getDeclaredFields();</span>
+<span class="fc" id="L1719">            MemberSignature[] fieldSigs = new MemberSignature[fields.length];</span>
+<span class="fc bfc" id="L1720" title="All 2 branches covered.">            for (int i = 0; i &lt; fields.length; i++) {</span>
+<span class="fc" id="L1721">                fieldSigs[i] = new MemberSignature(fields[i]);</span>
+            }
+<span class="fc" id="L1723">            Arrays.sort(fieldSigs, new Comparator&lt;MemberSignature&gt;() {</span>
+                public int compare(MemberSignature ms1, MemberSignature ms2) {
+<span class="fc" id="L1725">                    return ms1.name.compareTo(ms2.name);</span>
+                }
+            });
+<span class="fc bfc" id="L1728" title="All 2 branches covered.">            for (int i = 0; i &lt; fieldSigs.length; i++) {</span>
+<span class="fc" id="L1729">                MemberSignature sig = fieldSigs[i];</span>
+<span class="fc" id="L1730">                int mods = sig.member.getModifiers() &amp;</span>
+                    (Modifier.PUBLIC | Modifier.PRIVATE | Modifier.PROTECTED |
+                     Modifier.STATIC | Modifier.FINAL | Modifier.VOLATILE |
+                     Modifier.TRANSIENT);
+<span class="fc bfc" id="L1734" title="All 4 branches covered.">                if (((mods &amp; Modifier.PRIVATE) == 0) ||</span>
+                    ((mods &amp; (Modifier.STATIC | Modifier.TRANSIENT)) == 0))
+                {
+<span class="fc" id="L1737">                    dout.writeUTF(sig.name);</span>
+<span class="fc" id="L1738">                    dout.writeInt(mods);</span>
+<span class="fc" id="L1739">                    dout.writeUTF(sig.signature);</span>
+                }
+            }
+
+<span class="fc bfc" id="L1743" title="All 2 branches covered.">            if (hasStaticInitializer(cl)) {</span>
+<span class="fc" id="L1744">                dout.writeUTF(&quot;&lt;clinit&gt;&quot;);</span>
+<span class="fc" id="L1745">                dout.writeInt(Modifier.STATIC);</span>
+<span class="fc" id="L1746">                dout.writeUTF(&quot;()V&quot;);</span>
+            }
+
+<span class="fc" id="L1749">            Constructor&lt;?&gt;[] cons = cl.getDeclaredConstructors();</span>
+<span class="fc" id="L1750">            MemberSignature[] consSigs = new MemberSignature[cons.length];</span>
+<span class="fc bfc" id="L1751" title="All 2 branches covered.">            for (int i = 0; i &lt; cons.length; i++) {</span>
+<span class="fc" id="L1752">                consSigs[i] = new MemberSignature(cons[i]);</span>
+            }
+<span class="fc" id="L1754">            Arrays.sort(consSigs, new Comparator&lt;MemberSignature&gt;() {</span>
+                public int compare(MemberSignature ms1, MemberSignature ms2) {
+<span class="fc" id="L1756">                    return ms1.signature.compareTo(ms2.signature);</span>
+                }
+            });
+<span class="fc bfc" id="L1759" title="All 2 branches covered.">            for (int i = 0; i &lt; consSigs.length; i++) {</span>
+<span class="fc" id="L1760">                MemberSignature sig = consSigs[i];</span>
+<span class="fc" id="L1761">                int mods = sig.member.getModifiers() &amp;</span>
+                    (Modifier.PUBLIC | Modifier.PRIVATE | Modifier.PROTECTED |
+                     Modifier.STATIC | Modifier.FINAL |
+                     Modifier.SYNCHRONIZED | Modifier.NATIVE |
+                     Modifier.ABSTRACT | Modifier.STRICT);
+<span class="fc bfc" id="L1766" title="All 2 branches covered.">                if ((mods &amp; Modifier.PRIVATE) == 0) {</span>
+<span class="fc" id="L1767">                    dout.writeUTF(&quot;&lt;init&gt;&quot;);</span>
+<span class="fc" id="L1768">                    dout.writeInt(mods);</span>
+<span class="fc" id="L1769">                    dout.writeUTF(sig.signature.replace('/', '.'));</span>
+                }
+            }
+
+<span class="fc" id="L1773">            MemberSignature[] methSigs = new MemberSignature[methods.length];</span>
+<span class="fc bfc" id="L1774" title="All 2 branches covered.">            for (int i = 0; i &lt; methods.length; i++) {</span>
+<span class="fc" id="L1775">                methSigs[i] = new MemberSignature(methods[i]);</span>
+            }
+<span class="fc" id="L1777">            Arrays.sort(methSigs, new Comparator&lt;MemberSignature&gt;() {</span>
+                public int compare(MemberSignature ms1, MemberSignature ms2) {
+<span class="fc" id="L1779">                    int comp = ms1.name.compareTo(ms2.name);</span>
+<span class="fc bfc" id="L1780" title="All 2 branches covered.">                    if (comp == 0) {</span>
+<span class="fc" id="L1781">                        comp = ms1.signature.compareTo(ms2.signature);</span>
+                    }
+<span class="fc" id="L1783">                    return comp;</span>
+                }
+            });
+<span class="fc bfc" id="L1786" title="All 2 branches covered.">            for (int i = 0; i &lt; methSigs.length; i++) {</span>
+<span class="fc" id="L1787">                MemberSignature sig = methSigs[i];</span>
+<span class="fc" id="L1788">                int mods = sig.member.getModifiers() &amp;</span>
+                    (Modifier.PUBLIC | Modifier.PRIVATE | Modifier.PROTECTED |
+                     Modifier.STATIC | Modifier.FINAL |
+                     Modifier.SYNCHRONIZED | Modifier.NATIVE |
+                     Modifier.ABSTRACT | Modifier.STRICT);
+<span class="fc bfc" id="L1793" title="All 2 branches covered.">                if ((mods &amp; Modifier.PRIVATE) == 0) {</span>
+<span class="fc" id="L1794">                    dout.writeUTF(sig.name);</span>
+<span class="fc" id="L1795">                    dout.writeInt(mods);</span>
+<span class="fc" id="L1796">                    dout.writeUTF(sig.signature.replace('/', '.'));</span>
+                }
+            }
+
+<span class="fc" id="L1800">            dout.flush();</span>
+
+<span class="fc" id="L1802">            MessageDigest md = MessageDigest.getInstance(&quot;SHA&quot;);</span>
+<span class="fc" id="L1803">            byte[] hashBytes = md.digest(bout.toByteArray());</span>
+<span class="fc" id="L1804">            long hash = 0;</span>
+<span class="fc bfc" id="L1805" title="All 2 branches covered.">            for (int i = Math.min(hashBytes.length, 8) - 1; i &gt;= 0; i--) {</span>
+<span class="fc" id="L1806">                hash = (hash &lt;&lt; 8) | (hashBytes[i] &amp; 0xFF);</span>
+            }
+<span class="fc" id="L1808">            return hash;</span>
+<span class="nc" id="L1809">        } catch (IOException ex) {</span>
+<span class="nc" id="L1810">            throw new InternalError(ex);</span>
+<span class="nc" id="L1811">        } catch (NoSuchAlgorithmException ex) {</span>
+<span class="nc" id="L1812">            throw new SecurityException(ex.getMessage());</span>
+        }
+    }
+
+    /**
+     * Returns true if the given class defines a static initializer method,
+     * false otherwise.
+     */
+    private native static boolean hasStaticInitializer(Class&lt;?&gt; cl);
+
+    /**
+     * Class for computing and caching field/constructor/method signatures
+     * during serialVersionUID calculation.
+     */
+    private static class MemberSignature {
+
+        public final Member member;
+        public final String name;
+        public final String signature;
+
+<span class="fc" id="L1832">        public MemberSignature(Field field) {</span>
+<span class="fc" id="L1833">            member = field;</span>
+<span class="fc" id="L1834">            name = field.getName();</span>
+<span class="fc" id="L1835">            signature = getClassSignature(field.getType());</span>
+<span class="fc" id="L1836">        }</span>
+
+<span class="fc" id="L1838">        public MemberSignature(Constructor&lt;?&gt; cons) {</span>
+<span class="fc" id="L1839">            member = cons;</span>
+<span class="fc" id="L1840">            name = cons.getName();</span>
+<span class="fc" id="L1841">            signature = getMethodSignature(</span>
+<span class="fc" id="L1842">                cons.getParameterTypes(), Void.TYPE);</span>
+<span class="fc" id="L1843">        }</span>
+
+<span class="fc" id="L1845">        public MemberSignature(Method meth) {</span>
+<span class="fc" id="L1846">            member = meth;</span>
+<span class="fc" id="L1847">            name = meth.getName();</span>
+<span class="fc" id="L1848">            signature = getMethodSignature(</span>
+<span class="fc" id="L1849">                meth.getParameterTypes(), meth.getReturnType());</span>
+<span class="fc" id="L1850">        }</span>
+    }
+
+    /**
+     * Class for setting and retrieving serializable field values in batch.
+     */
+    // REMIND: dynamically generate these?
+    private static class FieldReflector {
+
+        /** handle for performing unsafe operations */
+<span class="fc" id="L1860">        private static final Unsafe unsafe = Unsafe.getUnsafe();</span>
+
+        /** fields to operate on */
+        private final ObjectStreamField[] fields;
+        /** number of primitive fields */
+        private final int numPrimFields;
+        /** unsafe field keys for reading fields - may contain dupes */
+        private final long[] readKeys;
+        /** unsafe fields keys for writing fields - no dupes */
+        private final long[] writeKeys;
+        /** field data offsets */
+        private final int[] offsets;
+        /** field type codes */
+        private final char[] typeCodes;
+        /** field types */
+        private final Class&lt;?&gt;[] types;
+
+        /**
+         * Constructs FieldReflector capable of setting/getting values from the
+         * subset of fields whose ObjectStreamFields contain non-null
+         * reflective Field objects.  ObjectStreamFields with null Fields are
+         * treated as filler, for which get operations return default values
+         * and set operations discard given values.
+         */
+<span class="fc" id="L1884">        FieldReflector(ObjectStreamField[] fields) {</span>
+<span class="fc" id="L1885">            this.fields = fields;</span>
+<span class="fc" id="L1886">            int nfields = fields.length;</span>
+<span class="fc" id="L1887">            readKeys = new long[nfields];</span>
+<span class="fc" id="L1888">            writeKeys = new long[nfields];</span>
+<span class="fc" id="L1889">            offsets = new int[nfields];</span>
+<span class="fc" id="L1890">            typeCodes = new char[nfields];</span>
+<span class="fc" id="L1891">            ArrayList&lt;Class&lt;?&gt;&gt; typeList = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L1892">            Set&lt;Long&gt; usedKeys = new HashSet&lt;&gt;();</span>
+
+
+<span class="fc bfc" id="L1895" title="All 2 branches covered.">            for (int i = 0; i &lt; nfields; i++) {</span>
+<span class="fc" id="L1896">                ObjectStreamField f = fields[i];</span>
+<span class="fc" id="L1897">                Field rf = f.getField();</span>
+<span class="fc bfc" id="L1898" title="All 2 branches covered.">                long key = (rf != null) ?</span>
+<span class="fc" id="L1899">                    unsafe.objectFieldOffset(rf) : Unsafe.INVALID_FIELD_OFFSET;</span>
+<span class="fc" id="L1900">                readKeys[i] = key;</span>
+<span class="fc bfc" id="L1901" title="All 2 branches covered.">                writeKeys[i] = usedKeys.add(key) ?</span>
+                    key : Unsafe.INVALID_FIELD_OFFSET;
+<span class="fc" id="L1903">                offsets[i] = f.getOffset();</span>
+<span class="fc" id="L1904">                typeCodes[i] = f.getTypeCode();</span>
+<span class="fc bfc" id="L1905" title="All 2 branches covered.">                if (!f.isPrimitive()) {</span>
+<span class="fc bfc" id="L1906" title="All 2 branches covered.">                    typeList.add((rf != null) ? rf.getType() : null);</span>
+                }
+            }
+
+<span class="fc" id="L1910">            types = typeList.toArray(new Class&lt;?&gt;[typeList.size()]);</span>
+<span class="fc" id="L1911">            numPrimFields = nfields - types.length;</span>
+<span class="fc" id="L1912">        }</span>
+
+        /**
+         * Returns list of ObjectStreamFields representing fields operated on
+         * by this reflector.  The shared/unshared values and Field objects
+         * contained by ObjectStreamFields in the list reflect their bindings
+         * to locally defined serializable fields.
+         */
+        ObjectStreamField[] getFields() {
+<span class="fc" id="L1921">            return fields;</span>
+        }
+
+        /**
+         * Fetches the serializable primitive field values of object obj and
+         * marshals them into byte array buf starting at offset 0.  The caller
+         * is responsible for ensuring that obj is of the proper type.
+         */
+        void getPrimFieldValues(Object obj, byte[] buf) {
+<span class="pc bpc" id="L1930" title="1 of 2 branches missed.">            if (obj == null) {</span>
+<span class="nc" id="L1931">                throw new NullPointerException();</span>
+            }
+            /* assuming checkDefaultSerialize() has been called on the class
+             * descriptor this FieldReflector was obtained from, no field keys
+             * in array should be equal to Unsafe.INVALID_FIELD_OFFSET.
+             */
+<span class="fc bfc" id="L1937" title="All 2 branches covered.">            for (int i = 0; i &lt; numPrimFields; i++) {</span>
+<span class="fc" id="L1938">                long key = readKeys[i];</span>
+<span class="fc" id="L1939">                int off = offsets[i];</span>
+<span class="pc bpc" id="L1940" title="1 of 9 branches missed.">                switch (typeCodes[i]) {</span>
+                    case 'Z':
+<span class="fc" id="L1942">                        Bits.putBoolean(buf, off, unsafe.getBoolean(obj, key));</span>
+<span class="fc" id="L1943">                        break;</span>
+
+                    case 'B':
+<span class="fc" id="L1946">                        buf[off] = unsafe.getByte(obj, key);</span>
+<span class="fc" id="L1947">                        break;</span>
+
+                    case 'C':
+<span class="fc" id="L1950">                        Bits.putChar(buf, off, unsafe.getChar(obj, key));</span>
+<span class="fc" id="L1951">                        break;</span>
+
+                    case 'S':
+<span class="fc" id="L1954">                        Bits.putShort(buf, off, unsafe.getShort(obj, key));</span>
+<span class="fc" id="L1955">                        break;</span>
+
+                    case 'I':
+<span class="fc" id="L1958">                        Bits.putInt(buf, off, unsafe.getInt(obj, key));</span>
+<span class="fc" id="L1959">                        break;</span>
+
+                    case 'F':
+<span class="fc" id="L1962">                        Bits.putFloat(buf, off, unsafe.getFloat(obj, key));</span>
+<span class="fc" id="L1963">                        break;</span>
+
+                    case 'J':
+<span class="fc" id="L1966">                        Bits.putLong(buf, off, unsafe.getLong(obj, key));</span>
+<span class="fc" id="L1967">                        break;</span>
+
+                    case 'D':
+<span class="fc" id="L1970">                        Bits.putDouble(buf, off, unsafe.getDouble(obj, key));</span>
+<span class="fc" id="L1971">                        break;</span>
+
+                    default:
+<span class="nc" id="L1974">                        throw new InternalError();</span>
+                }
+            }
+<span class="fc" id="L1977">        }</span>
+
+        /**
+         * Sets the serializable primitive fields of object obj using values
+         * unmarshalled from byte array buf starting at offset 0.  The caller
+         * is responsible for ensuring that obj is of the proper type.
+         */
+        void setPrimFieldValues(Object obj, byte[] buf) {
+<span class="pc bpc" id="L1985" title="1 of 2 branches missed.">            if (obj == null) {</span>
+<span class="nc" id="L1986">                throw new NullPointerException();</span>
+            }
+<span class="fc bfc" id="L1988" title="All 2 branches covered.">            for (int i = 0; i &lt; numPrimFields; i++) {</span>
+<span class="fc" id="L1989">                long key = writeKeys[i];</span>
+<span class="fc bfc" id="L1990" title="All 2 branches covered.">                if (key == Unsafe.INVALID_FIELD_OFFSET) {</span>
+<span class="fc" id="L1991">                    continue;           // discard value</span>
+                }
+<span class="fc" id="L1993">                int off = offsets[i];</span>
+<span class="pc bpc" id="L1994" title="1 of 9 branches missed.">                switch (typeCodes[i]) {</span>
+                    case 'Z':
+<span class="fc" id="L1996">                        unsafe.putBoolean(obj, key, Bits.getBoolean(buf, off));</span>
+<span class="fc" id="L1997">                        break;</span>
+
+                    case 'B':
+<span class="fc" id="L2000">                        unsafe.putByte(obj, key, buf[off]);</span>
+<span class="fc" id="L2001">                        break;</span>
+
+                    case 'C':
+<span class="fc" id="L2004">                        unsafe.putChar(obj, key, Bits.getChar(buf, off));</span>
+<span class="fc" id="L2005">                        break;</span>
+
+                    case 'S':
+<span class="fc" id="L2008">                        unsafe.putShort(obj, key, Bits.getShort(buf, off));</span>
+<span class="fc" id="L2009">                        break;</span>
+
+                    case 'I':
+<span class="fc" id="L2012">                        unsafe.putInt(obj, key, Bits.getInt(buf, off));</span>
+<span class="fc" id="L2013">                        break;</span>
+
+                    case 'F':
+<span class="fc" id="L2016">                        unsafe.putFloat(obj, key, Bits.getFloat(buf, off));</span>
+<span class="fc" id="L2017">                        break;</span>
+
+                    case 'J':
+<span class="fc" id="L2020">                        unsafe.putLong(obj, key, Bits.getLong(buf, off));</span>
+<span class="fc" id="L2021">                        break;</span>
+
+                    case 'D':
+<span class="fc" id="L2024">                        unsafe.putDouble(obj, key, Bits.getDouble(buf, off));</span>
+<span class="fc" id="L2025">                        break;</span>
+
+                    default:
+<span class="nc" id="L2028">                        throw new InternalError();</span>
+                }
+            }
+<span class="fc" id="L2031">        }</span>
+
+        /**
+         * Fetches the serializable object field values of object obj and
+         * stores them in array vals starting at offset 0.  The caller is
+         * responsible for ensuring that obj is of the proper type.
+         */
+        void getObjFieldValues(Object obj, Object[] vals) {
+<span class="pc bpc" id="L2039" title="1 of 2 branches missed.">            if (obj == null) {</span>
+<span class="nc" id="L2040">                throw new NullPointerException();</span>
+            }
+            /* assuming checkDefaultSerialize() has been called on the class
+             * descriptor this FieldReflector was obtained from, no field keys
+             * in array should be equal to Unsafe.INVALID_FIELD_OFFSET.
+             */
+<span class="fc bfc" id="L2046" title="All 2 branches covered.">            for (int i = numPrimFields; i &lt; fields.length; i++) {</span>
+<span class="pc bpc" id="L2047" title="1 of 2 branches missed.">                switch (typeCodes[i]) {</span>
+                    case 'L':
+                    case '[':
+<span class="fc" id="L2050">                        vals[offsets[i]] = unsafe.getObject(obj, readKeys[i]);</span>
+<span class="fc" id="L2051">                        break;</span>
+
+                    default:
+<span class="nc" id="L2054">                        throw new InternalError();</span>
+                }
+            }
+<span class="fc" id="L2057">        }</span>
+
+        /**
+         * Sets the serializable object fields of object obj using values from
+         * array vals starting at offset 0.  The caller is responsible for
+         * ensuring that obj is of the proper type; however, attempts to set a
+         * field with a value of the wrong type will trigger an appropriate
+         * ClassCastException.
+         */
+        void setObjFieldValues(Object obj, Object[] vals) {
+<span class="pc bpc" id="L2067" title="1 of 2 branches missed.">            if (obj == null) {</span>
+<span class="nc" id="L2068">                throw new NullPointerException();</span>
+            }
+<span class="fc bfc" id="L2070" title="All 2 branches covered.">            for (int i = numPrimFields; i &lt; fields.length; i++) {</span>
+<span class="fc" id="L2071">                long key = writeKeys[i];</span>
+<span class="fc bfc" id="L2072" title="All 2 branches covered.">                if (key == Unsafe.INVALID_FIELD_OFFSET) {</span>
+<span class="fc" id="L2073">                    continue;           // discard value</span>
+                }
+<span class="pc bpc" id="L2075" title="1 of 2 branches missed.">                switch (typeCodes[i]) {</span>
+                    case 'L':
+                    case '[':
+<span class="fc" id="L2078">                        Object val = vals[offsets[i]];</span>
+<span class="fc bfc" id="L2079" title="All 2 branches covered.">                        if (val != null &amp;&amp;</span>
+<span class="fc bfc" id="L2080" title="All 2 branches covered.">                            !types[i - numPrimFields].isInstance(val))</span>
+                        {
+<span class="fc" id="L2082">                            Field f = fields[i].getField();</span>
+<span class="fc" id="L2083">                            throw new ClassCastException(</span>
+                                &quot;cannot assign instance of &quot; +
+<span class="fc" id="L2085">                                val.getClass().getName() + &quot; to field &quot; +</span>
+<span class="fc" id="L2086">                                f.getDeclaringClass().getName() + &quot;.&quot; +</span>
+<span class="fc" id="L2087">                                f.getName() + &quot; of type &quot; +</span>
+<span class="fc" id="L2088">                                f.getType().getName() + &quot; in instance of &quot; +</span>
+<span class="fc" id="L2089">                                obj.getClass().getName());</span>
+                        }
+<span class="fc" id="L2091">                        unsafe.putObject(obj, key, val);</span>
+<span class="fc" id="L2092">                        break;</span>
+
+                    default:
+<span class="nc" id="L2095">                        throw new InternalError();</span>
+                }
+            }
+<span class="fc" id="L2098">        }</span>
+    }
+
+    /**
+     * Matches given set of serializable fields with serializable fields
+     * described by the given local class descriptor, and returns a
+     * FieldReflector instance capable of setting/getting values from the
+     * subset of fields that match (non-matching fields are treated as filler,
+     * for which get operations return default values and set operations
+     * discard given values).  Throws InvalidClassException if unresolvable
+     * type conflicts exist between the two sets of fields.
+     */
+    private static FieldReflector getReflector(ObjectStreamField[] fields,
+                                               ObjectStreamClass localDesc)
+        throws InvalidClassException
+    {
+        // class irrelevant if no fields
+<span class="fc bfc" id="L2115" title="All 4 branches covered.">        Class&lt;?&gt; cl = (localDesc != null &amp;&amp; fields.length &gt; 0) ?</span>
+            localDesc.cl : null;
+<span class="fc" id="L2117">        processQueue(Caches.reflectorsQueue, Caches.reflectors);</span>
+<span class="fc" id="L2118">        FieldReflectorKey key = new FieldReflectorKey(cl, fields,</span>
+<span class="fc" id="L2119">                                                      Caches.reflectorsQueue);</span>
+<span class="fc" id="L2120">        Reference&lt;?&gt; ref = Caches.reflectors.get(key);</span>
+<span class="fc" id="L2121">        Object entry = null;</span>
+<span class="fc bfc" id="L2122" title="All 2 branches covered.">        if (ref != null) {</span>
+<span class="fc" id="L2123">            entry = ref.get();</span>
+        }
+<span class="fc" id="L2125">        EntryFuture future = null;</span>
+<span class="fc bfc" id="L2126" title="All 2 branches covered.">        if (entry == null) {</span>
+<span class="fc" id="L2127">            EntryFuture newEntry = new EntryFuture();</span>
+<span class="fc" id="L2128">            Reference&lt;?&gt; newRef = new SoftReference&lt;&gt;(newEntry);</span>
+            do {
+<span class="pc bpc" id="L2130" title="1 of 2 branches missed.">                if (ref != null) {</span>
+<span class="nc" id="L2131">                    Caches.reflectors.remove(key, ref);</span>
+                }
+<span class="fc" id="L2133">                ref = Caches.reflectors.putIfAbsent(key, newRef);</span>
+<span class="pc bpc" id="L2134" title="1 of 2 branches missed.">                if (ref != null) {</span>
+<span class="nc" id="L2135">                    entry = ref.get();</span>
+                }
+<span class="pc bpc" id="L2137" title="3 of 4 branches missed.">            } while (ref != null &amp;&amp; entry == null);</span>
+<span class="pc bpc" id="L2138" title="1 of 2 branches missed.">            if (entry == null) {</span>
+<span class="fc" id="L2139">                future = newEntry;</span>
+            }
+        }
+
+<span class="fc bfc" id="L2143" title="All 2 branches covered.">        if (entry instanceof FieldReflector) {  // check common case first</span>
+<span class="fc" id="L2144">            return (FieldReflector) entry;</span>
+<span class="pc bpc" id="L2145" title="1 of 2 branches missed.">        } else if (entry instanceof EntryFuture) {</span>
+<span class="nc" id="L2146">            entry = ((EntryFuture) entry).get();</span>
+<span class="pc bpc" id="L2147" title="1 of 2 branches missed.">        } else if (entry == null) {</span>
+            try {
+<span class="fc" id="L2149">                entry = new FieldReflector(matchFields(fields, localDesc));</span>
+<span class="fc" id="L2150">            } catch (Throwable th) {</span>
+<span class="fc" id="L2151">                entry = th;</span>
+<span class="fc" id="L2152">            }</span>
+<span class="fc" id="L2153">            future.set(entry);</span>
+<span class="fc" id="L2154">            Caches.reflectors.put(key, new SoftReference&lt;Object&gt;(entry));</span>
+        }
+
+<span class="fc bfc" id="L2157" title="All 2 branches covered.">        if (entry instanceof FieldReflector) {</span>
+<span class="fc" id="L2158">            return (FieldReflector) entry;</span>
+<span class="pc bpc" id="L2159" title="1 of 2 branches missed.">        } else if (entry instanceof InvalidClassException) {</span>
+<span class="fc" id="L2160">            throw (InvalidClassException) entry;</span>
+<span class="nc bnc" id="L2161" title="All 2 branches missed.">        } else if (entry instanceof RuntimeException) {</span>
+<span class="nc" id="L2162">            throw (RuntimeException) entry;</span>
+<span class="nc bnc" id="L2163" title="All 2 branches missed.">        } else if (entry instanceof Error) {</span>
+<span class="nc" id="L2164">            throw (Error) entry;</span>
+        } else {
+<span class="nc" id="L2166">            throw new InternalError(&quot;unexpected entry: &quot; + entry);</span>
+        }
+    }
+
+    /**
+     * FieldReflector cache lookup key.  Keys are considered equal if they
+     * refer to the same class and equivalent field formats.
+     */
+    private static class FieldReflectorKey extends WeakReference&lt;Class&lt;?&gt;&gt; {
+
+        private final String sigs;
+        private final int hash;
+        private final boolean nullClass;
+
+        FieldReflectorKey(Class&lt;?&gt; cl, ObjectStreamField[] fields,
+                          ReferenceQueue&lt;Class&lt;?&gt;&gt; queue)
+        {
+<span class="fc" id="L2183">            super(cl, queue);</span>
+<span class="fc bfc" id="L2184" title="All 2 branches covered.">            nullClass = (cl == null);</span>
+<span class="fc" id="L2185">            StringBuilder sbuf = new StringBuilder();</span>
+<span class="fc bfc" id="L2186" title="All 2 branches covered.">            for (int i = 0; i &lt; fields.length; i++) {</span>
+<span class="fc" id="L2187">                ObjectStreamField f = fields[i];</span>
+<span class="fc" id="L2188">                sbuf.append(f.getName()).append(f.getSignature());</span>
+            }
+<span class="fc" id="L2190">            sigs = sbuf.toString();</span>
+<span class="fc" id="L2191">            hash = System.identityHashCode(cl) + sigs.hashCode();</span>
+<span class="fc" id="L2192">        }</span>
+
+        public int hashCode() {
+<span class="fc" id="L2195">            return hash;</span>
+        }
+
+        public boolean equals(Object obj) {
+<span class="pc bpc" id="L2199" title="1 of 2 branches missed.">            if (obj == this) {</span>
+<span class="nc" id="L2200">                return true;</span>
+            }
+
+<span class="pc bpc" id="L2203" title="1 of 2 branches missed.">            if (obj instanceof FieldReflectorKey) {</span>
+<span class="fc" id="L2204">                FieldReflectorKey other = (FieldReflectorKey) obj;</span>
+                Class&lt;?&gt; referent;
+<span class="pc bpc" id="L2206" title="1 of 4 branches missed.">                return (nullClass ? other.nullClass</span>
+<span class="pc bpc" id="L2207" title="1 of 2 branches missed.">                                  : ((referent = get()) != null) &amp;&amp;</span>
+<span class="pc bpc" id="L2208" title="1 of 2 branches missed.">                                    (referent == other.get())) &amp;&amp;</span>
+<span class="pc bpc" id="L2209" title="1 of 2 branches missed.">                    sigs.equals(other.sigs);</span>
+            } else {
+<span class="nc" id="L2211">                return false;</span>
+            }
+        }
+    }
+
+    /**
+     * Matches given set of serializable fields with serializable fields
+     * obtained from the given local class descriptor (which contain bindings
+     * to reflective Field objects).  Returns list of ObjectStreamFields in
+     * which each ObjectStreamField whose signature matches that of a local
+     * field contains a Field object for that field; unmatched
+     * ObjectStreamFields contain null Field objects.  Shared/unshared settings
+     * of the returned ObjectStreamFields also reflect those of matched local
+     * ObjectStreamFields.  Throws InvalidClassException if unresolvable type
+     * conflicts exist between the two sets of fields.
+     */
+    private static ObjectStreamField[] matchFields(ObjectStreamField[] fields,
+                                                   ObjectStreamClass localDesc)
+        throws InvalidClassException
+    {
+<span class="fc bfc" id="L2231" title="All 2 branches covered.">        ObjectStreamField[] localFields = (localDesc != null) ?</span>
+            localDesc.fields : NO_FIELDS;
+
+        /*
+         * Even if fields == localFields, we cannot simply return localFields
+         * here.  In previous implementations of serialization,
+         * ObjectStreamField.getType() returned Object.class if the
+         * ObjectStreamField represented a non-primitive field and belonged to
+         * a non-local class descriptor.  To preserve this (questionable)
+         * behavior, the ObjectStreamField instances returned by matchFields
+         * cannot report non-primitive types other than Object.class; hence
+         * localFields cannot be returned directly.
+         */
+
+<span class="fc" id="L2245">        ObjectStreamField[] matches = new ObjectStreamField[fields.length];</span>
+<span class="fc bfc" id="L2246" title="All 2 branches covered.">        for (int i = 0; i &lt; fields.length; i++) {</span>
+<span class="fc" id="L2247">            ObjectStreamField f = fields[i], m = null;</span>
+<span class="fc bfc" id="L2248" title="All 2 branches covered.">            for (int j = 0; j &lt; localFields.length; j++) {</span>
+<span class="fc" id="L2249">                ObjectStreamField lf = localFields[j];</span>
+<span class="fc bfc" id="L2250" title="All 2 branches covered.">                if (f.getName().equals(lf.getName())) {</span>
+<span class="pc bpc" id="L2251" title="1 of 4 branches missed.">                    if ((f.isPrimitive() || lf.isPrimitive()) &amp;&amp;</span>
+<span class="fc bfc" id="L2252" title="All 2 branches covered.">                        f.getTypeCode() != lf.getTypeCode())</span>
+                    {
+<span class="fc" id="L2254">                        throw new InvalidClassException(localDesc.name,</span>
+<span class="fc" id="L2255">                            &quot;incompatible types for field &quot; + f.getName());</span>
+                    }
+<span class="fc bfc" id="L2257" title="All 2 branches covered.">                    if (lf.getField() != null) {</span>
+<span class="fc" id="L2258">                        m = new ObjectStreamField(</span>
+<span class="fc" id="L2259">                            lf.getField(), lf.isUnshared(), false);</span>
+                    } else {
+<span class="fc" id="L2261">                        m = new ObjectStreamField(</span>
+<span class="fc" id="L2262">                            lf.getName(), lf.getSignature(), lf.isUnshared());</span>
+                    }
+                }
+            }
+<span class="fc bfc" id="L2266" title="All 2 branches covered.">            if (m == null) {</span>
+<span class="fc" id="L2267">                m = new ObjectStreamField(</span>
+<span class="fc" id="L2268">                    f.getName(), f.getSignature(), false);</span>
+            }
+<span class="fc" id="L2270">            m.setOffset(f.getOffset());</span>
+<span class="fc" id="L2271">            matches[i] = m;</span>
+        }
+<span class="fc" id="L2273">        return matches;</span>
+    }
+
+    /**
+     * Removes from the specified map any keys that have been enqueued
+     * on the specified reference queue.
+     */
+    static void processQueue(ReferenceQueue&lt;Class&lt;?&gt;&gt; queue,
+                             ConcurrentMap&lt;? extends
+                             WeakReference&lt;Class&lt;?&gt;&gt;, ?&gt; map)
+    {
+        Reference&lt;? extends Class&lt;?&gt;&gt; ref;
+<span class="pc bpc" id="L2285" title="1 of 2 branches missed.">        while((ref = queue.poll()) != null) {</span>
+<span class="nc" id="L2286">            map.remove(ref);</span>
+        }
+<span class="fc" id="L2288">    }</span>
+
+    /**
+     *  Weak key for Class objects.
+     *
+     **/
+    static class WeakClassKey extends WeakReference&lt;Class&lt;?&gt;&gt; {
+        /**
+         * saved value of the referent's identity hash code, to maintain
+         * a consistent hash code after the referent has been cleared
+         */
+        private final int hash;
+
+        /**
+         * Create a new WeakClassKey to the given object, registered
+         * with a queue.
+         */
+        WeakClassKey(Class&lt;?&gt; cl, ReferenceQueue&lt;Class&lt;?&gt;&gt; refQueue) {
+<span class="fc" id="L2306">            super(cl, refQueue);</span>
+<span class="fc" id="L2307">            hash = System.identityHashCode(cl);</span>
+<span class="fc" id="L2308">        }</span>
+
+        /**
+         * Returns the identity hash code of the original referent.
+         */
+        public int hashCode() {
+<span class="fc" id="L2314">            return hash;</span>
+        }
+
+        /**
+         * Returns true if the given object is this identical
+         * WeakClassKey instance, or, if this object's referent has not
+         * been cleared, if the given object is another WeakClassKey
+         * instance with the identical non-null referent as this one.
+         */
+        public boolean equals(Object obj) {
+<span class="pc bpc" id="L2324" title="1 of 2 branches missed.">            if (obj == this) {</span>
+<span class="nc" id="L2325">                return true;</span>
+            }
+
+<span class="pc bpc" id="L2328" title="1 of 2 branches missed.">            if (obj instanceof WeakClassKey) {</span>
+<span class="fc" id="L2329">                Object referent = get();</span>
+<span class="pc bpc" id="L2330" title="1 of 2 branches missed.">                return (referent != null) &amp;&amp;</span>
+<span class="pc bpc" id="L2331" title="1 of 2 branches missed.">                       (referent == ((WeakClassKey) obj).get());</span>
+            } else {
+<span class="nc" id="L2333">                return false;</span>
+            }
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

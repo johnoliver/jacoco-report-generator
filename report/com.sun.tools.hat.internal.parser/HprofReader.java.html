@@ -1,0 +1,893 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>HprofReader.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">com.sun.tools.hat.internal.parser</a> &gt; <span class="el_source">HprofReader.java</span></div><h1>HprofReader.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1997, 2008, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+
+/*
+ * The Original Code is HAT. The Initial Developer of the
+ * Original Code is Bill Foote, with contributions from others
+ * at JavaSoft/Sun.
+ */
+
+package com.sun.tools.hat.internal.parser;
+
+import java.io.*;
+import java.util.Date;
+import java.util.Hashtable;
+import com.sun.tools.hat.internal.model.ArrayTypeCodes;
+import com.sun.tools.hat.internal.model.*;
+
+/**
+ * Object that's used to read a hprof file.
+ *
+ * @author      Bill Foote
+ */
+
+public class HprofReader extends Reader /* imports */ implements ArrayTypeCodes {
+
+    final static int MAGIC_NUMBER = 0x4a415641;
+    // That's &quot;JAVA&quot;, the first part of &quot;JAVA PROFILE ...&quot;
+<span class="nc" id="L51">    private final static String[] VERSIONS = {</span>
+            &quot; PROFILE 1.0\0&quot;,
+            &quot; PROFILE 1.0.1\0&quot;,
+            &quot; PROFILE 1.0.2\0&quot;,
+    };
+
+    private final static int VERSION_JDK12BETA3 = 0;
+    private final static int VERSION_JDK12BETA4 = 1;
+    private final static int VERSION_JDK6       = 2;
+    // These version numbers are indices into VERSIONS.  The instance data
+    // member version is set to one of these, and it drives decisions when
+    // reading the file.
+    //
+    // Version 1.0.1 added HPROF_GC_PRIM_ARRAY_DUMP, which requires no
+    // version-sensitive parsing.
+    //
+    // Version 1.0.1 changed the type of a constant pool entry from a signature
+    // to a typecode.
+    //
+    // Version 1.0.2 added HPROF_HEAP_DUMP_SEGMENT and HPROF_HEAP_DUMP_END
+    // to allow a large heap to be dumped as a sequence of heap dump segments.
+    //
+    // The HPROF agent in J2SE 1.2 through to 5.0 generate a version 1.0.1
+    // file. In Java SE 6.0 the version is either 1.0.1 or 1.0.2 depending on
+    // the size of the heap (normally it will be 1.0.1 but for multi-GB
+    // heaps the heap dump will not fit in a HPROF_HEAP_DUMP record so the
+    // dump is generated as version 1.0.2).
+
+    //
+    // Record types:
+    //
+    static final int HPROF_UTF8          = 0x01;
+    static final int HPROF_LOAD_CLASS    = 0x02;
+    static final int HPROF_UNLOAD_CLASS  = 0x03;
+    static final int HPROF_FRAME         = 0x04;
+    static final int HPROF_TRACE         = 0x05;
+    static final int HPROF_ALLOC_SITES   = 0x06;
+    static final int HPROF_HEAP_SUMMARY  = 0x07;
+
+    static final int HPROF_START_THREAD  = 0x0a;
+    static final int HPROF_END_THREAD    = 0x0b;
+
+    static final int HPROF_HEAP_DUMP     = 0x0c;
+
+    static final int HPROF_CPU_SAMPLES   = 0x0d;
+    static final int HPROF_CONTROL_SETTINGS = 0x0e;
+    static final int HPROF_LOCKSTATS_WAIT_TIME = 0x10;
+    static final int HPROF_LOCKSTATS_HOLD_TIME = 0x11;
+
+    static final int HPROF_GC_ROOT_UNKNOWN       = 0xff;
+    static final int HPROF_GC_ROOT_JNI_GLOBAL    = 0x01;
+    static final int HPROF_GC_ROOT_JNI_LOCAL     = 0x02;
+    static final int HPROF_GC_ROOT_JAVA_FRAME    = 0x03;
+    static final int HPROF_GC_ROOT_NATIVE_STACK  = 0x04;
+    static final int HPROF_GC_ROOT_STICKY_CLASS  = 0x05;
+    static final int HPROF_GC_ROOT_THREAD_BLOCK  = 0x06;
+    static final int HPROF_GC_ROOT_MONITOR_USED  = 0x07;
+    static final int HPROF_GC_ROOT_THREAD_OBJ    = 0x08;
+
+    static final int HPROF_GC_CLASS_DUMP         = 0x20;
+    static final int HPROF_GC_INSTANCE_DUMP      = 0x21;
+    static final int HPROF_GC_OBJ_ARRAY_DUMP         = 0x22;
+    static final int HPROF_GC_PRIM_ARRAY_DUMP         = 0x23;
+
+    static final int HPROF_HEAP_DUMP_SEGMENT     = 0x1c;
+    static final int HPROF_HEAP_DUMP_END         = 0x2c;
+
+    private final static int T_CLASS = 2;
+
+    private int version;        // The version of .hprof being read
+
+    private int debugLevel;
+    private long currPos;        // Current position in the file
+
+    private int dumpsToSkip;
+    private boolean callStack;  // If true, read the call stack of objects
+
+    private int identifierSize;         // Size, in bytes, of identifiers.
+    private Hashtable&lt;Long, String&gt; names;
+
+    // Hashtable&lt;Integer, ThreadObject&gt;, used to map the thread sequence number
+    // (aka &quot;serial number&quot;) to the thread object ID for
+    // HPROF_GC_ROOT_THREAD_OBJ.  ThreadObject is a trivial inner class,
+    // at the end of this file.
+    private Hashtable&lt;Integer, ThreadObject&gt; threadObjects;
+
+    // Hashtable&lt;Long, String&gt;, maps class object ID to class name
+    // (with / converted to .)
+    private Hashtable&lt;Long, String&gt; classNameFromObjectID;
+
+    // Hashtable&lt;Integer, Integer&gt;, maps class serial # to class object ID
+    private Hashtable&lt;Integer, String&gt; classNameFromSerialNo;
+
+    // Hashtable&lt;Long, StackFrame&gt; maps stack frame ID to StackFrame.
+    // Null if we're not tracking them.
+    private Hashtable&lt;Long, StackFrame&gt; stackFrames;
+
+    // Hashtable&lt;Integer, StackTrace&gt; maps stack frame ID to StackTrace
+    // Null if we're not tracking them.
+    private Hashtable&lt;Integer, StackTrace&gt; stackTraces;
+
+    private Snapshot snapshot;
+
+    public HprofReader(String fileName, PositionDataInputStream in,
+                       int dumpNumber, boolean callStack, int debugLevel)
+                       throws IOException {
+<span class="nc" id="L157">        super(in);</span>
+<span class="nc" id="L158">        RandomAccessFile file = new RandomAccessFile(fileName, &quot;r&quot;);</span>
+<span class="nc" id="L159">        this.snapshot = new Snapshot(MappedReadBuffer.create(file));</span>
+<span class="nc" id="L160">        this.dumpsToSkip = dumpNumber - 1;</span>
+<span class="nc" id="L161">        this.callStack = callStack;</span>
+<span class="nc" id="L162">        this.debugLevel = debugLevel;</span>
+<span class="nc" id="L163">        names = new Hashtable&lt;Long, String&gt;();</span>
+<span class="nc" id="L164">        threadObjects = new Hashtable&lt;Integer, ThreadObject&gt;(43);</span>
+<span class="nc" id="L165">        classNameFromObjectID = new Hashtable&lt;Long, String&gt;();</span>
+<span class="nc bnc" id="L166" title="All 2 branches missed.">        if (callStack) {</span>
+<span class="nc" id="L167">            stackFrames = new Hashtable&lt;Long, StackFrame&gt;(43);</span>
+<span class="nc" id="L168">            stackTraces = new Hashtable&lt;Integer, StackTrace&gt;(43);</span>
+<span class="nc" id="L169">            classNameFromSerialNo = new Hashtable&lt;Integer, String&gt;();</span>
+        }
+<span class="nc" id="L171">    }</span>
+
+    public Snapshot read() throws IOException {
+<span class="nc" id="L174">        currPos = 4;    // 4 because of the magic number</span>
+<span class="nc" id="L175">        version = readVersionHeader();</span>
+<span class="nc" id="L176">        identifierSize = in.readInt();</span>
+<span class="nc" id="L177">        snapshot.setIdentifierSize(identifierSize);</span>
+<span class="nc bnc" id="L178" title="All 2 branches missed.">        if (version &gt;= VERSION_JDK12BETA4) {</span>
+<span class="nc" id="L179">            snapshot.setNewStyleArrayClass(true);</span>
+        } else {
+<span class="nc" id="L181">            snapshot.setNewStyleArrayClass(false);</span>
+        }
+
+<span class="nc" id="L184">        currPos += 4;</span>
+<span class="nc bnc" id="L185" title="All 4 branches missed.">        if (identifierSize != 4 &amp;&amp; identifierSize != 8) {</span>
+<span class="nc" id="L186">            throw new IOException(&quot;I'm sorry, but I can't deal with an identifier size of &quot; + identifierSize + &quot;.  I can only deal with 4 or 8.&quot;);</span>
+        }
+<span class="nc" id="L188">        System.out.println(&quot;Dump file created &quot; + (new Date(in.readLong())));</span>
+<span class="nc" id="L189">        currPos += 8;</span>
+
+        for (;;) {
+            int type;
+            try {
+<span class="nc" id="L194">                type = in.readUnsignedByte();</span>
+<span class="nc" id="L195">            } catch (EOFException ignored) {</span>
+<span class="nc" id="L196">                break;</span>
+<span class="nc" id="L197">            }</span>
+<span class="nc" id="L198">            in.readInt();       // Timestamp of this record</span>
+            // Length of record: readInt() will return negative value for record
+            // length &gt;2GB.  so store 32bit value in long to keep it unsigned.
+<span class="nc" id="L201">            long length = in.readInt() &amp; 0xffffffffL;</span>
+<span class="nc bnc" id="L202" title="All 2 branches missed.">            if (debugLevel &gt; 0) {</span>
+<span class="nc" id="L203">                System.out.println(&quot;Read record type &quot; + type</span>
+                                   + &quot;, length &quot; + length
+<span class="nc" id="L205">                                   + &quot; at position &quot; + toHex(currPos));</span>
+            }
+<span class="nc bnc" id="L207" title="All 2 branches missed.">            if (length &lt; 0) {</span>
+<span class="nc" id="L208">                throw new IOException(&quot;Bad record length of &quot; + length</span>
+<span class="nc" id="L209">                                      + &quot; at byte &quot; + toHex(currPos+5)</span>
+                                      + &quot; of file.&quot;);
+            }
+<span class="nc" id="L212">            currPos += 9 + length;</span>
+<span class="nc bnc" id="L213" title="All 9 branches missed.">            switch (type) {</span>
+                case HPROF_UTF8: {
+<span class="nc" id="L215">                    long id = readID();</span>
+<span class="nc" id="L216">                    byte[] chars = new byte[(int)length - identifierSize];</span>
+<span class="nc" id="L217">                    in.readFully(chars);</span>
+<span class="nc" id="L218">                    names.put(new Long(id), new String(chars));</span>
+<span class="nc" id="L219">                    break;</span>
+                }
+                case HPROF_LOAD_CLASS: {
+<span class="nc" id="L222">                    int serialNo = in.readInt();        // Not used</span>
+<span class="nc" id="L223">                    long classID = readID();</span>
+<span class="nc" id="L224">                    int stackTraceSerialNo = in.readInt();</span>
+<span class="nc" id="L225">                    long classNameID = readID();</span>
+<span class="nc" id="L226">                    Long classIdI = new Long(classID);</span>
+<span class="nc" id="L227">                    String nm = getNameFromID(classNameID).replace('/', '.');</span>
+<span class="nc" id="L228">                    classNameFromObjectID.put(classIdI, nm);</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">                    if (classNameFromSerialNo != null) {</span>
+<span class="nc" id="L230">                        classNameFromSerialNo.put(new Integer(serialNo), nm);</span>
+                    }
+                    break;
+                }
+
+                case HPROF_HEAP_DUMP: {
+<span class="nc bnc" id="L236" title="All 2 branches missed.">                    if (dumpsToSkip &lt;= 0) {</span>
+                        try {
+<span class="nc" id="L238">                            readHeapDump(length, currPos);</span>
+<span class="nc" id="L239">                        } catch (EOFException exp) {</span>
+<span class="nc" id="L240">                            handleEOF(exp, snapshot);</span>
+<span class="nc" id="L241">                        }</span>
+<span class="nc bnc" id="L242" title="All 2 branches missed.">                        if (debugLevel &gt; 0) {</span>
+<span class="nc" id="L243">                            System.out.println(&quot;    Finished processing instances in heap dump.&quot;);</span>
+                        }
+<span class="nc" id="L245">                        return snapshot;</span>
+                    } else {
+<span class="nc" id="L247">                        dumpsToSkip--;</span>
+<span class="nc" id="L248">                        skipBytes(length);</span>
+                    }
+<span class="nc" id="L250">                    break;</span>
+                }
+
+                case HPROF_HEAP_DUMP_END: {
+<span class="nc bnc" id="L254" title="All 2 branches missed.">                    if (version &gt;= VERSION_JDK6) {</span>
+<span class="nc bnc" id="L255" title="All 2 branches missed.">                        if (dumpsToSkip &lt;= 0) {</span>
+<span class="nc" id="L256">                            skipBytes(length);  // should be no-op</span>
+<span class="nc" id="L257">                            return snapshot;</span>
+                        } else {
+                            // skip this dump (of the end record for a sequence of dump segments)
+<span class="nc" id="L260">                            dumpsToSkip--;</span>
+                        }
+                    } else {
+                        // HPROF_HEAP_DUMP_END only recognized in &gt;= 1.0.2
+<span class="nc" id="L264">                        warn(&quot;Ignoring unrecognized record type &quot; + type);</span>
+                    }
+<span class="nc" id="L266">                    skipBytes(length);  // should be no-op</span>
+<span class="nc" id="L267">                    break;</span>
+                }
+
+                case HPROF_HEAP_DUMP_SEGMENT: {
+<span class="nc bnc" id="L271" title="All 2 branches missed.">                    if (version &gt;= VERSION_JDK6) {</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">                        if (dumpsToSkip &lt;= 0) {</span>
+                            try {
+                                // read the dump segment
+<span class="nc" id="L275">                                readHeapDump(length, currPos);</span>
+<span class="nc" id="L276">                            } catch (EOFException exp) {</span>
+<span class="nc" id="L277">                                handleEOF(exp, snapshot);</span>
+<span class="nc" id="L278">                            }</span>
+                        } else {
+                            // all segments comprising the heap dump will be skipped
+<span class="nc" id="L281">                            skipBytes(length);</span>
+                        }
+                    } else {
+                        // HPROF_HEAP_DUMP_SEGMENT only recognized in &gt;= 1.0.2
+<span class="nc" id="L285">                        warn(&quot;Ignoring unrecognized record type &quot; + type);</span>
+<span class="nc" id="L286">                        skipBytes(length);</span>
+                    }
+<span class="nc" id="L288">                    break;</span>
+                }
+
+                case HPROF_FRAME: {
+<span class="nc bnc" id="L292" title="All 2 branches missed.">                    if (stackFrames == null) {</span>
+<span class="nc" id="L293">                        skipBytes(length);</span>
+                    } else {
+<span class="nc" id="L295">                        long id = readID();</span>
+<span class="nc" id="L296">                        String methodName = getNameFromID(readID());</span>
+<span class="nc" id="L297">                        String methodSig = getNameFromID(readID());</span>
+<span class="nc" id="L298">                        String sourceFile = getNameFromID(readID());</span>
+<span class="nc" id="L299">                        int classSer = in.readInt();</span>
+<span class="nc" id="L300">                        String className = classNameFromSerialNo.get(new Integer(classSer));</span>
+<span class="nc" id="L301">                        int lineNumber = in.readInt();</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">                        if (lineNumber &lt; StackFrame.LINE_NUMBER_NATIVE) {</span>
+<span class="nc" id="L303">                            warn(&quot;Weird stack frame line number:  &quot; + lineNumber);</span>
+<span class="nc" id="L304">                            lineNumber = StackFrame.LINE_NUMBER_UNKNOWN;</span>
+                        }
+<span class="nc" id="L306">                        stackFrames.put(new Long(id),</span>
+                                        new StackFrame(methodName, methodSig,
+                                                       className, sourceFile,
+                                                       lineNumber));
+                    }
+<span class="nc" id="L311">                    break;</span>
+                }
+                case HPROF_TRACE: {
+<span class="nc bnc" id="L314" title="All 2 branches missed.">                    if (stackTraces == null) {</span>
+<span class="nc" id="L315">                        skipBytes(length);</span>
+                    } else {
+<span class="nc" id="L317">                        int serialNo = in.readInt();</span>
+<span class="nc" id="L318">                        int threadSeq = in.readInt();   // Not used</span>
+<span class="nc" id="L319">                        StackFrame[] frames = new StackFrame[in.readInt()];</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">                        for (int i = 0; i &lt; frames.length; i++) {</span>
+<span class="nc" id="L321">                            long fid = readID();</span>
+<span class="nc" id="L322">                            frames[i] = stackFrames.get(new Long(fid));</span>
+<span class="nc bnc" id="L323" title="All 2 branches missed.">                            if (frames[i] == null) {</span>
+<span class="nc" id="L324">                                throw new IOException(&quot;Stack frame &quot; + toHex(fid) + &quot; not found&quot;);</span>
+                            }
+                        }
+<span class="nc" id="L327">                        stackTraces.put(new Integer(serialNo),</span>
+                                        new StackTrace(frames));
+                    }
+<span class="nc" id="L330">                    break;</span>
+                }
+                case HPROF_UNLOAD_CLASS:
+                case HPROF_ALLOC_SITES:
+                case HPROF_START_THREAD:
+                case HPROF_END_THREAD:
+                case HPROF_HEAP_SUMMARY:
+                case HPROF_CPU_SAMPLES:
+                case HPROF_CONTROL_SETTINGS:
+                case HPROF_LOCKSTATS_WAIT_TIME:
+                case HPROF_LOCKSTATS_HOLD_TIME:
+                {
+                    // Ignore these record types
+<span class="nc" id="L343">                    skipBytes(length);</span>
+<span class="nc" id="L344">                    break;</span>
+                }
+                default: {
+<span class="nc" id="L347">                    skipBytes(length);</span>
+<span class="nc" id="L348">                    warn(&quot;Ignoring unrecognized record type &quot; + type);</span>
+                }
+            }
+<span class="nc" id="L351">        }</span>
+
+<span class="nc" id="L353">        return snapshot;</span>
+    }
+
+    private void skipBytes(long length) throws IOException {
+<span class="nc" id="L357">        in.skipBytes((int)length);</span>
+<span class="nc" id="L358">    }</span>
+
+    private int readVersionHeader() throws IOException {
+<span class="nc" id="L361">        int candidatesLeft = VERSIONS.length;</span>
+<span class="nc" id="L362">        boolean[] matched = new boolean[VERSIONS.length];</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">        for (int i = 0; i &lt; candidatesLeft; i++) {</span>
+<span class="nc" id="L364">            matched[i] = true;</span>
+        }
+
+<span class="nc" id="L367">        int pos = 0;</span>
+<span class="nc bnc" id="L368" title="All 2 branches missed.">        while (candidatesLeft &gt; 0) {</span>
+<span class="nc" id="L369">            char c = (char) in.readByte();</span>
+<span class="nc" id="L370">            currPos++;</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">            for (int i = 0; i &lt; VERSIONS.length; i++) {</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">                if (matched[i]) {</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">                    if (c != VERSIONS[i].charAt(pos)) {   // Not matched</span>
+<span class="nc" id="L374">                        matched[i] = false;</span>
+<span class="nc" id="L375">                        --candidatesLeft;</span>
+<span class="nc bnc" id="L376" title="All 2 branches missed.">                    } else if (pos == VERSIONS[i].length() - 1) {  // Full match</span>
+<span class="nc" id="L377">                        return i;</span>
+                    }
+                }
+            }
+<span class="nc" id="L381">            ++pos;</span>
+<span class="nc" id="L382">        }</span>
+<span class="nc" id="L383">        throw new IOException(&quot;Version string not recognized at byte &quot; + (pos+3));</span>
+    }
+
+    private void readHeapDump(long bytesLeft, long posAtEnd) throws IOException {
+<span class="nc bnc" id="L387" title="All 2 branches missed.">        while (bytesLeft &gt; 0) {</span>
+<span class="nc" id="L388">            int type = in.readUnsignedByte();</span>
+<span class="nc bnc" id="L389" title="All 2 branches missed.">            if (debugLevel &gt; 0) {</span>
+<span class="nc" id="L390">                System.out.println(&quot;    Read heap sub-record type &quot; + type</span>
+                                   + &quot; at position &quot;
+<span class="nc" id="L392">                                   + toHex(posAtEnd - bytesLeft));</span>
+            }
+<span class="nc" id="L394">            bytesLeft--;</span>
+<span class="nc bnc" id="L395" title="All 14 branches missed.">            switch(type) {</span>
+                case HPROF_GC_ROOT_UNKNOWN: {
+<span class="nc" id="L397">                    long id = readID();</span>
+<span class="nc" id="L398">                    bytesLeft -= identifierSize;</span>
+<span class="nc" id="L399">                    snapshot.addRoot(new Root(id, 0, Root.UNKNOWN, &quot;&quot;));</span>
+<span class="nc" id="L400">                    break;</span>
+                }
+                case HPROF_GC_ROOT_THREAD_OBJ: {
+<span class="nc" id="L403">                    long id = readID();</span>
+<span class="nc" id="L404">                    int threadSeq = in.readInt();</span>
+<span class="nc" id="L405">                    int stackSeq = in.readInt();</span>
+<span class="nc" id="L406">                    bytesLeft -= identifierSize + 8;</span>
+<span class="nc" id="L407">                    threadObjects.put(new Integer(threadSeq),</span>
+                                      new ThreadObject(id, stackSeq));
+<span class="nc" id="L409">                    break;</span>
+                }
+                case HPROF_GC_ROOT_JNI_GLOBAL: {
+<span class="nc" id="L412">                    long id = readID();</span>
+<span class="nc" id="L413">                    long globalRefId = readID();        // Ignored, for now</span>
+<span class="nc" id="L414">                    bytesLeft -= 2*identifierSize;</span>
+<span class="nc" id="L415">                    snapshot.addRoot(new Root(id, 0, Root.NATIVE_STATIC, &quot;&quot;));</span>
+<span class="nc" id="L416">                    break;</span>
+                }
+                case HPROF_GC_ROOT_JNI_LOCAL: {
+<span class="nc" id="L419">                    long id = readID();</span>
+<span class="nc" id="L420">                    int threadSeq = in.readInt();</span>
+<span class="nc" id="L421">                    int depth = in.readInt();</span>
+<span class="nc" id="L422">                    bytesLeft -= identifierSize + 8;</span>
+<span class="nc" id="L423">                    ThreadObject to = getThreadObjectFromSequence(threadSeq);</span>
+<span class="nc" id="L424">                    StackTrace st = getStackTraceFromSerial(to.stackSeq);</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">                    if (st != null) {</span>
+<span class="nc" id="L426">                        st = st.traceForDepth(depth+1);</span>
+                    }
+<span class="nc" id="L428">                    snapshot.addRoot(new Root(id, to.threadId,</span>
+                                              Root.NATIVE_LOCAL, &quot;&quot;, st));
+<span class="nc" id="L430">                    break;</span>
+                }
+                case HPROF_GC_ROOT_JAVA_FRAME: {
+<span class="nc" id="L433">                    long id = readID();</span>
+<span class="nc" id="L434">                    int threadSeq = in.readInt();</span>
+<span class="nc" id="L435">                    int depth = in.readInt();</span>
+<span class="nc" id="L436">                    bytesLeft -= identifierSize + 8;</span>
+<span class="nc" id="L437">                    ThreadObject to = getThreadObjectFromSequence(threadSeq);</span>
+<span class="nc" id="L438">                    StackTrace st = getStackTraceFromSerial(to.stackSeq);</span>
+<span class="nc bnc" id="L439" title="All 2 branches missed.">                    if (st != null) {</span>
+<span class="nc" id="L440">                        st = st.traceForDepth(depth+1);</span>
+                    }
+<span class="nc" id="L442">                    snapshot.addRoot(new Root(id, to.threadId,</span>
+                                              Root.JAVA_LOCAL, &quot;&quot;, st));
+<span class="nc" id="L444">                    break;</span>
+                }
+                case HPROF_GC_ROOT_NATIVE_STACK: {
+<span class="nc" id="L447">                    long id = readID();</span>
+<span class="nc" id="L448">                    int threadSeq = in.readInt();</span>
+<span class="nc" id="L449">                    bytesLeft -= identifierSize + 4;</span>
+<span class="nc" id="L450">                    ThreadObject to = getThreadObjectFromSequence(threadSeq);</span>
+<span class="nc" id="L451">                    StackTrace st = getStackTraceFromSerial(to.stackSeq);</span>
+<span class="nc" id="L452">                    snapshot.addRoot(new Root(id, to.threadId,</span>
+                                              Root.NATIVE_STACK, &quot;&quot;, st));
+<span class="nc" id="L454">                    break;</span>
+                }
+                case HPROF_GC_ROOT_STICKY_CLASS: {
+<span class="nc" id="L457">                    long id = readID();</span>
+<span class="nc" id="L458">                    bytesLeft -= identifierSize;</span>
+<span class="nc" id="L459">                    snapshot.addRoot(new Root(id, 0, Root.SYSTEM_CLASS, &quot;&quot;));</span>
+<span class="nc" id="L460">                    break;</span>
+                }
+                case HPROF_GC_ROOT_THREAD_BLOCK: {
+<span class="nc" id="L463">                    long id = readID();</span>
+<span class="nc" id="L464">                    int threadSeq = in.readInt();</span>
+<span class="nc" id="L465">                    bytesLeft -= identifierSize + 4;</span>
+<span class="nc" id="L466">                    ThreadObject to = getThreadObjectFromSequence(threadSeq);</span>
+<span class="nc" id="L467">                    StackTrace st = getStackTraceFromSerial(to.stackSeq);</span>
+<span class="nc" id="L468">                    snapshot.addRoot(new Root(id, to.threadId,</span>
+                                     Root.THREAD_BLOCK, &quot;&quot;, st));
+<span class="nc" id="L470">                    break;</span>
+                }
+                case HPROF_GC_ROOT_MONITOR_USED: {
+<span class="nc" id="L473">                    long id = readID();</span>
+<span class="nc" id="L474">                    bytesLeft -= identifierSize;</span>
+<span class="nc" id="L475">                    snapshot.addRoot(new Root(id, 0, Root.BUSY_MONITOR, &quot;&quot;));</span>
+<span class="nc" id="L476">                    break;</span>
+                }
+                case HPROF_GC_CLASS_DUMP: {
+<span class="nc" id="L479">                    int bytesRead = readClass();</span>
+<span class="nc" id="L480">                    bytesLeft -= bytesRead;</span>
+<span class="nc" id="L481">                    break;</span>
+                }
+                case HPROF_GC_INSTANCE_DUMP: {
+<span class="nc" id="L484">                    int bytesRead = readInstance();</span>
+<span class="nc" id="L485">                    bytesLeft -= bytesRead;</span>
+<span class="nc" id="L486">                    break;</span>
+                }
+                case HPROF_GC_OBJ_ARRAY_DUMP: {
+<span class="nc" id="L489">                    int bytesRead = readArray(false);</span>
+<span class="nc" id="L490">                    bytesLeft -= bytesRead;</span>
+<span class="nc" id="L491">                    break;</span>
+                }
+                case HPROF_GC_PRIM_ARRAY_DUMP: {
+<span class="nc" id="L494">                    int bytesRead = readArray(true);</span>
+<span class="nc" id="L495">                    bytesLeft -= bytesRead;</span>
+<span class="nc" id="L496">                    break;</span>
+                }
+                default: {
+<span class="nc" id="L499">                    throw new IOException(&quot;Unrecognized heap dump sub-record type:  &quot; + type);</span>
+                }
+            }
+<span class="nc" id="L502">        }</span>
+<span class="nc bnc" id="L503" title="All 2 branches missed.">        if (bytesLeft != 0) {</span>
+<span class="nc" id="L504">            warn(&quot;Error reading heap dump or heap dump segment:  Byte count is &quot; + bytesLeft + &quot; instead of 0&quot;);</span>
+<span class="nc" id="L505">            skipBytes(bytesLeft);</span>
+        }
+<span class="nc bnc" id="L507" title="All 2 branches missed.">        if (debugLevel &gt; 0) {</span>
+<span class="nc" id="L508">            System.out.println(&quot;    Finished heap sub-records.&quot;);</span>
+        }
+<span class="nc" id="L510">    }</span>
+
+    private long readID() throws IOException {
+<span class="nc bnc" id="L513" title="All 2 branches missed.">        return (identifierSize == 4)?</span>
+<span class="nc" id="L514">            (Snapshot.SMALL_ID_MASK &amp; (long)in.readInt()) : in.readLong();</span>
+    }
+
+    //
+    // Read a java value.  If result is non-null, it's expected to be an
+    // array of one element.  We use it to fake multiple return values.
+    // @returns the number of bytes read
+    //
+    private int readValue(JavaThing[] resultArr) throws IOException {
+<span class="nc" id="L523">        byte type = in.readByte();</span>
+<span class="nc" id="L524">        return 1 + readValueForType(type, resultArr);</span>
+    }
+
+    private int readValueForType(byte type, JavaThing[] resultArr)
+            throws IOException {
+<span class="nc bnc" id="L529" title="All 2 branches missed.">        if (version &gt;= VERSION_JDK12BETA4) {</span>
+<span class="nc" id="L530">            type = signatureFromTypeId(type);</span>
+        }
+<span class="nc" id="L532">        return readValueForTypeSignature(type, resultArr);</span>
+    }
+
+    private int readValueForTypeSignature(byte type, JavaThing[] resultArr)
+            throws IOException {
+<span class="nc bnc" id="L537" title="All 10 branches missed.">        switch (type) {</span>
+            case '[':
+            case 'L': {
+<span class="nc" id="L540">                long id = readID();</span>
+<span class="nc bnc" id="L541" title="All 2 branches missed.">                if (resultArr != null) {</span>
+<span class="nc" id="L542">                    resultArr[0] = new JavaObjectRef(id);</span>
+                }
+<span class="nc" id="L544">                return identifierSize;</span>
+            }
+            case 'Z': {
+<span class="nc" id="L547">                int b = in.readByte();</span>
+<span class="nc bnc" id="L548" title="All 4 branches missed.">                if (b != 0 &amp;&amp; b != 1) {</span>
+<span class="nc" id="L549">                    warn(&quot;Illegal boolean value read&quot;);</span>
+                }
+<span class="nc bnc" id="L551" title="All 2 branches missed.">                if (resultArr != null) {</span>
+<span class="nc bnc" id="L552" title="All 2 branches missed.">                    resultArr[0] = new JavaBoolean(b != 0);</span>
+                }
+<span class="nc" id="L554">                return 1;</span>
+            }
+            case 'B': {
+<span class="nc" id="L557">                byte b = in.readByte();</span>
+<span class="nc bnc" id="L558" title="All 2 branches missed.">                if (resultArr != null) {</span>
+<span class="nc" id="L559">                    resultArr[0] = new JavaByte(b);</span>
+                }
+<span class="nc" id="L561">                return 1;</span>
+            }
+            case 'S': {
+<span class="nc" id="L564">                short s = in.readShort();</span>
+<span class="nc bnc" id="L565" title="All 2 branches missed.">                if (resultArr != null) {</span>
+<span class="nc" id="L566">                    resultArr[0] = new JavaShort(s);</span>
+                }
+<span class="nc" id="L568">                return 2;</span>
+            }
+            case 'C': {
+<span class="nc" id="L571">                char ch = in.readChar();</span>
+<span class="nc bnc" id="L572" title="All 2 branches missed.">                if (resultArr != null) {</span>
+<span class="nc" id="L573">                    resultArr[0] = new JavaChar(ch);</span>
+                }
+<span class="nc" id="L575">                return 2;</span>
+            }
+            case 'I': {
+<span class="nc" id="L578">                int val = in.readInt();</span>
+<span class="nc bnc" id="L579" title="All 2 branches missed.">                if (resultArr != null) {</span>
+<span class="nc" id="L580">                    resultArr[0] = new JavaInt(val);</span>
+                }
+<span class="nc" id="L582">                return 4;</span>
+            }
+            case 'J': {
+<span class="nc" id="L585">                long val = in.readLong();</span>
+<span class="nc bnc" id="L586" title="All 2 branches missed.">                if (resultArr != null) {</span>
+<span class="nc" id="L587">                    resultArr[0] = new JavaLong(val);</span>
+                }
+<span class="nc" id="L589">                return 8;</span>
+            }
+            case 'F': {
+<span class="nc" id="L592">                float val = in.readFloat();</span>
+<span class="nc bnc" id="L593" title="All 2 branches missed.">                if (resultArr != null) {</span>
+<span class="nc" id="L594">                    resultArr[0] = new JavaFloat(val);</span>
+                }
+<span class="nc" id="L596">                return 4;</span>
+            }
+            case 'D': {
+<span class="nc" id="L599">                double val = in.readDouble();</span>
+<span class="nc bnc" id="L600" title="All 2 branches missed.">                if (resultArr != null) {</span>
+<span class="nc" id="L601">                    resultArr[0] = new JavaDouble(val);</span>
+                }
+<span class="nc" id="L603">                return 8;</span>
+            }
+            default: {
+<span class="nc" id="L606">                throw new IOException(&quot;Bad value signature:  &quot; + type);</span>
+            }
+        }
+    }
+
+    private ThreadObject getThreadObjectFromSequence(int threadSeq)
+            throws IOException {
+<span class="nc" id="L613">        ThreadObject to = threadObjects.get(new Integer(threadSeq));</span>
+<span class="nc bnc" id="L614" title="All 2 branches missed.">        if (to == null) {</span>
+<span class="nc" id="L615">            throw new IOException(&quot;Thread &quot; + threadSeq +</span>
+                                  &quot; not found for JNI local ref&quot;);
+        }
+<span class="nc" id="L618">        return to;</span>
+    }
+
+    private String getNameFromID(long id) throws IOException {
+<span class="nc" id="L622">        return getNameFromID(new Long(id));</span>
+    }
+
+    private String getNameFromID(Long id) throws IOException {
+<span class="nc bnc" id="L626" title="All 2 branches missed.">        if (id.longValue() == 0L) {</span>
+<span class="nc" id="L627">            return &quot;&quot;;</span>
+        }
+<span class="nc" id="L629">        String result = names.get(id);</span>
+<span class="nc bnc" id="L630" title="All 2 branches missed.">        if (result == null) {</span>
+<span class="nc" id="L631">            warn(&quot;Name not found at &quot; + toHex(id.longValue()));</span>
+<span class="nc" id="L632">            return &quot;unresolved name &quot; + toHex(id.longValue());</span>
+        }
+<span class="nc" id="L634">        return result;</span>
+    }
+
+    private StackTrace getStackTraceFromSerial(int ser) throws IOException {
+<span class="nc bnc" id="L638" title="All 2 branches missed.">        if (stackTraces == null) {</span>
+<span class="nc" id="L639">            return null;</span>
+        }
+<span class="nc" id="L641">        StackTrace result = stackTraces.get(new Integer(ser));</span>
+<span class="nc bnc" id="L642" title="All 2 branches missed.">        if (result == null) {</span>
+<span class="nc" id="L643">            warn(&quot;Stack trace not found for serial # &quot; + ser);</span>
+        }
+<span class="nc" id="L645">        return result;</span>
+    }
+
+    //
+    // Handle a HPROF_GC_CLASS_DUMP
+    // Return number of bytes read
+    //
+    private int readClass() throws IOException {
+<span class="nc" id="L653">        long id = readID();</span>
+<span class="nc" id="L654">        StackTrace stackTrace = getStackTraceFromSerial(in.readInt());</span>
+<span class="nc" id="L655">        long superId = readID();</span>
+<span class="nc" id="L656">        long classLoaderId = readID();</span>
+<span class="nc" id="L657">        long signersId = readID();</span>
+<span class="nc" id="L658">        long protDomainId = readID();</span>
+<span class="nc" id="L659">        long reserved1 = readID();</span>
+<span class="nc" id="L660">        long reserved2 = readID();</span>
+<span class="nc" id="L661">        int instanceSize = in.readInt();</span>
+<span class="nc" id="L662">        int bytesRead = 7 * identifierSize + 8;</span>
+
+<span class="nc" id="L664">        int numConstPoolEntries = in.readUnsignedShort();</span>
+<span class="nc" id="L665">        bytesRead += 2;</span>
+<span class="nc bnc" id="L666" title="All 2 branches missed.">        for (int i = 0; i &lt; numConstPoolEntries; i++) {</span>
+<span class="nc" id="L667">            int index = in.readUnsignedShort(); // unused</span>
+<span class="nc" id="L668">            bytesRead += 2;</span>
+<span class="nc" id="L669">            bytesRead += readValue(null);       // We ignore the values</span>
+        }
+
+<span class="nc" id="L672">        int numStatics = in.readUnsignedShort();</span>
+<span class="nc" id="L673">        bytesRead += 2;</span>
+<span class="nc" id="L674">        JavaThing[] valueBin = new JavaThing[1];</span>
+<span class="nc" id="L675">        JavaStatic[] statics = new JavaStatic[numStatics];</span>
+<span class="nc bnc" id="L676" title="All 2 branches missed.">        for (int i = 0; i &lt; numStatics; i++) {</span>
+<span class="nc" id="L677">            long nameId = readID();</span>
+<span class="nc" id="L678">            bytesRead += identifierSize;</span>
+<span class="nc" id="L679">            byte type = in.readByte();</span>
+<span class="nc" id="L680">            bytesRead++;</span>
+<span class="nc" id="L681">            bytesRead += readValueForType(type, valueBin);</span>
+<span class="nc" id="L682">            String fieldName = getNameFromID(nameId);</span>
+<span class="nc bnc" id="L683" title="All 2 branches missed.">            if (version &gt;= VERSION_JDK12BETA4) {</span>
+<span class="nc" id="L684">                type = signatureFromTypeId(type);</span>
+            }
+<span class="nc" id="L686">            String signature = &quot;&quot; + ((char) type);</span>
+<span class="nc" id="L687">            JavaField f = new JavaField(fieldName, signature);</span>
+<span class="nc" id="L688">            statics[i] = new JavaStatic(f, valueBin[0]);</span>
+        }
+
+<span class="nc" id="L691">        int numFields = in.readUnsignedShort();</span>
+<span class="nc" id="L692">        bytesRead += 2;</span>
+<span class="nc" id="L693">        JavaField[] fields = new JavaField[numFields];</span>
+<span class="nc bnc" id="L694" title="All 2 branches missed.">        for (int i = 0; i &lt; numFields; i++) {</span>
+<span class="nc" id="L695">            long nameId = readID();</span>
+<span class="nc" id="L696">            bytesRead += identifierSize;</span>
+<span class="nc" id="L697">            byte type = in.readByte();</span>
+<span class="nc" id="L698">            bytesRead++;</span>
+<span class="nc" id="L699">            String fieldName = getNameFromID(nameId);</span>
+<span class="nc bnc" id="L700" title="All 2 branches missed.">            if (version &gt;= VERSION_JDK12BETA4) {</span>
+<span class="nc" id="L701">                type = signatureFromTypeId(type);</span>
+            }
+<span class="nc" id="L703">            String signature = &quot;&quot; + ((char) type);</span>
+<span class="nc" id="L704">            fields[i] = new JavaField(fieldName, signature);</span>
+        }
+<span class="nc" id="L706">        String name = classNameFromObjectID.get(new Long(id));</span>
+<span class="nc bnc" id="L707" title="All 2 branches missed.">        if (name == null) {</span>
+<span class="nc" id="L708">            warn(&quot;Class name not found for &quot; + toHex(id));</span>
+<span class="nc" id="L709">            name = &quot;unknown-name@&quot; + toHex(id);</span>
+        }
+<span class="nc" id="L711">        JavaClass c = new JavaClass(id, name, superId, classLoaderId, signersId,</span>
+                                    protDomainId, fields, statics,
+                                    instanceSize);
+<span class="nc" id="L714">        snapshot.addClass(id, c);</span>
+<span class="nc" id="L715">        snapshot.setSiteTrace(c, stackTrace);</span>
+
+<span class="nc" id="L717">        return bytesRead;</span>
+    }
+
+    private String toHex(long addr) {
+<span class="nc" id="L721">        return com.sun.tools.hat.internal.util.Misc.toHex(addr);</span>
+    }
+
+    //
+    // Handle a HPROF_GC_INSTANCE_DUMP
+    // Return number of bytes read
+    //
+    private int readInstance() throws IOException {
+<span class="nc" id="L729">        long start = in.position();</span>
+<span class="nc" id="L730">        long id = readID();</span>
+<span class="nc" id="L731">        StackTrace stackTrace = getStackTraceFromSerial(in.readInt());</span>
+<span class="nc" id="L732">        long classID = readID();</span>
+<span class="nc" id="L733">        int bytesFollowing = in.readInt();</span>
+<span class="nc" id="L734">        int bytesRead = (2 * identifierSize) + 8 + bytesFollowing;</span>
+<span class="nc" id="L735">        JavaObject jobj = new JavaObject(classID, start);</span>
+<span class="nc" id="L736">        skipBytes(bytesFollowing);</span>
+<span class="nc" id="L737">        snapshot.addHeapObject(id, jobj);</span>
+<span class="nc" id="L738">        snapshot.setSiteTrace(jobj, stackTrace);</span>
+<span class="nc" id="L739">        return bytesRead;</span>
+    }
+
+    //
+    // Handle a HPROF_GC_OBJ_ARRAY_DUMP or HPROF_GC_PRIM_ARRAY_DUMP
+    // Return number of bytes read
+    //
+    private int readArray(boolean isPrimitive) throws IOException {
+<span class="nc" id="L747">        long start = in.position();</span>
+<span class="nc" id="L748">        long id = readID();</span>
+<span class="nc" id="L749">        StackTrace stackTrace = getStackTraceFromSerial(in.readInt());</span>
+<span class="nc" id="L750">        int num = in.readInt();</span>
+<span class="nc" id="L751">        int bytesRead = identifierSize + 8;</span>
+        long elementClassID;
+<span class="nc bnc" id="L753" title="All 2 branches missed.">        if (isPrimitive) {</span>
+<span class="nc" id="L754">            elementClassID = in.readByte();</span>
+<span class="nc" id="L755">            bytesRead++;</span>
+        } else {
+<span class="nc" id="L757">            elementClassID = readID();</span>
+<span class="nc" id="L758">            bytesRead += identifierSize;</span>
+        }
+
+        // Check for primitive arrays:
+<span class="nc" id="L762">        byte primitiveSignature = 0x00;</span>
+<span class="nc" id="L763">        int elSize = 0;</span>
+<span class="nc bnc" id="L764" title="All 4 branches missed.">        if (isPrimitive || version &lt; VERSION_JDK12BETA4) {</span>
+<span class="nc bnc" id="L765" title="All 9 branches missed.">            switch ((int)elementClassID) {</span>
+                case T_BOOLEAN: {
+<span class="nc" id="L767">                    primitiveSignature = (byte) 'Z';</span>
+<span class="nc" id="L768">                    elSize = 1;</span>
+<span class="nc" id="L769">                    break;</span>
+                }
+                case T_CHAR: {
+<span class="nc" id="L772">                    primitiveSignature = (byte) 'C';</span>
+<span class="nc" id="L773">                    elSize = 2;</span>
+<span class="nc" id="L774">                    break;</span>
+                }
+                case T_FLOAT: {
+<span class="nc" id="L777">                    primitiveSignature = (byte) 'F';</span>
+<span class="nc" id="L778">                    elSize = 4;</span>
+<span class="nc" id="L779">                    break;</span>
+                }
+                case T_DOUBLE: {
+<span class="nc" id="L782">                    primitiveSignature = (byte) 'D';</span>
+<span class="nc" id="L783">                    elSize = 8;</span>
+<span class="nc" id="L784">                    break;</span>
+                }
+                case T_BYTE: {
+<span class="nc" id="L787">                    primitiveSignature = (byte) 'B';</span>
+<span class="nc" id="L788">                    elSize = 1;</span>
+<span class="nc" id="L789">                    break;</span>
+                }
+                case T_SHORT: {
+<span class="nc" id="L792">                    primitiveSignature = (byte) 'S';</span>
+<span class="nc" id="L793">                    elSize = 2;</span>
+<span class="nc" id="L794">                    break;</span>
+                }
+                case T_INT: {
+<span class="nc" id="L797">                    primitiveSignature = (byte) 'I';</span>
+<span class="nc" id="L798">                    elSize = 4;</span>
+<span class="nc" id="L799">                    break;</span>
+                }
+                case T_LONG: {
+<span class="nc" id="L802">                    primitiveSignature = (byte) 'J';</span>
+<span class="nc" id="L803">                    elSize = 8;</span>
+                    break;
+                }
+            }
+<span class="nc bnc" id="L807" title="All 4 branches missed.">            if (version &gt;= VERSION_JDK12BETA4 &amp;&amp; primitiveSignature == 0x00) {</span>
+<span class="nc" id="L808">                throw new IOException(&quot;Unrecognized typecode:  &quot;</span>
+                                        + elementClassID);
+            }
+        }
+<span class="nc bnc" id="L812" title="All 2 branches missed.">        if (primitiveSignature != 0x00) {</span>
+<span class="nc" id="L813">            int size = elSize * num;</span>
+<span class="nc" id="L814">            bytesRead += size;</span>
+<span class="nc" id="L815">            JavaValueArray va = new JavaValueArray(primitiveSignature, start);</span>
+<span class="nc" id="L816">            skipBytes(size);</span>
+<span class="nc" id="L817">            snapshot.addHeapObject(id, va);</span>
+<span class="nc" id="L818">            snapshot.setSiteTrace(va, stackTrace);</span>
+<span class="nc" id="L819">        } else {</span>
+<span class="nc" id="L820">            int sz = num * identifierSize;</span>
+<span class="nc" id="L821">            bytesRead += sz;</span>
+<span class="nc" id="L822">            JavaObjectArray arr = new JavaObjectArray(elementClassID, start);</span>
+<span class="nc" id="L823">            skipBytes(sz);</span>
+<span class="nc" id="L824">            snapshot.addHeapObject(id, arr);</span>
+<span class="nc" id="L825">            snapshot.setSiteTrace(arr, stackTrace);</span>
+        }
+<span class="nc" id="L827">        return bytesRead;</span>
+    }
+
+    private byte signatureFromTypeId(byte typeId) throws IOException {
+<span class="nc bnc" id="L831" title="All 10 branches missed.">        switch (typeId) {</span>
+            case T_CLASS: {
+<span class="nc" id="L833">                return (byte) 'L';</span>
+            }
+            case T_BOOLEAN: {
+<span class="nc" id="L836">                return (byte) 'Z';</span>
+            }
+            case T_CHAR: {
+<span class="nc" id="L839">                return (byte) 'C';</span>
+            }
+            case T_FLOAT: {
+<span class="nc" id="L842">                return (byte) 'F';</span>
+            }
+            case T_DOUBLE: {
+<span class="nc" id="L845">                return (byte) 'D';</span>
+            }
+            case T_BYTE: {
+<span class="nc" id="L848">                return (byte) 'B';</span>
+            }
+            case T_SHORT: {
+<span class="nc" id="L851">                return (byte) 'S';</span>
+            }
+            case T_INT: {
+<span class="nc" id="L854">                return (byte) 'I';</span>
+            }
+            case T_LONG: {
+<span class="nc" id="L857">                return (byte) 'J';</span>
+            }
+            default: {
+<span class="nc" id="L860">                throw new IOException(&quot;Invalid type id of &quot; + typeId);</span>
+            }
+        }
+    }
+
+    private void handleEOF(EOFException exp, Snapshot snapshot) {
+<span class="nc bnc" id="L866" title="All 2 branches missed.">        if (debugLevel &gt; 0) {</span>
+<span class="nc" id="L867">            exp.printStackTrace();</span>
+        }
+<span class="nc" id="L869">        warn(&quot;Unexpected EOF. Will miss information...&quot;);</span>
+        // we have EOF, we have to tolerate missing references
+<span class="nc" id="L871">        snapshot.setUnresolvedObjectsOK(true);</span>
+<span class="nc" id="L872">    }</span>
+
+    private void warn(String msg) {
+<span class="nc" id="L875">        System.out.println(&quot;WARNING: &quot; + msg);</span>
+<span class="nc" id="L876">    }</span>
+
+    //
+    // A trivial data-holder class for HPROF_GC_ROOT_THREAD_OBJ.
+    //
+    private class ThreadObject {
+
+        long threadId;
+        int stackSeq;
+
+<span class="nc" id="L886">        ThreadObject(long threadId, int stackSeq) {</span>
+<span class="nc" id="L887">            this.threadId = threadId;</span>
+<span class="nc" id="L888">            this.stackSeq = stackSeq;</span>
+<span class="nc" id="L889">        }</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

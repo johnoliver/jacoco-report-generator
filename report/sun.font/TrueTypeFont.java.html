@@ -1,0 +1,1701 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>TrueTypeFont.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.font</a> &gt; <span class="el_source">TrueTypeFont.java</span></div><h1>TrueTypeFont.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2003, 2010, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.font;
+
+import java.awt.Font;
+import java.awt.FontFormatException;
+import java.awt.GraphicsEnvironment;
+import java.awt.geom.Point2D;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.io.UnsupportedEncodingException;
+import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.nio.IntBuffer;
+import java.nio.ShortBuffer;
+import java.nio.channels.ClosedChannelException;
+import java.nio.channels.FileChannel;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Locale;
+import sun.java2d.Disposer;
+import sun.java2d.DisposerRecord;
+
+/**
+ * TrueTypeFont is not called SFntFont because it is not expected
+ * to handle all types that may be housed in a such a font file.
+ * If additional types are supported later, it may make sense to
+ * create an SFnt superclass. Eg to handle sfnt-housed postscript fonts.
+ * OpenType fonts are handled by this class, and possibly should be
+ * represented by a subclass.
+ * An instance stores some information from the font file to faciliate
+ * faster access. File size, the table directory and the names of the font
+ * are the most important of these. It amounts to approx 400 bytes
+ * for a typical font. Systems with mutiple locales sometimes have up to 400
+ * font files, and an app which loads all font files would need around
+ * 160Kbytes. So storing any more info than this would be expensive.
+ */
+public class TrueTypeFont extends FileFont {
+
+   /* -- Tags for required TrueType tables */
+    public static final int cmapTag = 0x636D6170; // 'cmap'
+    public static final int glyfTag = 0x676C7966; // 'glyf'
+    public static final int headTag = 0x68656164; // 'head'
+    public static final int hheaTag = 0x68686561; // 'hhea'
+    public static final int hmtxTag = 0x686D7478; // 'hmtx'
+    public static final int locaTag = 0x6C6F6361; // 'loca'
+    public static final int maxpTag = 0x6D617870; // 'maxp'
+    public static final int nameTag = 0x6E616D65; // 'name'
+    public static final int postTag = 0x706F7374; // 'post'
+    public static final int os_2Tag = 0x4F532F32; // 'OS/2'
+
+    /* -- Tags for opentype related tables */
+    public static final int GDEFTag = 0x47444546; // 'GDEF'
+    public static final int GPOSTag = 0x47504F53; // 'GPOS'
+    public static final int GSUBTag = 0x47535542; // 'GSUB'
+    public static final int mortTag = 0x6D6F7274; // 'mort'
+
+    /* -- Tags for non-standard tables */
+    public static final int fdscTag = 0x66647363; // 'fdsc' - gxFont descriptor
+    public static final int fvarTag = 0x66766172; // 'fvar' - gxFont variations
+    public static final int featTag = 0x66656174; // 'feat' - layout features
+    public static final int EBLCTag = 0x45424C43; // 'EBLC' - embedded bitmaps
+    public static final int gaspTag = 0x67617370; // 'gasp' - hint/smooth sizes
+
+    /* --  Other tags */
+    public static final int ttcfTag = 0x74746366; // 'ttcf' - TTC file
+    public static final int v1ttTag = 0x00010000; // 'v1tt' - Version 1 TT font
+    public static final int trueTag = 0x74727565; // 'true' - Version 2 TT font
+    public static final int ottoTag = 0x4f54544f; // 'otto' - OpenType font
+
+    /* -- ID's used in the 'name' table */
+    public static final int MS_PLATFORM_ID = 3;
+    /* MS locale id for US English is the &quot;default&quot; */
+    public static final short ENGLISH_LOCALE_ID = 0x0409; // 1033 decimal
+    public static final int FAMILY_NAME_ID = 1;
+    // public static final int STYLE_WEIGHT_ID = 2; // currently unused.
+    public static final int FULL_NAME_ID = 4;
+    public static final int POSTSCRIPT_NAME_ID = 6;
+
+    private static final short US_LCID = 0x0409;  // US English - default
+
+    private static Map&lt;String, Short&gt; lcidMap;
+
+<span class="nc" id="L109">    static class DirectoryEntry {</span>
+        int tag;
+        int offset;
+        int length;
+    }
+
+    /* There is a pool which limits the number of fd's that are in
+     * use. Normally fd's are closed as they are replaced in the pool.
+     * But if an instance of this class becomes unreferenced, then there
+     * needs to be a way to close the fd. A finalize() method could do this,
+     * but using the Disposer class will ensure its called in a more timely
+     * manner. This is not something which should be relied upon to free
+     * fd's - its a safeguard.
+     */
+<span class="nc" id="L123">    private static class TTDisposerRecord implements DisposerRecord {</span>
+
+<span class="nc" id="L125">        FileChannel channel = null;</span>
+
+        public synchronized void dispose() {
+            try {
+<span class="nc bnc" id="L129" title="All 2 branches missed.">                if (channel != null) {</span>
+<span class="nc" id="L130">                    channel.close();</span>
+                }
+<span class="nc" id="L132">            } catch (IOException e) {</span>
+            } finally {
+<span class="nc" id="L134">                channel = null;</span>
+<span class="nc" id="L135">            }</span>
+<span class="nc" id="L136">        }</span>
+    }
+
+<span class="nc" id="L139">    TTDisposerRecord disposerRecord = new TTDisposerRecord();</span>
+
+    /* &gt; 0 only if this font is a part of a collection */
+<span class="nc" id="L142">    int fontIndex = 0;</span>
+
+    /* Number of fonts in this collection. ==1 if not a collection */
+<span class="nc" id="L145">    int directoryCount = 1;</span>
+
+    /* offset in file of table directory for this font */
+    int directoryOffset; // 12 if its not a collection.
+
+    /* number of table entries in the directory/offsets table */
+    int numTables;
+
+    /* The contents of the the directory/offsets table */
+    DirectoryEntry []tableDirectory;
+
+//     protected byte []gposTable = null;
+//     protected byte []gdefTable = null;
+//     protected byte []gsubTable = null;
+//     protected byte []mortTable = null;
+//     protected boolean hintsTabledChecked = false;
+//     protected boolean containsHintsTable = false;
+
+    /* These fields are set from os/2 table info. */
+    private boolean supportsJA;
+    private boolean supportsCJK;
+
+    /* These are for faster access to the name of the font as
+     * typically exposed via API to applications.
+     */
+    private Locale nameLocale;
+    private String localeFamilyName;
+    private String localeFullName;
+
+    /**
+     * - does basic verification of the file
+     * - reads the header table for this font (within a collection)
+     * - reads the names (full, family).
+     * - determines the style of the font.
+     * - initializes the CMAP
+     * @throws FontFormatException - if the font can't be opened
+     * or fails verification,  or there's no usable cmap
+     */
+    public TrueTypeFont(String platname, Object nativeNames, int fIndex,
+                 boolean javaRasterizer)
+        throws FontFormatException {
+<span class="nc" id="L186">        super(platname, nativeNames);</span>
+<span class="nc" id="L187">        useJavaRasterizer = javaRasterizer;</span>
+<span class="nc" id="L188">        fontRank = Font2D.TTF_RANK;</span>
+        try {
+<span class="nc" id="L190">            verify();</span>
+<span class="nc" id="L191">            init(fIndex);</span>
+<span class="nc" id="L192">        } catch (Throwable t) {</span>
+<span class="nc" id="L193">            close();</span>
+<span class="nc bnc" id="L194" title="All 2 branches missed.">            if (t instanceof FontFormatException) {</span>
+<span class="nc" id="L195">                throw (FontFormatException)t;</span>
+            } else {
+<span class="nc" id="L197">                throw new FontFormatException(&quot;Unexpected runtime exception.&quot;);</span>
+            }
+<span class="nc" id="L199">        }</span>
+<span class="nc" id="L200">        Disposer.addObjectRecord(this, disposerRecord);</span>
+<span class="nc" id="L201">    }</span>
+
+    /* Enable natives just for fonts picked up from the platform that
+     * may have external bitmaps on Solaris. Could do this just for
+     * the fonts that are specified in font configuration files which
+     * would lighten the burden (think about that).
+     * The EBLCTag is used to skip natives for fonts that contain embedded
+     * bitmaps as there's no need to use X11 for those fonts.
+     * Skip all the latin fonts as they don't need this treatment.
+     * Further refine this to fonts that are natively accessible (ie
+     * as PCF bitmap fonts on the X11 font path).
+     * This method is called when creating the first strike for this font.
+     */
+    @Override
+    protected boolean checkUseNatives() {
+<span class="nc bnc" id="L216" title="All 2 branches missed.">        if (checkedNatives) {</span>
+<span class="nc" id="L217">            return useNatives;</span>
+        }
+<span class="nc bnc" id="L219" title="All 8 branches missed.">        if (!FontUtilities.isSolaris || useJavaRasterizer ||</span>
+            FontUtilities.useT2K || nativeNames == null ||
+<span class="nc bnc" id="L221" title="All 2 branches missed.">            getDirectoryEntry(EBLCTag) != null ||</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">            GraphicsEnvironment.isHeadless()) {</span>
+<span class="nc" id="L223">            checkedNatives = true;</span>
+<span class="nc" id="L224">            return false; /* useNatives is false */</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">        } else if (nativeNames instanceof String) {</span>
+<span class="nc" id="L226">            String name = (String)nativeNames;</span>
+            /* Don't do do this for Latin fonts */
+<span class="nc bnc" id="L228" title="All 2 branches missed.">            if (name.indexOf(&quot;8859&quot;) &gt; 0) {</span>
+<span class="nc" id="L229">                checkedNatives = true;</span>
+<span class="nc" id="L230">                return false;</span>
+<span class="nc bnc" id="L231" title="All 2 branches missed.">            } else if (NativeFont.hasExternalBitmaps(name)) {</span>
+<span class="nc" id="L232">                nativeFonts = new NativeFont[1];</span>
+                try {
+<span class="nc" id="L234">                    nativeFonts[0] = new NativeFont(name, true);</span>
+                    /* If reach here we have an non-latin font that has
+                     * external bitmaps and we successfully created it.
+                     */
+<span class="nc" id="L238">                    useNatives = true;</span>
+<span class="nc" id="L239">                } catch (FontFormatException e) {</span>
+<span class="nc" id="L240">                    nativeFonts = null;</span>
+<span class="nc" id="L241">                }</span>
+            }
+<span class="nc bnc" id="L243" title="All 2 branches missed.">        } else if (nativeNames instanceof String[]) {</span>
+<span class="nc" id="L244">            String[] natNames = (String[])nativeNames;</span>
+<span class="nc" id="L245">            int numNames = natNames.length;</span>
+<span class="nc" id="L246">            boolean externalBitmaps = false;</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">            for (int nn = 0; nn &lt; numNames; nn++) {</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">                if (natNames[nn].indexOf(&quot;8859&quot;) &gt; 0) {</span>
+<span class="nc" id="L249">                    checkedNatives = true;</span>
+<span class="nc" id="L250">                    return false;</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">                } else if (NativeFont.hasExternalBitmaps(natNames[nn])) {</span>
+<span class="nc" id="L252">                    externalBitmaps = true;</span>
+                }
+            }
+<span class="nc bnc" id="L255" title="All 2 branches missed.">            if (!externalBitmaps) {</span>
+<span class="nc" id="L256">                checkedNatives = true;</span>
+<span class="nc" id="L257">                return false;</span>
+            }
+<span class="nc" id="L259">            useNatives = true;</span>
+<span class="nc" id="L260">            nativeFonts = new NativeFont[numNames];</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">            for (int nn = 0; nn &lt; numNames; nn++) {</span>
+                try {
+<span class="nc" id="L263">                    nativeFonts[nn] = new NativeFont(natNames[nn], true);</span>
+<span class="nc" id="L264">                } catch (FontFormatException e) {</span>
+<span class="nc" id="L265">                    useNatives = false;</span>
+<span class="nc" id="L266">                    nativeFonts = null;</span>
+<span class="nc" id="L267">                }</span>
+            }
+        }
+<span class="nc bnc" id="L270" title="All 2 branches missed.">        if (useNatives) {</span>
+<span class="nc" id="L271">            glyphToCharMap = new char[getMapper().getNumGlyphs()];</span>
+        }
+<span class="nc" id="L273">        checkedNatives = true;</span>
+<span class="nc" id="L274">        return useNatives;</span>
+    }
+
+
+    /* This is intended to be called, and the returned value used,
+     * from within a block synchronized on this font object.
+     * ie the channel returned may be nulled out at any time by &quot;close()&quot;
+     * unless the caller holds a lock.
+     * Deadlock warning: FontManager.addToPool(..) acquires a global lock,
+     * which means nested locks may be in effect.
+     */
+    private synchronized FileChannel open() throws FontFormatException {
+<span class="nc bnc" id="L286" title="All 2 branches missed.">        if (disposerRecord.channel == null) {</span>
+<span class="nc bnc" id="L287" title="All 2 branches missed.">            if (FontUtilities.isLogging()) {</span>
+<span class="nc" id="L288">                FontUtilities.getLogger().info(&quot;open TTF: &quot; + platName);</span>
+            }
+            try {
+<span class="nc" id="L291">                RandomAccessFile raf = (RandomAccessFile)</span>
+<span class="nc" id="L292">                java.security.AccessController.doPrivileged(</span>
+<span class="nc" id="L293">                    new java.security.PrivilegedAction() {</span>
+                        public Object run() {
+                            try {
+<span class="nc" id="L296">                                return new RandomAccessFile(platName, &quot;r&quot;);</span>
+<span class="nc" id="L297">                            } catch (FileNotFoundException ffne) {</span>
+                            }
+<span class="nc" id="L299">                            return null;</span>
+                    }
+                });
+<span class="nc" id="L302">                disposerRecord.channel = raf.getChannel();</span>
+<span class="nc" id="L303">                fileSize = (int)disposerRecord.channel.size();</span>
+<span class="nc" id="L304">                FontManager fm = FontManagerFactory.getInstance();</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">                if (fm instanceof SunFontManager) {</span>
+<span class="nc" id="L306">                    ((SunFontManager) fm).addToPool(this);</span>
+                }
+<span class="nc" id="L308">            } catch (NullPointerException e) {</span>
+<span class="nc" id="L309">                close();</span>
+<span class="nc" id="L310">                throw new FontFormatException(e.toString());</span>
+<span class="nc" id="L311">            } catch (ClosedChannelException e) {</span>
+                /* NIO I/O is interruptible, recurse to retry operation.
+                 * The call to channel.size() above can throw this exception.
+                 * Clear interrupts before recursing in case NIO didn't.
+                 * Note that close() sets disposerRecord.channel to null.
+                 */
+<span class="nc" id="L317">                Thread.interrupted();</span>
+<span class="nc" id="L318">                close();</span>
+<span class="nc" id="L319">                open();</span>
+<span class="nc" id="L320">            } catch (IOException e) {</span>
+<span class="nc" id="L321">                close();</span>
+<span class="nc" id="L322">                throw new FontFormatException(e.toString());</span>
+<span class="nc" id="L323">            }</span>
+        }
+<span class="nc" id="L325">        return disposerRecord.channel;</span>
+    }
+
+    protected synchronized void close() {
+<span class="nc" id="L329">        disposerRecord.dispose();</span>
+<span class="nc" id="L330">    }</span>
+
+
+    int readBlock(ByteBuffer buffer, int offset, int length) {
+<span class="nc" id="L334">        int bread = 0;</span>
+        try {
+<span class="nc" id="L336">            synchronized (this) {</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">                if (disposerRecord.channel == null) {</span>
+<span class="nc" id="L338">                    open();</span>
+                }
+<span class="nc bnc" id="L340" title="All 2 branches missed.">                if (offset + length &gt; fileSize) {</span>
+<span class="nc bnc" id="L341" title="All 2 branches missed.">                    if (offset &gt;= fileSize) {</span>
+                        /* Since the caller ensures that offset is &lt; fileSize
+                         * this condition suggests that fileSize is now
+                         * different than the value we originally provided
+                         * to native when the scaler was created.
+                         * Also fileSize is updated every time we
+                         * open() the file here, but in native the value
+                         * isn't updated. If the file has changed whilst we
+                         * are executing we want to bail, not spin.
+                         */
+<span class="nc bnc" id="L351" title="All 2 branches missed.">                        if (FontUtilities.isLogging()) {</span>
+<span class="nc" id="L352">                            String msg = &quot;Read offset is &quot; + offset +</span>
+                                &quot; file size is &quot; + fileSize+
+                                &quot; file is &quot; + platName;
+<span class="nc" id="L355">                            FontUtilities.getLogger().severe(msg);</span>
+                        }
+<span class="nc" id="L357">                        return -1;</span>
+                    } else {
+<span class="nc" id="L359">                        length = fileSize - offset;</span>
+                    }
+                }
+<span class="nc" id="L362">                buffer.clear();</span>
+<span class="nc" id="L363">                disposerRecord.channel.position(offset);</span>
+<span class="nc bnc" id="L364" title="All 2 branches missed.">                while (bread &lt; length) {</span>
+<span class="nc" id="L365">                    int cnt = disposerRecord.channel.read(buffer);</span>
+<span class="nc bnc" id="L366" title="All 2 branches missed.">                    if (cnt == -1) {</span>
+<span class="nc" id="L367">                        String msg = &quot;Unexpected EOF &quot; + this;</span>
+<span class="nc" id="L368">                        int currSize = (int)disposerRecord.channel.size();</span>
+<span class="nc bnc" id="L369" title="All 2 branches missed.">                        if (currSize != fileSize) {</span>
+<span class="nc" id="L370">                            msg += &quot; File size was &quot; + fileSize +</span>
+                                &quot; and now is &quot; + currSize;
+                        }
+<span class="nc bnc" id="L373" title="All 2 branches missed.">                        if (FontUtilities.isLogging()) {</span>
+<span class="nc" id="L374">                            FontUtilities.getLogger().severe(msg);</span>
+                        }
+                        // We could still flip() the buffer here because
+                        // it's possible that we did read some data in
+                        // an earlier loop, and we probably should
+                        // return that to the caller. Although if
+                        // the caller expected 8K of data and we return
+                        // only a few bytes then maybe it's better instead to
+                        // set bread = -1 to indicate failure.
+                        // The following is therefore using arbitrary values
+                        // but is meant to allow cases where enough
+                        // data was read to probably continue.
+<span class="nc bnc" id="L386" title="All 4 branches missed.">                        if (bread &gt; length/2 || bread &gt; 16384) {</span>
+<span class="nc" id="L387">                            buffer.flip();</span>
+<span class="nc bnc" id="L388" title="All 2 branches missed.">                            if (FontUtilities.isLogging()) {</span>
+<span class="nc" id="L389">                                msg = &quot;Returning &quot; + bread +</span>
+                                    &quot; bytes instead of &quot; + length;
+<span class="nc" id="L391">                                FontUtilities.getLogger().severe(msg);</span>
+                            }
+                        } else {
+<span class="nc" id="L394">                            bread = -1;</span>
+                        }
+<span class="nc" id="L396">                        throw new IOException(msg);</span>
+                    }
+<span class="nc" id="L398">                    bread += cnt;</span>
+<span class="nc" id="L399">                }</span>
+<span class="nc" id="L400">                buffer.flip();</span>
+<span class="nc bnc" id="L401" title="All 2 branches missed.">                if (bread &gt; length) { // possible if buffer.size() &gt; length</span>
+<span class="nc" id="L402">                    bread = length;</span>
+                }
+<span class="nc" id="L404">            }</span>
+<span class="nc" id="L405">        } catch (FontFormatException e) {</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">            if (FontUtilities.isLogging()) {</span>
+<span class="nc" id="L407">                FontUtilities.getLogger().severe(</span>
+                                       &quot;While reading &quot; + platName, e);
+            }
+<span class="nc" id="L410">            bread = -1; // signal EOF</span>
+<span class="nc" id="L411">            deregisterFontAndClearStrikeCache();</span>
+<span class="nc" id="L412">        } catch (ClosedChannelException e) {</span>
+            /* NIO I/O is interruptible, recurse to retry operation.
+             * Clear interrupts before recursing in case NIO didn't.
+             */
+<span class="nc" id="L416">            Thread.interrupted();</span>
+<span class="nc" id="L417">            close();</span>
+<span class="nc" id="L418">            return readBlock(buffer, offset, length);</span>
+<span class="nc" id="L419">        } catch (IOException e) {</span>
+            /* If we did not read any bytes at all and the exception is
+             * not a recoverable one (ie is not ClosedChannelException) then
+             * we should indicate that there is no point in re-trying.
+             * Other than an attempt to read past the end of the file it
+             * seems unlikely this would occur as problems opening the
+             * file are handled as a FontFormatException.
+             */
+<span class="nc bnc" id="L427" title="All 2 branches missed.">            if (FontUtilities.isLogging()) {</span>
+<span class="nc" id="L428">                FontUtilities.getLogger().severe(</span>
+                                       &quot;While reading &quot; + platName, e);
+            }
+<span class="nc bnc" id="L431" title="All 2 branches missed.">            if (bread == 0) {</span>
+<span class="nc" id="L432">                bread = -1; // signal EOF</span>
+<span class="nc" id="L433">                deregisterFontAndClearStrikeCache();</span>
+            }
+<span class="nc" id="L435">        }</span>
+<span class="nc" id="L436">        return bread;</span>
+    }
+
+    ByteBuffer readBlock(int offset, int length) {
+
+<span class="nc" id="L441">        ByteBuffer buffer = ByteBuffer.allocate(length);</span>
+        try {
+<span class="nc" id="L443">            synchronized (this) {</span>
+<span class="nc bnc" id="L444" title="All 2 branches missed.">                if (disposerRecord.channel == null) {</span>
+<span class="nc" id="L445">                    open();</span>
+                }
+<span class="nc bnc" id="L447" title="All 2 branches missed.">                if (offset + length &gt; fileSize) {</span>
+<span class="nc bnc" id="L448" title="All 2 branches missed.">                    if (offset &gt; fileSize) {</span>
+<span class="nc" id="L449">                        return null; // assert?</span>
+                    } else {
+<span class="nc" id="L451">                        buffer = ByteBuffer.allocate(fileSize-offset);</span>
+                    }
+                }
+<span class="nc" id="L454">                disposerRecord.channel.position(offset);</span>
+<span class="nc" id="L455">                disposerRecord.channel.read(buffer);</span>
+<span class="nc" id="L456">                buffer.flip();</span>
+<span class="nc" id="L457">            }</span>
+<span class="nc" id="L458">        } catch (FontFormatException e) {</span>
+<span class="nc" id="L459">            return null;</span>
+<span class="nc" id="L460">        } catch (ClosedChannelException e) {</span>
+            /* NIO I/O is interruptible, recurse to retry operation.
+             * Clear interrupts before recursing in case NIO didn't.
+             */
+<span class="nc" id="L464">            Thread.interrupted();</span>
+<span class="nc" id="L465">            close();</span>
+<span class="nc" id="L466">            readBlock(buffer, offset, length);</span>
+<span class="nc" id="L467">        } catch (IOException e) {</span>
+<span class="nc" id="L468">            return null;</span>
+<span class="nc" id="L469">        }</span>
+<span class="nc" id="L470">        return buffer;</span>
+    }
+
+    /* This is used by native code which can't allocate a direct byte
+     * buffer because of bug 4845371. It, and references to it in native
+     * code in scalerMethods.c can be removed once that bug is fixed.
+     * 4845371 is now fixed but we'll keep this around as it doesn't cost
+     * us anything if its never used/called.
+     */
+    byte[] readBytes(int offset, int length) {
+<span class="nc" id="L480">        ByteBuffer buffer = readBlock(offset, length);</span>
+<span class="nc bnc" id="L481" title="All 2 branches missed.">        if (buffer.hasArray()) {</span>
+<span class="nc" id="L482">            return buffer.array();</span>
+        } else {
+<span class="nc" id="L484">            byte[] bufferBytes = new byte[buffer.limit()];</span>
+<span class="nc" id="L485">            buffer.get(bufferBytes);</span>
+<span class="nc" id="L486">            return bufferBytes;</span>
+        }
+    }
+
+    private void verify() throws FontFormatException {
+<span class="nc" id="L491">        open();</span>
+<span class="nc" id="L492">    }</span>
+
+    /* sizes, in bytes, of TT/TTC header records */
+    private static final int TTCHEADERSIZE = 12;
+    private static final int DIRECTORYHEADERSIZE = 12;
+    private static final int DIRECTORYENTRYSIZE = 16;
+
+    protected void init(int fIndex) throws FontFormatException  {
+<span class="nc" id="L500">        int headerOffset = 0;</span>
+<span class="nc" id="L501">        ByteBuffer buffer = readBlock(0, TTCHEADERSIZE);</span>
+        try {
+<span class="nc bnc" id="L503" title="All 3 branches missed.">            switch (buffer.getInt()) {</span>
+
+            case ttcfTag:
+<span class="nc" id="L506">                buffer.getInt(); // skip TTC version ID</span>
+<span class="nc" id="L507">                directoryCount = buffer.getInt();</span>
+<span class="nc bnc" id="L508" title="All 2 branches missed.">                if (fIndex &gt;= directoryCount) {</span>
+<span class="nc" id="L509">                    throw new FontFormatException(&quot;Bad collection index&quot;);</span>
+                }
+<span class="nc" id="L511">                fontIndex = fIndex;</span>
+<span class="nc" id="L512">                buffer = readBlock(TTCHEADERSIZE+4*fIndex, 4);</span>
+<span class="nc" id="L513">                headerOffset = buffer.getInt();</span>
+<span class="nc" id="L514">                break;</span>
+
+            case v1ttTag:
+            case trueTag:
+            case ottoTag:
+<span class="nc" id="L519">                break;</span>
+
+            default:
+<span class="nc" id="L522">                throw new FontFormatException(&quot;Unsupported sfnt &quot; +</span>
+<span class="nc" id="L523">                                              getPublicFileName());</span>
+            }
+
+            /* Now have the offset of this TT font (possibly within a TTC)
+             * After the TT version/scaler type field, is the short
+             * representing the number of tables in the table directory.
+             * The table directory begins at 12 bytes after the header.
+             * Each table entry is 16 bytes long (4 32-bit ints)
+             */
+<span class="nc" id="L532">            buffer = readBlock(headerOffset+4, 2);</span>
+<span class="nc" id="L533">            numTables = buffer.getShort();</span>
+<span class="nc" id="L534">            directoryOffset = headerOffset+DIRECTORYHEADERSIZE;</span>
+<span class="nc" id="L535">            ByteBuffer bbuffer = readBlock(directoryOffset,</span>
+                                           numTables*DIRECTORYENTRYSIZE);
+<span class="nc" id="L537">            IntBuffer ibuffer = bbuffer.asIntBuffer();</span>
+            DirectoryEntry table;
+<span class="nc" id="L539">            tableDirectory = new DirectoryEntry[numTables];</span>
+<span class="nc bnc" id="L540" title="All 2 branches missed.">            for (int i=0; i&lt;numTables;i++) {</span>
+<span class="nc" id="L541">                tableDirectory[i] = table = new DirectoryEntry();</span>
+<span class="nc" id="L542">                table.tag   =  ibuffer.get();</span>
+<span class="nc" id="L543">                /* checksum */ ibuffer.get();</span>
+<span class="nc" id="L544">                table.offset = ibuffer.get();</span>
+<span class="nc" id="L545">                table.length = ibuffer.get();</span>
+<span class="nc bnc" id="L546" title="All 2 branches missed.">                if (table.offset + table.length &gt; fileSize) {</span>
+<span class="nc" id="L547">                    throw new FontFormatException(&quot;bad table, tag=&quot;+table.tag);</span>
+                }
+            }
+
+<span class="nc bnc" id="L551" title="All 2 branches missed.">            if (getDirectoryEntry(headTag) == null) {</span>
+<span class="nc" id="L552">                throw new FontFormatException(&quot;missing head table&quot;);</span>
+            }
+<span class="nc bnc" id="L554" title="All 2 branches missed.">            if (getDirectoryEntry(maxpTag) == null) {</span>
+<span class="nc" id="L555">                throw new FontFormatException(&quot;missing maxp table&quot;);</span>
+            }
+<span class="nc bnc" id="L557" title="All 2 branches missed.">            if (getDirectoryEntry(hmtxTag) != null</span>
+<span class="nc bnc" id="L558" title="All 2 branches missed.">                    &amp;&amp; getDirectoryEntry(hheaTag) == null) {</span>
+<span class="nc" id="L559">                throw new FontFormatException(&quot;missing hhea table&quot;);</span>
+            }
+<span class="nc" id="L561">            initNames();</span>
+<span class="nc" id="L562">        } catch (Exception e) {</span>
+<span class="nc bnc" id="L563" title="All 2 branches missed.">            if (FontUtilities.isLogging()) {</span>
+<span class="nc" id="L564">                FontUtilities.getLogger().severe(e.toString());</span>
+            }
+<span class="nc bnc" id="L566" title="All 2 branches missed.">            if (e instanceof FontFormatException) {</span>
+<span class="nc" id="L567">                throw (FontFormatException)e;</span>
+            } else {
+<span class="nc" id="L569">                throw new FontFormatException(e.toString());</span>
+            }
+<span class="nc" id="L571">        }</span>
+<span class="nc bnc" id="L572" title="All 4 branches missed.">        if (familyName == null || fullName == null) {</span>
+<span class="nc" id="L573">            throw new FontFormatException(&quot;Font name not found&quot;);</span>
+        }
+        /* The os2_Table is needed to gather some info, but we don't
+         * want to keep it around (as a field) so obtain it once and
+         * pass it to the code that needs it.
+         */
+<span class="nc" id="L579">        ByteBuffer os2_Table = getTableBuffer(os_2Tag);</span>
+<span class="nc" id="L580">        setStyle(os2_Table);</span>
+<span class="nc" id="L581">        setCJKSupport(os2_Table);</span>
+<span class="nc" id="L582">    }</span>
+
+    /* The array index corresponds to a bit offset in the TrueType
+     * font's OS/2 compatibility table's code page ranges fields.
+     * These are two 32 bit unsigned int fields at offsets 78 and 82.
+     * We are only interested in determining if the font supports
+     * the windows encodings we expect as the default encoding in
+     * supported locales, so we only map the first of these fields.
+     */
+<span class="nc" id="L591">    static final String encoding_mapping[] = {</span>
+        &quot;cp1252&quot;,    /*  0:Latin 1  */
+        &quot;cp1250&quot;,    /*  1:Latin 2  */
+        &quot;cp1251&quot;,    /*  2:Cyrillic */
+        &quot;cp1253&quot;,    /*  3:Greek    */
+        &quot;cp1254&quot;,    /*  4:Turkish/Latin 5  */
+        &quot;cp1255&quot;,    /*  5:Hebrew   */
+        &quot;cp1256&quot;,    /*  6:Arabic   */
+        &quot;cp1257&quot;,    /*  7:Windows Baltic   */
+        &quot;&quot;,          /*  8:reserved for alternate ANSI */
+        &quot;&quot;,          /*  9:reserved for alternate ANSI */
+        &quot;&quot;,          /* 10:reserved for alternate ANSI */
+        &quot;&quot;,          /* 11:reserved for alternate ANSI */
+        &quot;&quot;,          /* 12:reserved for alternate ANSI */
+        &quot;&quot;,          /* 13:reserved for alternate ANSI */
+        &quot;&quot;,          /* 14:reserved for alternate ANSI */
+        &quot;&quot;,          /* 15:reserved for alternate ANSI */
+        &quot;ms874&quot;,     /* 16:Thai     */
+        &quot;ms932&quot;,     /* 17:JIS/Japanese */
+        &quot;gbk&quot;,       /* 18:PRC GBK Cp950  */
+        &quot;ms949&quot;,     /* 19:Korean Extended Wansung */
+        &quot;ms950&quot;,     /* 20:Chinese (Taiwan, Hongkong, Macau) */
+        &quot;ms1361&quot;,    /* 21:Korean Johab */
+        &quot;&quot;,          /* 22 */
+        &quot;&quot;,          /* 23 */
+        &quot;&quot;,          /* 24 */
+        &quot;&quot;,          /* 25 */
+        &quot;&quot;,          /* 26 */
+        &quot;&quot;,          /* 27 */
+        &quot;&quot;,          /* 28 */
+        &quot;&quot;,          /* 29 */
+        &quot;&quot;,          /* 30 */
+        &quot;&quot;,          /* 31 */
+    };
+
+    /* This maps two letter language codes to a Windows code page.
+     * Note that eg Cp1252 (the first subarray) is not exactly the same as
+     * Latin-1 since Windows code pages are do not necessarily correspond.
+     * There are two codepages for zh and ko so if a font supports
+     * only one of these ranges then we need to distinguish based on
+     * country. So far this only seems to matter for zh.
+     * REMIND: Unicode locales such as Hindi do not have a code page so
+     * this whole mechanism needs to be revised to map languages to
+     * the Unicode ranges either when this fails, or as an additional
+     * validating test. Basing it on Unicode ranges should get us away
+     * from needing to map to this small and incomplete set of Windows
+     * code pages which looks odd on non-Windows platforms.
+     */
+<span class="nc" id="L639">    private static final String languages[][] = {</span>
+
+        /* cp1252/Latin 1 */
+        { &quot;en&quot;, &quot;ca&quot;, &quot;da&quot;, &quot;de&quot;, &quot;es&quot;, &quot;fi&quot;, &quot;fr&quot;, &quot;is&quot;, &quot;it&quot;,
+          &quot;nl&quot;, &quot;no&quot;, &quot;pt&quot;, &quot;sq&quot;, &quot;sv&quot;, },
+
+         /* cp1250/Latin2 */
+        { &quot;cs&quot;, &quot;cz&quot;, &quot;et&quot;, &quot;hr&quot;, &quot;hu&quot;, &quot;nr&quot;, &quot;pl&quot;, &quot;ro&quot;, &quot;sk&quot;,
+          &quot;sl&quot;, &quot;sq&quot;, &quot;sr&quot;, },
+
+        /* cp1251/Cyrillic */
+        { &quot;bg&quot;, &quot;mk&quot;, &quot;ru&quot;, &quot;sh&quot;, &quot;uk&quot; },
+
+        /* cp1253/Greek*/
+        { &quot;el&quot; },
+
+         /* cp1254/Turkish,Latin 5 */
+        { &quot;tr&quot; },
+
+         /* cp1255/Hebrew */
+        { &quot;he&quot; },
+
+        /* cp1256/Arabic */
+        { &quot;ar&quot; },
+
+         /* cp1257/Windows Baltic */
+        { &quot;et&quot;, &quot;lt&quot;, &quot;lv&quot; },
+
+        /* ms874/Thai */
+        { &quot;th&quot; },
+
+         /* ms932/Japanese */
+        { &quot;ja&quot; },
+
+        /* gbk/Chinese (PRC GBK Cp950) */
+        { &quot;zh&quot;, &quot;zh_CN&quot;, },
+
+        /* ms949/Korean Extended Wansung */
+        { &quot;ko&quot; },
+
+        /* ms950/Chinese (Taiwan, Hongkong, Macau) */
+        { &quot;zh_HK&quot;, &quot;zh_TW&quot;, },
+
+        /* ms1361/Korean Johab */
+        { &quot;ko&quot; },
+    };
+
+<span class="nc" id="L686">    private static final String codePages[] = {</span>
+        &quot;cp1252&quot;,
+        &quot;cp1250&quot;,
+        &quot;cp1251&quot;,
+        &quot;cp1253&quot;,
+        &quot;cp1254&quot;,
+        &quot;cp1255&quot;,
+        &quot;cp1256&quot;,
+        &quot;cp1257&quot;,
+        &quot;ms874&quot;,
+        &quot;ms932&quot;,
+        &quot;gbk&quot;,
+        &quot;ms949&quot;,
+        &quot;ms950&quot;,
+        &quot;ms1361&quot;,
+    };
+
+<span class="nc" id="L703">    private static String defaultCodePage = null;</span>
+    static String getCodePage() {
+
+<span class="nc bnc" id="L706" title="All 2 branches missed.">        if (defaultCodePage != null) {</span>
+<span class="nc" id="L707">            return defaultCodePage;</span>
+        }
+
+<span class="nc bnc" id="L710" title="All 2 branches missed.">        if (FontUtilities.isWindows) {</span>
+<span class="nc" id="L711">            defaultCodePage =</span>
+<span class="nc" id="L712">                (String)java.security.AccessController.doPrivileged(</span>
+                   new sun.security.action.GetPropertyAction(&quot;file.encoding&quot;));
+        } else {
+<span class="nc bnc" id="L715" title="All 2 branches missed.">            if (languages.length != codePages.length) {</span>
+<span class="nc" id="L716">                throw new InternalError(&quot;wrong code pages array length&quot;);</span>
+            }
+<span class="nc" id="L718">            Locale locale = sun.awt.SunToolkit.getStartupLocale();</span>
+
+<span class="nc" id="L720">            String language = locale.getLanguage();</span>
+<span class="nc bnc" id="L721" title="All 2 branches missed.">            if (language != null) {</span>
+<span class="nc bnc" id="L722" title="All 2 branches missed.">                if (language.equals(&quot;zh&quot;)) {</span>
+<span class="nc" id="L723">                    String country = locale.getCountry();</span>
+<span class="nc bnc" id="L724" title="All 2 branches missed.">                    if (country != null) {</span>
+<span class="nc" id="L725">                        language = language + &quot;_&quot; + country;</span>
+                    }
+                }
+<span class="nc bnc" id="L728" title="All 2 branches missed.">                for (int i=0; i&lt;languages.length;i++) {</span>
+<span class="nc bnc" id="L729" title="All 2 branches missed.">                    for (int l=0;l&lt;languages[i].length; l++) {</span>
+<span class="nc bnc" id="L730" title="All 2 branches missed.">                        if (language.equals(languages[i][l])) {</span>
+<span class="nc" id="L731">                            defaultCodePage = codePages[i];</span>
+<span class="nc" id="L732">                            return defaultCodePage;</span>
+                        }
+                    }
+                }
+            }
+        }
+<span class="nc bnc" id="L738" title="All 2 branches missed.">        if (defaultCodePage == null) {</span>
+<span class="nc" id="L739">            defaultCodePage = &quot;&quot;;</span>
+        }
+<span class="nc" id="L741">        return defaultCodePage;</span>
+    }
+
+    /* Theoretically, reserved bits must not be set, include symbol bits */
+    public static final int reserved_bits1 = 0x80000000;
+    public static final int reserved_bits2 = 0x0000ffff;
+    @Override
+    boolean supportsEncoding(String encoding) {
+<span class="nc bnc" id="L749" title="All 2 branches missed.">        if (encoding == null) {</span>
+<span class="nc" id="L750">            encoding = getCodePage();</span>
+        }
+<span class="nc bnc" id="L752" title="All 2 branches missed.">        if (&quot;&quot;.equals(encoding)) {</span>
+<span class="nc" id="L753">            return false;</span>
+        }
+
+<span class="nc" id="L756">        encoding = encoding.toLowerCase();</span>
+
+        /* java_props_md.c has a couple of special cases
+         * if language packs are installed. In these encodings the
+         * fontconfig files pick up different fonts :
+         * SimSun-18030 and MingLiU_HKSCS. Since these fonts will
+         * indicate they support the base encoding, we need to rewrite
+         * these encodings here before checking the map/array.
+         */
+<span class="nc bnc" id="L765" title="All 2 branches missed.">        if (encoding.equals(&quot;gb18030&quot;)) {</span>
+<span class="nc" id="L766">            encoding = &quot;gbk&quot;;</span>
+<span class="nc bnc" id="L767" title="All 2 branches missed.">        } else if (encoding.equals(&quot;ms950_hkscs&quot;)) {</span>
+<span class="nc" id="L768">            encoding = &quot;ms950&quot;;</span>
+        }
+
+<span class="nc" id="L771">        ByteBuffer buffer = getTableBuffer(os_2Tag);</span>
+        /* required info is at offsets 78 and 82 */
+<span class="nc bnc" id="L773" title="All 4 branches missed.">        if (buffer == null || buffer.capacity() &lt; 86) {</span>
+<span class="nc" id="L774">            return false;</span>
+        }
+
+<span class="nc" id="L777">        int range1 = buffer.getInt(78); /* ulCodePageRange1 */</span>
+<span class="nc" id="L778">        int range2 = buffer.getInt(82); /* ulCodePageRange2 */</span>
+
+        /* This test is too stringent for Arial on Solaris (and perhaps
+         * other fonts). Arial has at least one reserved bit set for an
+         * unknown reason.
+         */
+//         if (((range1 &amp; reserved_bits1) | (range2 &amp; reserved_bits2)) != 0) {
+//             return false;
+//         }
+
+<span class="nc bnc" id="L788" title="All 2 branches missed.">        for (int em=0; em&lt;encoding_mapping.length; em++) {</span>
+<span class="nc bnc" id="L789" title="All 2 branches missed.">            if (encoding_mapping[em].equals(encoding)) {</span>
+<span class="nc bnc" id="L790" title="All 2 branches missed.">                if (((1 &lt;&lt; em) &amp; range1) != 0) {</span>
+<span class="nc" id="L791">                    return true;</span>
+                }
+            }
+        }
+<span class="nc" id="L795">        return false;</span>
+    }
+
+
+    /* Use info in the os_2Table to test CJK support */
+    private void setCJKSupport(ByteBuffer os2Table) {
+        /* required info is in ulong at offset 46 */
+<span class="nc bnc" id="L802" title="All 4 branches missed.">        if (os2Table == null || os2Table.capacity() &lt; 50) {</span>
+<span class="nc" id="L803">            return;</span>
+        }
+<span class="nc" id="L805">        int range2 = os2Table.getInt(46); /* ulUnicodeRange2 */</span>
+
+        /* Any of these bits set in the 32-63 range indicate a font with
+         * support for a CJK range. We aren't looking at some other bits
+         * in the 64-69 range such as half width forms as its unlikely a font
+         * would include those and none of these.
+         */
+<span class="nc bnc" id="L812" title="All 2 branches missed.">        supportsCJK = ((range2 &amp; 0x29bf0000) != 0);</span>
+
+        /* This should be generalised, but for now just need to know if
+         * Hiragana or Katakana ranges are supported by the font.
+         * In the 4 longs representing unicode ranges supported
+         * bits 49 &amp; 50 indicate hiragana and katakana
+         * This is bits 17 &amp; 18 in the 2nd ulong. If either is supported
+         * we presume this is a JA font.
+         */
+<span class="nc bnc" id="L821" title="All 2 branches missed.">        supportsJA = ((range2 &amp; 0x60000) != 0);</span>
+<span class="nc" id="L822">    }</span>
+
+    boolean supportsJA() {
+<span class="nc" id="L825">        return supportsJA;</span>
+    }
+
+     ByteBuffer getTableBuffer(int tag) {
+<span class="nc" id="L829">        DirectoryEntry entry = null;</span>
+
+<span class="nc bnc" id="L831" title="All 2 branches missed.">        for (int i=0;i&lt;numTables;i++) {</span>
+<span class="nc bnc" id="L832" title="All 2 branches missed.">            if (tableDirectory[i].tag == tag) {</span>
+<span class="nc" id="L833">                entry = tableDirectory[i];</span>
+<span class="nc" id="L834">                break;</span>
+            }
+        }
+<span class="nc bnc" id="L837" title="All 6 branches missed.">        if (entry == null || entry.length == 0 ||</span>
+            entry.offset+entry.length &gt; fileSize) {
+<span class="nc" id="L839">            return null;</span>
+        }
+
+<span class="nc" id="L842">        int bread = 0;</span>
+<span class="nc" id="L843">        ByteBuffer buffer = ByteBuffer.allocate(entry.length);</span>
+<span class="nc" id="L844">        synchronized (this) {</span>
+            try {
+<span class="nc bnc" id="L846" title="All 2 branches missed.">                if (disposerRecord.channel == null) {</span>
+<span class="nc" id="L847">                    open();</span>
+                }
+<span class="nc" id="L849">                disposerRecord.channel.position(entry.offset);</span>
+<span class="nc" id="L850">                bread = disposerRecord.channel.read(buffer);</span>
+<span class="nc" id="L851">                buffer.flip();</span>
+<span class="nc" id="L852">            } catch (ClosedChannelException e) {</span>
+                /* NIO I/O is interruptible, recurse to retry operation.
+                 * Clear interrupts before recursing in case NIO didn't.
+                 */
+<span class="nc" id="L856">                Thread.interrupted();</span>
+<span class="nc" id="L857">                close();</span>
+<span class="nc" id="L858">                return getTableBuffer(tag);</span>
+<span class="nc" id="L859">            } catch (IOException e) {</span>
+<span class="nc" id="L860">                return null;</span>
+<span class="nc" id="L861">            } catch (FontFormatException e) {</span>
+<span class="nc" id="L862">                return null;</span>
+<span class="nc" id="L863">            }</span>
+
+<span class="nc bnc" id="L865" title="All 2 branches missed.">            if (bread &lt; entry.length) {</span>
+<span class="nc" id="L866">                return null;</span>
+            } else {
+<span class="nc" id="L868">                return buffer;</span>
+            }
+<span class="nc" id="L870">        }</span>
+    }
+
+    /* NB: is it better to move declaration to Font2D? */
+    long getLayoutTableCache() {
+        try {
+<span class="nc" id="L876">          return getScaler().getLayoutTableCache();</span>
+<span class="nc" id="L877">        } catch(FontScalerException fe) {</span>
+<span class="nc" id="L878">            return 0L;</span>
+        }
+    }
+
+    @Override
+    byte[] getTableBytes(int tag) {
+<span class="nc" id="L884">        ByteBuffer buffer = getTableBuffer(tag);</span>
+<span class="nc bnc" id="L885" title="All 2 branches missed.">        if (buffer == null) {</span>
+<span class="nc" id="L886">            return null;</span>
+<span class="nc bnc" id="L887" title="All 2 branches missed.">        } else if (buffer.hasArray()) {</span>
+            try {
+<span class="nc" id="L889">                return buffer.array();</span>
+<span class="nc" id="L890">            } catch (Exception re) {</span>
+            }
+        }
+<span class="nc" id="L893">        byte []data = new byte[getTableSize(tag)];</span>
+<span class="nc" id="L894">        buffer.get(data);</span>
+<span class="nc" id="L895">        return data;</span>
+    }
+
+    int getTableSize(int tag) {
+<span class="nc bnc" id="L899" title="All 2 branches missed.">        for (int i=0;i&lt;numTables;i++) {</span>
+<span class="nc bnc" id="L900" title="All 2 branches missed.">            if (tableDirectory[i].tag == tag) {</span>
+<span class="nc" id="L901">                return tableDirectory[i].length;</span>
+            }
+        }
+<span class="nc" id="L904">        return 0;</span>
+    }
+
+    int getTableOffset(int tag) {
+<span class="nc bnc" id="L908" title="All 2 branches missed.">        for (int i=0;i&lt;numTables;i++) {</span>
+<span class="nc bnc" id="L909" title="All 2 branches missed.">            if (tableDirectory[i].tag == tag) {</span>
+<span class="nc" id="L910">                return tableDirectory[i].offset;</span>
+            }
+        }
+<span class="nc" id="L913">        return 0;</span>
+    }
+
+    DirectoryEntry getDirectoryEntry(int tag) {
+<span class="nc bnc" id="L917" title="All 2 branches missed.">        for (int i=0;i&lt;numTables;i++) {</span>
+<span class="nc bnc" id="L918" title="All 2 branches missed.">            if (tableDirectory[i].tag == tag) {</span>
+<span class="nc" id="L919">                return tableDirectory[i];</span>
+            }
+        }
+<span class="nc" id="L922">        return null;</span>
+    }
+
+    /* Used to determine if this size has embedded bitmaps, which
+     * for CJK fonts should be used in preference to LCD glyphs.
+     */
+    boolean useEmbeddedBitmapsForSize(int ptSize) {
+<span class="nc bnc" id="L929" title="All 2 branches missed.">        if (!supportsCJK) {</span>
+<span class="nc" id="L930">            return false;</span>
+        }
+<span class="nc bnc" id="L932" title="All 2 branches missed.">        if (getDirectoryEntry(EBLCTag) == null) {</span>
+<span class="nc" id="L933">            return false;</span>
+        }
+<span class="nc" id="L935">        ByteBuffer eblcTable = getTableBuffer(EBLCTag);</span>
+<span class="nc" id="L936">        int numSizes = eblcTable.getInt(4);</span>
+        /* The bitmapSizeTable's start at offset of 8.
+         * Each bitmapSizeTable entry is 48 bytes.
+         * The offset of ppemY in the entry is 45.
+         */
+<span class="nc bnc" id="L941" title="All 2 branches missed.">        for (int i=0;i&lt;numSizes;i++) {</span>
+<span class="nc" id="L942">            int ppemY = eblcTable.get(8+(i*48)+45) &amp;0xff;</span>
+<span class="nc bnc" id="L943" title="All 2 branches missed.">            if (ppemY == ptSize) {</span>
+<span class="nc" id="L944">                return true;</span>
+            }
+        }
+<span class="nc" id="L947">        return false;</span>
+    }
+
+    public String getFullName() {
+<span class="nc" id="L951">        return fullName;</span>
+    }
+
+    /* This probably won't get called but is there to support the
+     * contract() of setStyle() defined in the superclass.
+     */
+    @Override
+    protected void setStyle() {
+<span class="nc" id="L959">        setStyle(getTableBuffer(os_2Tag));</span>
+<span class="nc" id="L960">    }</span>
+
+    /* TrueTypeFont can use the fsSelection fields of OS/2 table
+     * to determine the style. In the unlikely case that doesn't exist,
+     * can use macStyle in the 'head' table but simpler to
+     * fall back to super class algorithm of looking for well known string.
+     * A very few fonts don't specify this information, but I only
+     * came across one: Lucida Sans Thai Typewriter Oblique in
+     * /usr/openwin/lib/locale/th_TH/X11/fonts/TrueType/lucidai.ttf
+     * that explicitly specified the wrong value. It says its regular.
+     * I didn't find any fonts that were inconsistent (ie regular plus some
+     * other value).
+     */
+    private static final int fsSelectionItalicBit  = 0x00001;
+    private static final int fsSelectionBoldBit    = 0x00020;
+    private static final int fsSelectionRegularBit = 0x00040;
+    private void setStyle(ByteBuffer os_2Table) {
+        /* fsSelection is unsigned short at buffer offset 62 */
+<span class="nc bnc" id="L978" title="All 4 branches missed.">        if (os_2Table == null || os_2Table.capacity() &lt; 64) {</span>
+<span class="nc" id="L979">            super.setStyle();</span>
+<span class="nc" id="L980">            return;</span>
+        }
+<span class="nc" id="L982">        int fsSelection = os_2Table.getChar(62) &amp; 0xffff;</span>
+<span class="nc" id="L983">        int italic  = fsSelection &amp; fsSelectionItalicBit;</span>
+<span class="nc" id="L984">        int bold    = fsSelection &amp; fsSelectionBoldBit;</span>
+<span class="nc" id="L985">        int regular = fsSelection &amp; fsSelectionRegularBit;</span>
+//      System.out.println(&quot;platname=&quot;+platName+&quot; font=&quot;+fullName+
+//                         &quot; family=&quot;+familyName+
+//                         &quot; R=&quot;+regular+&quot; I=&quot;+italic+&quot; B=&quot;+bold);
+<span class="nc bnc" id="L989" title="All 4 branches missed.">        if (regular!=0 &amp;&amp; ((italic|bold)!=0)) {</span>
+            /* This is inconsistent. Try using the font name algorithm */
+<span class="nc" id="L991">            super.setStyle();</span>
+<span class="nc" id="L992">            return;</span>
+<span class="nc bnc" id="L993" title="All 2 branches missed.">        } else if ((regular|italic|bold) == 0) {</span>
+            /* No style specified. Try using the font name algorithm */
+<span class="nc" id="L995">            super.setStyle();</span>
+<span class="nc" id="L996">            return;</span>
+        }
+<span class="nc bnc" id="L998" title="All 4 branches missed.">        switch (bold|italic) {</span>
+        case fsSelectionItalicBit:
+<span class="nc" id="L1000">            style = Font.ITALIC;</span>
+<span class="nc" id="L1001">            break;</span>
+        case fsSelectionBoldBit:
+<span class="nc bnc" id="L1003" title="All 4 branches missed.">            if (FontUtilities.isSolaris &amp;&amp; platName.endsWith(&quot;HG-GothicB.ttf&quot;)) {</span>
+                /* Workaround for Solaris's use of a JA font that's marked as
+                 * being designed bold, but is used as a PLAIN font.
+                 */
+<span class="nc" id="L1007">                style = Font.PLAIN;</span>
+            } else {
+<span class="nc" id="L1009">                style = Font.BOLD;</span>
+            }
+<span class="nc" id="L1011">            break;</span>
+        case fsSelectionBoldBit|fsSelectionItalicBit:
+<span class="nc" id="L1013">            style = Font.BOLD|Font.ITALIC;</span>
+        }
+<span class="nc" id="L1015">    }</span>
+
+    private float stSize, stPos, ulSize, ulPos;
+
+    private void setStrikethroughMetrics(ByteBuffer os_2Table, int upem) {
+<span class="nc bnc" id="L1020" title="All 6 branches missed.">        if (os_2Table == null || os_2Table.capacity() &lt; 30 || upem &lt; 0) {</span>
+<span class="nc" id="L1021">            stSize = .05f;</span>
+<span class="nc" id="L1022">            stPos = -.4f;</span>
+<span class="nc" id="L1023">            return;</span>
+        }
+<span class="nc" id="L1025">        ShortBuffer sb = os_2Table.asShortBuffer();</span>
+<span class="nc" id="L1026">        stSize = sb.get(13) / (float)upem;</span>
+<span class="nc" id="L1027">        stPos = -sb.get(14) / (float)upem;</span>
+<span class="nc" id="L1028">    }</span>
+
+    private void setUnderlineMetrics(ByteBuffer postTable, int upem) {
+<span class="nc bnc" id="L1031" title="All 6 branches missed.">        if (postTable == null || postTable.capacity() &lt; 12 || upem &lt; 0) {</span>
+<span class="nc" id="L1032">            ulSize = .05f;</span>
+<span class="nc" id="L1033">            ulPos = .1f;</span>
+<span class="nc" id="L1034">            return;</span>
+        }
+<span class="nc" id="L1036">        ShortBuffer sb = postTable.asShortBuffer();</span>
+<span class="nc" id="L1037">        ulSize = sb.get(5) / (float)upem;</span>
+<span class="nc" id="L1038">        ulPos = -sb.get(4) / (float)upem;</span>
+<span class="nc" id="L1039">    }</span>
+
+    @Override
+    public void getStyleMetrics(float pointSize, float[] metrics, int offset) {
+
+<span class="nc bnc" id="L1044" title="All 4 branches missed.">        if (ulSize == 0f &amp;&amp; ulPos == 0f) {</span>
+
+<span class="nc" id="L1046">            ByteBuffer head_Table = getTableBuffer(headTag);</span>
+<span class="nc" id="L1047">            int upem = -1;</span>
+<span class="nc bnc" id="L1048" title="All 4 branches missed.">            if (head_Table != null &amp;&amp; head_Table.capacity() &gt;= 18) {</span>
+<span class="nc" id="L1049">                ShortBuffer sb = head_Table.asShortBuffer();</span>
+<span class="nc" id="L1050">                upem = sb.get(9) &amp; 0xffff;</span>
+<span class="nc bnc" id="L1051" title="All 4 branches missed.">                if (upem &lt; 16 || upem &gt; 16384) {</span>
+<span class="nc" id="L1052">                    upem = 2048;</span>
+                }
+            }
+
+<span class="nc" id="L1056">            ByteBuffer os2_Table = getTableBuffer(os_2Tag);</span>
+<span class="nc" id="L1057">            setStrikethroughMetrics(os2_Table, upem);</span>
+
+<span class="nc" id="L1059">            ByteBuffer post_Table = getTableBuffer(postTag);</span>
+<span class="nc" id="L1060">            setUnderlineMetrics(post_Table, upem);</span>
+        }
+
+<span class="nc" id="L1063">        metrics[offset] = stPos * pointSize;</span>
+<span class="nc" id="L1064">        metrics[offset+1] = stSize * pointSize;</span>
+
+<span class="nc" id="L1066">        metrics[offset+2] = ulPos * pointSize;</span>
+<span class="nc" id="L1067">        metrics[offset+3] = ulSize * pointSize;</span>
+<span class="nc" id="L1068">    }</span>
+
+    private String makeString(byte[] bytes, int len, short encoding) {
+
+        /* Check for fonts using encodings 2-&gt;6 is just for
+         * some old DBCS fonts, apparently mostly on Solaris.
+         * Some of these fonts encode ascii names as double-byte characters.
+         * ie with a leading zero byte for what properly should be a
+         * single byte-char.
+         */
+<span class="nc bnc" id="L1078" title="All 4 branches missed.">        if (encoding &gt;=2 &amp;&amp; encoding &lt;= 6) {</span>
+<span class="nc" id="L1079">             byte[] oldbytes = bytes;</span>
+<span class="nc" id="L1080">             int oldlen = len;</span>
+<span class="nc" id="L1081">             bytes = new byte[oldlen];</span>
+<span class="nc" id="L1082">             len = 0;</span>
+<span class="nc bnc" id="L1083" title="All 2 branches missed.">             for (int i=0; i&lt;oldlen; i++) {</span>
+<span class="nc bnc" id="L1084" title="All 2 branches missed.">                 if (oldbytes[i] != 0) {</span>
+<span class="nc" id="L1085">                     bytes[len++] = oldbytes[i];</span>
+                 }
+             }
+         }
+
+        String charset;
+<span class="nc bnc" id="L1091" title="All 8 branches missed.">        switch (encoding) {</span>
+<span class="nc" id="L1092">            case 1:  charset = &quot;UTF-16&quot;;  break; // most common case first.</span>
+<span class="nc" id="L1093">            case 0:  charset = &quot;UTF-16&quot;;  break; // symbol uses this</span>
+<span class="nc" id="L1094">            case 2:  charset = &quot;SJIS&quot;;    break;</span>
+<span class="nc" id="L1095">            case 3:  charset = &quot;GBK&quot;;     break;</span>
+<span class="nc" id="L1096">            case 4:  charset = &quot;MS950&quot;;   break;</span>
+<span class="nc" id="L1097">            case 5:  charset = &quot;EUC_KR&quot;;  break;</span>
+<span class="nc" id="L1098">            case 6:  charset = &quot;Johab&quot;;   break;</span>
+<span class="nc" id="L1099">            default: charset = &quot;UTF-16&quot;;  break;</span>
+        }
+
+        try {
+<span class="nc" id="L1103">            return new String(bytes, 0, len, charset);</span>
+<span class="nc" id="L1104">        } catch (UnsupportedEncodingException e) {</span>
+<span class="nc bnc" id="L1105" title="All 2 branches missed.">            if (FontUtilities.isLogging()) {</span>
+<span class="nc" id="L1106">                FontUtilities.getLogger().warning(e + &quot; EncodingID=&quot; + encoding);</span>
+            }
+<span class="nc" id="L1108">            return new String(bytes, 0, len);</span>
+<span class="nc" id="L1109">        } catch (Throwable t) {</span>
+<span class="nc" id="L1110">            return null;</span>
+        }
+    }
+
+    protected void initNames() {
+
+<span class="nc" id="L1116">        byte[] name = new byte[256];</span>
+<span class="nc" id="L1117">        ByteBuffer buffer = getTableBuffer(nameTag);</span>
+
+<span class="nc bnc" id="L1119" title="All 2 branches missed.">        if (buffer != null) {</span>
+<span class="nc" id="L1120">            ShortBuffer sbuffer = buffer.asShortBuffer();</span>
+<span class="nc" id="L1121">            sbuffer.get(); // format - not needed.</span>
+<span class="nc" id="L1122">            short numRecords = sbuffer.get();</span>
+            /* The name table uses unsigned shorts. Many of these
+             * are known small values that fit in a short.
+             * The values that are sizes or offsets into the table could be
+             * greater than 32767, so read and store those as ints
+             */
+<span class="nc" id="L1128">            int stringPtr = sbuffer.get() &amp; 0xffff;</span>
+
+<span class="nc" id="L1130">            nameLocale = sun.awt.SunToolkit.getStartupLocale();</span>
+<span class="nc" id="L1131">            short nameLocaleID = getLCIDFromLocale(nameLocale);</span>
+
+<span class="nc bnc" id="L1133" title="All 2 branches missed.">            for (int i=0; i&lt;numRecords; i++) {</span>
+<span class="nc" id="L1134">                short platformID = sbuffer.get();</span>
+<span class="nc bnc" id="L1135" title="All 2 branches missed.">                if (platformID != MS_PLATFORM_ID) {</span>
+<span class="nc" id="L1136">                    sbuffer.position(sbuffer.position()+5);</span>
+<span class="nc" id="L1137">                    continue; // skip over this record.</span>
+                }
+<span class="nc" id="L1139">                short encodingID = sbuffer.get();</span>
+<span class="nc" id="L1140">                short langID     = sbuffer.get();</span>
+<span class="nc" id="L1141">                short nameID     = sbuffer.get();</span>
+<span class="nc" id="L1142">                int nameLen    = ((int) sbuffer.get()) &amp; 0xffff;</span>
+<span class="nc" id="L1143">                int namePtr    = (((int) sbuffer.get()) &amp; 0xffff) + stringPtr;</span>
+<span class="nc" id="L1144">                String tmpName = null;</span>
+<span class="nc bnc" id="L1145" title="All 3 branches missed.">                switch (nameID) {</span>
+
+                case FAMILY_NAME_ID:
+
+<span class="nc bnc" id="L1149" title="All 6 branches missed.">                    if (familyName == null || langID == ENGLISH_LOCALE_ID ||</span>
+                        langID == nameLocaleID)
+                    {
+<span class="nc" id="L1152">                        buffer.position(namePtr);</span>
+<span class="nc" id="L1153">                        buffer.get(name, 0, nameLen);</span>
+<span class="nc" id="L1154">                        tmpName = makeString(name, nameLen, encodingID);</span>
+
+<span class="nc bnc" id="L1156" title="All 4 branches missed.">                        if (familyName == null || langID == ENGLISH_LOCALE_ID){</span>
+<span class="nc" id="L1157">                            familyName = tmpName;</span>
+                        }
+<span class="nc bnc" id="L1159" title="All 2 branches missed.">                        if (langID == nameLocaleID) {</span>
+<span class="nc" id="L1160">                            localeFamilyName = tmpName;</span>
+                        }
+                    }
+/*
+                    for (int ii=0;ii&lt;nameLen;ii++) {
+                        int val = (int)name[ii]&amp;0xff;
+                        System.err.print(Integer.toHexString(val)+ &quot; &quot;);
+                    }
+                    System.err.println();
+                    System.err.println(&quot;familyName=&quot;+familyName +
+                                       &quot; nameLen=&quot;+nameLen+
+                                       &quot; langID=&quot;+langID+ &quot; eid=&quot;+encodingID +
+                                       &quot; str len=&quot;+familyName.length());
+
+*/
+                    break;
+
+                case FULL_NAME_ID:
+
+<span class="nc bnc" id="L1179" title="All 6 branches missed.">                    if (fullName == null || langID == ENGLISH_LOCALE_ID ||</span>
+                        langID == nameLocaleID)
+                    {
+<span class="nc" id="L1182">                        buffer.position(namePtr);</span>
+<span class="nc" id="L1183">                        buffer.get(name, 0, nameLen);</span>
+<span class="nc" id="L1184">                        tmpName = makeString(name, nameLen, encodingID);</span>
+
+<span class="nc bnc" id="L1186" title="All 4 branches missed.">                        if (fullName == null || langID == ENGLISH_LOCALE_ID) {</span>
+<span class="nc" id="L1187">                            fullName = tmpName;</span>
+                        }
+<span class="nc bnc" id="L1189" title="All 2 branches missed.">                        if (langID == nameLocaleID) {</span>
+<span class="nc" id="L1190">                            localeFullName = tmpName;</span>
+                        }
+                    }
+                    break;
+                }
+            }
+<span class="nc bnc" id="L1196" title="All 2 branches missed.">            if (localeFamilyName == null) {</span>
+<span class="nc" id="L1197">                localeFamilyName = familyName;</span>
+            }
+<span class="nc bnc" id="L1199" title="All 2 branches missed.">            if (localeFullName == null) {</span>
+<span class="nc" id="L1200">                localeFullName = fullName;</span>
+            }
+        }
+<span class="nc" id="L1203">    }</span>
+
+    /* Return the requested name in the requested locale, for the
+     * MS platform ID. If the requested locale isn't found, return US
+     * English, if that isn't found, return null and let the caller
+     * figure out how to handle that.
+     */
+    protected String lookupName(short findLocaleID, int findNameID) {
+<span class="nc" id="L1211">        String foundName = null;</span>
+<span class="nc" id="L1212">        byte[] name = new byte[1024];</span>
+
+<span class="nc" id="L1214">        ByteBuffer buffer = getTableBuffer(nameTag);</span>
+<span class="nc bnc" id="L1215" title="All 2 branches missed.">        if (buffer != null) {</span>
+<span class="nc" id="L1216">            ShortBuffer sbuffer = buffer.asShortBuffer();</span>
+<span class="nc" id="L1217">            sbuffer.get(); // format - not needed.</span>
+<span class="nc" id="L1218">            short numRecords = sbuffer.get();</span>
+
+            /* The name table uses unsigned shorts. Many of these
+             * are known small values that fit in a short.
+             * The values that are sizes or offsets into the table could be
+             * greater than 32767, so read and store those as ints
+             */
+<span class="nc" id="L1225">            int stringPtr = ((int) sbuffer.get()) &amp; 0xffff;</span>
+
+<span class="nc bnc" id="L1227" title="All 2 branches missed.">            for (int i=0; i&lt;numRecords; i++) {</span>
+<span class="nc" id="L1228">                short platformID = sbuffer.get();</span>
+<span class="nc bnc" id="L1229" title="All 2 branches missed.">                if (platformID != MS_PLATFORM_ID) {</span>
+<span class="nc" id="L1230">                    sbuffer.position(sbuffer.position()+5);</span>
+<span class="nc" id="L1231">                    continue; // skip over this record.</span>
+                }
+<span class="nc" id="L1233">                short encodingID = sbuffer.get();</span>
+<span class="nc" id="L1234">                short langID     = sbuffer.get();</span>
+<span class="nc" id="L1235">                short nameID     = sbuffer.get();</span>
+<span class="nc" id="L1236">                int   nameLen    = ((int) sbuffer.get()) &amp; 0xffff;</span>
+<span class="nc" id="L1237">                int   namePtr    = (((int) sbuffer.get()) &amp; 0xffff) + stringPtr;</span>
+<span class="nc bnc" id="L1238" title="All 8 branches missed.">                if (nameID == findNameID &amp;&amp;</span>
+                    ((foundName == null &amp;&amp; langID == ENGLISH_LOCALE_ID)
+                     || langID == findLocaleID)) {
+<span class="nc" id="L1241">                    buffer.position(namePtr);</span>
+<span class="nc" id="L1242">                    buffer.get(name, 0, nameLen);</span>
+<span class="nc" id="L1243">                    foundName = makeString(name, nameLen, encodingID);</span>
+<span class="nc bnc" id="L1244" title="All 2 branches missed.">                    if (langID == findLocaleID) {</span>
+<span class="nc" id="L1245">                        return foundName;</span>
+                    }
+                }
+            }
+        }
+<span class="nc" id="L1250">        return foundName;</span>
+    }
+
+    /**
+     * @return number of logical fonts. Is &quot;1&quot; for all but TTC files
+     */
+    public int getFontCount() {
+<span class="nc" id="L1257">        return directoryCount;</span>
+    }
+
+    protected synchronized FontScaler getScaler() {
+<span class="nc bnc" id="L1261" title="All 2 branches missed.">        if (scaler == null) {</span>
+<span class="nc" id="L1262">            scaler = FontScaler.getScaler(this, fontIndex,</span>
+                supportsCJK, fileSize);
+        }
+<span class="nc" id="L1265">        return scaler;</span>
+    }
+
+
+    /* Postscript name is rarely requested. Don't waste cycles locating it
+     * as part of font creation, nor storage to hold it. Get it only on demand.
+     */
+    @Override
+    public String getPostscriptName() {
+<span class="nc" id="L1274">        String name = lookupName(ENGLISH_LOCALE_ID, POSTSCRIPT_NAME_ID);</span>
+<span class="nc bnc" id="L1275" title="All 2 branches missed.">        if (name == null) {</span>
+<span class="nc" id="L1276">            return fullName;</span>
+        } else {
+<span class="nc" id="L1278">            return name;</span>
+        }
+    }
+
+    @Override
+    public String getFontName(Locale locale) {
+<span class="nc bnc" id="L1284" title="All 2 branches missed.">        if (locale == null) {</span>
+<span class="nc" id="L1285">            return fullName;</span>
+<span class="nc bnc" id="L1286" title="All 4 branches missed.">        } else if (locale.equals(nameLocale) &amp;&amp; localeFullName != null) {</span>
+<span class="nc" id="L1287">            return localeFullName;</span>
+        } else {
+<span class="nc" id="L1289">            short localeID = getLCIDFromLocale(locale);</span>
+<span class="nc" id="L1290">            String name = lookupName(localeID, FULL_NAME_ID);</span>
+<span class="nc bnc" id="L1291" title="All 2 branches missed.">            if (name == null) {</span>
+<span class="nc" id="L1292">                return fullName;</span>
+            } else {
+<span class="nc" id="L1294">                return name;</span>
+            }
+        }
+    }
+
+    // Return a Microsoft LCID from the given Locale.
+    // Used when getting localized font data.
+
+    private static void addLCIDMapEntry(Map&lt;String, Short&gt; map,
+                                        String key, short value) {
+<span class="nc" id="L1304">        map.put(key, Short.valueOf(value));</span>
+<span class="nc" id="L1305">    }</span>
+
+    private static synchronized void createLCIDMap() {
+<span class="nc bnc" id="L1308" title="All 2 branches missed.">        if (lcidMap != null) {</span>
+<span class="nc" id="L1309">            return;</span>
+        }
+
+<span class="nc" id="L1312">        Map&lt;String, Short&gt; map = new HashMap&lt;String, Short&gt;(200);</span>
+
+        // the following statements are derived from the langIDMap
+        // in src/windows/native/java/lang/java_props_md.c using the following
+        // awk script:
+        //    $1~/\/\*/   { next}
+        //    $3~/\?\?/   { next }
+        //    $3!~/_/     { next }
+        //    $1~/0x0409/ { next }
+        //    $1~/0x0c0a/ { next }
+        //    $1~/0x042c/ { next }
+        //    $1~/0x0443/ { next }
+        //    $1~/0x0812/ { next }
+        //    $1~/0x04/   { print &quot;        addLCIDMapEntry(map, &quot; substr($3, 0, 3) &quot;\&quot;, (short) &quot; substr($1, 0, 6) &quot;);&quot; ; next }
+        //    $3~/,/      { print &quot;        addLCIDMapEntry(map, &quot; $3  &quot; (short) &quot; substr($1, 0, 6) &quot;);&quot; ; next }
+        //                { print &quot;        addLCIDMapEntry(map, &quot; $3 &quot;, (short) &quot; substr($1, 0, 6) &quot;);&quot; ; next }
+        // The lines of this script:
+        // - eliminate comments
+        // - eliminate questionable locales
+        // - eliminate language-only locales
+        // - eliminate the default LCID value
+        // - eliminate a few other unneeded LCID values
+        // - print language-only locale entries for x04* LCID values
+        //   (apparently Microsoft doesn't use language-only LCID values -
+        //   see http://www.microsoft.com/OpenType/otspec/name.htm
+        // - print complete entries for all other LCID values
+        // Run
+        //     awk -f awk-script langIDMap &gt; statements
+<span class="nc" id="L1340">        addLCIDMapEntry(map, &quot;ar&quot;, (short) 0x0401);</span>
+<span class="nc" id="L1341">        addLCIDMapEntry(map, &quot;bg&quot;, (short) 0x0402);</span>
+<span class="nc" id="L1342">        addLCIDMapEntry(map, &quot;ca&quot;, (short) 0x0403);</span>
+<span class="nc" id="L1343">        addLCIDMapEntry(map, &quot;zh&quot;, (short) 0x0404);</span>
+<span class="nc" id="L1344">        addLCIDMapEntry(map, &quot;cs&quot;, (short) 0x0405);</span>
+<span class="nc" id="L1345">        addLCIDMapEntry(map, &quot;da&quot;, (short) 0x0406);</span>
+<span class="nc" id="L1346">        addLCIDMapEntry(map, &quot;de&quot;, (short) 0x0407);</span>
+<span class="nc" id="L1347">        addLCIDMapEntry(map, &quot;el&quot;, (short) 0x0408);</span>
+<span class="nc" id="L1348">        addLCIDMapEntry(map, &quot;es&quot;, (short) 0x040a);</span>
+<span class="nc" id="L1349">        addLCIDMapEntry(map, &quot;fi&quot;, (short) 0x040b);</span>
+<span class="nc" id="L1350">        addLCIDMapEntry(map, &quot;fr&quot;, (short) 0x040c);</span>
+<span class="nc" id="L1351">        addLCIDMapEntry(map, &quot;iw&quot;, (short) 0x040d);</span>
+<span class="nc" id="L1352">        addLCIDMapEntry(map, &quot;hu&quot;, (short) 0x040e);</span>
+<span class="nc" id="L1353">        addLCIDMapEntry(map, &quot;is&quot;, (short) 0x040f);</span>
+<span class="nc" id="L1354">        addLCIDMapEntry(map, &quot;it&quot;, (short) 0x0410);</span>
+<span class="nc" id="L1355">        addLCIDMapEntry(map, &quot;ja&quot;, (short) 0x0411);</span>
+<span class="nc" id="L1356">        addLCIDMapEntry(map, &quot;ko&quot;, (short) 0x0412);</span>
+<span class="nc" id="L1357">        addLCIDMapEntry(map, &quot;nl&quot;, (short) 0x0413);</span>
+<span class="nc" id="L1358">        addLCIDMapEntry(map, &quot;no&quot;, (short) 0x0414);</span>
+<span class="nc" id="L1359">        addLCIDMapEntry(map, &quot;pl&quot;, (short) 0x0415);</span>
+<span class="nc" id="L1360">        addLCIDMapEntry(map, &quot;pt&quot;, (short) 0x0416);</span>
+<span class="nc" id="L1361">        addLCIDMapEntry(map, &quot;rm&quot;, (short) 0x0417);</span>
+<span class="nc" id="L1362">        addLCIDMapEntry(map, &quot;ro&quot;, (short) 0x0418);</span>
+<span class="nc" id="L1363">        addLCIDMapEntry(map, &quot;ru&quot;, (short) 0x0419);</span>
+<span class="nc" id="L1364">        addLCIDMapEntry(map, &quot;hr&quot;, (short) 0x041a);</span>
+<span class="nc" id="L1365">        addLCIDMapEntry(map, &quot;sk&quot;, (short) 0x041b);</span>
+<span class="nc" id="L1366">        addLCIDMapEntry(map, &quot;sq&quot;, (short) 0x041c);</span>
+<span class="nc" id="L1367">        addLCIDMapEntry(map, &quot;sv&quot;, (short) 0x041d);</span>
+<span class="nc" id="L1368">        addLCIDMapEntry(map, &quot;th&quot;, (short) 0x041e);</span>
+<span class="nc" id="L1369">        addLCIDMapEntry(map, &quot;tr&quot;, (short) 0x041f);</span>
+<span class="nc" id="L1370">        addLCIDMapEntry(map, &quot;ur&quot;, (short) 0x0420);</span>
+<span class="nc" id="L1371">        addLCIDMapEntry(map, &quot;in&quot;, (short) 0x0421);</span>
+<span class="nc" id="L1372">        addLCIDMapEntry(map, &quot;uk&quot;, (short) 0x0422);</span>
+<span class="nc" id="L1373">        addLCIDMapEntry(map, &quot;be&quot;, (short) 0x0423);</span>
+<span class="nc" id="L1374">        addLCIDMapEntry(map, &quot;sl&quot;, (short) 0x0424);</span>
+<span class="nc" id="L1375">        addLCIDMapEntry(map, &quot;et&quot;, (short) 0x0425);</span>
+<span class="nc" id="L1376">        addLCIDMapEntry(map, &quot;lv&quot;, (short) 0x0426);</span>
+<span class="nc" id="L1377">        addLCIDMapEntry(map, &quot;lt&quot;, (short) 0x0427);</span>
+<span class="nc" id="L1378">        addLCIDMapEntry(map, &quot;fa&quot;, (short) 0x0429);</span>
+<span class="nc" id="L1379">        addLCIDMapEntry(map, &quot;vi&quot;, (short) 0x042a);</span>
+<span class="nc" id="L1380">        addLCIDMapEntry(map, &quot;hy&quot;, (short) 0x042b);</span>
+<span class="nc" id="L1381">        addLCIDMapEntry(map, &quot;eu&quot;, (short) 0x042d);</span>
+<span class="nc" id="L1382">        addLCIDMapEntry(map, &quot;mk&quot;, (short) 0x042f);</span>
+<span class="nc" id="L1383">        addLCIDMapEntry(map, &quot;tn&quot;, (short) 0x0432);</span>
+<span class="nc" id="L1384">        addLCIDMapEntry(map, &quot;xh&quot;, (short) 0x0434);</span>
+<span class="nc" id="L1385">        addLCIDMapEntry(map, &quot;zu&quot;, (short) 0x0435);</span>
+<span class="nc" id="L1386">        addLCIDMapEntry(map, &quot;af&quot;, (short) 0x0436);</span>
+<span class="nc" id="L1387">        addLCIDMapEntry(map, &quot;ka&quot;, (short) 0x0437);</span>
+<span class="nc" id="L1388">        addLCIDMapEntry(map, &quot;fo&quot;, (short) 0x0438);</span>
+<span class="nc" id="L1389">        addLCIDMapEntry(map, &quot;hi&quot;, (short) 0x0439);</span>
+<span class="nc" id="L1390">        addLCIDMapEntry(map, &quot;mt&quot;, (short) 0x043a);</span>
+<span class="nc" id="L1391">        addLCIDMapEntry(map, &quot;se&quot;, (short) 0x043b);</span>
+<span class="nc" id="L1392">        addLCIDMapEntry(map, &quot;gd&quot;, (short) 0x043c);</span>
+<span class="nc" id="L1393">        addLCIDMapEntry(map, &quot;ms&quot;, (short) 0x043e);</span>
+<span class="nc" id="L1394">        addLCIDMapEntry(map, &quot;kk&quot;, (short) 0x043f);</span>
+<span class="nc" id="L1395">        addLCIDMapEntry(map, &quot;ky&quot;, (short) 0x0440);</span>
+<span class="nc" id="L1396">        addLCIDMapEntry(map, &quot;sw&quot;, (short) 0x0441);</span>
+<span class="nc" id="L1397">        addLCIDMapEntry(map, &quot;tt&quot;, (short) 0x0444);</span>
+<span class="nc" id="L1398">        addLCIDMapEntry(map, &quot;bn&quot;, (short) 0x0445);</span>
+<span class="nc" id="L1399">        addLCIDMapEntry(map, &quot;pa&quot;, (short) 0x0446);</span>
+<span class="nc" id="L1400">        addLCIDMapEntry(map, &quot;gu&quot;, (short) 0x0447);</span>
+<span class="nc" id="L1401">        addLCIDMapEntry(map, &quot;ta&quot;, (short) 0x0449);</span>
+<span class="nc" id="L1402">        addLCIDMapEntry(map, &quot;te&quot;, (short) 0x044a);</span>
+<span class="nc" id="L1403">        addLCIDMapEntry(map, &quot;kn&quot;, (short) 0x044b);</span>
+<span class="nc" id="L1404">        addLCIDMapEntry(map, &quot;ml&quot;, (short) 0x044c);</span>
+<span class="nc" id="L1405">        addLCIDMapEntry(map, &quot;mr&quot;, (short) 0x044e);</span>
+<span class="nc" id="L1406">        addLCIDMapEntry(map, &quot;sa&quot;, (short) 0x044f);</span>
+<span class="nc" id="L1407">        addLCIDMapEntry(map, &quot;mn&quot;, (short) 0x0450);</span>
+<span class="nc" id="L1408">        addLCIDMapEntry(map, &quot;cy&quot;, (short) 0x0452);</span>
+<span class="nc" id="L1409">        addLCIDMapEntry(map, &quot;gl&quot;, (short) 0x0456);</span>
+<span class="nc" id="L1410">        addLCIDMapEntry(map, &quot;dv&quot;, (short) 0x0465);</span>
+<span class="nc" id="L1411">        addLCIDMapEntry(map, &quot;qu&quot;, (short) 0x046b);</span>
+<span class="nc" id="L1412">        addLCIDMapEntry(map, &quot;mi&quot;, (short) 0x0481);</span>
+<span class="nc" id="L1413">        addLCIDMapEntry(map, &quot;ar_IQ&quot;, (short) 0x0801);</span>
+<span class="nc" id="L1414">        addLCIDMapEntry(map, &quot;zh_CN&quot;, (short) 0x0804);</span>
+<span class="nc" id="L1415">        addLCIDMapEntry(map, &quot;de_CH&quot;, (short) 0x0807);</span>
+<span class="nc" id="L1416">        addLCIDMapEntry(map, &quot;en_GB&quot;, (short) 0x0809);</span>
+<span class="nc" id="L1417">        addLCIDMapEntry(map, &quot;es_MX&quot;, (short) 0x080a);</span>
+<span class="nc" id="L1418">        addLCIDMapEntry(map, &quot;fr_BE&quot;, (short) 0x080c);</span>
+<span class="nc" id="L1419">        addLCIDMapEntry(map, &quot;it_CH&quot;, (short) 0x0810);</span>
+<span class="nc" id="L1420">        addLCIDMapEntry(map, &quot;nl_BE&quot;, (short) 0x0813);</span>
+<span class="nc" id="L1421">        addLCIDMapEntry(map, &quot;no_NO_NY&quot;, (short) 0x0814);</span>
+<span class="nc" id="L1422">        addLCIDMapEntry(map, &quot;pt_PT&quot;, (short) 0x0816);</span>
+<span class="nc" id="L1423">        addLCIDMapEntry(map, &quot;ro_MD&quot;, (short) 0x0818);</span>
+<span class="nc" id="L1424">        addLCIDMapEntry(map, &quot;ru_MD&quot;, (short) 0x0819);</span>
+<span class="nc" id="L1425">        addLCIDMapEntry(map, &quot;sr_CS&quot;, (short) 0x081a);</span>
+<span class="nc" id="L1426">        addLCIDMapEntry(map, &quot;sv_FI&quot;, (short) 0x081d);</span>
+<span class="nc" id="L1427">        addLCIDMapEntry(map, &quot;az_AZ&quot;, (short) 0x082c);</span>
+<span class="nc" id="L1428">        addLCIDMapEntry(map, &quot;se_SE&quot;, (short) 0x083b);</span>
+<span class="nc" id="L1429">        addLCIDMapEntry(map, &quot;ga_IE&quot;, (short) 0x083c);</span>
+<span class="nc" id="L1430">        addLCIDMapEntry(map, &quot;ms_BN&quot;, (short) 0x083e);</span>
+<span class="nc" id="L1431">        addLCIDMapEntry(map, &quot;uz_UZ&quot;, (short) 0x0843);</span>
+<span class="nc" id="L1432">        addLCIDMapEntry(map, &quot;qu_EC&quot;, (short) 0x086b);</span>
+<span class="nc" id="L1433">        addLCIDMapEntry(map, &quot;ar_EG&quot;, (short) 0x0c01);</span>
+<span class="nc" id="L1434">        addLCIDMapEntry(map, &quot;zh_HK&quot;, (short) 0x0c04);</span>
+<span class="nc" id="L1435">        addLCIDMapEntry(map, &quot;de_AT&quot;, (short) 0x0c07);</span>
+<span class="nc" id="L1436">        addLCIDMapEntry(map, &quot;en_AU&quot;, (short) 0x0c09);</span>
+<span class="nc" id="L1437">        addLCIDMapEntry(map, &quot;fr_CA&quot;, (short) 0x0c0c);</span>
+<span class="nc" id="L1438">        addLCIDMapEntry(map, &quot;sr_CS&quot;, (short) 0x0c1a);</span>
+<span class="nc" id="L1439">        addLCIDMapEntry(map, &quot;se_FI&quot;, (short) 0x0c3b);</span>
+<span class="nc" id="L1440">        addLCIDMapEntry(map, &quot;qu_PE&quot;, (short) 0x0c6b);</span>
+<span class="nc" id="L1441">        addLCIDMapEntry(map, &quot;ar_LY&quot;, (short) 0x1001);</span>
+<span class="nc" id="L1442">        addLCIDMapEntry(map, &quot;zh_SG&quot;, (short) 0x1004);</span>
+<span class="nc" id="L1443">        addLCIDMapEntry(map, &quot;de_LU&quot;, (short) 0x1007);</span>
+<span class="nc" id="L1444">        addLCIDMapEntry(map, &quot;en_CA&quot;, (short) 0x1009);</span>
+<span class="nc" id="L1445">        addLCIDMapEntry(map, &quot;es_GT&quot;, (short) 0x100a);</span>
+<span class="nc" id="L1446">        addLCIDMapEntry(map, &quot;fr_CH&quot;, (short) 0x100c);</span>
+<span class="nc" id="L1447">        addLCIDMapEntry(map, &quot;hr_BA&quot;, (short) 0x101a);</span>
+<span class="nc" id="L1448">        addLCIDMapEntry(map, &quot;ar_DZ&quot;, (short) 0x1401);</span>
+<span class="nc" id="L1449">        addLCIDMapEntry(map, &quot;zh_MO&quot;, (short) 0x1404);</span>
+<span class="nc" id="L1450">        addLCIDMapEntry(map, &quot;de_LI&quot;, (short) 0x1407);</span>
+<span class="nc" id="L1451">        addLCIDMapEntry(map, &quot;en_NZ&quot;, (short) 0x1409);</span>
+<span class="nc" id="L1452">        addLCIDMapEntry(map, &quot;es_CR&quot;, (short) 0x140a);</span>
+<span class="nc" id="L1453">        addLCIDMapEntry(map, &quot;fr_LU&quot;, (short) 0x140c);</span>
+<span class="nc" id="L1454">        addLCIDMapEntry(map, &quot;bs_BA&quot;, (short) 0x141a);</span>
+<span class="nc" id="L1455">        addLCIDMapEntry(map, &quot;ar_MA&quot;, (short) 0x1801);</span>
+<span class="nc" id="L1456">        addLCIDMapEntry(map, &quot;en_IE&quot;, (short) 0x1809);</span>
+<span class="nc" id="L1457">        addLCIDMapEntry(map, &quot;es_PA&quot;, (short) 0x180a);</span>
+<span class="nc" id="L1458">        addLCIDMapEntry(map, &quot;fr_MC&quot;, (short) 0x180c);</span>
+<span class="nc" id="L1459">        addLCIDMapEntry(map, &quot;sr_BA&quot;, (short) 0x181a);</span>
+<span class="nc" id="L1460">        addLCIDMapEntry(map, &quot;ar_TN&quot;, (short) 0x1c01);</span>
+<span class="nc" id="L1461">        addLCIDMapEntry(map, &quot;en_ZA&quot;, (short) 0x1c09);</span>
+<span class="nc" id="L1462">        addLCIDMapEntry(map, &quot;es_DO&quot;, (short) 0x1c0a);</span>
+<span class="nc" id="L1463">        addLCIDMapEntry(map, &quot;sr_BA&quot;, (short) 0x1c1a);</span>
+<span class="nc" id="L1464">        addLCIDMapEntry(map, &quot;ar_OM&quot;, (short) 0x2001);</span>
+<span class="nc" id="L1465">        addLCIDMapEntry(map, &quot;en_JM&quot;, (short) 0x2009);</span>
+<span class="nc" id="L1466">        addLCIDMapEntry(map, &quot;es_VE&quot;, (short) 0x200a);</span>
+<span class="nc" id="L1467">        addLCIDMapEntry(map, &quot;ar_YE&quot;, (short) 0x2401);</span>
+<span class="nc" id="L1468">        addLCIDMapEntry(map, &quot;es_CO&quot;, (short) 0x240a);</span>
+<span class="nc" id="L1469">        addLCIDMapEntry(map, &quot;ar_SY&quot;, (short) 0x2801);</span>
+<span class="nc" id="L1470">        addLCIDMapEntry(map, &quot;en_BZ&quot;, (short) 0x2809);</span>
+<span class="nc" id="L1471">        addLCIDMapEntry(map, &quot;es_PE&quot;, (short) 0x280a);</span>
+<span class="nc" id="L1472">        addLCIDMapEntry(map, &quot;ar_JO&quot;, (short) 0x2c01);</span>
+<span class="nc" id="L1473">        addLCIDMapEntry(map, &quot;en_TT&quot;, (short) 0x2c09);</span>
+<span class="nc" id="L1474">        addLCIDMapEntry(map, &quot;es_AR&quot;, (short) 0x2c0a);</span>
+<span class="nc" id="L1475">        addLCIDMapEntry(map, &quot;ar_LB&quot;, (short) 0x3001);</span>
+<span class="nc" id="L1476">        addLCIDMapEntry(map, &quot;en_ZW&quot;, (short) 0x3009);</span>
+<span class="nc" id="L1477">        addLCIDMapEntry(map, &quot;es_EC&quot;, (short) 0x300a);</span>
+<span class="nc" id="L1478">        addLCIDMapEntry(map, &quot;ar_KW&quot;, (short) 0x3401);</span>
+<span class="nc" id="L1479">        addLCIDMapEntry(map, &quot;en_PH&quot;, (short) 0x3409);</span>
+<span class="nc" id="L1480">        addLCIDMapEntry(map, &quot;es_CL&quot;, (short) 0x340a);</span>
+<span class="nc" id="L1481">        addLCIDMapEntry(map, &quot;ar_AE&quot;, (short) 0x3801);</span>
+<span class="nc" id="L1482">        addLCIDMapEntry(map, &quot;es_UY&quot;, (short) 0x380a);</span>
+<span class="nc" id="L1483">        addLCIDMapEntry(map, &quot;ar_BH&quot;, (short) 0x3c01);</span>
+<span class="nc" id="L1484">        addLCIDMapEntry(map, &quot;es_PY&quot;, (short) 0x3c0a);</span>
+<span class="nc" id="L1485">        addLCIDMapEntry(map, &quot;ar_QA&quot;, (short) 0x4001);</span>
+<span class="nc" id="L1486">        addLCIDMapEntry(map, &quot;es_BO&quot;, (short) 0x400a);</span>
+<span class="nc" id="L1487">        addLCIDMapEntry(map, &quot;es_SV&quot;, (short) 0x440a);</span>
+<span class="nc" id="L1488">        addLCIDMapEntry(map, &quot;es_HN&quot;, (short) 0x480a);</span>
+<span class="nc" id="L1489">        addLCIDMapEntry(map, &quot;es_NI&quot;, (short) 0x4c0a);</span>
+<span class="nc" id="L1490">        addLCIDMapEntry(map, &quot;es_PR&quot;, (short) 0x500a);</span>
+
+<span class="nc" id="L1492">        lcidMap = map;</span>
+<span class="nc" id="L1493">    }</span>
+
+    private static short getLCIDFromLocale(Locale locale) {
+        // optimize for common case
+<span class="nc bnc" id="L1497" title="All 2 branches missed.">        if (locale.equals(Locale.US)) {</span>
+<span class="nc" id="L1498">            return US_LCID;</span>
+        }
+
+<span class="nc bnc" id="L1501" title="All 2 branches missed.">        if (lcidMap == null) {</span>
+<span class="nc" id="L1502">            createLCIDMap();</span>
+        }
+
+<span class="nc" id="L1505">        String key = locale.toString();</span>
+<span class="nc bnc" id="L1506" title="All 2 branches missed.">        while (!&quot;&quot;.equals(key)) {</span>
+<span class="nc" id="L1507">            Short lcidObject = (Short) lcidMap.get(key);</span>
+<span class="nc bnc" id="L1508" title="All 2 branches missed.">            if (lcidObject != null) {</span>
+<span class="nc" id="L1509">                return lcidObject.shortValue();</span>
+            }
+<span class="nc" id="L1511">            int pos = key.lastIndexOf('_');</span>
+<span class="nc bnc" id="L1512" title="All 2 branches missed.">            if (pos &lt; 1) {</span>
+<span class="nc" id="L1513">                return US_LCID;</span>
+            }
+<span class="nc" id="L1515">            key = key.substring(0, pos);</span>
+<span class="nc" id="L1516">        }</span>
+
+<span class="nc" id="L1518">        return US_LCID;</span>
+    }
+
+    @Override
+    public String getFamilyName(Locale locale) {
+<span class="nc bnc" id="L1523" title="All 2 branches missed.">        if (locale == null) {</span>
+<span class="nc" id="L1524">            return familyName;</span>
+<span class="nc bnc" id="L1525" title="All 4 branches missed.">        } else if (locale.equals(nameLocale) &amp;&amp; localeFamilyName != null) {</span>
+<span class="nc" id="L1526">            return localeFamilyName;</span>
+        } else {
+<span class="nc" id="L1528">            short localeID = getLCIDFromLocale(locale);</span>
+<span class="nc" id="L1529">            String name = lookupName(localeID, FAMILY_NAME_ID);</span>
+<span class="nc bnc" id="L1530" title="All 2 branches missed.">            if (name == null) {</span>
+<span class="nc" id="L1531">                return familyName;</span>
+            } else {
+<span class="nc" id="L1533">                return name;</span>
+            }
+        }
+    }
+
+    public CharToGlyphMapper getMapper() {
+<span class="nc bnc" id="L1539" title="All 2 branches missed.">        if (mapper == null) {</span>
+<span class="nc" id="L1540">            mapper = new TrueTypeGlyphMapper(this);</span>
+        }
+<span class="nc" id="L1542">        return mapper;</span>
+    }
+
+    /* This duplicates initNames() but that has to run fast as its used
+     * during typical start-up and the information here is likely never
+     * needed.
+     */
+    protected void initAllNames(int requestedID, HashSet names) {
+
+<span class="nc" id="L1551">        byte[] name = new byte[256];</span>
+<span class="nc" id="L1552">        ByteBuffer buffer = getTableBuffer(nameTag);</span>
+
+<span class="nc bnc" id="L1554" title="All 2 branches missed.">        if (buffer != null) {</span>
+<span class="nc" id="L1555">            ShortBuffer sbuffer = buffer.asShortBuffer();</span>
+<span class="nc" id="L1556">            sbuffer.get(); // format - not needed.</span>
+<span class="nc" id="L1557">            short numRecords = sbuffer.get();</span>
+
+            /* The name table uses unsigned shorts. Many of these
+             * are known small values that fit in a short.
+             * The values that are sizes or offsets into the table could be
+             * greater than 32767, so read and store those as ints
+             */
+<span class="nc" id="L1564">            int stringPtr = ((int) sbuffer.get()) &amp; 0xffff;</span>
+<span class="nc bnc" id="L1565" title="All 2 branches missed.">            for (int i=0; i&lt;numRecords; i++) {</span>
+<span class="nc" id="L1566">                short platformID = sbuffer.get();</span>
+<span class="nc bnc" id="L1567" title="All 2 branches missed.">                if (platformID != MS_PLATFORM_ID) {</span>
+<span class="nc" id="L1568">                    sbuffer.position(sbuffer.position()+5);</span>
+<span class="nc" id="L1569">                    continue; // skip over this record.</span>
+                }
+<span class="nc" id="L1571">                short encodingID = sbuffer.get();</span>
+<span class="nc" id="L1572">                short langID     = sbuffer.get();</span>
+<span class="nc" id="L1573">                short nameID     = sbuffer.get();</span>
+<span class="nc" id="L1574">                int   nameLen    = ((int) sbuffer.get()) &amp; 0xffff;</span>
+<span class="nc" id="L1575">                int   namePtr    = (((int) sbuffer.get()) &amp; 0xffff) + stringPtr;</span>
+
+<span class="nc bnc" id="L1577" title="All 2 branches missed.">                if (nameID == requestedID) {</span>
+<span class="nc" id="L1578">                    buffer.position(namePtr);</span>
+<span class="nc" id="L1579">                    buffer.get(name, 0, nameLen);</span>
+<span class="nc" id="L1580">                    names.add(makeString(name, nameLen, encodingID));</span>
+                }
+            }
+        }
+<span class="nc" id="L1584">    }</span>
+
+    String[] getAllFamilyNames() {
+<span class="nc" id="L1587">        HashSet aSet = new HashSet();</span>
+        try {
+<span class="nc" id="L1589">            initAllNames(FAMILY_NAME_ID, aSet);</span>
+<span class="nc" id="L1590">        } catch (Exception e) {</span>
+            /* In case of malformed font */
+<span class="nc" id="L1592">        }</span>
+<span class="nc" id="L1593">        return (String[])aSet.toArray(new String[0]);</span>
+    }
+
+    String[] getAllFullNames() {
+<span class="nc" id="L1597">        HashSet aSet = new HashSet();</span>
+        try {
+<span class="nc" id="L1599">            initAllNames(FULL_NAME_ID, aSet);</span>
+<span class="nc" id="L1600">        } catch (Exception e) {</span>
+            /* In case of malformed font */
+<span class="nc" id="L1602">        }</span>
+<span class="nc" id="L1603">        return (String[])aSet.toArray(new String[0]);</span>
+    }
+
+    /*  Used by the OpenType engine for mark positioning.
+     */
+    @Override
+    Point2D.Float getGlyphPoint(long pScalerContext,
+                                int glyphCode, int ptNumber) {
+        try {
+<span class="nc" id="L1612">            return getScaler().getGlyphPoint(pScalerContext,</span>
+                                             glyphCode, ptNumber);
+<span class="nc" id="L1614">        } catch(FontScalerException fe) {</span>
+<span class="nc" id="L1615">            return null;</span>
+        }
+    }
+
+    private char[] gaspTable;
+
+    private char[] getGaspTable() {
+
+<span class="nc bnc" id="L1623" title="All 2 branches missed.">        if (gaspTable != null) {</span>
+<span class="nc" id="L1624">            return gaspTable;</span>
+        }
+
+<span class="nc" id="L1627">        ByteBuffer buffer = getTableBuffer(gaspTag);</span>
+<span class="nc bnc" id="L1628" title="All 2 branches missed.">        if (buffer == null) {</span>
+<span class="nc" id="L1629">            return gaspTable = new char[0];</span>
+        }
+
+<span class="nc" id="L1632">        CharBuffer cbuffer = buffer.asCharBuffer();</span>
+<span class="nc" id="L1633">        char format = cbuffer.get();</span>
+        /* format &quot;1&quot; has appeared for some Windows Vista fonts.
+         * Its presently undocumented but the existing values
+         * seem to be still valid so we can use it.
+         */
+<span class="nc bnc" id="L1638" title="All 2 branches missed.">        if (format &gt; 1) { // unrecognised format</span>
+<span class="nc" id="L1639">            return gaspTable = new char[0];</span>
+        }
+
+<span class="nc" id="L1642">        char numRanges = cbuffer.get();</span>
+<span class="nc bnc" id="L1643" title="All 2 branches missed.">        if (4+numRanges*4 &gt; getTableSize(gaspTag)) { // sanity check</span>
+<span class="nc" id="L1644">            return gaspTable = new char[0];</span>
+        }
+<span class="nc" id="L1646">        gaspTable = new char[2*numRanges];</span>
+<span class="nc" id="L1647">        cbuffer.get(gaspTable);</span>
+<span class="nc" id="L1648">        return gaspTable;</span>
+    }
+
+    /* This is to obtain info from the TT 'gasp' (grid-fitting and
+     * scan-conversion procedure) table which specifies three combinations:
+     * Hint, Smooth (greyscale), Hint and Smooth.
+     * In this simplified scheme we don't distinguish the latter two. We
+     * hint even at small sizes, so as to preserve metrics consistency.
+     * If the information isn't available default values are substituted.
+     * The more precise defaults we'd do if we distinguished the cases are:
+     * Bold (no other style) fonts :
+     * 0-8 : Smooth ( do grey)
+     * 9+  : Hint + smooth (gridfit + grey)
+     * Plain, Italic and Bold-Italic fonts :
+     * 0-8 : Smooth ( do grey)
+     * 9-17 : Hint (gridfit)
+     * 18+  : Hint + smooth (gridfit + grey)
+     * The defaults should rarely come into play as most TT fonts provide
+     * better defaults.
+     * REMIND: consider unpacking the table into an array of booleans
+     * for faster use.
+     */
+    @Override
+    public boolean useAAForPtSize(int ptsize) {
+
+<span class="nc" id="L1673">        char[] gasp = getGaspTable();</span>
+<span class="nc bnc" id="L1674" title="All 2 branches missed.">        if (gasp.length &gt; 0) {</span>
+<span class="nc bnc" id="L1675" title="All 2 branches missed.">            for (int i=0;i&lt;gasp.length;i+=2) {</span>
+<span class="nc bnc" id="L1676" title="All 2 branches missed.">                if (ptsize &lt;= gasp[i]) {</span>
+<span class="nc bnc" id="L1677" title="All 2 branches missed.">                    return ((gasp[i+1] &amp; 0x2) != 0); // bit 2 means DO_GRAY;</span>
+                }
+            }
+<span class="nc" id="L1680">            return true;</span>
+        }
+
+<span class="nc bnc" id="L1683" title="All 2 branches missed.">        if (style == Font.BOLD) {</span>
+<span class="nc" id="L1684">            return true;</span>
+        } else {
+<span class="nc bnc" id="L1686" title="All 4 branches missed.">            return ptsize &lt;= 8 || ptsize &gt;= 18;</span>
+        }
+    }
+
+    @Override
+    public boolean hasSupplementaryChars() {
+<span class="nc" id="L1692">        return ((TrueTypeGlyphMapper)getMapper()).hasSupplementaryChars();</span>
+    }
+
+    @Override
+    public String toString() {
+<span class="nc" id="L1697">        return &quot;** TrueType Font: Family=&quot;+familyName+ &quot; Name=&quot;+fullName+</span>
+<span class="nc" id="L1698">            &quot; style=&quot;+style+&quot; fileName=&quot;+getPublicFileName();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

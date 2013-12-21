@@ -1,0 +1,687 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>GlyphLayout.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.font</a> &gt; <span class="el_source">GlyphLayout.java</span></div><h1>GlyphLayout.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2003, 2008, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+/*
+ *
+ * (C) Copyright IBM Corp. 1999-2003 - All Rights Reserved
+ *
+ * The original version of this source code and documentation is
+ * copyrighted and owned by IBM. These materials are provided
+ * under terms of a License Agreement between IBM and Sun.
+ * This technology is protected by multiple US and International
+ * patents. This notice and attribution to IBM may not be removed.
+ */
+
+/*
+ * GlyphLayout is used to process a run of text into a run of run of
+ * glyphs, optionally with position and char mapping info.
+ *
+ * The text has already been processed for numeric shaping and bidi.
+ * The run of text that layout works on has a single bidi level.  It
+ * also has a single font/style.  Some operations need context to work
+ * on (shaping, script resolution) so context for the text run text is
+ * provided.  It is assumed that the text array contains sufficient
+ * context, and the offset and count delimit the portion of the text
+ * that needs to actually be processed.
+ *
+ * The font might be a composite font.  Layout generally requires
+ * tables from a single physical font to operate, and so it must
+ * resolve the 'single' font run into runs of physical fonts.
+ *
+ * Some characters are supported by several fonts of a composite, and
+ * in order to properly emulate the glyph substitution behavior of a
+ * single physical font, these characters might need to be mapped to
+ * different physical fonts.  The script code that is assigned
+ * characters normally considered 'common script' can be used to
+ * resolve which physical font to use for these characters. The input
+ * to the char to glyph mapper (which assigns physical fonts as it
+ * processes the glyphs) should include the script code, and the
+ * mapper should operate on runs of a single script.
+ *
+ * To perform layout, call get() to get a new (or reuse an old)
+ * GlyphLayout, call layout on it, then call done(GlyphLayout) when
+ * finished.  There's no particular problem if you don't call done,
+ * but it assists in reuse of the GlyphLayout.
+ */
+
+package sun.font;
+
+import java.lang.ref.SoftReference;
+import java.awt.Font;
+import java.awt.font.FontRenderContext;
+import java.awt.font.GlyphVector;
+import java.awt.geom.AffineTransform;
+import java.awt.geom.NoninvertibleTransformException;
+import java.awt.geom.Point2D;
+import java.util.ArrayList;
+import java.util.concurrent.ConcurrentHashMap;
+
+import static java.lang.Character.*;
+
+public final class GlyphLayout {
+    // data for glyph vector
+    private GVData _gvdata;
+
+    // cached glyph layout data for reuse
+    private static volatile GlyphLayout cache;  // reusable
+
+    private LayoutEngineFactory _lef;  // set when get is called, unset when done is called
+    private TextRecord _textRecord;    // the text we're working on, used by iterators
+    private ScriptRun _scriptRuns;     // iterator over script runs
+    private FontRunIterator _fontRuns; // iterator over physical fonts in a composite
+    private int _ercount;
+    private ArrayList _erecords;
+    private Point2D.Float _pt;
+    private FontStrikeDesc _sd;
+    private float[] _mat;
+    private int _typo_flags;
+    private int _offset;
+
+    public static final class LayoutEngineKey {
+        private Font2D font;
+        private int script;
+        private int lang;
+
+<span class="nc" id="L107">        LayoutEngineKey() {</span>
+<span class="nc" id="L108">        }</span>
+
+<span class="nc" id="L110">        LayoutEngineKey(Font2D font, int script, int lang) {</span>
+<span class="nc" id="L111">            init(font, script, lang);</span>
+<span class="nc" id="L112">        }</span>
+
+        void init(Font2D font, int script, int lang) {
+<span class="nc" id="L115">            this.font = font;</span>
+<span class="nc" id="L116">            this.script = script;</span>
+<span class="nc" id="L117">            this.lang = lang;</span>
+<span class="nc" id="L118">        }</span>
+
+        LayoutEngineKey copy() {
+<span class="nc" id="L121">            return new LayoutEngineKey(font, script, lang);</span>
+        }
+
+        Font2D font() {
+<span class="nc" id="L125">            return font;</span>
+        }
+
+        int script() {
+<span class="nc" id="L129">            return script;</span>
+        }
+
+        int lang() {
+<span class="nc" id="L133">            return lang;</span>
+        }
+
+        public boolean equals(Object rhs) {
+<span class="nc bnc" id="L137" title="All 2 branches missed.">            if (this == rhs) return true;</span>
+<span class="nc bnc" id="L138" title="All 2 branches missed.">            if (rhs == null) return false;</span>
+            try {
+<span class="nc" id="L140">                LayoutEngineKey that = (LayoutEngineKey)rhs;</span>
+<span class="nc bnc" id="L141" title="All 4 branches missed.">                return this.script == that.script &amp;&amp;</span>
+                       this.lang == that.lang &amp;&amp;
+<span class="nc bnc" id="L143" title="All 2 branches missed.">                       this.font.equals(that.font);</span>
+            }
+<span class="nc" id="L145">            catch (ClassCastException e) {</span>
+<span class="nc" id="L146">                return false;</span>
+            }
+        }
+
+        public int hashCode() {
+<span class="nc" id="L151">            return script ^ lang ^ font.hashCode();</span>
+        }
+    }
+
+    public static interface LayoutEngineFactory {
+        /**
+         * Given a font, script, and language, determine a layout engine to use.
+         */
+        public LayoutEngine getEngine(Font2D font, int script, int lang);
+
+        /**
+         * Given a key, determine a layout engine to use.
+         */
+        public LayoutEngine getEngine(LayoutEngineKey key);
+    }
+
+    public static interface LayoutEngine {
+        /**
+         * Given a strike descriptor, text, rtl flag, and starting point, append information about
+         * glyphs, positions, and character indices to the glyphvector data, and advance the point.
+         *
+         * If the GVData does not have room for the glyphs, throws an IndexOutOfBoundsException and
+         * leave pt and the gvdata unchanged.
+         */
+        public void layout(FontStrikeDesc sd, float[] mat, int gmask,
+                           int baseIndex, TextRecord text, int typo_flags, Point2D.Float pt, GVData data);
+    }
+
+    /**
+     * Return a new instance of GlyphLayout, using the provided layout engine factory.
+     * If null, the system layout engine factory will be used.
+     */
+    public static GlyphLayout get(LayoutEngineFactory lef) {
+<span class="nc bnc" id="L184" title="All 2 branches missed.">        if (lef == null) {</span>
+<span class="nc" id="L185">            lef = SunLayoutEngine.instance();</span>
+        }
+<span class="nc" id="L187">        GlyphLayout result = null;</span>
+<span class="nc" id="L188">        synchronized(GlyphLayout.class) {</span>
+<span class="nc bnc" id="L189" title="All 2 branches missed.">            if (cache != null) {</span>
+<span class="nc" id="L190">                result = cache;</span>
+<span class="nc" id="L191">                cache = null;</span>
+            }
+<span class="nc" id="L193">        }</span>
+<span class="nc bnc" id="L194" title="All 2 branches missed.">        if (result == null) {</span>
+<span class="nc" id="L195">            result = new GlyphLayout();</span>
+        }
+<span class="nc" id="L197">        result._lef = lef;</span>
+<span class="nc" id="L198">        return result;</span>
+    }
+
+    /**
+     * Return the old instance of GlyphLayout when you are done.  This enables reuse
+     * of GlyphLayout objects.
+     */
+    public static void done(GlyphLayout gl) {
+<span class="nc" id="L206">        gl._lef = null;</span>
+<span class="nc" id="L207">        cache = gl; // object reference assignment is thread safe, it says here...</span>
+<span class="nc" id="L208">    }</span>
+
+    private static final class SDCache {
+        public Font key_font;
+        public FontRenderContext key_frc;
+
+        public AffineTransform dtx;
+        public AffineTransform invdtx;
+        public AffineTransform gtx;
+        public Point2D.Float delta;
+        public FontStrikeDesc sd;
+
+<span class="nc" id="L220">        private SDCache(Font font, FontRenderContext frc) {</span>
+<span class="nc" id="L221">            key_font = font;</span>
+<span class="nc" id="L222">            key_frc = frc;</span>
+
+            // !!! add getVectorTransform and hasVectorTransform to frc?  then
+            // we could just skip this work...
+
+<span class="nc" id="L227">            dtx = frc.getTransform();</span>
+<span class="nc" id="L228">            dtx.setTransform(dtx.getScaleX(), dtx.getShearY(),</span>
+<span class="nc" id="L229">                             dtx.getShearX(), dtx.getScaleY(),</span>
+                             0, 0);
+<span class="nc bnc" id="L231" title="All 2 branches missed.">            if (!dtx.isIdentity()) {</span>
+                try {
+<span class="nc" id="L233">                    invdtx = dtx.createInverse();</span>
+                }
+<span class="nc" id="L235">                catch (NoninvertibleTransformException e) {</span>
+<span class="nc" id="L236">                    throw new InternalError(e);</span>
+<span class="nc" id="L237">                }</span>
+            }
+
+<span class="nc" id="L240">            float ptSize = font.getSize2D();</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">            if (font.isTransformed()) {</span>
+<span class="nc" id="L242">                gtx = font.getTransform();</span>
+<span class="nc" id="L243">                gtx.scale(ptSize, ptSize);</span>
+<span class="nc" id="L244">                delta = new Point2D.Float((float)gtx.getTranslateX(),</span>
+<span class="nc" id="L245">                                          (float)gtx.getTranslateY());</span>
+<span class="nc" id="L246">                gtx.setTransform(gtx.getScaleX(), gtx.getShearY(),</span>
+<span class="nc" id="L247">                                 gtx.getShearX(), gtx.getScaleY(),</span>
+                                 0, 0);
+<span class="nc" id="L249">                gtx.preConcatenate(dtx);</span>
+            } else {
+<span class="nc" id="L251">                delta = ZERO_DELTA;</span>
+<span class="nc" id="L252">                gtx = new AffineTransform(dtx);</span>
+<span class="nc" id="L253">                gtx.scale(ptSize, ptSize);</span>
+            }
+
+            /* Similar logic to that used in SunGraphics2D.checkFontInfo().
+             * Whether a grey (AA) strike is needed is size dependent if
+             * AA mode is 'gasp'.
+             */
+<span class="nc" id="L260">            int aa =</span>
+<span class="nc" id="L261">                FontStrikeDesc.getAAHintIntVal(frc.getAntiAliasingHint(),</span>
+<span class="nc" id="L262">                                               FontUtilities.getFont2D(font),</span>
+<span class="nc" id="L263">                                               (int)Math.abs(ptSize));</span>
+<span class="nc" id="L264">            int fm = FontStrikeDesc.getFMHintIntVal</span>
+<span class="nc" id="L265">                (frc.getFractionalMetricsHint());</span>
+<span class="nc" id="L266">            sd = new FontStrikeDesc(dtx, gtx, font.getStyle(), aa, fm);</span>
+<span class="nc" id="L267">        }</span>
+
+<span class="nc" id="L269">        private static final Point2D.Float ZERO_DELTA = new Point2D.Float();</span>
+
+        private static
+            SoftReference&lt;ConcurrentHashMap&lt;SDKey, SDCache&gt;&gt; cacheRef;
+
+        private static final class SDKey {
+            private final Font font;
+            private final FontRenderContext frc;
+            private final int hash;
+
+<span class="nc" id="L279">            SDKey(Font font, FontRenderContext frc) {</span>
+<span class="nc" id="L280">                this.font = font;</span>
+<span class="nc" id="L281">                this.frc = frc;</span>
+<span class="nc" id="L282">                this.hash = font.hashCode() ^ frc.hashCode();</span>
+<span class="nc" id="L283">            }</span>
+
+            public int hashCode() {
+<span class="nc" id="L286">                return hash;</span>
+            }
+
+            public boolean equals(Object o) {
+                try {
+<span class="nc" id="L291">                    SDKey rhs = (SDKey)o;</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">                    return</span>
+                        hash == rhs.hash &amp;&amp;
+<span class="nc bnc" id="L294" title="All 2 branches missed.">                        font.equals(rhs.font) &amp;&amp;</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">                        frc.equals(rhs.frc);</span>
+                }
+<span class="nc" id="L297">                catch (ClassCastException e) {</span>
+                }
+<span class="nc" id="L299">                return false;</span>
+            }
+        }
+
+        public static SDCache get(Font font, FontRenderContext frc) {
+
+            // It is possible a translation component will be in the FRC.
+            // It doesn't affect us except adversely as we would consider
+            // FRC's which are really the same to be different. If we
+            // detect a translation component, then we need to exclude it
+            // by creating a new transform which excludes the translation.
+<span class="nc bnc" id="L310" title="All 2 branches missed.">            if (frc.isTransformed()) {</span>
+<span class="nc" id="L311">                AffineTransform transform = frc.getTransform();</span>
+<span class="nc bnc" id="L312" title="All 2 branches missed.">                if (transform.getTranslateX() != 0 ||</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">                    transform.getTranslateY() != 0) {</span>
+<span class="nc" id="L314">                    transform = new AffineTransform(transform.getScaleX(),</span>
+<span class="nc" id="L315">                                                    transform.getShearY(),</span>
+<span class="nc" id="L316">                                                    transform.getShearX(),</span>
+<span class="nc" id="L317">                                                    transform.getScaleY(),</span>
+                                                    0, 0);
+<span class="nc" id="L319">                    frc = new FontRenderContext(transform,</span>
+<span class="nc" id="L320">                                                frc.getAntiAliasingHint(),</span>
+<span class="nc" id="L321">                                                frc.getFractionalMetricsHint()</span>
+                                                );
+                }
+            }
+
+<span class="nc" id="L326">            SDKey key = new SDKey(font, frc); // garbage, yuck...</span>
+<span class="nc" id="L327">            ConcurrentHashMap&lt;SDKey, SDCache&gt; cache = null;</span>
+<span class="nc" id="L328">            SDCache res = null;</span>
+<span class="nc bnc" id="L329" title="All 2 branches missed.">            if (cacheRef != null) {</span>
+<span class="nc" id="L330">                cache = cacheRef.get();</span>
+<span class="nc bnc" id="L331" title="All 2 branches missed.">                if (cache != null) {</span>
+<span class="nc" id="L332">                    res = cache.get(key);</span>
+                }
+            }
+<span class="nc bnc" id="L335" title="All 2 branches missed.">            if (res == null) {</span>
+<span class="nc" id="L336">                res = new SDCache(font, frc);</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">                if (cache == null) {</span>
+<span class="nc" id="L338">                    cache = new ConcurrentHashMap&lt;SDKey, SDCache&gt;(10);</span>
+<span class="nc" id="L339">                    cacheRef = new</span>
+                       SoftReference&lt;ConcurrentHashMap&lt;SDKey, SDCache&gt;&gt;(cache);
+<span class="nc bnc" id="L341" title="All 2 branches missed.">                } else if (cache.size() &gt;= 512) {</span>
+<span class="nc" id="L342">                    cache.clear();</span>
+                }
+<span class="nc" id="L344">                cache.put(key, res);</span>
+            }
+<span class="nc" id="L346">            return res;</span>
+        }
+    }
+
+    /**
+     * Create a glyph vector.
+     * @param font the font to use
+     * @param frc the font render context
+     * @param text the text, including optional context before start and after start + count
+     * @param offset the start of the text to lay out
+     * @param count the length of the text to lay out
+     * @param flags bidi and context flags {@see #java.awt.Font}
+     * @param result a StandardGlyphVector to modify, can be null
+     * @return the layed out glyphvector, if result was passed in, it is returned
+     */
+    public StandardGlyphVector layout(Font font, FontRenderContext frc,
+                                      char[] text, int offset, int count,
+                                      int flags, StandardGlyphVector result)
+    {
+<span class="nc bnc" id="L365" title="All 8 branches missed.">        if (text == null || offset &lt; 0 || count &lt; 0 || (count &gt; text.length - offset)) {</span>
+<span class="nc" id="L366">            throw new IllegalArgumentException();</span>
+        }
+
+<span class="nc" id="L369">        init(count);</span>
+
+        // need to set after init
+        // go through the back door for this
+<span class="nc bnc" id="L373" title="All 2 branches missed.">        if (font.hasLayoutAttributes()) {</span>
+<span class="nc" id="L374">            AttributeValues values = ((AttributeMap)font.getAttributes()).getValues();</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">            if (values.getKerning() != 0) _typo_flags |= 0x1;</span>
+<span class="nc bnc" id="L376" title="All 2 branches missed.">            if (values.getLigatures() != 0) _typo_flags |= 0x2;</span>
+        }
+
+<span class="nc" id="L379">        _offset = offset;</span>
+
+        // use cache now - can we use the strike cache for this?
+
+<span class="nc" id="L383">        SDCache txinfo = SDCache.get(font, frc);</span>
+<span class="nc" id="L384">        _mat[0] = (float)txinfo.gtx.getScaleX();</span>
+<span class="nc" id="L385">        _mat[1] = (float)txinfo.gtx.getShearY();</span>
+<span class="nc" id="L386">        _mat[2] = (float)txinfo.gtx.getShearX();</span>
+<span class="nc" id="L387">        _mat[3] = (float)txinfo.gtx.getScaleY();</span>
+<span class="nc" id="L388">        _pt.setLocation(txinfo.delta);</span>
+
+<span class="nc" id="L390">        int lim = offset + count;</span>
+
+<span class="nc" id="L392">        int min = 0;</span>
+<span class="nc" id="L393">        int max = text.length;</span>
+<span class="nc bnc" id="L394" title="All 2 branches missed.">        if (flags != 0) {</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">            if ((flags &amp; Font.LAYOUT_RIGHT_TO_LEFT) != 0) {</span>
+<span class="nc" id="L396">              _typo_flags |= 0x80000000; // RTL</span>
+            }
+
+<span class="nc bnc" id="L399" title="All 2 branches missed.">            if ((flags &amp; Font.LAYOUT_NO_START_CONTEXT) != 0) {</span>
+<span class="nc" id="L400">                min = offset;</span>
+            }
+
+<span class="nc bnc" id="L403" title="All 2 branches missed.">            if ((flags &amp; Font.LAYOUT_NO_LIMIT_CONTEXT) != 0) {</span>
+<span class="nc" id="L404">                max = lim;</span>
+            }
+        }
+
+<span class="nc" id="L408">        int lang = -1; // default for now</span>
+
+<span class="nc" id="L410">        Font2D font2D = FontUtilities.getFont2D(font);</span>
+
+<span class="nc" id="L412">        _textRecord.init(text, offset, lim, min, max);</span>
+<span class="nc" id="L413">        int start = offset;</span>
+<span class="nc bnc" id="L414" title="All 2 branches missed.">        if (font2D instanceof CompositeFont) {</span>
+<span class="nc" id="L415">            _scriptRuns.init(text, offset, count); // ??? how to handle 'common' chars</span>
+<span class="nc" id="L416">            _fontRuns.init((CompositeFont)font2D, text, offset, lim);</span>
+<span class="nc bnc" id="L417" title="All 2 branches missed.">            while (_scriptRuns.next()) {</span>
+<span class="nc" id="L418">                int limit = _scriptRuns.getScriptLimit();</span>
+<span class="nc" id="L419">                int script = _scriptRuns.getScriptCode();</span>
+<span class="nc bnc" id="L420" title="All 2 branches missed.">                while (_fontRuns.next(script, limit)) {</span>
+<span class="nc" id="L421">                    Font2D pfont = _fontRuns.getFont();</span>
+                    /* layout can't deal with NativeFont instances. The
+                     * native font is assumed to know of a suitable non-native
+                     * substitute font. This currently works because
+                     * its consistent with the way NativeFonts delegate
+                     * in other cases too.
+                     */
+<span class="nc bnc" id="L428" title="All 2 branches missed.">                    if (pfont instanceof NativeFont) {</span>
+<span class="nc" id="L429">                        pfont = ((NativeFont)pfont).getDelegateFont();</span>
+                    }
+<span class="nc" id="L431">                    int gmask = _fontRuns.getGlyphMask();</span>
+<span class="nc" id="L432">                    int pos = _fontRuns.getPos();</span>
+<span class="nc" id="L433">                    nextEngineRecord(start, pos, script, lang, pfont, gmask);</span>
+<span class="nc" id="L434">                    start = pos;</span>
+<span class="nc" id="L435">                }</span>
+<span class="nc" id="L436">            }</span>
+        } else {
+<span class="nc" id="L438">            _scriptRuns.init(text, offset, count); // ??? don't worry about 'common' chars</span>
+<span class="nc bnc" id="L439" title="All 2 branches missed.">            while (_scriptRuns.next()) {</span>
+<span class="nc" id="L440">                int limit = _scriptRuns.getScriptLimit();</span>
+<span class="nc" id="L441">                int script = _scriptRuns.getScriptCode();</span>
+<span class="nc" id="L442">                nextEngineRecord(start, limit, script, lang, font2D, 0);</span>
+<span class="nc" id="L443">                start = limit;</span>
+<span class="nc" id="L444">            }</span>
+        }
+
+<span class="nc" id="L447">        int ix = 0;</span>
+<span class="nc" id="L448">        int stop = _ercount;</span>
+<span class="nc" id="L449">        int dir = 1;</span>
+
+<span class="nc bnc" id="L451" title="All 2 branches missed.">        if (_typo_flags &lt; 0) { // RTL</span>
+<span class="nc" id="L452">            ix = stop - 1;</span>
+<span class="nc" id="L453">            stop = -1;</span>
+<span class="nc" id="L454">            dir = -1;</span>
+        }
+
+        //        _sd.init(dtx, gtx, font.getStyle(), frc.isAntiAliased(), frc.usesFractionalMetrics());
+<span class="nc" id="L458">        _sd = txinfo.sd;</span>
+<span class="nc bnc" id="L459" title="All 2 branches missed.">        for (;ix != stop; ix += dir) {</span>
+<span class="nc" id="L460">            EngineRecord er = (EngineRecord)_erecords.get(ix);</span>
+            for (;;) {
+                try {
+<span class="nc" id="L463">                    er.layout();</span>
+<span class="nc" id="L464">                    break;</span>
+                }
+<span class="nc" id="L466">                catch (IndexOutOfBoundsException e) {</span>
+<span class="nc bnc" id="L467" title="All 2 branches missed.">                    if (_gvdata._count &gt;=0) {</span>
+<span class="nc" id="L468">                        _gvdata.grow();</span>
+                    }
+<span class="nc" id="L470">                }</span>
+            }
+            // Break out of the outer for loop if layout fails.
+<span class="nc bnc" id="L473" title="All 2 branches missed.">            if (_gvdata._count &lt; 0) {</span>
+<span class="nc" id="L474">                break;</span>
+            }
+        }
+
+        //        if (txinfo.invdtx != null) {
+        //            _gvdata.adjustPositions(txinfo.invdtx);
+        //        }
+
+        // If layout fails (negative glyph count) create an un-laid out GV instead.
+        // ie default positions. This will be a lot better than the alternative of
+        // a complete blank layout.
+        StandardGlyphVector gv;
+<span class="nc bnc" id="L486" title="All 2 branches missed.">        if (_gvdata._count &lt; 0) {</span>
+<span class="nc" id="L487">            gv = new StandardGlyphVector(font, text, offset, count, frc);</span>
+<span class="nc bnc" id="L488" title="All 2 branches missed.">            if (FontUtilities.debugFonts()) {</span>
+<span class="nc" id="L489">               FontUtilities.getLogger().warning(&quot;OpenType layout failed on font: &quot; +</span>
+                                                 font);
+            }
+        } else {
+<span class="nc" id="L493">            gv = _gvdata.createGlyphVector(font, frc, result);</span>
+        }
+        //        System.err.println(&quot;Layout returns: &quot; + gv);
+<span class="nc" id="L496">        return gv;</span>
+    }
+
+    //
+    // private methods
+    //
+
+<span class="nc" id="L503">    private GlyphLayout() {</span>
+<span class="nc" id="L504">        this._gvdata = new GVData();</span>
+<span class="nc" id="L505">        this._textRecord = new TextRecord();</span>
+<span class="nc" id="L506">        this._scriptRuns = new ScriptRun();</span>
+<span class="nc" id="L507">        this._fontRuns = new FontRunIterator();</span>
+<span class="nc" id="L508">        this._erecords = new ArrayList(10);</span>
+<span class="nc" id="L509">        this._pt = new Point2D.Float();</span>
+<span class="nc" id="L510">        this._sd = new FontStrikeDesc();</span>
+<span class="nc" id="L511">        this._mat = new float[4];</span>
+<span class="nc" id="L512">    }</span>
+
+    private void init(int capacity) {
+<span class="nc" id="L515">        this._typo_flags = 0;</span>
+<span class="nc" id="L516">        this._ercount = 0;</span>
+<span class="nc" id="L517">        this._gvdata.init(capacity);</span>
+<span class="nc" id="L518">    }</span>
+
+    private void nextEngineRecord(int start, int limit, int script, int lang, Font2D font, int gmask) {
+<span class="nc" id="L521">        EngineRecord er = null;</span>
+<span class="nc bnc" id="L522" title="All 2 branches missed.">        if (_ercount == _erecords.size()) {</span>
+<span class="nc" id="L523">            er = new EngineRecord();</span>
+<span class="nc" id="L524">            _erecords.add(er);</span>
+        } else {
+<span class="nc" id="L526">            er = (EngineRecord)_erecords.get(_ercount);</span>
+        }
+<span class="nc" id="L528">        er.init(start, limit, font, script, lang, gmask);</span>
+<span class="nc" id="L529">        ++_ercount;</span>
+<span class="nc" id="L530">    }</span>
+
+    /**
+     * Storage for layout to build glyph vector data, then generate a real GlyphVector
+     */
+<span class="nc" id="L535">    public static final class GVData {</span>
+        public int _count; // number of glyphs, &gt;= number of chars
+        public int _flags;
+        public int[] _glyphs;
+        public float[] _positions;
+        public int[] _indices;
+
+        private static final int UNINITIALIZED_FLAGS = -1;
+
+        public void init(int size) {
+<span class="nc" id="L545">            _count = 0;</span>
+<span class="nc" id="L546">            _flags = UNINITIALIZED_FLAGS;</span>
+
+<span class="nc bnc" id="L548" title="All 4 branches missed.">            if (_glyphs == null || _glyphs.length &lt; size) {</span>
+<span class="nc bnc" id="L549" title="All 2 branches missed.">                if (size &lt; 20) {</span>
+<span class="nc" id="L550">                    size = 20;</span>
+                }
+<span class="nc" id="L552">                _glyphs = new int[size];</span>
+<span class="nc" id="L553">                _positions = new float[size * 2 + 2];</span>
+<span class="nc" id="L554">                _indices = new int[size];</span>
+            }
+<span class="nc" id="L556">        }</span>
+
+        public void grow() {
+<span class="nc" id="L559">            grow(_glyphs.length / 4); // always grows because min length is 20</span>
+<span class="nc" id="L560">        }</span>
+
+        public void grow(int delta) {
+<span class="nc" id="L563">            int size = _glyphs.length + delta;</span>
+<span class="nc" id="L564">            int[] nglyphs = new int[size];</span>
+<span class="nc" id="L565">            System.arraycopy(_glyphs, 0, nglyphs, 0, _count);</span>
+<span class="nc" id="L566">            _glyphs = nglyphs;</span>
+
+<span class="nc" id="L568">            float[] npositions = new float[size * 2 + 2];</span>
+<span class="nc" id="L569">            System.arraycopy(_positions, 0, npositions, 0, _count * 2 + 2);</span>
+<span class="nc" id="L570">            _positions = npositions;</span>
+
+<span class="nc" id="L572">            int[] nindices = new int[size];</span>
+<span class="nc" id="L573">            System.arraycopy(_indices, 0, nindices, 0, _count);</span>
+<span class="nc" id="L574">            _indices = nindices;</span>
+<span class="nc" id="L575">        }</span>
+
+        public void adjustPositions(AffineTransform invdtx) {
+<span class="nc" id="L578">            invdtx.transform(_positions, 0, _positions, 0, _count);</span>
+<span class="nc" id="L579">        }</span>
+
+        public StandardGlyphVector createGlyphVector(Font font, FontRenderContext frc, StandardGlyphVector result) {
+
+            // !!! default initialization until we let layout engines do it
+<span class="nc bnc" id="L584" title="All 2 branches missed.">            if (_flags == UNINITIALIZED_FLAGS) {</span>
+<span class="nc" id="L585">                _flags = 0;</span>
+
+<span class="nc bnc" id="L587" title="All 2 branches missed.">                if (_count &gt; 1) { // if only 1 glyph assume LTR</span>
+<span class="nc" id="L588">                    boolean ltr = true;</span>
+<span class="nc" id="L589">                    boolean rtl = true;</span>
+
+<span class="nc" id="L591">                    int rtlix = _count; // rtl index</span>
+<span class="nc bnc" id="L592" title="All 6 branches missed.">                    for (int i = 0; i &lt; _count &amp;&amp; (ltr || rtl); ++i) {</span>
+<span class="nc" id="L593">                        int cx = _indices[i];</span>
+
+<span class="nc bnc" id="L595" title="All 4 branches missed.">                        ltr = ltr &amp;&amp; (cx == i);</span>
+<span class="nc bnc" id="L596" title="All 4 branches missed.">                        rtl = rtl &amp;&amp; (cx == --rtlix);</span>
+                    }
+
+<span class="nc bnc" id="L599" title="All 2 branches missed.">                    if (rtl) _flags |= GlyphVector.FLAG_RUN_RTL;</span>
+<span class="nc bnc" id="L600" title="All 4 branches missed.">                    if (!rtl &amp;&amp; !ltr) _flags |= GlyphVector.FLAG_COMPLEX_GLYPHS;</span>
+                }
+
+                // !!! layout engines need to tell us whether they performed
+                // position adjustments. currently they don't tell us, so
+                // we must assume they did
+<span class="nc" id="L606">                _flags |= GlyphVector.FLAG_HAS_POSITION_ADJUSTMENTS;</span>
+            }
+
+<span class="nc" id="L609">            int[] glyphs = new int[_count];</span>
+<span class="nc" id="L610">            System.arraycopy(_glyphs, 0, glyphs, 0, _count);</span>
+
+<span class="nc" id="L612">            float[] positions = null;</span>
+<span class="nc bnc" id="L613" title="All 2 branches missed.">            if ((_flags &amp; GlyphVector.FLAG_HAS_POSITION_ADJUSTMENTS) != 0) {</span>
+<span class="nc" id="L614">                positions = new float[_count * 2 + 2];</span>
+<span class="nc" id="L615">                System.arraycopy(_positions, 0, positions, 0, positions.length);</span>
+            }
+
+<span class="nc" id="L618">            int[] indices = null;</span>
+<span class="nc bnc" id="L619" title="All 2 branches missed.">            if ((_flags &amp; GlyphVector.FLAG_COMPLEX_GLYPHS) != 0) {</span>
+<span class="nc" id="L620">                indices = new int[_count];</span>
+<span class="nc" id="L621">                System.arraycopy(_indices, 0, indices, 0, _count);</span>
+            }
+
+<span class="nc bnc" id="L624" title="All 2 branches missed.">            if (result == null) {</span>
+<span class="nc" id="L625">                result = new StandardGlyphVector(font, frc, glyphs, positions, indices, _flags);</span>
+            } else {
+<span class="nc" id="L627">                result.initGlyphVector(font, frc, glyphs, positions, indices, _flags);</span>
+            }
+
+<span class="nc" id="L630">            return result;</span>
+        }
+    }
+
+    /**
+     * Utility class to keep track of script runs, which may have to be reordered rtl when we're
+     * finished.
+     */
+    private final class EngineRecord {
+        private int start;
+        private int limit;
+        private int gmask;
+        private int eflags;
+        private LayoutEngineKey key;
+        private LayoutEngine engine;
+
+<span class="nc" id="L646">        EngineRecord() {</span>
+<span class="nc" id="L647">            key = new LayoutEngineKey();</span>
+<span class="nc" id="L648">        }</span>
+
+        void init(int start, int limit, Font2D font, int script, int lang, int gmask) {
+<span class="nc" id="L651">            this.start = start;</span>
+<span class="nc" id="L652">            this.limit = limit;</span>
+<span class="nc" id="L653">            this.gmask = gmask;</span>
+<span class="nc" id="L654">            this.key.init(font, script, lang);</span>
+<span class="nc" id="L655">            this.eflags = 0;</span>
+
+            // only request canonical substitution if we have combining marks
+<span class="nc bnc" id="L658" title="All 2 branches missed.">            for (int i = start; i &lt; limit; ++i) {</span>
+<span class="nc" id="L659">                int ch = _textRecord.text[i];</span>
+<span class="nc bnc" id="L660" title="All 4 branches missed.">                if (isHighSurrogate((char)ch) &amp;&amp;</span>
+                    i &lt; limit - 1 &amp;&amp;
+<span class="nc bnc" id="L662" title="All 2 branches missed.">                    isLowSurrogate(_textRecord.text[i+1])) {</span>
+                    // rare case
+<span class="nc" id="L664">                    ch = toCodePoint((char)ch,_textRecord.text[++i]); // inc</span>
+                }
+<span class="nc" id="L666">                int gc = getType(ch);</span>
+<span class="nc bnc" id="L667" title="All 6 branches missed.">                if (gc == NON_SPACING_MARK ||</span>
+                    gc == ENCLOSING_MARK ||
+                    gc == COMBINING_SPACING_MARK) { // could do range test also
+
+<span class="nc" id="L671">                    this.eflags = 0x4;</span>
+<span class="nc" id="L672">                    break;</span>
+                }
+            }
+
+<span class="nc" id="L676">            this.engine = _lef.getEngine(key); // flags?</span>
+<span class="nc" id="L677">        }</span>
+
+        void layout() {
+<span class="nc" id="L680">            _textRecord.start = start;</span>
+<span class="nc" id="L681">            _textRecord.limit = limit;</span>
+<span class="nc" id="L682">            engine.layout(_sd, _mat, gmask, start - _offset, _textRecord,</span>
+<span class="nc" id="L683">                          _typo_flags | eflags, _pt, _gvdata);</span>
+<span class="nc" id="L684">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

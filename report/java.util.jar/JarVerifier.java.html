@@ -1,0 +1,893 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>JarVerifier.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">java.util.jar</a> &gt; <span class="el_source">JarVerifier.java</span></div><h1>JarVerifier.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1997, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package java.util.jar;
+
+import java.io.*;
+import java.net.URL;
+import java.util.*;
+import java.security.*;
+import java.security.cert.CertificateException;
+import java.util.zip.ZipEntry;
+
+import sun.misc.JarIndex;
+import sun.security.util.ManifestDigester;
+import sun.security.util.ManifestEntryVerifier;
+import sun.security.util.SignatureFileVerifier;
+import sun.security.util.Debug;
+
+/**
+ *
+ * @author      Roland Schemers
+ */
+class JarVerifier {
+
+    /* Are we debugging ? */
+<span class="fc" id="L48">    static final Debug debug = Debug.getInstance(&quot;jar&quot;);</span>
+
+    /* a table mapping names to code signers, for jar entries that have
+       had their actual hashes verified */
+    private Hashtable&lt;String, CodeSigner[]&gt; verifiedSigners;
+
+    /* a table mapping names to code signers, for jar entries that have
+       passed the .SF/.DSA/.EC -&gt; MANIFEST check */
+    private Hashtable&lt;String, CodeSigner[]&gt; sigFileSigners;
+
+    /* a hash table to hold .SF bytes */
+    private Hashtable&lt;String, byte[]&gt; sigFileData;
+
+    /** &quot;queue&quot; of pending PKCS7 blocks that we couldn't parse
+     *  until we parsed the .SF file */
+    private ArrayList&lt;SignatureFileVerifier&gt; pendingBlocks;
+
+    /* cache of CodeSigner objects */
+    private ArrayList&lt;CodeSigner[]&gt; signerCache;
+
+    /* Are we parsing a block? */
+<span class="fc" id="L69">    private boolean parsingBlockOrSF = false;</span>
+
+    /* Are we done parsing META-INF entries? */
+<span class="fc" id="L72">    private boolean parsingMeta = true;</span>
+
+    /* Are there are files to verify? */
+<span class="fc" id="L75">    private boolean anyToVerify = true;</span>
+
+    /* The output stream to use when keeping track of files we are interested
+       in */
+    private ByteArrayOutputStream baos;
+
+    /** The ManifestDigester object */
+    private volatile ManifestDigester manDig;
+
+    /** the bytes for the manDig object */
+<span class="fc" id="L85">    byte manifestRawBytes[] = null;</span>
+
+    /** controls eager signature validation */
+    boolean eagerValidation;
+
+    /** makes code source singleton instances unique to us */
+<span class="fc" id="L91">    private Object csdomain = new Object();</span>
+
+    /** collect -DIGEST-MANIFEST values for blacklist */
+    private List&lt;Object&gt; manifestDigests;
+
+<span class="fc" id="L96">    public JarVerifier(byte rawBytes[]) {</span>
+<span class="fc" id="L97">        manifestRawBytes = rawBytes;</span>
+<span class="fc" id="L98">        sigFileSigners = new Hashtable&lt;&gt;();</span>
+<span class="fc" id="L99">        verifiedSigners = new Hashtable&lt;&gt;();</span>
+<span class="fc" id="L100">        sigFileData = new Hashtable&lt;&gt;(11);</span>
+<span class="fc" id="L101">        pendingBlocks = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L102">        baos = new ByteArrayOutputStream();</span>
+<span class="fc" id="L103">        manifestDigests = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L104">    }</span>
+
+    /**
+     * This method scans to see which entry we're parsing and
+     * keeps various state information depending on what type of
+     * file is being parsed.
+     */
+    public void beginEntry(JarEntry je, ManifestEntryVerifier mev)
+        throws IOException
+    {
+<span class="pc bpc" id="L114" title="1 of 2 branches missed.">        if (je == null)</span>
+<span class="nc" id="L115">            return;</span>
+
+<span class="fc bfc" id="L117" title="All 2 branches covered.">        if (debug != null) {</span>
+<span class="fc" id="L118">            debug.println(&quot;beginEntry &quot;+je.getName());</span>
+        }
+
+<span class="fc" id="L121">        String name = je.getName();</span>
+
+        /*
+         * Assumptions:
+         * 1. The manifest should be the first entry in the META-INF directory.
+         * 2. The .SF/.DSA/.EC files follow the manifest, before any normal entries
+         * 3. Any of the following will throw a SecurityException:
+         *    a. digest mismatch between a manifest section and
+         *       the SF section.
+         *    b. digest mismatch between the actual jar entry and the manifest
+         */
+
+<span class="fc bfc" id="L133" title="All 2 branches covered.">        if (parsingMeta) {</span>
+<span class="fc" id="L134">            String uname = name.toUpperCase(Locale.ENGLISH);</span>
+<span class="fc bfc" id="L135" title="All 2 branches covered.">            if ((uname.startsWith(&quot;META-INF/&quot;) ||</span>
+<span class="pc bpc" id="L136" title="1 of 2 branches missed.">                 uname.startsWith(&quot;/META-INF/&quot;))) {</span>
+
+<span class="pc bpc" id="L138" title="1 of 2 branches missed.">                if (je.isDirectory()) {</span>
+<span class="nc" id="L139">                    mev.setEntry(null, je);</span>
+<span class="nc" id="L140">                    return;</span>
+                }
+
+<span class="fc bfc" id="L143" title="All 2 branches covered.">                if (uname.equals(JarFile.MANIFEST_NAME) ||</span>
+<span class="pc bpc" id="L144" title="1 of 2 branches missed.">                        uname.equals(JarIndex.INDEX_NAME)) {</span>
+<span class="fc" id="L145">                    return;</span>
+                }
+
+<span class="fc bfc" id="L148" title="All 2 branches covered.">                if (SignatureFileVerifier.isBlockOrSF(uname)) {</span>
+                    /* We parse only DSA, RSA or EC PKCS7 blocks. */
+<span class="fc" id="L150">                    parsingBlockOrSF = true;</span>
+<span class="fc" id="L151">                    baos.reset();</span>
+<span class="fc" id="L152">                    mev.setEntry(null, je);</span>
+<span class="fc" id="L153">                    return;</span>
+                }
+
+                // If a META-INF entry is not MF or block or SF, they should
+                // be normal entries. According to 2 above, no more block or
+                // SF will appear. Let's doneWithMeta.
+            }
+        }
+
+<span class="fc bfc" id="L162" title="All 2 branches covered.">        if (parsingMeta) {</span>
+<span class="fc" id="L163">            doneWithMeta();</span>
+        }
+
+<span class="pc bpc" id="L166" title="1 of 2 branches missed.">        if (je.isDirectory()) {</span>
+<span class="nc" id="L167">            mev.setEntry(null, je);</span>
+<span class="nc" id="L168">            return;</span>
+        }
+
+        // be liberal in what you accept. If the name starts with ./, remove
+        // it as we internally canonicalize it with out the ./.
+<span class="pc bpc" id="L173" title="1 of 2 branches missed.">        if (name.startsWith(&quot;./&quot;))</span>
+<span class="nc" id="L174">            name = name.substring(2);</span>
+
+        // be liberal in what you accept. If the name starts with /, remove
+        // it as we internally canonicalize it with out the /.
+<span class="pc bpc" id="L178" title="1 of 2 branches missed.">        if (name.startsWith(&quot;/&quot;))</span>
+<span class="nc" id="L179">            name = name.substring(1);</span>
+
+        // only set the jev object for entries that have a signature
+<span class="fc bfc" id="L182" title="All 2 branches covered.">        if (sigFileSigners.get(name) != null) {</span>
+<span class="fc" id="L183">            mev.setEntry(name, je);</span>
+<span class="fc" id="L184">            return;</span>
+        }
+
+        // don't compute the digest for this entry
+<span class="fc" id="L188">        mev.setEntry(null, je);</span>
+
+<span class="fc" id="L190">        return;</span>
+    }
+
+    /**
+     * update a single byte.
+     */
+
+    public void update(int b, ManifestEntryVerifier mev)
+        throws IOException
+    {
+<span class="nc bnc" id="L200" title="All 2 branches missed.">        if (b != -1) {</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">            if (parsingBlockOrSF) {</span>
+<span class="nc" id="L202">                baos.write(b);</span>
+            } else {
+<span class="nc" id="L204">                mev.update((byte)b);</span>
+            }
+        } else {
+<span class="nc" id="L207">            processEntry(mev);</span>
+        }
+<span class="nc" id="L209">    }</span>
+
+    /**
+     * update an array of bytes.
+     */
+
+    public void update(int n, byte[] b, int off, int len,
+                       ManifestEntryVerifier mev)
+        throws IOException
+    {
+<span class="fc bfc" id="L219" title="All 2 branches covered.">        if (n != -1) {</span>
+<span class="fc bfc" id="L220" title="All 2 branches covered.">            if (parsingBlockOrSF) {</span>
+<span class="fc" id="L221">                baos.write(b, off, n);</span>
+            } else {
+<span class="fc" id="L223">                mev.update(b, off, n);</span>
+            }
+        } else {
+<span class="fc" id="L226">            processEntry(mev);</span>
+        }
+<span class="fc" id="L228">    }</span>
+
+    /**
+     * called when we reach the end of entry in one of the read() methods.
+     */
+    private void processEntry(ManifestEntryVerifier mev)
+        throws IOException
+    {
+<span class="fc bfc" id="L236" title="All 2 branches covered.">        if (!parsingBlockOrSF) {</span>
+<span class="fc" id="L237">            JarEntry je = mev.getEntry();</span>
+<span class="pc bpc" id="L238" title="1 of 4 branches missed.">            if ((je != null) &amp;&amp; (je.signers == null)) {</span>
+<span class="fc" id="L239">                je.signers = mev.verify(verifiedSigners, sigFileSigners);</span>
+<span class="fc" id="L240">                je.certs = mapSignersToCertArray(je.signers);</span>
+            }
+<span class="fc" id="L242">        } else {</span>
+
+            try {
+<span class="fc" id="L245">                parsingBlockOrSF = false;</span>
+
+<span class="pc bpc" id="L247" title="1 of 2 branches missed.">                if (debug != null) {</span>
+<span class="nc" id="L248">                    debug.println(&quot;processEntry: processing block&quot;);</span>
+                }
+
+<span class="fc" id="L251">                String uname = mev.getEntry().getName()</span>
+<span class="fc" id="L252">                                             .toUpperCase(Locale.ENGLISH);</span>
+
+<span class="fc bfc" id="L254" title="All 2 branches covered.">                if (uname.endsWith(&quot;.SF&quot;)) {</span>
+<span class="fc" id="L255">                    String key = uname.substring(0, uname.length()-3);</span>
+<span class="fc" id="L256">                    byte bytes[] = baos.toByteArray();</span>
+                    // add to sigFileData in case future blocks need it
+<span class="fc" id="L258">                    sigFileData.put(key, bytes);</span>
+                    // check pending blocks, we can now process
+                    // anyone waiting for this .SF file
+<span class="fc" id="L261">                    Iterator&lt;SignatureFileVerifier&gt; it = pendingBlocks.iterator();</span>
+<span class="pc bpc" id="L262" title="1 of 2 branches missed.">                    while (it.hasNext()) {</span>
+<span class="nc" id="L263">                        SignatureFileVerifier sfv = it.next();</span>
+<span class="nc bnc" id="L264" title="All 2 branches missed.">                        if (sfv.needSignatureFile(key)) {</span>
+<span class="nc bnc" id="L265" title="All 2 branches missed.">                            if (debug != null) {</span>
+<span class="nc" id="L266">                                debug.println(</span>
+                                 &quot;processEntry: processing pending block&quot;);
+                            }
+
+<span class="nc" id="L270">                            sfv.setSignatureFile(bytes);</span>
+<span class="nc" id="L271">                            sfv.process(sigFileSigners, manifestDigests);</span>
+                        }
+<span class="nc" id="L273">                    }</span>
+<span class="fc" id="L274">                    return;</span>
+                }
+
+                // now we are parsing a signature block file
+
+<span class="fc" id="L279">                String key = uname.substring(0, uname.lastIndexOf(&quot;.&quot;));</span>
+
+<span class="pc bpc" id="L281" title="1 of 2 branches missed.">                if (signerCache == null)</span>
+<span class="fc" id="L282">                    signerCache = new ArrayList&lt;&gt;();</span>
+
+<span class="pc bpc" id="L284" title="1 of 2 branches missed.">                if (manDig == null) {</span>
+<span class="fc" id="L285">                    synchronized(manifestRawBytes) {</span>
+<span class="pc bpc" id="L286" title="1 of 2 branches missed.">                        if (manDig == null) {</span>
+<span class="fc" id="L287">                            manDig = new ManifestDigester(manifestRawBytes);</span>
+<span class="fc" id="L288">                            manifestRawBytes = null;</span>
+                        }
+<span class="pc" id="L290">                    }</span>
+                }
+
+<span class="fc" id="L293">                SignatureFileVerifier sfv =</span>
+                  new SignatureFileVerifier(signerCache,
+<span class="fc" id="L295">                                            manDig, uname, baos.toByteArray());</span>
+
+<span class="pc bpc" id="L297" title="1 of 2 branches missed.">                if (sfv.needSignatureFileBytes()) {</span>
+                    // see if we have already parsed an external .SF file
+<span class="fc" id="L299">                    byte[] bytes = sigFileData.get(key);</span>
+
+<span class="pc bpc" id="L301" title="1 of 2 branches missed.">                    if (bytes == null) {</span>
+                        // put this block on queue for later processing
+                        // since we don't have the .SF bytes yet
+                        // (uname, block);
+<span class="nc bnc" id="L305" title="All 2 branches missed.">                        if (debug != null) {</span>
+<span class="nc" id="L306">                            debug.println(&quot;adding pending block&quot;);</span>
+                        }
+<span class="nc" id="L308">                        pendingBlocks.add(sfv);</span>
+<span class="nc" id="L309">                        return;</span>
+                    } else {
+<span class="fc" id="L311">                        sfv.setSignatureFile(bytes);</span>
+                    }
+                }
+<span class="fc" id="L314">                sfv.process(sigFileSigners, manifestDigests);</span>
+
+<span class="nc" id="L316">            } catch (IOException ioe) {</span>
+                // e.g. sun.security.pkcs.ParsingException
+<span class="nc bnc" id="L318" title="All 2 branches missed.">                if (debug != null) debug.println(&quot;processEntry caught: &quot;+ioe);</span>
+                // ignore and treat as unsigned
+<span class="nc" id="L320">            } catch (SignatureException se) {</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">                if (debug != null) debug.println(&quot;processEntry caught: &quot;+se);</span>
+                // ignore and treat as unsigned
+<span class="nc" id="L323">            } catch (NoSuchAlgorithmException nsae) {</span>
+<span class="nc bnc" id="L324" title="All 2 branches missed.">                if (debug != null) debug.println(&quot;processEntry caught: &quot;+nsae);</span>
+                // ignore and treat as unsigned
+<span class="nc" id="L326">            } catch (CertificateException ce) {</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">                if (debug != null) debug.println(&quot;processEntry caught: &quot;+ce);</span>
+                // ignore and treat as unsigned
+<span class="pc" id="L329">            }</span>
+        }
+<span class="fc" id="L331">    }</span>
+
+    /**
+     * Return an array of java.security.cert.Certificate objects for
+     * the given file in the jar.
+     * @deprecated
+     */
+    @Deprecated
+    public java.security.cert.Certificate[] getCerts(String name)
+    {
+<span class="nc" id="L341">        return mapSignersToCertArray(getCodeSigners(name));</span>
+    }
+
+    public java.security.cert.Certificate[] getCerts(JarFile jar, JarEntry entry)
+    {
+<span class="nc" id="L346">        return mapSignersToCertArray(getCodeSigners(jar, entry));</span>
+    }
+
+    /**
+     * return an array of CodeSigner objects for
+     * the given file in the jar. this array is not cloned.
+     *
+     */
+    public CodeSigner[] getCodeSigners(String name)
+    {
+<span class="nc" id="L356">        return verifiedSigners.get(name);</span>
+    }
+
+    public CodeSigner[] getCodeSigners(JarFile jar, JarEntry entry)
+    {
+<span class="nc" id="L361">        String name = entry.getName();</span>
+<span class="nc bnc" id="L362" title="All 4 branches missed.">        if (eagerValidation &amp;&amp; sigFileSigners.get(name) != null) {</span>
+            /*
+             * Force a read of the entry data to generate the
+             * verification hash.
+             */
+            try {
+<span class="nc" id="L368">                InputStream s = jar.getInputStream(entry);</span>
+<span class="nc" id="L369">                byte[] buffer = new byte[1024];</span>
+<span class="nc" id="L370">                int n = buffer.length;</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">                while (n != -1) {</span>
+<span class="nc" id="L372">                    n = s.read(buffer, 0, buffer.length);</span>
+                }
+<span class="nc" id="L374">                s.close();</span>
+<span class="nc" id="L375">            } catch (IOException e) {</span>
+<span class="nc" id="L376">            }</span>
+        }
+<span class="nc" id="L378">        return getCodeSigners(name);</span>
+    }
+
+    /*
+     * Convert an array of signers into an array of concatenated certificate
+     * arrays.
+     */
+    private static java.security.cert.Certificate[] mapSignersToCertArray(
+        CodeSigner[] signers) {
+
+<span class="fc bfc" id="L388" title="All 2 branches covered.">        if (signers != null) {</span>
+<span class="fc" id="L389">            ArrayList&lt;java.security.cert.Certificate&gt; certChains = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L390" title="All 2 branches covered.">            for (int i = 0; i &lt; signers.length; i++) {</span>
+<span class="fc" id="L391">                certChains.addAll(</span>
+<span class="fc" id="L392">                    signers[i].getSignerCertPath().getCertificates());</span>
+            }
+
+            // Convert into a Certificate[]
+<span class="fc" id="L396">            return certChains.toArray(</span>
+<span class="fc" id="L397">                    new java.security.cert.Certificate[certChains.size()]);</span>
+        }
+<span class="fc" id="L399">        return null;</span>
+    }
+
+    /**
+     * returns true if there no files to verify.
+     * should only be called after all the META-INF entries
+     * have been processed.
+     */
+    boolean nothingToVerify()
+    {
+<span class="fc bfc" id="L409" title="All 2 branches covered.">        return (anyToVerify == false);</span>
+    }
+
+    /**
+     * called to let us know we have processed all the
+     * META-INF entries, and if we re-read one of them, don't
+     * re-process it. Also gets rid of any data structures
+     * we needed when parsing META-INF entries.
+     */
+    void doneWithMeta()
+    {
+<span class="fc" id="L420">        parsingMeta = false;</span>
+<span class="fc bfc" id="L421" title="All 2 branches covered.">        anyToVerify = !sigFileSigners.isEmpty();</span>
+<span class="fc" id="L422">        baos = null;</span>
+<span class="fc" id="L423">        sigFileData = null;</span>
+<span class="fc" id="L424">        pendingBlocks = null;</span>
+<span class="fc" id="L425">        signerCache = null;</span>
+<span class="fc" id="L426">        manDig = null;</span>
+        // MANIFEST.MF is always treated as signed and verified,
+        // move its signers from sigFileSigners to verifiedSigners.
+<span class="fc bfc" id="L429" title="All 2 branches covered.">        if (sigFileSigners.containsKey(JarFile.MANIFEST_NAME)) {</span>
+<span class="fc" id="L430">            CodeSigner[] codeSigners = sigFileSigners.remove(JarFile.MANIFEST_NAME);</span>
+<span class="fc" id="L431">            verifiedSigners.put(JarFile.MANIFEST_NAME, codeSigners);</span>
+        }
+<span class="fc" id="L433">    }</span>
+
+    static class VerifierStream extends java.io.InputStream {
+
+        private InputStream is;
+        private JarVerifier jv;
+        private ManifestEntryVerifier mev;
+        private long numLeft;
+
+        VerifierStream(Manifest man,
+                       JarEntry je,
+                       InputStream is,
+                       JarVerifier jv) throws IOException
+<span class="fc" id="L446">        {</span>
+<span class="fc" id="L447">            this.is = is;</span>
+<span class="fc" id="L448">            this.jv = jv;</span>
+<span class="fc" id="L449">            this.mev = new ManifestEntryVerifier(man);</span>
+<span class="fc" id="L450">            this.jv.beginEntry(je, mev);</span>
+<span class="fc" id="L451">            this.numLeft = je.getSize();</span>
+<span class="pc bpc" id="L452" title="1 of 2 branches missed.">            if (this.numLeft == 0)</span>
+<span class="nc" id="L453">                this.jv.update(-1, this.mev);</span>
+<span class="fc" id="L454">        }</span>
+
+        public int read() throws IOException
+        {
+<span class="nc bnc" id="L458" title="All 2 branches missed.">            if (numLeft &gt; 0) {</span>
+<span class="nc" id="L459">                int b = is.read();</span>
+<span class="nc" id="L460">                jv.update(b, mev);</span>
+<span class="nc" id="L461">                numLeft--;</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">                if (numLeft == 0)</span>
+<span class="nc" id="L463">                    jv.update(-1, mev);</span>
+<span class="nc" id="L464">                return b;</span>
+            } else {
+<span class="nc" id="L466">                return -1;</span>
+            }
+        }
+
+        public int read(byte b[], int off, int len) throws IOException {
+<span class="fc bfc" id="L471" title="All 4 branches covered.">            if ((numLeft &gt; 0) &amp;&amp; (numLeft &lt; len)) {</span>
+<span class="fc" id="L472">                len = (int)numLeft;</span>
+            }
+
+<span class="fc bfc" id="L475" title="All 2 branches covered.">            if (numLeft &gt; 0) {</span>
+<span class="fc" id="L476">                int n = is.read(b, off, len);</span>
+<span class="fc" id="L477">                jv.update(n, b, off, len, mev);</span>
+<span class="fc" id="L478">                numLeft -= n;</span>
+<span class="fc bfc" id="L479" title="All 2 branches covered.">                if (numLeft == 0)</span>
+<span class="fc" id="L480">                    jv.update(-1, b, off, len, mev);</span>
+<span class="fc" id="L481">                return n;</span>
+            } else {
+<span class="fc" id="L483">                return -1;</span>
+            }
+        }
+
+        public void close()
+            throws IOException
+        {
+<span class="pc bpc" id="L490" title="1 of 2 branches missed.">            if (is != null)</span>
+<span class="fc" id="L491">                is.close();</span>
+<span class="fc" id="L492">            is = null;</span>
+<span class="fc" id="L493">            mev = null;</span>
+<span class="fc" id="L494">            jv = null;</span>
+<span class="fc" id="L495">        }</span>
+
+        public int available() throws IOException {
+<span class="nc" id="L498">            return is.available();</span>
+        }
+
+    }
+
+    // Extended JavaUtilJarAccess CodeSource API Support
+
+<span class="fc" id="L505">    private Map&lt;URL, Map&lt;CodeSigner[], CodeSource&gt;&gt; urlToCodeSourceMap = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L506">    private Map&lt;CodeSigner[], CodeSource&gt; signerToCodeSource = new HashMap&lt;&gt;();</span>
+    private URL lastURL;
+    private Map&lt;CodeSigner[], CodeSource&gt; lastURLMap;
+
+    /*
+     * Create a unique mapping from codeSigner cache entries to CodeSource.
+     * In theory, multiple URLs origins could map to a single locally cached
+     * and shared JAR file although in practice there will be a single URL in use.
+     */
+    private synchronized CodeSource mapSignersToCodeSource(URL url, CodeSigner[] signers) {
+        Map&lt;CodeSigner[], CodeSource&gt; map;
+<span class="nc bnc" id="L517" title="All 2 branches missed.">        if (url == lastURL) {</span>
+<span class="nc" id="L518">            map = lastURLMap;</span>
+        } else {
+<span class="nc" id="L520">            map = urlToCodeSourceMap.get(url);</span>
+<span class="nc bnc" id="L521" title="All 2 branches missed.">            if (map == null) {</span>
+<span class="nc" id="L522">                map = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L523">                urlToCodeSourceMap.put(url, map);</span>
+            }
+<span class="nc" id="L525">            lastURLMap = map;</span>
+<span class="nc" id="L526">            lastURL = url;</span>
+        }
+<span class="nc" id="L528">        CodeSource cs = map.get(signers);</span>
+<span class="nc bnc" id="L529" title="All 2 branches missed.">        if (cs == null) {</span>
+<span class="nc" id="L530">            cs = new VerifierCodeSource(csdomain, url, signers);</span>
+<span class="nc" id="L531">            signerToCodeSource.put(signers, cs);</span>
+        }
+<span class="nc" id="L533">        return cs;</span>
+    }
+
+    private CodeSource[] mapSignersToCodeSources(URL url, List&lt;CodeSigner[]&gt; signers, boolean unsigned) {
+<span class="nc" id="L537">        List&lt;CodeSource&gt; sources = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L539" title="All 2 branches missed.">        for (int i = 0; i &lt; signers.size(); i++) {</span>
+<span class="nc" id="L540">            sources.add(mapSignersToCodeSource(url, signers.get(i)));</span>
+        }
+<span class="nc bnc" id="L542" title="All 2 branches missed.">        if (unsigned) {</span>
+<span class="nc" id="L543">            sources.add(mapSignersToCodeSource(url, null));</span>
+        }
+<span class="nc" id="L545">        return sources.toArray(new CodeSource[sources.size()]);</span>
+    }
+<span class="fc" id="L547">    private CodeSigner[] emptySigner = new CodeSigner[0];</span>
+
+    /*
+     * Match CodeSource to a CodeSigner[] in the signer cache.
+     */
+    private CodeSigner[] findMatchingSigners(CodeSource cs) {
+<span class="nc bnc" id="L553" title="All 2 branches missed.">        if (cs instanceof VerifierCodeSource) {</span>
+<span class="nc" id="L554">            VerifierCodeSource vcs = (VerifierCodeSource) cs;</span>
+<span class="nc bnc" id="L555" title="All 2 branches missed.">            if (vcs.isSameDomain(csdomain)) {</span>
+<span class="nc" id="L556">                return ((VerifierCodeSource) cs).getPrivateSigners();</span>
+            }
+        }
+
+        /*
+         * In practice signers should always be optimized above
+         * but this handles a CodeSource of any type, just in case.
+         */
+<span class="nc" id="L564">        CodeSource[] sources = mapSignersToCodeSources(cs.getLocation(), getJarCodeSigners(), true);</span>
+<span class="nc" id="L565">        List&lt;CodeSource&gt; sourceList = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L566" title="All 2 branches missed.">        for (int i = 0; i &lt; sources.length; i++) {</span>
+<span class="nc" id="L567">            sourceList.add(sources[i]);</span>
+        }
+<span class="nc" id="L569">        int j = sourceList.indexOf(cs);</span>
+<span class="nc bnc" id="L570" title="All 2 branches missed.">        if (j != -1) {</span>
+            CodeSigner[] match;
+<span class="nc" id="L572">            match = ((VerifierCodeSource) sourceList.get(j)).getPrivateSigners();</span>
+<span class="nc bnc" id="L573" title="All 2 branches missed.">            if (match == null) {</span>
+<span class="nc" id="L574">                match = emptySigner;</span>
+            }
+<span class="nc" id="L576">            return match;</span>
+        }
+<span class="nc" id="L578">        return null;</span>
+    }
+
+    /*
+     * Instances of this class hold uncopied references to internal
+     * signing data that can be compared by object reference identity.
+     */
+    private static class VerifierCodeSource extends CodeSource {
+        private static final long serialVersionUID = -9047366145967768825L;
+
+        URL vlocation;
+        CodeSigner[] vsigners;
+        java.security.cert.Certificate[] vcerts;
+        Object csdomain;
+
+        VerifierCodeSource(Object csdomain, URL location, CodeSigner[] signers) {
+<span class="nc" id="L594">            super(location, signers);</span>
+<span class="nc" id="L595">            this.csdomain = csdomain;</span>
+<span class="nc" id="L596">            vlocation = location;</span>
+<span class="nc" id="L597">            vsigners = signers; // from signerCache</span>
+<span class="nc" id="L598">        }</span>
+
+        VerifierCodeSource(Object csdomain, URL location, java.security.cert.Certificate[] certs) {
+<span class="nc" id="L601">            super(location, certs);</span>
+<span class="nc" id="L602">            this.csdomain = csdomain;</span>
+<span class="nc" id="L603">            vlocation = location;</span>
+<span class="nc" id="L604">            vcerts = certs; // from signerCache</span>
+<span class="nc" id="L605">        }</span>
+
+        /*
+         * All VerifierCodeSource instances are constructed based on
+         * singleton signerCache or signerCacheCert entries for each unique signer.
+         * No CodeSigner&lt;-&gt;Certificate[] conversion is required.
+         * We use these assumptions to optimize equality comparisons.
+         */
+        public boolean equals(Object obj) {
+<span class="nc bnc" id="L614" title="All 2 branches missed.">            if (obj == this) {</span>
+<span class="nc" id="L615">                return true;</span>
+            }
+<span class="nc bnc" id="L617" title="All 2 branches missed.">            if (obj instanceof VerifierCodeSource) {</span>
+<span class="nc" id="L618">                VerifierCodeSource that = (VerifierCodeSource) obj;</span>
+
+                /*
+                 * Only compare against other per-signer singletons constructed
+                 * on behalf of the same JarFile instance. Otherwise, compare
+                 * things the slower way.
+                 */
+<span class="nc bnc" id="L625" title="All 2 branches missed.">                if (isSameDomain(that.csdomain)) {</span>
+<span class="nc bnc" id="L626" title="All 4 branches missed.">                    if (that.vsigners != this.vsigners</span>
+                            || that.vcerts != this.vcerts) {
+<span class="nc" id="L628">                        return false;</span>
+                    }
+<span class="nc bnc" id="L630" title="All 2 branches missed.">                    if (that.vlocation != null) {</span>
+<span class="nc" id="L631">                        return that.vlocation.equals(this.vlocation);</span>
+<span class="nc bnc" id="L632" title="All 2 branches missed.">                    } else if (this.vlocation != null) {</span>
+<span class="nc" id="L633">                        return this.vlocation.equals(that.vlocation);</span>
+                    } else { // both null
+<span class="nc" id="L635">                        return true;</span>
+                    }
+                }
+            }
+<span class="nc" id="L639">            return super.equals(obj);</span>
+        }
+
+        boolean isSameDomain(Object csdomain) {
+<span class="nc bnc" id="L643" title="All 2 branches missed.">            return this.csdomain == csdomain;</span>
+        }
+
+        private CodeSigner[] getPrivateSigners() {
+<span class="nc" id="L647">            return vsigners;</span>
+        }
+
+        private java.security.cert.Certificate[] getPrivateCertificates() {
+<span class="nc" id="L651">            return vcerts;</span>
+        }
+    }
+    private Map&lt;String, CodeSigner[]&gt; signerMap;
+
+    private synchronized Map&lt;String, CodeSigner[]&gt; signerMap() {
+<span class="nc bnc" id="L657" title="All 2 branches missed.">        if (signerMap == null) {</span>
+            /*
+             * Snapshot signer state so it doesn't change on us. We care
+             * only about the asserted signatures. Verification of
+             * signature validity happens via the JarEntry apis.
+             */
+<span class="nc" id="L663">            signerMap = new HashMap&lt;&gt;(verifiedSigners.size() + sigFileSigners.size());</span>
+<span class="nc" id="L664">            signerMap.putAll(verifiedSigners);</span>
+<span class="nc" id="L665">            signerMap.putAll(sigFileSigners);</span>
+        }
+<span class="nc" id="L667">        return signerMap;</span>
+    }
+
+    public synchronized Enumeration&lt;String&gt; entryNames(JarFile jar, final CodeSource[] cs) {
+<span class="nc" id="L671">        final Map&lt;String, CodeSigner[]&gt; map = signerMap();</span>
+<span class="nc" id="L672">        final Iterator&lt;Map.Entry&lt;String, CodeSigner[]&gt;&gt; itor = map.entrySet().iterator();</span>
+<span class="nc" id="L673">        boolean matchUnsigned = false;</span>
+
+        /*
+         * Grab a single copy of the CodeSigner arrays. Check
+         * to see if we can optimize CodeSigner equality test.
+         */
+<span class="nc" id="L679">        List&lt;CodeSigner[]&gt; req = new ArrayList&lt;&gt;(cs.length);</span>
+<span class="nc bnc" id="L680" title="All 2 branches missed.">        for (int i = 0; i &lt; cs.length; i++) {</span>
+<span class="nc" id="L681">            CodeSigner[] match = findMatchingSigners(cs[i]);</span>
+<span class="nc bnc" id="L682" title="All 2 branches missed.">            if (match != null) {</span>
+<span class="nc bnc" id="L683" title="All 2 branches missed.">                if (match.length &gt; 0) {</span>
+<span class="nc" id="L684">                    req.add(match);</span>
+                } else {
+<span class="nc" id="L686">                    matchUnsigned = true;</span>
+                }
+            }
+        }
+
+<span class="nc" id="L691">        final List&lt;CodeSigner[]&gt; signersReq = req;</span>
+<span class="nc bnc" id="L692" title="All 2 branches missed.">        final Enumeration&lt;String&gt; enum2 = (matchUnsigned) ? unsignedEntryNames(jar) : emptyEnumeration;</span>
+
+<span class="nc" id="L694">        return new Enumeration&lt;String&gt;() {</span>
+
+            String name;
+
+            public boolean hasMoreElements() {
+<span class="nc bnc" id="L699" title="All 2 branches missed.">                if (name != null) {</span>
+<span class="nc" id="L700">                    return true;</span>
+                }
+
+<span class="nc bnc" id="L703" title="All 2 branches missed.">                while (itor.hasNext()) {</span>
+<span class="nc" id="L704">                    Map.Entry&lt;String, CodeSigner[]&gt; e = itor.next();</span>
+<span class="nc bnc" id="L705" title="All 2 branches missed.">                    if (signersReq.contains(e.getValue())) {</span>
+<span class="nc" id="L706">                        name = e.getKey();</span>
+<span class="nc" id="L707">                        return true;</span>
+                    }
+<span class="nc" id="L709">                }</span>
+<span class="nc bnc" id="L710" title="All 2 branches missed.">                while (enum2.hasMoreElements()) {</span>
+<span class="nc" id="L711">                    name = enum2.nextElement();</span>
+<span class="nc" id="L712">                    return true;</span>
+                }
+<span class="nc" id="L714">                return false;</span>
+            }
+
+            public String nextElement() {
+<span class="nc bnc" id="L718" title="All 2 branches missed.">                if (hasMoreElements()) {</span>
+<span class="nc" id="L719">                    String value = name;</span>
+<span class="nc" id="L720">                    name = null;</span>
+<span class="nc" id="L721">                    return value;</span>
+                }
+<span class="nc" id="L723">                throw new NoSuchElementException();</span>
+            }
+        };
+    }
+
+    /*
+     * Like entries() but screens out internal JAR mechanism entries
+     * and includes signed entries with no ZIP data.
+     */
+    public Enumeration&lt;JarEntry&gt; entries2(final JarFile jar, Enumeration&lt;? extends ZipEntry&gt; e) {
+<span class="nc" id="L733">        final Map&lt;String, CodeSigner[]&gt; map = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L734">        map.putAll(signerMap());</span>
+<span class="nc" id="L735">        final Enumeration&lt;? extends ZipEntry&gt; enum_ = e;</span>
+<span class="nc" id="L736">        return new Enumeration&lt;JarEntry&gt;() {</span>
+
+<span class="nc" id="L738">            Enumeration&lt;String&gt; signers = null;</span>
+            JarEntry entry;
+
+            public boolean hasMoreElements() {
+<span class="nc bnc" id="L742" title="All 2 branches missed.">                if (entry != null) {</span>
+<span class="nc" id="L743">                    return true;</span>
+                }
+<span class="nc bnc" id="L745" title="All 2 branches missed.">                while (enum_.hasMoreElements()) {</span>
+<span class="nc" id="L746">                    ZipEntry ze = enum_.nextElement();</span>
+<span class="nc bnc" id="L747" title="All 2 branches missed.">                    if (JarVerifier.isSigningRelated(ze.getName())) {</span>
+<span class="nc" id="L748">                        continue;</span>
+                    }
+<span class="nc" id="L750">                    entry = jar.newEntry(ze);</span>
+<span class="nc" id="L751">                    return true;</span>
+                }
+<span class="nc bnc" id="L753" title="All 2 branches missed.">                if (signers == null) {</span>
+<span class="nc" id="L754">                    signers = Collections.enumeration(map.keySet());</span>
+                }
+<span class="nc bnc" id="L756" title="All 2 branches missed.">                while (signers.hasMoreElements()) {</span>
+<span class="nc" id="L757">                    String name = signers.nextElement();</span>
+<span class="nc" id="L758">                    entry = jar.newEntry(new ZipEntry(name));</span>
+<span class="nc" id="L759">                    return true;</span>
+                }
+
+                // Any map entries left?
+<span class="nc" id="L763">                return false;</span>
+            }
+
+            public JarEntry nextElement() {
+<span class="nc bnc" id="L767" title="All 2 branches missed.">                if (hasMoreElements()) {</span>
+<span class="nc" id="L768">                    JarEntry je = entry;</span>
+<span class="nc" id="L769">                    map.remove(je.getName());</span>
+<span class="nc" id="L770">                    entry = null;</span>
+<span class="nc" id="L771">                    return je;</span>
+                }
+<span class="nc" id="L773">                throw new NoSuchElementException();</span>
+            }
+        };
+    }
+<span class="fc" id="L777">    private Enumeration&lt;String&gt; emptyEnumeration = new Enumeration&lt;String&gt;() {</span>
+
+        public boolean hasMoreElements() {
+<span class="nc" id="L780">            return false;</span>
+        }
+
+        public String nextElement() {
+<span class="nc" id="L784">            throw new NoSuchElementException();</span>
+        }
+    };
+
+    // true if file is part of the signature mechanism itself
+    static boolean isSigningRelated(String name) {
+<span class="nc" id="L790">        name = name.toUpperCase(Locale.ENGLISH);</span>
+<span class="nc bnc" id="L791" title="All 2 branches missed.">        if (!name.startsWith(&quot;META-INF/&quot;)) {</span>
+<span class="nc" id="L792">            return false;</span>
+        }
+<span class="nc" id="L794">        name = name.substring(9);</span>
+<span class="nc bnc" id="L795" title="All 2 branches missed.">        if (name.indexOf('/') != -1) {</span>
+<span class="nc" id="L796">            return false;</span>
+        }
+<span class="nc bnc" id="L798" title="All 2 branches missed.">        if (name.endsWith(&quot;.DSA&quot;)</span>
+<span class="nc bnc" id="L799" title="All 2 branches missed.">                || name.endsWith(&quot;.RSA&quot;)</span>
+<span class="nc bnc" id="L800" title="All 2 branches missed.">                || name.endsWith(&quot;.SF&quot;)</span>
+<span class="nc bnc" id="L801" title="All 2 branches missed.">                || name.endsWith(&quot;.EC&quot;)</span>
+<span class="nc bnc" id="L802" title="All 2 branches missed.">                || name.startsWith(&quot;SIG-&quot;)</span>
+<span class="nc bnc" id="L803" title="All 2 branches missed.">                || name.equals(&quot;MANIFEST.MF&quot;)) {</span>
+<span class="nc" id="L804">            return true;</span>
+        }
+<span class="nc" id="L806">        return false;</span>
+    }
+
+    private Enumeration&lt;String&gt; unsignedEntryNames(JarFile jar) {
+<span class="nc" id="L810">        final Map&lt;String, CodeSigner[]&gt; map = signerMap();</span>
+<span class="nc" id="L811">        final Enumeration&lt;JarEntry&gt; entries = jar.entries();</span>
+<span class="nc" id="L812">        return new Enumeration&lt;String&gt;() {</span>
+
+            String name;
+
+            /*
+             * Grab entries from ZIP directory but screen out
+             * metadata.
+             */
+            public boolean hasMoreElements() {
+<span class="nc bnc" id="L821" title="All 2 branches missed.">                if (name != null) {</span>
+<span class="nc" id="L822">                    return true;</span>
+                }
+<span class="nc bnc" id="L824" title="All 2 branches missed.">                while (entries.hasMoreElements()) {</span>
+                    String value;
+<span class="nc" id="L826">                    ZipEntry e = entries.nextElement();</span>
+<span class="nc" id="L827">                    value = e.getName();</span>
+<span class="nc bnc" id="L828" title="All 4 branches missed.">                    if (e.isDirectory() || isSigningRelated(value)) {</span>
+<span class="nc" id="L829">                        continue;</span>
+                    }
+<span class="nc bnc" id="L831" title="All 2 branches missed.">                    if (map.get(value) == null) {</span>
+<span class="nc" id="L832">                        name = value;</span>
+<span class="nc" id="L833">                        return true;</span>
+                    }
+<span class="nc" id="L835">                }</span>
+<span class="nc" id="L836">                return false;</span>
+            }
+
+            public String nextElement() {
+<span class="nc bnc" id="L840" title="All 2 branches missed.">                if (hasMoreElements()) {</span>
+<span class="nc" id="L841">                    String value = name;</span>
+<span class="nc" id="L842">                    name = null;</span>
+<span class="nc" id="L843">                    return value;</span>
+                }
+<span class="nc" id="L845">                throw new NoSuchElementException();</span>
+            }
+        };
+    }
+    private List&lt;CodeSigner[]&gt; jarCodeSigners;
+
+    private synchronized List&lt;CodeSigner[]&gt; getJarCodeSigners() {
+        CodeSigner[] signers;
+<span class="nc bnc" id="L853" title="All 2 branches missed.">        if (jarCodeSigners == null) {</span>
+<span class="nc" id="L854">            HashSet&lt;CodeSigner[]&gt; set = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L855">            set.addAll(signerMap().values());</span>
+<span class="nc" id="L856">            jarCodeSigners = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L857">            jarCodeSigners.addAll(set);</span>
+        }
+<span class="nc" id="L859">        return jarCodeSigners;</span>
+    }
+
+    public synchronized CodeSource[] getCodeSources(JarFile jar, URL url) {
+<span class="nc" id="L863">        boolean hasUnsigned = unsignedEntryNames(jar).hasMoreElements();</span>
+
+<span class="nc" id="L865">        return mapSignersToCodeSources(url, getJarCodeSigners(), hasUnsigned);</span>
+    }
+
+    public CodeSource getCodeSource(URL url, String name) {
+        CodeSigner[] signers;
+
+<span class="nc" id="L871">        signers = signerMap().get(name);</span>
+<span class="nc" id="L872">        return mapSignersToCodeSource(url, signers);</span>
+    }
+
+    public CodeSource getCodeSource(URL url, JarFile jar, JarEntry je) {
+        CodeSigner[] signers;
+
+<span class="nc" id="L878">        return mapSignersToCodeSource(url, getCodeSigners(jar, je));</span>
+    }
+
+    public void setEagerValidation(boolean eager) {
+<span class="nc" id="L882">        eagerValidation = eager;</span>
+<span class="nc" id="L883">    }</span>
+
+    public synchronized List&lt;Object&gt; getManifestDigests() {
+<span class="nc" id="L886">        return Collections.unmodifiableList(manifestDigests);</span>
+    }
+
+    static CodeSource getUnsignedCS(URL url) {
+<span class="nc" id="L890">        return new VerifierCodeSource(null, url, (java.security.cert.Certificate[]) null);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

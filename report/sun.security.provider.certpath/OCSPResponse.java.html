@@ -1,0 +1,751 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>OCSPResponse.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.provider.certpath</a> &gt; <span class="el_source">OCSPResponse.java</span></div><h1>OCSPResponse.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2003, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.security.provider.certpath;
+
+import java.io.*;
+import java.security.*;
+import java.security.cert.CertificateException;
+import java.security.cert.CertificateParsingException;
+import java.security.cert.CertPathValidatorException;
+import java.security.cert.CertPathValidatorException.BasicReason;
+import java.security.cert.CRLReason;
+import java.security.cert.TrustAnchor;
+import java.security.cert.X509Certificate;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import javax.security.auth.x500.X500Principal;
+
+import sun.misc.HexDumpEncoder;
+import sun.security.action.GetIntegerAction;
+import sun.security.x509.*;
+import sun.security.util.*;
+
+/**
+ * This class is used to process an OCSP response.
+ * The OCSP Response is defined
+ * in RFC 2560 and the ASN.1 encoding is as follows:
+ * &lt;pre&gt;
+ *
+ *  OCSPResponse ::= SEQUENCE {
+ *      responseStatus         OCSPResponseStatus,
+ *      responseBytes          [0] EXPLICIT ResponseBytes OPTIONAL }
+ *
+ *   OCSPResponseStatus ::= ENUMERATED {
+ *       successful            (0),  --Response has valid confirmations
+ *       malformedRequest      (1),  --Illegal confirmation request
+ *       internalError         (2),  --Internal error in issuer
+ *       tryLater              (3),  --Try again later
+ *                                   --(4) is not used
+ *       sigRequired           (5),  --Must sign the request
+ *       unauthorized          (6)   --Request unauthorized
+ *   }
+ *
+ *   ResponseBytes ::=       SEQUENCE {
+ *       responseType   OBJECT IDENTIFIER,
+ *       response       OCTET STRING }
+ *
+ *   BasicOCSPResponse       ::= SEQUENCE {
+ *      tbsResponseData      ResponseData,
+ *      signatureAlgorithm   AlgorithmIdentifier,
+ *      signature            BIT STRING,
+ *      certs                [0] EXPLICIT SEQUENCE OF Certificate OPTIONAL }
+ *
+ *   The value for signature SHALL be computed on the hash of the DER
+ *   encoding ResponseData.
+ *
+ *   ResponseData ::= SEQUENCE {
+ *      version              [0] EXPLICIT Version DEFAULT v1,
+ *      responderID              ResponderID,
+ *      producedAt               GeneralizedTime,
+ *      responses                SEQUENCE OF SingleResponse,
+ *      responseExtensions   [1] EXPLICIT Extensions OPTIONAL }
+ *
+ *   ResponderID ::= CHOICE {
+ *      byName               [1] Name,
+ *      byKey                [2] KeyHash }
+ *
+ *   KeyHash ::= OCTET STRING -- SHA-1 hash of responder's public key
+ *   (excluding the tag and length fields)
+ *
+ *   SingleResponse ::= SEQUENCE {
+ *      certID                       CertID,
+ *      certStatus                   CertStatus,
+ *      thisUpdate                   GeneralizedTime,
+ *      nextUpdate         [0]       EXPLICIT GeneralizedTime OPTIONAL,
+ *      singleExtensions   [1]       EXPLICIT Extensions OPTIONAL }
+ *
+ *   CertStatus ::= CHOICE {
+ *       good        [0]     IMPLICIT NULL,
+ *       revoked     [1]     IMPLICIT RevokedInfo,
+ *       unknown     [2]     IMPLICIT UnknownInfo }
+ *
+ *   RevokedInfo ::= SEQUENCE {
+ *       revocationTime              GeneralizedTime,
+ *       revocationReason    [0]     EXPLICIT CRLReason OPTIONAL }
+ *
+ *   UnknownInfo ::= NULL -- this can be replaced with an enumeration
+ *
+ * &lt;/pre&gt;
+ *
+ * @author      Ram Marti
+ */
+
+public final class OCSPResponse {
+
+<span class="nc" id="L123">    public enum ResponseStatus {</span>
+<span class="nc" id="L124">        SUCCESSFUL,            // Response has valid confirmations</span>
+<span class="nc" id="L125">        MALFORMED_REQUEST,     // Illegal request</span>
+<span class="nc" id="L126">        INTERNAL_ERROR,        // Internal error in responder</span>
+<span class="nc" id="L127">        TRY_LATER,             // Try again later</span>
+<span class="nc" id="L128">        UNUSED,                // is not used</span>
+<span class="nc" id="L129">        SIG_REQUIRED,          // Must sign the request</span>
+<span class="nc" id="L130">        UNAUTHORIZED           // Request unauthorized</span>
+    };
+<span class="nc" id="L132">    private static ResponseStatus[] rsvalues = ResponseStatus.values();</span>
+
+<span class="nc" id="L134">    private static final Debug debug = Debug.getInstance(&quot;certpath&quot;);</span>
+    private static final boolean dump = false;
+<span class="nc" id="L136">    private static final ObjectIdentifier OCSP_BASIC_RESPONSE_OID =</span>
+<span class="nc" id="L137">        ObjectIdentifier.newInternal(new int[] { 1, 3, 6, 1, 5, 5, 7, 48, 1, 1});</span>
+    private static final int CERT_STATUS_GOOD = 0;
+    private static final int CERT_STATUS_REVOKED = 1;
+    private static final int CERT_STATUS_UNKNOWN = 2;
+
+    // ResponderID CHOICE tags
+    private static final int NAME_TAG = 1;
+    private static final int KEY_TAG = 2;
+
+    // Object identifier for the OCSPSigning key purpose
+    private static final String KP_OCSP_SIGNING_OID = &quot;1.3.6.1.5.5.7.3.9&quot;;
+
+    // Default maximum clock skew in milliseconds (15 minutes)
+    // allowed when checking validity of OCSP responses
+    private static final int DEFAULT_MAX_CLOCK_SKEW = 900000;
+
+    /**
+     * Integer value indicating the maximum allowable clock skew, in seconds,
+     * to be used for the OCSP check.
+     */
+<span class="nc" id="L157">    private static final int MAX_CLOCK_SKEW = initializeClockSkew();</span>
+
+    /**
+     * Initialize the maximum allowable clock skew by getting the OCSP
+     * clock skew system property. If the property has not been set, or if its
+     * value is negative, set the skew to the default.
+     */
+    private static int initializeClockSkew() {
+<span class="nc" id="L165">        Integer tmp = java.security.AccessController.doPrivileged(</span>
+                new GetIntegerAction(&quot;com.sun.security.ocsp.clockSkew&quot;));
+<span class="nc bnc" id="L167" title="All 4 branches missed.">        if (tmp == null || tmp &lt; 0) {</span>
+<span class="nc" id="L168">            return DEFAULT_MAX_CLOCK_SKEW;</span>
+        }
+        // Convert to milliseconds, as the system property will be
+        // specified in seconds
+<span class="nc" id="L172">        return tmp * 1000;</span>
+    }
+
+    // an array of all of the CRLReasons (used in SingleResponse)
+<span class="nc" id="L176">    private static CRLReason[] values = CRLReason.values();</span>
+
+    private final ResponseStatus responseStatus;
+    private final Map&lt;CertId, SingleResponse&gt; singleResponseMap;
+    private final List&lt;X509CertImpl&gt; certs;
+    private final AlgorithmId sigAlgId;
+    private final byte[] signature;
+    private final byte[] tbsResponseData;
+    private final byte[] responseNonce;
+
+    /*
+     * Create an OCSP response from its ASN.1 DER encoding.
+     */
+<span class="nc" id="L189">    OCSPResponse(byte[] bytes) throws IOException {</span>
+        if (dump) {
+            HexDumpEncoder hexEnc = new HexDumpEncoder();
+            System.out.println(&quot;OCSPResponse bytes are...&quot;);
+            System.out.println(hexEnc.encode(bytes));
+        }
+<span class="nc" id="L195">        DerValue der = new DerValue(bytes);</span>
+<span class="nc bnc" id="L196" title="All 2 branches missed.">        if (der.tag != DerValue.tag_Sequence) {</span>
+<span class="nc" id="L197">            throw new IOException(&quot;Bad encoding in OCSP response: &quot; +</span>
+                &quot;expected ASN.1 SEQUENCE tag.&quot;);
+        }
+<span class="nc" id="L200">        DerInputStream derIn = der.getData();</span>
+
+        // responseStatus
+<span class="nc" id="L203">        int status = derIn.getEnumerated();</span>
+<span class="nc bnc" id="L204" title="All 4 branches missed.">        if (status &gt;= 0 &amp;&amp; status &lt; rsvalues.length) {</span>
+<span class="nc" id="L205">            responseStatus = rsvalues[status];</span>
+        } else {
+            // unspecified responseStatus
+<span class="nc" id="L208">            throw new IOException(&quot;Unknown OCSPResponse status: &quot; + status);</span>
+        }
+<span class="nc bnc" id="L210" title="All 2 branches missed.">        if (debug != null) {</span>
+<span class="nc" id="L211">            debug.println(&quot;OCSP response status: &quot; + responseStatus);</span>
+        }
+<span class="nc bnc" id="L213" title="All 2 branches missed.">        if (responseStatus != ResponseStatus.SUCCESSFUL) {</span>
+            // no need to continue, responseBytes are not set.
+<span class="nc" id="L215">            singleResponseMap = Collections.emptyMap();</span>
+<span class="nc" id="L216">            certs = Collections.&lt;X509CertImpl&gt;emptyList();</span>
+<span class="nc" id="L217">            sigAlgId = null;</span>
+<span class="nc" id="L218">            signature = null;</span>
+<span class="nc" id="L219">            tbsResponseData = null;</span>
+<span class="nc" id="L220">            responseNonce = null;</span>
+<span class="nc" id="L221">            return;</span>
+        }
+
+        // responseBytes
+<span class="nc" id="L225">        der = derIn.getDerValue();</span>
+<span class="nc bnc" id="L226" title="All 2 branches missed.">        if (!der.isContextSpecific((byte)0)) {</span>
+<span class="nc" id="L227">            throw new IOException(&quot;Bad encoding in responseBytes element &quot; +</span>
+                &quot;of OCSP response: expected ASN.1 context specific tag 0.&quot;);
+        }
+<span class="nc" id="L230">        DerValue tmp = der.data.getDerValue();</span>
+<span class="nc bnc" id="L231" title="All 2 branches missed.">        if (tmp.tag != DerValue.tag_Sequence) {</span>
+<span class="nc" id="L232">            throw new IOException(&quot;Bad encoding in responseBytes element &quot; +</span>
+                &quot;of OCSP response: expected ASN.1 SEQUENCE tag.&quot;);
+        }
+
+        // responseType
+<span class="nc" id="L237">        derIn = tmp.data;</span>
+<span class="nc" id="L238">        ObjectIdentifier responseType = derIn.getOID();</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">        if (responseType.equals((Object)OCSP_BASIC_RESPONSE_OID)) {</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L241">                debug.println(&quot;OCSP response type: basic&quot;);</span>
+            }
+        } else {
+<span class="nc bnc" id="L244" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L245">                debug.println(&quot;OCSP response type: &quot; + responseType);</span>
+            }
+<span class="nc" id="L247">            throw new IOException(&quot;Unsupported OCSP response type: &quot; +</span>
+                                  responseType);
+        }
+
+        // BasicOCSPResponse
+<span class="nc" id="L252">        DerInputStream basicOCSPResponse =</span>
+<span class="nc" id="L253">            new DerInputStream(derIn.getOctetString());</span>
+
+<span class="nc" id="L255">        DerValue[] seqTmp = basicOCSPResponse.getSequence(2);</span>
+<span class="nc bnc" id="L256" title="All 2 branches missed.">        if (seqTmp.length &lt; 3) {</span>
+<span class="nc" id="L257">            throw new IOException(&quot;Unexpected BasicOCSPResponse value&quot;);</span>
+        }
+
+<span class="nc" id="L260">        DerValue responseData = seqTmp[0];</span>
+
+        // Need the DER encoded ResponseData to verify the signature later
+<span class="nc" id="L263">        tbsResponseData = seqTmp[0].toByteArray();</span>
+
+        // tbsResponseData
+<span class="nc bnc" id="L266" title="All 2 branches missed.">        if (responseData.tag != DerValue.tag_Sequence) {</span>
+<span class="nc" id="L267">            throw new IOException(&quot;Bad encoding in tbsResponseData &quot; +</span>
+                &quot;element of OCSP response: expected ASN.1 SEQUENCE tag.&quot;);
+        }
+<span class="nc" id="L270">        DerInputStream seqDerIn = responseData.data;</span>
+<span class="nc" id="L271">        DerValue seq = seqDerIn.getDerValue();</span>
+
+        // version
+<span class="nc bnc" id="L274" title="All 2 branches missed.">        if (seq.isContextSpecific((byte)0)) {</span>
+            // seq[0] is version
+<span class="nc bnc" id="L276" title="All 4 branches missed.">            if (seq.isConstructed() &amp;&amp; seq.isContextSpecific()) {</span>
+                //System.out.println (&quot;version is available&quot;);
+<span class="nc" id="L278">                seq = seq.data.getDerValue();</span>
+<span class="nc" id="L279">                int version = seq.getInteger();</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">                if (seq.data.available() != 0) {</span>
+<span class="nc" id="L281">                    throw new IOException(&quot;Bad encoding in version &quot; +</span>
+                        &quot; element of OCSP response: bad format&quot;);
+                }
+<span class="nc" id="L284">                seq = seqDerIn.getDerValue();</span>
+            }
+        }
+
+        // responderID
+<span class="nc" id="L289">        short tag = (byte)(seq.tag &amp; 0x1f);</span>
+<span class="nc bnc" id="L290" title="All 2 branches missed.">        if (tag == NAME_TAG) {</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L292">                X500Principal responderName =</span>
+<span class="nc" id="L293">                    new X500Principal(seq.getData().toByteArray());</span>
+<span class="nc" id="L294">                debug.println(&quot;OCSP Responder name: &quot; + responderName);</span>
+<span class="nc" id="L295">            }</span>
+<span class="nc bnc" id="L296" title="All 2 branches missed.">        } else if (tag == KEY_TAG) {</span>
+<span class="nc bnc" id="L297" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L298">                byte[] responderKey = seq.getData().getOctetString();</span>
+<span class="nc" id="L299">                debug.println(&quot;OCSP Responder key: &quot; +</span>
+<span class="nc" id="L300">                              Debug.toString(responderKey));</span>
+<span class="nc" id="L301">            }</span>
+        } else {
+<span class="nc" id="L303">            throw new IOException(&quot;Bad encoding in responderID element of &quot; +</span>
+                &quot;OCSP response: expected ASN.1 context specific tag 0 or 1&quot;);
+        }
+
+        // producedAt
+<span class="nc" id="L308">        seq = seqDerIn.getDerValue();</span>
+<span class="nc bnc" id="L309" title="All 2 branches missed.">        if (debug != null) {</span>
+<span class="nc" id="L310">            Date producedAtDate = seq.getGeneralizedTime();</span>
+<span class="nc" id="L311">            debug.println(&quot;OCSP response produced at: &quot; + producedAtDate);</span>
+        }
+
+        // responses
+<span class="nc" id="L315">        DerValue[] singleResponseDer = seqDerIn.getSequence(1);</span>
+<span class="nc" id="L316">        singleResponseMap = new HashMap&lt;&gt;(singleResponseDer.length);</span>
+<span class="nc bnc" id="L317" title="All 2 branches missed.">        if (debug != null) {</span>
+<span class="nc" id="L318">            debug.println(&quot;OCSP number of SingleResponses: &quot;</span>
+                          + singleResponseDer.length);
+        }
+<span class="nc bnc" id="L321" title="All 2 branches missed.">        for (int i = 0; i &lt; singleResponseDer.length; i++) {</span>
+<span class="nc" id="L322">            SingleResponse singleResponse =</span>
+                new SingleResponse(singleResponseDer[i]);
+<span class="nc" id="L324">            singleResponseMap.put(singleResponse.getCertId(), singleResponse);</span>
+        }
+
+        // responseExtensions
+<span class="nc" id="L328">        byte[] nonce = null;</span>
+<span class="nc bnc" id="L329" title="All 2 branches missed.">        if (seqDerIn.available() &gt; 0) {</span>
+<span class="nc" id="L330">            seq = seqDerIn.getDerValue();</span>
+<span class="nc bnc" id="L331" title="All 2 branches missed.">            if (seq.isContextSpecific((byte)1)) {</span>
+<span class="nc" id="L332">                DerValue[] responseExtDer = seq.data.getSequence(3);</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">                for (int i = 0; i &lt; responseExtDer.length; i++) {</span>
+<span class="nc" id="L334">                    Extension ext = new Extension(responseExtDer[i]);</span>
+<span class="nc bnc" id="L335" title="All 2 branches missed.">                    if (debug != null) {</span>
+<span class="nc" id="L336">                        debug.println(&quot;OCSP extension: &quot; + ext);</span>
+                    }
+                    // Only the NONCE extension is recognized
+<span class="nc bnc" id="L339" title="All 2 branches missed.">                    if (ext.getExtensionId().equals((Object)</span>
+                        OCSP.NONCE_EXTENSION_OID))
+                    {
+<span class="nc" id="L342">                        nonce = ext.getExtensionValue();</span>
+<span class="nc bnc" id="L343" title="All 2 branches missed.">                    } else if (ext.isCritical())  {</span>
+<span class="nc" id="L344">                        throw new IOException(</span>
+                            &quot;Unsupported OCSP critical extension: &quot; +
+<span class="nc" id="L346">                            ext.getExtensionId());</span>
+                    }
+                }
+            }
+        }
+<span class="nc" id="L351">        responseNonce = nonce;</span>
+
+        // signatureAlgorithmId
+<span class="nc" id="L354">        sigAlgId = AlgorithmId.parse(seqTmp[1]);</span>
+
+        // signature
+<span class="nc" id="L357">        signature = seqTmp[2].getBitString();</span>
+
+        // if seq[3] is available , then it is a sequence of certificates
+<span class="nc bnc" id="L360" title="All 2 branches missed.">        if (seqTmp.length &gt; 3) {</span>
+            // certs are available
+<span class="nc" id="L362">            DerValue seqCert = seqTmp[3];</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">            if (!seqCert.isContextSpecific((byte)0)) {</span>
+<span class="nc" id="L364">                throw new IOException(&quot;Bad encoding in certs element of &quot; +</span>
+                    &quot;OCSP response: expected ASN.1 context specific tag 0.&quot;);
+            }
+<span class="nc" id="L367">            DerValue[] derCerts = seqCert.getData().getSequence(3);</span>
+<span class="nc" id="L368">            certs = new ArrayList&lt;X509CertImpl&gt;(derCerts.length);</span>
+            try {
+<span class="nc bnc" id="L370" title="All 2 branches missed.">                for (int i = 0; i &lt; derCerts.length; i++) {</span>
+<span class="nc" id="L371">                    certs.add(new X509CertImpl(derCerts[i].toByteArray()));</span>
+                }
+<span class="nc" id="L373">            } catch (CertificateException ce) {</span>
+<span class="nc" id="L374">                throw new IOException(&quot;Bad encoding in X509 Certificate&quot;, ce);</span>
+<span class="nc" id="L375">            }</span>
+<span class="nc" id="L376">        } else {</span>
+<span class="nc" id="L377">            certs = Collections.&lt;X509CertImpl&gt;emptyList();</span>
+        }
+<span class="nc" id="L379">    }</span>
+
+    void verify(List&lt;CertId&gt; certIds, X509Certificate responderCert,
+                Date date, byte[] nonce)
+        throws CertPathValidatorException
+    {
+<span class="nc bnc" id="L385" title="All 3 branches missed.">        switch (responseStatus) {</span>
+            case SUCCESSFUL:
+<span class="nc" id="L387">                break;</span>
+            case TRY_LATER:
+            case INTERNAL_ERROR:
+<span class="nc" id="L390">                throw new CertPathValidatorException(</span>
+                    &quot;OCSP response error: &quot; + responseStatus, null, null, -1,
+                    BasicReason.UNDETERMINED_REVOCATION_STATUS);
+            case UNAUTHORIZED:
+            default:
+<span class="nc" id="L395">                throw new CertPathValidatorException(&quot;OCSP response error: &quot; +</span>
+                                                     responseStatus);
+        }
+
+        // Check that the response includes a response for all of the
+        // certs that were supplied in the request
+<span class="nc bnc" id="L401" title="All 2 branches missed.">        for (CertId certId : certIds) {</span>
+<span class="nc" id="L402">            SingleResponse sr = getSingleResponse(certId);</span>
+<span class="nc bnc" id="L403" title="All 2 branches missed.">            if (sr == null) {</span>
+<span class="nc bnc" id="L404" title="All 2 branches missed.">                if (debug != null) {</span>
+<span class="nc" id="L405">                    debug.println(&quot;No response found for CertId: &quot; + certId);</span>
+                }
+<span class="nc" id="L407">                throw new CertPathValidatorException(</span>
+                    &quot;OCSP response does not include a response for a &quot; +
+                    &quot;certificate supplied in the OCSP request&quot;);
+            }
+<span class="nc bnc" id="L411" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L412">                debug.println(&quot;Status of certificate (with serial number &quot; +</span>
+<span class="nc" id="L413">                    certId.getSerialNumber() + &quot;) is: &quot; + sr.getCertStatus());</span>
+            }
+<span class="nc" id="L415">        }</span>
+
+
+        // Check whether the cert returned by the responder is trusted
+<span class="nc bnc" id="L419" title="All 2 branches missed.">        if (!certs.isEmpty()) {</span>
+<span class="nc" id="L420">            X509CertImpl cert = certs.get(0);</span>
+            // First check if the cert matches the expected responder cert
+<span class="nc bnc" id="L422" title="All 2 branches missed.">            if (cert.equals(responderCert)) {</span>
+                // cert is trusted, now verify the signed response
+
+            // Next check if the cert was issued by the responder cert
+            // which was set locally.
+<span class="nc bnc" id="L427" title="All 2 branches missed.">            } else if (cert.getIssuerX500Principal().equals(</span>
+<span class="nc" id="L428">                       responderCert.getSubjectX500Principal())) {</span>
+
+                // Check for the OCSPSigning key purpose
+                try {
+<span class="nc" id="L432">                    List&lt;String&gt; keyPurposes = cert.getExtendedKeyUsage();</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">                    if (keyPurposes == null ||</span>
+<span class="nc bnc" id="L434" title="All 2 branches missed.">                        !keyPurposes.contains(KP_OCSP_SIGNING_OID)) {</span>
+<span class="nc" id="L435">                        throw new CertPathValidatorException(</span>
+                            &quot;Responder's certificate not valid for signing &quot; +
+                            &quot;OCSP responses&quot;);
+                    }
+<span class="nc" id="L439">                } catch (CertificateParsingException cpe) {</span>
+                    // assume cert is not valid for signing
+<span class="nc" id="L441">                    throw new CertPathValidatorException(</span>
+                        &quot;Responder's certificate not valid for signing &quot; +
+                        &quot;OCSP responses&quot;, cpe);
+<span class="nc" id="L444">                }</span>
+
+                // Check algorithm constraints specified in security property
+                // &quot;jdk.certpath.disabledAlgorithms&quot;.
+<span class="nc" id="L448">                AlgorithmChecker algChecker = new AlgorithmChecker(</span>
+                                    new TrustAnchor(responderCert, null));
+<span class="nc" id="L450">                algChecker.init(false);</span>
+<span class="nc" id="L451">                algChecker.check(cert, Collections.&lt;String&gt;emptySet());</span>
+
+                // check the validity
+                try {
+<span class="nc bnc" id="L455" title="All 2 branches missed.">                    if (date == null) {</span>
+<span class="nc" id="L456">                        cert.checkValidity();</span>
+                    } else {
+<span class="nc" id="L458">                        cert.checkValidity(date);</span>
+                    }
+<span class="nc" id="L460">                } catch (CertificateException e) {</span>
+<span class="nc" id="L461">                    throw new CertPathValidatorException(</span>
+                        &quot;Responder's certificate not within the &quot; +
+                        &quot;validity period&quot;, e);
+<span class="nc" id="L464">                }</span>
+
+                // check for revocation
+                //
+                // A CA may specify that an OCSP client can trust a
+                // responder for the lifetime of the responder's
+                // certificate. The CA does so by including the
+                // extension id-pkix-ocsp-nocheck.
+                //
+<span class="nc" id="L473">                Extension noCheck =</span>
+<span class="nc" id="L474">                    cert.getExtension(PKIXExtensions.OCSPNoCheck_Id);</span>
+<span class="nc bnc" id="L475" title="All 2 branches missed.">                if (noCheck != null) {</span>
+<span class="nc bnc" id="L476" title="All 2 branches missed.">                    if (debug != null) {</span>
+<span class="nc" id="L477">                        debug.println(&quot;Responder's certificate includes &quot; +</span>
+                            &quot;the extension id-pkix-ocsp-nocheck.&quot;);
+                    }
+                } else {
+                    // we should do the revocation checking of the
+                    // authorized responder in a future update.
+                }
+
+                // verify the signature
+                try {
+<span class="nc" id="L487">                    cert.verify(responderCert.getPublicKey());</span>
+<span class="nc" id="L488">                    responderCert = cert;</span>
+                    // cert is trusted, now verify the signed response
+
+<span class="nc" id="L491">                } catch (GeneralSecurityException e) {</span>
+<span class="nc" id="L492">                    responderCert = null;</span>
+<span class="nc" id="L493">                }</span>
+<span class="nc" id="L494">            } else {</span>
+<span class="nc" id="L495">                throw new CertPathValidatorException(</span>
+                    &quot;Responder's certificate is not authorized to sign &quot; +
+                    &quot;OCSP responses&quot;);
+            }
+        }
+
+        // Confirm that the signed response was generated using the public
+        // key from the trusted responder cert
+<span class="nc bnc" id="L503" title="All 2 branches missed.">        if (responderCert != null) {</span>
+            // Check algorithm constraints specified in security property
+            // &quot;jdk.certpath.disabledAlgorithms&quot;.
+<span class="nc" id="L506">            AlgorithmChecker.check(responderCert.getPublicKey(), sigAlgId);</span>
+
+<span class="nc bnc" id="L508" title="All 2 branches missed.">            if (!verifySignature(responderCert)) {</span>
+<span class="nc" id="L509">                throw new CertPathValidatorException(</span>
+                    &quot;Error verifying OCSP Response's signature&quot;);
+            }
+        } else {
+            // Need responder's cert in order to verify the signature
+<span class="nc" id="L514">            throw new CertPathValidatorException(</span>
+                &quot;Unable to verify OCSP Response's signature&quot;);
+        }
+
+        // Check freshness of OCSPResponse
+<span class="nc bnc" id="L519" title="All 2 branches missed.">        if (nonce != null) {</span>
+<span class="nc bnc" id="L520" title="All 4 branches missed.">            if (responseNonce != null &amp;&amp; !Arrays.equals(nonce, responseNonce)) {</span>
+<span class="nc" id="L521">                throw new CertPathValidatorException(&quot;Nonces don't match&quot;);</span>
+            }
+        }
+
+<span class="nc bnc" id="L525" title="All 2 branches missed.">        long now = (date == null) ? System.currentTimeMillis() : date.getTime();</span>
+<span class="nc" id="L526">        Date nowPlusSkew = new Date(now + MAX_CLOCK_SKEW);</span>
+<span class="nc" id="L527">        Date nowMinusSkew = new Date(now - MAX_CLOCK_SKEW);</span>
+<span class="nc bnc" id="L528" title="All 2 branches missed.">        for (SingleResponse sr : singleResponseMap.values()) {</span>
+<span class="nc bnc" id="L529" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L530">                String until = &quot;&quot;;</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">                if (sr.nextUpdate != null) {</span>
+<span class="nc" id="L532">                    until = &quot; until &quot; + sr.nextUpdate;</span>
+                }
+<span class="nc" id="L534">                debug.println(&quot;Response's validity interval is from &quot; +</span>
+<span class="nc" id="L535">                              sr.thisUpdate + until);</span>
+            }
+
+            // Check that the test date is within the validity interval
+<span class="nc bnc" id="L539" title="All 4 branches missed.">            if ((sr.thisUpdate != null &amp;&amp; nowPlusSkew.before(sr.thisUpdate)) ||</span>
+<span class="nc bnc" id="L540" title="All 4 branches missed.">                (sr.nextUpdate != null &amp;&amp; nowMinusSkew.after(sr.nextUpdate)))</span>
+            {
+<span class="nc" id="L542">                throw new CertPathValidatorException(</span>
+                                      &quot;Response is unreliable: its validity &quot; +
+                                      &quot;interval is out-of-date&quot;);
+            }
+<span class="nc" id="L546">        }</span>
+<span class="nc" id="L547">    }</span>
+
+    /**
+     * Returns the OCSP ResponseStatus.
+     */
+    ResponseStatus getResponseStatus() {
+<span class="nc" id="L553">        return responseStatus;</span>
+    }
+
+    /*
+     * Verify the signature of the OCSP response.
+     * The responder's cert is implicitly trusted.
+     */
+    private boolean verifySignature(X509Certificate cert)
+        throws CertPathValidatorException {
+
+        try {
+<span class="nc" id="L564">            Signature respSignature = Signature.getInstance(sigAlgId.getName());</span>
+<span class="nc" id="L565">            respSignature.initVerify(cert.getPublicKey());</span>
+<span class="nc" id="L566">            respSignature.update(tbsResponseData);</span>
+
+<span class="nc bnc" id="L568" title="All 2 branches missed.">            if (respSignature.verify(signature)) {</span>
+<span class="nc bnc" id="L569" title="All 2 branches missed.">                if (debug != null) {</span>
+<span class="nc" id="L570">                    debug.println(&quot;Verified signature of OCSP Response&quot;);</span>
+                }
+<span class="nc" id="L572">                return true;</span>
+
+            } else {
+<span class="nc bnc" id="L575" title="All 2 branches missed.">                if (debug != null) {</span>
+<span class="nc" id="L576">                    debug.println(</span>
+                        &quot;Error verifying signature of OCSP Response&quot;);
+                }
+<span class="nc" id="L579">                return false;</span>
+            }
+<span class="nc" id="L581">        } catch (InvalidKeyException | NoSuchAlgorithmException |</span>
+                 SignatureException e)
+        {
+<span class="nc" id="L584">            throw new CertPathValidatorException(e);</span>
+        }
+    }
+
+    /**
+     * Returns the SingleResponse of the specified CertId, or null if
+     * there is no response for that CertId.
+     */
+    SingleResponse getSingleResponse(CertId certId) {
+<span class="nc" id="L593">        return singleResponseMap.get(certId);</span>
+    }
+
+    /*
+     * A class representing a single OCSP response.
+     */
+    final static class SingleResponse implements OCSP.RevocationStatus {
+        private final CertId certId;
+        private final CertStatus certStatus;
+        private final Date thisUpdate;
+        private final Date nextUpdate;
+        private final Date revocationTime;
+        private final CRLReason revocationReason;
+        private final Map&lt;String, java.security.cert.Extension&gt; singleExtensions;
+
+<span class="nc" id="L608">        private SingleResponse(DerValue der) throws IOException {</span>
+<span class="nc bnc" id="L609" title="All 2 branches missed.">            if (der.tag != DerValue.tag_Sequence) {</span>
+<span class="nc" id="L610">                throw new IOException(&quot;Bad ASN.1 encoding in SingleResponse&quot;);</span>
+            }
+<span class="nc" id="L612">            DerInputStream tmp = der.data;</span>
+
+<span class="nc" id="L614">            certId = new CertId(tmp.getDerValue().data);</span>
+<span class="nc" id="L615">            DerValue derVal = tmp.getDerValue();</span>
+<span class="nc" id="L616">            short tag = (byte)(derVal.tag &amp; 0x1f);</span>
+<span class="nc bnc" id="L617" title="All 2 branches missed.">            if (tag ==  CERT_STATUS_REVOKED) {</span>
+<span class="nc" id="L618">                certStatus = CertStatus.REVOKED;</span>
+<span class="nc" id="L619">                revocationTime = derVal.data.getGeneralizedTime();</span>
+<span class="nc bnc" id="L620" title="All 2 branches missed.">                if (derVal.data.available() != 0) {</span>
+<span class="nc" id="L621">                    DerValue dv = derVal.data.getDerValue();</span>
+<span class="nc" id="L622">                    tag = (byte)(dv.tag &amp; 0x1f);</span>
+<span class="nc bnc" id="L623" title="All 2 branches missed.">                    if (tag == 0) {</span>
+<span class="nc" id="L624">                        int reason = dv.data.getEnumerated();</span>
+                        // if reason out-of-range just leave as UNSPECIFIED
+<span class="nc bnc" id="L626" title="All 4 branches missed.">                        if (reason &gt;= 0 &amp;&amp; reason &lt; values.length) {</span>
+<span class="nc" id="L627">                            revocationReason = values[reason];</span>
+                        } else {
+<span class="nc" id="L629">                            revocationReason = CRLReason.UNSPECIFIED;</span>
+                        }
+<span class="nc" id="L631">                    } else {</span>
+<span class="nc" id="L632">                        revocationReason = CRLReason.UNSPECIFIED;</span>
+                    }
+<span class="nc" id="L634">                } else {</span>
+<span class="nc" id="L635">                    revocationReason = CRLReason.UNSPECIFIED;</span>
+                }
+                // RevokedInfo
+<span class="nc bnc" id="L638" title="All 2 branches missed.">                if (debug != null) {</span>
+<span class="nc" id="L639">                    debug.println(&quot;Revocation time: &quot; + revocationTime);</span>
+<span class="nc" id="L640">                    debug.println(&quot;Revocation reason: &quot; + revocationReason);</span>
+                }
+            } else {
+<span class="nc" id="L643">                revocationTime = null;</span>
+<span class="nc" id="L644">                revocationReason = CRLReason.UNSPECIFIED;</span>
+<span class="nc bnc" id="L645" title="All 2 branches missed.">                if (tag == CERT_STATUS_GOOD) {</span>
+<span class="nc" id="L646">                    certStatus = CertStatus.GOOD;</span>
+<span class="nc bnc" id="L647" title="All 2 branches missed.">                } else if (tag == CERT_STATUS_UNKNOWN) {</span>
+<span class="nc" id="L648">                    certStatus = CertStatus.UNKNOWN;</span>
+                } else {
+<span class="nc" id="L650">                    throw new IOException(&quot;Invalid certificate status&quot;);</span>
+                }
+            }
+
+<span class="nc" id="L654">            thisUpdate = tmp.getGeneralizedTime();</span>
+
+<span class="nc bnc" id="L656" title="All 2 branches missed.">            if (tmp.available() == 0)  {</span>
+                // we are done
+<span class="nc" id="L658">                nextUpdate = null;</span>
+            } else {
+<span class="nc" id="L660">                derVal = tmp.getDerValue();</span>
+<span class="nc" id="L661">                tag = (byte)(derVal.tag &amp; 0x1f);</span>
+<span class="nc bnc" id="L662" title="All 2 branches missed.">                if (tag == 0) {</span>
+                    // next update
+<span class="nc" id="L664">                    nextUpdate = derVal.data.getGeneralizedTime();</span>
+
+<span class="nc bnc" id="L666" title="All 2 branches missed.">                    if (tmp.available() == 0)  {</span>
+                        // we are done
+                    } else {
+<span class="nc" id="L669">                        derVal = tmp.getDerValue();</span>
+<span class="nc" id="L670">                        tag = (byte)(derVal.tag &amp; 0x1f);</span>
+                    }
+                } else {
+<span class="nc" id="L673">                    nextUpdate = null;</span>
+                }
+            }
+            // singleExtensions
+<span class="nc bnc" id="L677" title="All 2 branches missed.">            if (tmp.available() &gt; 0) {</span>
+<span class="nc" id="L678">                derVal = tmp.getDerValue();</span>
+<span class="nc bnc" id="L679" title="All 2 branches missed.">                if (derVal.isContextSpecific((byte)1)) {</span>
+<span class="nc" id="L680">                    DerValue[] singleExtDer = derVal.data.getSequence(3);</span>
+<span class="nc" id="L681">                    singleExtensions =</span>
+                        new HashMap&lt;String, java.security.cert.Extension&gt;
+                            (singleExtDer.length);
+<span class="nc bnc" id="L684" title="All 2 branches missed.">                    for (int i = 0; i &lt; singleExtDer.length; i++) {</span>
+<span class="nc" id="L685">                        Extension ext = new Extension(singleExtDer[i]);</span>
+<span class="nc bnc" id="L686" title="All 2 branches missed.">                        if (debug != null) {</span>
+<span class="nc" id="L687">                            debug.println(&quot;OCSP single extension: &quot; + ext);</span>
+                        }
+                        // We don't support any extensions yet. Therefore, if it
+                        // is critical we must throw an exception because we
+                        // don't know how to process it.
+<span class="nc bnc" id="L692" title="All 2 branches missed.">                        if (ext.isCritical()) {</span>
+<span class="nc" id="L693">                            throw new IOException(</span>
+                                &quot;Unsupported OCSP critical extension: &quot; +
+<span class="nc" id="L695">                                ext.getExtensionId());</span>
+                        }
+<span class="nc" id="L697">                        singleExtensions.put(ext.getId(), ext);</span>
+                    }
+<span class="nc" id="L699">                } else {</span>
+<span class="nc" id="L700">                    singleExtensions = Collections.emptyMap();</span>
+                }
+            } else {
+<span class="nc" id="L703">                singleExtensions = Collections.emptyMap();</span>
+            }
+<span class="nc" id="L705">        }</span>
+
+        /*
+         * Return the certificate's revocation status code
+         */
+        @Override public CertStatus getCertStatus() {
+<span class="nc" id="L711">            return certStatus;</span>
+        }
+
+        private CertId getCertId() {
+<span class="nc" id="L715">            return certId;</span>
+        }
+
+        @Override public Date getRevocationTime() {
+<span class="nc" id="L719">            return (Date) revocationTime.clone();</span>
+        }
+
+        @Override public CRLReason getRevocationReason() {
+<span class="nc" id="L723">            return revocationReason;</span>
+        }
+
+        @Override
+        public Map&lt;String, java.security.cert.Extension&gt; getSingleExtensions() {
+<span class="nc" id="L728">            return Collections.unmodifiableMap(singleExtensions);</span>
+        }
+
+        /**
+         * Construct a string representation of a single OCSP response.
+         */
+        @Override public String toString() {
+<span class="nc" id="L735">            StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L736">            sb.append(&quot;SingleResponse:  \n&quot;);</span>
+<span class="nc" id="L737">            sb.append(certId);</span>
+<span class="nc" id="L738">            sb.append(&quot;\nCertStatus: &quot;+ certStatus + &quot;\n&quot;);</span>
+<span class="nc bnc" id="L739" title="All 2 branches missed.">            if (certStatus == CertStatus.REVOKED) {</span>
+<span class="nc" id="L740">                sb.append(&quot;revocationTime is &quot; + revocationTime + &quot;\n&quot;);</span>
+<span class="nc" id="L741">                sb.append(&quot;revocationReason is &quot; + revocationReason + &quot;\n&quot;);</span>
+            }
+<span class="nc" id="L743">            sb.append(&quot;thisUpdate is &quot; + thisUpdate + &quot;\n&quot;);</span>
+<span class="nc bnc" id="L744" title="All 2 branches missed.">            if (nextUpdate != null) {</span>
+<span class="nc" id="L745">                sb.append(&quot;nextUpdate is &quot; + nextUpdate + &quot;\n&quot;);</span>
+            }
+<span class="nc" id="L747">            return sb.toString();</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

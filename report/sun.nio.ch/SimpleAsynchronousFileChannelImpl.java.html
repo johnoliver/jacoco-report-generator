@@ -1,0 +1,398 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>SimpleAsynchronousFileChannelImpl.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.nio.ch</a> &gt; <span class="el_source">SimpleAsynchronousFileChannelImpl.java</span></div><h1>SimpleAsynchronousFileChannelImpl.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2008, 2009, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.nio.ch;
+
+import java.nio.channels.*;
+import java.util.concurrent.*;
+import java.nio.ByteBuffer;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
+import java.io.FileDescriptor;
+import java.io.IOException;
+
+/**
+ * &quot;Portable&quot; implementation of AsynchronousFileChannel for use on operating
+ * systems that don't support asynchronous file I/O.
+ */
+
+public class SimpleAsynchronousFileChannelImpl
+    extends AsynchronousFileChannelImpl
+{
+    // lazy initialization of default thread pool for file I/O
+<span class="nc" id="L45">    private static class DefaultExecutorHolder {</span>
+<span class="fc" id="L46">        static final ExecutorService defaultExecutor =</span>
+<span class="fc" id="L47">            ThreadPool.createDefault().executor();</span>
+    }
+
+    // Used to make native read and write calls
+<span class="fc" id="L51">    private static final FileDispatcher nd = new FileDispatcherImpl();</span>
+
+    // Thread-safe set of IDs of native threads, for signalling
+<span class="fc" id="L54">    private final NativeThreadSet threads = new NativeThreadSet(2);</span>
+
+
+    SimpleAsynchronousFileChannelImpl(FileDescriptor fdObj,
+                                      boolean reading,
+                                      boolean writing,
+                                      ExecutorService executor)
+    {
+<span class="fc" id="L62">        super(fdObj, reading, writing, executor);</span>
+<span class="fc" id="L63">    }</span>
+
+    public static AsynchronousFileChannel open(FileDescriptor fdo,
+                                               boolean reading,
+                                               boolean writing,
+                                               ThreadPool pool)
+    {
+        // Executor is either default or based on pool parameters
+<span class="fc bfc" id="L71" title="All 2 branches covered.">        ExecutorService executor = (pool == null) ?</span>
+<span class="fc" id="L72">            DefaultExecutorHolder.defaultExecutor : pool.executor();</span>
+<span class="fc" id="L73">        return new SimpleAsynchronousFileChannelImpl(fdo, reading, writing, executor);</span>
+    }
+
+    @Override
+    public void close() throws IOException {
+        // mark channel as closed
+<span class="fc" id="L79">        synchronized (fdObj) {</span>
+<span class="fc bfc" id="L80" title="All 2 branches covered.">            if (closed)</span>
+<span class="fc" id="L81">                return;     // already closed</span>
+<span class="fc" id="L82">            closed = true;</span>
+            // from this point on, if another thread invokes the begin() method
+            // then it will throw ClosedChannelException
+<span class="pc" id="L85">        }</span>
+
+        // Invalidate and release any locks that we still hold
+<span class="fc" id="L88">        invalidateAllLocks();</span>
+
+        // signal any threads blocked on this channel
+<span class="fc" id="L91">        nd.preClose(fdObj);</span>
+<span class="fc" id="L92">        threads.signalAndWait();</span>
+
+        // wait until all async I/O operations have completely gracefully
+<span class="fc" id="L95">        closeLock.writeLock().lock();</span>
+        try {
+            // do nothing
+        } finally {
+<span class="fc" id="L99">            closeLock.writeLock().unlock();</span>
+        }
+
+        // close file
+<span class="fc" id="L103">        nd.close(fdObj);</span>
+<span class="fc" id="L104">    }</span>
+
+    @Override
+    public long size() throws IOException {
+<span class="fc" id="L108">        int ti = threads.add();</span>
+        try {
+<span class="fc" id="L110">            long n = 0L;</span>
+            try {
+<span class="fc" id="L112">                begin();</span>
+                do {
+<span class="fc" id="L114">                    n = nd.size(fdObj);</span>
+<span class="pc bpc" id="L115" title="3 of 4 branches missed.">                } while ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="fc" id="L116">                return n;</span>
+            } finally {
+<span class="pc bpc" id="L118" title="3 of 4 branches missed.">                end(n &gt;= 0L);</span>
+            }
+        } finally {
+<span class="pc" id="L121">            threads.remove(ti);</span>
+        }
+    }
+
+    @Override
+    public AsynchronousFileChannel truncate(long size) throws IOException {
+<span class="fc bfc" id="L127" title="All 2 branches covered.">        if (size &lt; 0L)</span>
+<span class="fc" id="L128">            throw new IllegalArgumentException(&quot;Negative size&quot;);</span>
+<span class="fc bfc" id="L129" title="All 2 branches covered.">        if (!writing)</span>
+<span class="fc" id="L130">            throw new NonWritableChannelException();</span>
+<span class="fc" id="L131">        int ti = threads.add();</span>
+        try {
+<span class="fc" id="L133">            long n = 0L;</span>
+            try {
+<span class="fc" id="L135">                begin();</span>
+                do {
+<span class="fc" id="L137">                    n = nd.size(fdObj);</span>
+<span class="pc bpc" id="L138" title="3 of 4 branches missed.">                } while ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+
+                // truncate file if 'size' less than current size
+<span class="pc bpc" id="L141" title="1 of 4 branches missed.">                if (size &lt; n &amp;&amp; isOpen()) {</span>
+                    do {
+<span class="fc" id="L143">                        n = nd.truncate(fdObj, size);</span>
+<span class="pc bpc" id="L144" title="3 of 4 branches missed.">                    } while ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+                }
+<span class="fc" id="L146">                return this;</span>
+            } finally {
+<span class="pc bpc" id="L148" title="1 of 4 branches missed.">                end(n &gt; 0);</span>
+            }
+        } finally {
+<span class="fc" id="L151">            threads.remove(ti);</span>
+        }
+    }
+
+    @Override
+    public void force(boolean metaData) throws IOException {
+<span class="nc" id="L157">        int ti = threads.add();</span>
+        try {
+<span class="nc" id="L159">            int n = 0;</span>
+            try {
+<span class="nc" id="L161">                begin();</span>
+                do {
+<span class="nc" id="L163">                    n = nd.force(fdObj, metaData);</span>
+<span class="nc bnc" id="L164" title="All 4 branches missed.">                } while ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+            } finally {
+<span class="nc bnc" id="L166" title="All 4 branches missed.">                end(n &gt;= 0);</span>
+<span class="nc" id="L167">            }</span>
+        } finally {
+<span class="nc" id="L169">            threads.remove(ti);</span>
+<span class="nc" id="L170">        }</span>
+<span class="nc" id="L171">    }</span>
+
+    @Override
+    &lt;A&gt; Future&lt;FileLock&gt; implLock(final long position,
+                                  final long size,
+                                  final boolean shared,
+                                  final A attachment,
+                                  final CompletionHandler&lt;FileLock,? super A&gt; handler)
+    {
+<span class="pc bpc" id="L180" title="3 of 4 branches missed.">        if (shared &amp;&amp; !reading)</span>
+<span class="nc" id="L181">            throw new NonReadableChannelException();</span>
+<span class="pc bpc" id="L182" title="2 of 4 branches missed.">        if (!shared &amp;&amp; !writing)</span>
+<span class="nc" id="L183">            throw new NonWritableChannelException();</span>
+
+        // add to lock table
+<span class="fc" id="L186">        final FileLockImpl fli = addToFileLockTable(position, size, shared);</span>
+<span class="fc bfc" id="L187" title="All 2 branches covered.">        if (fli == null) {</span>
+<span class="fc" id="L188">            Throwable exc = new ClosedChannelException();</span>
+<span class="pc bpc" id="L189" title="1 of 2 branches missed.">            if (handler == null)</span>
+<span class="fc" id="L190">                return CompletedFuture.withFailure(exc);</span>
+<span class="nc" id="L191">            Invoker.invokeIndirectly(handler, attachment, null, exc, executor);</span>
+<span class="nc" id="L192">            return null;</span>
+        }
+
+<span class="pc bpc" id="L195" title="1 of 2 branches missed.">        final PendingFuture&lt;FileLock,A&gt; result = (handler == null) ?</span>
+            new PendingFuture&lt;FileLock,A&gt;(this) : null;
+<span class="fc" id="L197">        Runnable task = new Runnable() {</span>
+            public void run() {
+<span class="fc" id="L199">                Throwable exc = null;</span>
+
+<span class="fc" id="L201">                int ti = threads.add();</span>
+                try {
+                    int n;
+                    try {
+<span class="fc" id="L205">                        begin();</span>
+                        do {
+<span class="fc" id="L207">                            n = nd.lock(fdObj, true, position, size, shared);</span>
+<span class="pc bpc" id="L208" title="1 of 4 branches missed.">                        } while ((n == FileDispatcher.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="pc bpc" id="L209" title="1 of 4 branches missed.">                        if (n != FileDispatcher.LOCKED || !isOpen()) {</span>
+<span class="fc" id="L210">                            throw new AsynchronousCloseException();</span>
+                        }
+<span class="fc" id="L212">                    } catch (IOException x) {</span>
+<span class="fc" id="L213">                        removeFromFileLockTable(fli);</span>
+<span class="pc bpc" id="L214" title="1 of 2 branches missed.">                        if (!isOpen())</span>
+<span class="fc" id="L215">                            x = new AsynchronousCloseException();</span>
+<span class="fc" id="L216">                        exc = x;</span>
+                    } finally {
+<span class="pc" id="L218">                        end();</span>
+<span class="fc" id="L219">                    }</span>
+                } finally {
+<span class="pc" id="L221">                    threads.remove(ti);</span>
+<span class="fc" id="L222">                }</span>
+<span class="pc bpc" id="L223" title="1 of 2 branches missed.">                if (handler == null) {</span>
+<span class="fc" id="L224">                    result.setResult(fli, exc);</span>
+                } else {
+<span class="nc" id="L226">                    Invoker.invokeUnchecked(handler, attachment, fli, exc);</span>
+                }
+<span class="fc" id="L228">            }</span>
+        };
+<span class="fc" id="L230">        boolean executed = false;</span>
+        try {
+<span class="fc" id="L232">            executor.execute(task);</span>
+<span class="fc" id="L233">            executed = true;</span>
+        } finally {
+<span class="pc bpc" id="L235" title="3 of 4 branches missed.">            if (!executed) {</span>
+                // rollback
+<span class="nc" id="L237">                removeFromFileLockTable(fli);</span>
+            }
+        }
+<span class="fc" id="L240">        return result;</span>
+    }
+
+    @Override
+    public FileLock tryLock(long position, long size, boolean shared)
+        throws IOException
+    {
+<span class="pc bpc" id="L247" title="3 of 4 branches missed.">        if (shared &amp;&amp; !reading)</span>
+<span class="nc" id="L248">            throw new NonReadableChannelException();</span>
+<span class="pc bpc" id="L249" title="2 of 4 branches missed.">        if (!shared &amp;&amp; !writing)</span>
+<span class="nc" id="L250">            throw new NonWritableChannelException();</span>
+
+        // add to lock table
+<span class="fc" id="L253">        FileLockImpl fli = addToFileLockTable(position, size, shared);</span>
+<span class="pc bpc" id="L254" title="1 of 2 branches missed.">        if (fli == null)</span>
+<span class="nc" id="L255">            throw new ClosedChannelException();</span>
+
+<span class="fc" id="L257">        int ti = threads.add();</span>
+<span class="fc" id="L258">        boolean gotLock = false;</span>
+        try {
+<span class="fc" id="L260">            begin();</span>
+            int n;
+            do {
+<span class="fc" id="L263">                n = nd.lock(fdObj, false, position, size, shared);</span>
+<span class="pc bpc" id="L264" title="3 of 4 branches missed.">            } while ((n == FileDispatcher.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="pc bpc" id="L265" title="2 of 4 branches missed.">            if (n == FileDispatcher.LOCKED &amp;&amp; isOpen()) {</span>
+<span class="fc" id="L266">                gotLock = true;</span>
+<span class="fc" id="L267">                return fli;    // lock acquired</span>
+            }
+<span class="nc bnc" id="L269" title="All 2 branches missed.">            if (n == FileDispatcher.NO_LOCK)</span>
+<span class="nc" id="L270">                return null;    // locked by someone else</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">            if (n == FileDispatcher.INTERRUPTED)</span>
+<span class="nc" id="L272">                throw new AsynchronousCloseException();</span>
+            // should not get here
+<span class="nc" id="L274">            throw new AssertionError();</span>
+        } finally {
+<span class="pc bpc" id="L276" title="5 of 6 branches missed.">            if (!gotLock)</span>
+<span class="nc" id="L277">                removeFromFileLockTable(fli);</span>
+<span class="pc" id="L278">            end();</span>
+<span class="pc" id="L279">            threads.remove(ti);</span>
+        }
+    }
+
+    @Override
+    protected void implRelease(FileLockImpl fli) throws IOException {
+<span class="fc" id="L285">        nd.release(fdObj, fli.position(), fli.size());</span>
+<span class="fc" id="L286">    }</span>
+
+    @Override
+    &lt;A&gt; Future&lt;Integer&gt; implRead(final ByteBuffer dst,
+                                 final long position,
+                                 final A attachment,
+                                 final CompletionHandler&lt;Integer,? super A&gt; handler)
+    {
+<span class="pc bpc" id="L294" title="1 of 2 branches missed.">        if (position &lt; 0)</span>
+<span class="nc" id="L295">            throw new IllegalArgumentException(&quot;Negative position&quot;);</span>
+<span class="pc bpc" id="L296" title="1 of 2 branches missed.">        if (!reading)</span>
+<span class="nc" id="L297">            throw new NonReadableChannelException();</span>
+<span class="pc bpc" id="L298" title="1 of 2 branches missed.">        if (dst.isReadOnly())</span>
+<span class="nc" id="L299">            throw new IllegalArgumentException(&quot;Read-only buffer&quot;);</span>
+
+        // complete immediately if channel closed or no space remaining
+<span class="fc bfc" id="L302" title="All 4 branches covered.">        if (!isOpen() || (dst.remaining() == 0)) {</span>
+<span class="fc bfc" id="L303" title="All 2 branches covered.">            Throwable exc = (isOpen()) ? null : new ClosedChannelException();</span>
+<span class="fc bfc" id="L304" title="All 2 branches covered.">            if (handler == null)</span>
+<span class="fc" id="L305">                return CompletedFuture.withResult(0, exc);</span>
+<span class="fc" id="L306">            Invoker.invokeIndirectly(handler, attachment, 0, exc, executor);</span>
+<span class="fc" id="L307">            return null;</span>
+        }
+
+<span class="fc bfc" id="L310" title="All 2 branches covered.">        final PendingFuture&lt;Integer,A&gt; result = (handler == null) ?</span>
+            new PendingFuture&lt;Integer,A&gt;(this) : null;
+<span class="fc" id="L312">        Runnable task = new Runnable() {</span>
+            public void run() {
+<span class="fc" id="L314">                int n = 0;</span>
+<span class="fc" id="L315">                Throwable exc = null;</span>
+
+<span class="fc" id="L317">                int ti = threads.add();</span>
+                try {
+<span class="fc" id="L319">                    begin();</span>
+                    do {
+<span class="fc" id="L321">                        n = IOUtil.read(fdObj, dst, position, nd);</span>
+<span class="pc bpc" id="L322" title="3 of 4 branches missed.">                    } while ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="pc bpc" id="L323" title="3 of 4 branches missed.">                    if (n &lt; 0 &amp;&amp; !isOpen())</span>
+<span class="nc" id="L324">                        throw new AsynchronousCloseException();</span>
+<span class="nc" id="L325">                } catch (IOException x) {</span>
+<span class="nc bnc" id="L326" title="All 2 branches missed.">                    if (!isOpen())</span>
+<span class="nc" id="L327">                        x = new AsynchronousCloseException();</span>
+<span class="nc" id="L328">                    exc = x;</span>
+                } finally {
+<span class="pc" id="L330">                    end();</span>
+<span class="pc" id="L331">                    threads.remove(ti);</span>
+<span class="pc" id="L332">                }</span>
+<span class="fc bfc" id="L333" title="All 2 branches covered.">                if (handler == null) {</span>
+<span class="fc" id="L334">                    result.setResult(n, exc);</span>
+                } else {
+<span class="fc" id="L336">                    Invoker.invokeUnchecked(handler, attachment, n, exc);</span>
+                }
+<span class="fc" id="L338">            }</span>
+        };
+<span class="fc" id="L340">        executor.execute(task);</span>
+<span class="fc" id="L341">        return result;</span>
+    }
+
+    @Override
+    &lt;A&gt; Future&lt;Integer&gt; implWrite(final ByteBuffer src,
+                                  final long position,
+                                  final A attachment,
+                                  final CompletionHandler&lt;Integer,? super A&gt; handler)
+    {
+<span class="pc bpc" id="L350" title="1 of 2 branches missed.">        if (position &lt; 0)</span>
+<span class="nc" id="L351">            throw new IllegalArgumentException(&quot;Negative position&quot;);</span>
+<span class="pc bpc" id="L352" title="1 of 2 branches missed.">        if (!writing)</span>
+<span class="nc" id="L353">            throw new NonWritableChannelException();</span>
+
+        // complete immediately if channel is closed or no bytes remaining
+<span class="pc bpc" id="L356" title="1 of 4 branches missed.">        if (!isOpen() || (src.remaining() == 0)) {</span>
+<span class="pc bpc" id="L357" title="1 of 2 branches missed.">            Throwable exc = (isOpen()) ? null : new ClosedChannelException();</span>
+<span class="pc bpc" id="L358" title="1 of 2 branches missed.">            if (handler == null)</span>
+<span class="fc" id="L359">                return CompletedFuture.withResult(0, exc);</span>
+<span class="nc" id="L360">            Invoker.invokeIndirectly(handler, attachment, 0, exc, executor);</span>
+<span class="nc" id="L361">            return null;</span>
+        }
+
+<span class="fc bfc" id="L364" title="All 2 branches covered.">        final PendingFuture&lt;Integer,A&gt; result = (handler == null) ?</span>
+            new PendingFuture&lt;Integer,A&gt;(this) : null;
+<span class="fc" id="L366">        Runnable task = new Runnable() {</span>
+            public void run() {
+<span class="fc" id="L368">                int n = 0;</span>
+<span class="fc" id="L369">                Throwable exc = null;</span>
+
+<span class="fc" id="L371">                int ti = threads.add();</span>
+                try {
+<span class="fc" id="L373">                    begin();</span>
+                    do {
+<span class="fc" id="L375">                        n = IOUtil.write(fdObj, src, position, nd);</span>
+<span class="pc bpc" id="L376" title="3 of 4 branches missed.">                    } while ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen());</span>
+<span class="pc bpc" id="L377" title="3 of 4 branches missed.">                    if (n &lt; 0 &amp;&amp; !isOpen())</span>
+<span class="nc" id="L378">                        throw new AsynchronousCloseException();</span>
+<span class="fc" id="L379">                } catch (IOException x) {</span>
+<span class="pc bpc" id="L380" title="1 of 2 branches missed.">                    if (!isOpen())</span>
+<span class="fc" id="L381">                        x = new AsynchronousCloseException();</span>
+<span class="fc" id="L382">                    exc = x;</span>
+                } finally {
+<span class="pc" id="L384">                    end();</span>
+<span class="pc" id="L385">                    threads.remove(ti);</span>
+<span class="fc" id="L386">                }</span>
+<span class="fc bfc" id="L387" title="All 2 branches covered.">                if (handler == null) {</span>
+<span class="fc" id="L388">                    result.setResult(n, exc);</span>
+                } else {
+<span class="fc" id="L390">                    Invoker.invokeUnchecked(handler, attachment, n, exc);</span>
+                }
+<span class="fc" id="L392">            }</span>
+        };
+<span class="fc" id="L394">        executor.execute(task);</span>
+<span class="fc" id="L395">        return result;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

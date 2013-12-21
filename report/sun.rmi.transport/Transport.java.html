@@ -1,0 +1,237 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>Transport.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.rmi.transport</a> &gt; <span class="el_source">Transport.java</span></div><h1>Transport.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1996, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.rmi.transport;
+
+import java.io.IOException;
+import java.io.ObjectOutput;
+import java.rmi.MarshalException;
+import java.rmi.NoSuchObjectException;
+import java.rmi.Remote;
+import java.rmi.RemoteException;
+import java.rmi.server.LogStream;
+import java.rmi.server.ObjID;
+import java.rmi.server.RemoteCall;
+import java.rmi.server.RemoteServer;
+import java.rmi.server.ServerNotActiveException;
+import java.security.AccessControlContext;
+import sun.rmi.runtime.Log;
+import sun.rmi.server.Dispatcher;
+import sun.rmi.server.UnicastServerRef;
+
+/**
+ * Transport abstraction for enabling communication between different
+ * VMs.
+ *
+ * @author Ann Wollrath
+ */
+@SuppressWarnings(&quot;deprecation&quot;)
+<span class="fc" id="L51">public abstract class Transport {</span>
+
+    /** &quot;transport&quot; package log level */
+<span class="fc" id="L54">    static final int logLevel = LogStream.parseLevel(getLogLevel());</span>
+
+    private static String getLogLevel() {
+<span class="fc" id="L57">        return java.security.AccessController.doPrivileged(</span>
+            new sun.security.action.GetPropertyAction(&quot;sun.rmi.transport.logLevel&quot;));
+    }
+
+    /* transport package log */
+<span class="fc" id="L62">    static final Log transportLog =</span>
+<span class="fc" id="L63">        Log.getLog(&quot;sun.rmi.transport.misc&quot;, &quot;transport&quot;, Transport.logLevel);</span>
+
+    /** References the current transport when a call is being serviced */
+<span class="fc" id="L66">    private static final ThreadLocal&lt;Transport&gt; currentTransport = new ThreadLocal&lt;&gt;();</span>
+
+    /** ObjID for DGCImpl */
+<span class="fc" id="L69">    private static final ObjID dgcID = new ObjID(ObjID.DGC_ID);</span>
+
+    /**
+     * Returns a &lt;I&gt;Channel&lt;/I&gt; that generates connections to the
+     * endpoint &lt;I&gt;ep&lt;/I&gt;. A Channel is an object that creates and
+     * manages connections of a particular type to some particular
+     * address space.
+     * @param ep the endpoint to which connections will be generated.
+     * @return the channel or null if the transport cannot
+     * generate connections to this endpoint
+     */
+    public abstract Channel getChannel(Endpoint ep);
+
+    /**
+     * Removes the &lt;I&gt;Channel&lt;/I&gt; that generates connections to the
+     * endpoint &lt;I&gt;ep&lt;/I&gt;.
+     */
+    public abstract void free(Endpoint ep);
+
+    /**
+     * Export the object so that it can accept incoming calls.
+     */
+    public void exportObject(Target target) throws RemoteException {
+<span class="fc" id="L92">        target.setExportedTransport(this);</span>
+<span class="fc" id="L93">        ObjectTable.putTarget(target);</span>
+<span class="fc" id="L94">    }</span>
+
+    /**
+     * Invoked when an object that was exported on this transport has
+     * become unexported, either by being garbage collected or by
+     * being explicitly unexported.
+     **/
+<span class="nc" id="L101">    protected void targetUnexported() { }</span>
+
+    /**
+     * Returns the current transport if a call is being serviced, otherwise
+     * returns null.
+     **/
+    static Transport currentTransport() {
+<span class="fc" id="L108">        return currentTransport.get();</span>
+    }
+
+    /**
+     * Verify that the current access control context has permission to accept
+     * the connection being dispatched by the current thread.  The current
+     * access control context is passed as a parameter to avoid the overhead of
+     * an additional call to AccessController.getContext.
+     */
+    protected abstract void checkAcceptPermission(AccessControlContext acc);
+
+    /**
+     * Service an incoming remote call. When a message arrives on the
+     * connection indicating the beginning of a remote call, the
+     * threads are required to call the &lt;I&gt;serviceCall&lt;/I&gt; method of
+     * their transport.  The default implementation of this method
+     * locates and calls the dispatcher object.  Ordinarily a
+     * transport implementation will not need to override this method.
+     * At the entry to &lt;I&gt;tr.serviceCall(conn)&lt;/I&gt;, the connection's
+     * input stream is positioned at the start of the incoming
+     * message.  The &lt;I&gt;serviceCall&lt;/I&gt; method processes the incoming
+     * remote invocation and sends the result on the connection's
+     * output stream.  If it returns &quot;true&quot;, then the remote
+     * invocation was processed without error and the transport can
+     * cache the connection.  If it returns &quot;false&quot;, a protocol error
+     * occurred during the call, and the transport should destroy the
+     * connection.
+     */
+    public boolean serviceCall(final RemoteCall call) {
+        try {
+            /* read object id */
+            final Remote impl;
+            ObjID id;
+
+            try {
+<span class="fc" id="L143">                id = ObjID.read(call.getInputStream());</span>
+<span class="nc" id="L144">            } catch (java.io.IOException e) {</span>
+<span class="nc" id="L145">                throw new MarshalException(&quot;unable to read objID&quot;, e);</span>
+<span class="fc" id="L146">            }</span>
+
+            /* get the remote object */
+<span class="fc bfc" id="L149" title="All 2 branches covered.">            Transport transport = id.equals(dgcID) ? null : this;</span>
+<span class="fc" id="L150">            Target target =</span>
+<span class="fc" id="L151">                ObjectTable.getTarget(new ObjectEndpoint(id, transport));</span>
+
+<span class="pc bpc" id="L153" title="1 of 4 branches missed.">            if (target == null || (impl = target.getImpl()) == null) {</span>
+<span class="fc" id="L154">                throw new NoSuchObjectException(&quot;no such object in table&quot;);</span>
+            }
+
+<span class="fc" id="L157">            final Dispatcher disp = target.getDispatcher();</span>
+<span class="fc" id="L158">            target.incrementCallCount();</span>
+            try {
+                /* call the dispatcher */
+<span class="fc" id="L161">                transportLog.log(Log.VERBOSE, &quot;call dispatcher&quot;);</span>
+
+<span class="fc" id="L163">                final AccessControlContext acc =</span>
+<span class="fc" id="L164">                    target.getAccessControlContext();</span>
+<span class="fc" id="L165">                ClassLoader ccl = target.getContextClassLoader();</span>
+
+<span class="fc" id="L167">                Thread t = Thread.currentThread();</span>
+<span class="fc" id="L168">                ClassLoader savedCcl = t.getContextClassLoader();</span>
+
+                try {
+<span class="fc" id="L171">                    t.setContextClassLoader(ccl);</span>
+<span class="fc" id="L172">                    currentTransport.set(this);</span>
+                    try {
+<span class="fc" id="L174">                        java.security.AccessController.doPrivileged(</span>
+<span class="fc" id="L175">                            new java.security.PrivilegedExceptionAction&lt;Void&gt;() {</span>
+                            public Void run() throws IOException {
+<span class="fc" id="L177">                                checkAcceptPermission(acc);</span>
+<span class="fc" id="L178">                                disp.dispatch(impl, call);</span>
+<span class="fc" id="L179">                                return null;</span>
+                            }
+                        }, acc);
+<span class="nc" id="L182">                    } catch (java.security.PrivilegedActionException pae) {</span>
+<span class="nc" id="L183">                        throw (IOException) pae.getException();</span>
+<span class="fc" id="L184">                    }</span>
+                } finally {
+<span class="pc" id="L186">                    t.setContextClassLoader(savedCcl);</span>
+<span class="pc" id="L187">                    currentTransport.set(null);</span>
+<span class="fc" id="L188">                }</span>
+
+<span class="nc" id="L190">            } catch (IOException ex) {</span>
+<span class="nc" id="L191">                transportLog.log(Log.BRIEF,</span>
+                                 &quot;exception thrown by dispatcher: &quot;, ex);
+<span class="nc" id="L193">                return false;</span>
+            } finally {
+<span class="pc" id="L195">                target.decrementCallCount();</span>
+<span class="fc" id="L196">            }</span>
+
+<span class="fc" id="L198">        } catch (RemoteException e) {</span>
+
+            // if calls are being logged, write out exception
+<span class="pc bpc" id="L201" title="1 of 2 branches missed.">            if (UnicastServerRef.callLog.isLoggable(Log.BRIEF)) {</span>
+                // include client host name if possible
+<span class="nc" id="L203">                String clientHost = &quot;&quot;;</span>
+                try {
+<span class="nc" id="L205">                    clientHost = &quot;[&quot; +</span>
+<span class="nc" id="L206">                        RemoteServer.getClientHost() + &quot;] &quot;;</span>
+<span class="nc" id="L207">                } catch (ServerNotActiveException ex) {</span>
+<span class="nc" id="L208">                }</span>
+<span class="nc" id="L209">                String message = clientHost + &quot;exception: &quot;;</span>
+<span class="nc" id="L210">                UnicastServerRef.callLog.log(Log.BRIEF, message, e);</span>
+            }
+
+            /* We will get a RemoteException if either a) the objID is
+             * not readable, b) the target is not in the object table, or
+             * c) the object is in the midst of being unexported (note:
+             * NoSuchObjectException is thrown by the incrementCallCount
+             * method if the object is being unexported).  Here it is
+             * relatively safe to marshal an exception to the client
+             * since the client will not have seen a return value yet.
+             */
+            try {
+<span class="fc" id="L222">                ObjectOutput out = call.getResultStream(false);</span>
+<span class="fc" id="L223">                UnicastServerRef.clearStackTraces(e);</span>
+<span class="fc" id="L224">                out.writeObject(e);</span>
+<span class="fc" id="L225">                call.releaseOutputStream();</span>
+
+<span class="nc" id="L227">            } catch (IOException ie) {</span>
+<span class="nc" id="L228">                transportLog.log(Log.BRIEF,</span>
+                    &quot;exception thrown marshalling exception: &quot;, ie);
+<span class="nc" id="L230">                return false;</span>
+<span class="fc" id="L231">            }</span>
+<span class="fc" id="L232">        }</span>
+
+<span class="fc" id="L234">        return true;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

@@ -1,0 +1,1027 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>Connection.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">com.sun.jndi.ldap</a> &gt; <span class="el_source">Connection.java</span></div><h1>Connection.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1999, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package com.sun.jndi.ldap;
+
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.InterruptedIOException;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.io.InputStream;
+import java.net.Socket;
+import javax.net.ssl.SSLSocket;
+
+import javax.naming.CommunicationException;
+import javax.naming.ServiceUnavailableException;
+import javax.naming.NamingException;
+import javax.naming.InterruptedNamingException;
+
+import javax.naming.ldap.Control;
+
+import java.lang.reflect.Method;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
+import java.util.Arrays;
+import sun.misc.IOUtils;
+//import javax.net.SocketFactory;
+
+/**
+  * A thread that creates a connection to an LDAP server.
+  * After the connection, the thread reads from the connection.
+  * A caller can invoke methods on the instance to read LDAP responses
+  * and to send LDAP requests.
+  * &lt;p&gt;
+  * There is a one-to-one correspondence between an LdapClient and
+  * a Connection. Access to Connection and its methods is only via
+  * LdapClient with two exceptions: SASL authentication and StartTLS.
+  * SASL needs to access Connection's socket IO streams (in order to do encryption
+  * of the security layer). StartTLS needs to do replace IO streams
+  * and close the IO  streams on nonfatal close. The code for SASL
+  * authentication can be treated as being the same as from LdapClient
+  * because the SASL code is only ever called from LdapClient, from
+  * inside LdapClient's synchronized authenticate() method. StartTLS is called
+  * directly by the application but should only occur when the underlying
+  * connection is quiet.
+  * &lt;p&gt;
+  * In terms of synchronization, worry about data structures
+  * used by the Connection thread because that usage might contend
+  * with calls by the main threads (i.e., those that call LdapClient).
+  * Main threads need to worry about contention with each other.
+  * Fields that Connection thread uses:
+  *     inStream - synced access and update; initialized in constructor;
+  *           referenced outside class unsync'ed (by LdapSasl) only
+  *           when connection is quiet
+  *     traceFile, traceTagIn, traceTagOut - no sync; debugging only
+  *     parent - no sync; initialized in constructor; no updates
+  *     pendingRequests - sync
+  *     pauseLock - per-instance lock;
+  *     paused - sync via pauseLock (pauseReader())
+  * Members used by main threads (LdapClient):
+  *     host, port - unsync; read-only access for StartTLS and debug messages
+  *     setBound(), setV3() - no sync; called only by LdapClient.authenticate(),
+  *             which is a sync method called only when connection is &quot;quiet&quot;
+  *     getMsgId() - sync
+  *     writeRequest(), removeRequest(),findRequest(), abandonOutstandingReqs() -
+  *             access to shared pendingRequests is sync
+  *     writeRequest(),  abandonRequest(), ldapUnbind() - access to outStream sync
+  *     cleanup() - sync
+  *     readReply() - access to sock sync
+  *     unpauseReader() - (indirectly via writeRequest) sync on pauseLock
+  * Members used by SASL auth (main thread):
+  *     inStream, outStream - no sync; used to construct new stream; accessed
+  *             only when conn is &quot;quiet&quot; and not shared
+  *     replaceStreams() - sync method
+  * Members used by StartTLS:
+  *     inStream, outStream - no sync; used to record the existing streams;
+  *             accessed only when conn is &quot;quiet&quot; and not shared
+  *     replaceStreams() - sync method
+  * &lt;p&gt;
+  * Handles anonymous, simple, and SASL bind for v3; anonymous and simple
+  * for v2.
+  * %%% made public for access by LdapSasl %%%
+  *
+  * @author Vincent Ryan
+  * @author Rosanna Lee
+  * @author Jagane Sundar
+  */
+public final class Connection implements Runnable {
+
+    private static final boolean debug = false;
+    private static final int dump = 0; // &gt; 0 r, &gt; 1 rw
+
+
+    final private Thread worker;    // Initialized in constructor
+
+<span class="fc" id="L118">    private boolean v3 = true;       // Set in setV3()</span>
+
+    final public String host;  // used by LdapClient for generating exception messages
+                         // used by StartTlsResponse when creating an SSL socket
+    final public int port;     // used by LdapClient for generating exception messages
+                         // used by StartTlsResponse when creating an SSL socket
+
+<span class="fc" id="L125">    private boolean bound = false;   // Set in setBound()</span>
+
+    // All three are initialized in constructor and read-only afterwards
+<span class="fc" id="L128">    private OutputStream traceFile = null;</span>
+<span class="fc" id="L129">    private String traceTagIn = null;</span>
+<span class="fc" id="L130">    private String traceTagOut = null;</span>
+
+    // Initialized in constructor; read and used externally (LdapSasl);
+    // Updated in replaceStreams() during &quot;quiet&quot;, unshared, period
+    public InputStream inStream;   // must be public; used by LdapSasl
+
+    // Initialized in constructor; read and used externally (LdapSasl);
+    // Updated in replaceOutputStream() during &quot;quiet&quot;, unshared, period
+    public OutputStream outStream; // must be public; used by LdapSasl
+
+    // Initialized in constructor; read and used externally (TLS) to
+    // get new IO streams; closed during cleanup
+    public Socket sock;            // for TLS
+
+    // For processing &quot;disconnect&quot; unsolicited notification
+    // Initialized in constructor
+    final private LdapClient parent;
+
+    // Incremented and returned in sync getMsgId()
+<span class="fc" id="L149">    private int outMsgId = 0;</span>
+
+    //
+    // The list of ldapRequests pending on this binding
+    //
+    // Accessed only within sync methods
+<span class="fc" id="L155">    private LdapRequest pendingRequests = null;</span>
+
+<span class="fc" id="L157">    volatile IOException closureReason = null;</span>
+<span class="fc" id="L158">    volatile boolean useable = true;  // is Connection still useable</span>
+
+    int readTimeout;
+    int connectTimeout;
+
+    // true means v3; false means v2
+    // Called in LdapClient.authenticate() (which is synchronized)
+    // when connection is &quot;quiet&quot; and not shared; no need to synchronize
+    void setV3(boolean v) {
+<span class="fc" id="L167">        v3 = v;</span>
+<span class="fc" id="L168">    }</span>
+
+    // A BIND request has been successfully made on this connection
+    // When cleaning up, remember to do an UNBIND
+    // Called in LdapClient.authenticate() (which is synchronized)
+    // when connection is &quot;quiet&quot; and not shared; no need to synchronize
+    void setBound() {
+<span class="fc" id="L175">        bound = true;</span>
+<span class="fc" id="L176">    }</span>
+
+    ////////////////////////////////////////////////////////////////////////////
+    //
+    // Create an LDAP Binding object and bind to a particular server
+    //
+    ////////////////////////////////////////////////////////////////////////////
+
+    Connection(LdapClient parent, String host, int port, String socketFactory,
+<span class="fc" id="L185">        int connectTimeout, int readTimeout, OutputStream trace) throws NamingException {</span>
+
+<span class="fc" id="L187">        this.host = host;</span>
+<span class="fc" id="L188">        this.port = port;</span>
+<span class="fc" id="L189">        this.parent = parent;</span>
+<span class="fc" id="L190">        this.readTimeout = readTimeout;</span>
+<span class="fc" id="L191">        this.connectTimeout = connectTimeout;</span>
+
+<span class="pc bpc" id="L193" title="1 of 2 branches missed.">        if (trace != null) {</span>
+<span class="nc" id="L194">            traceFile = trace;</span>
+<span class="nc" id="L195">            traceTagIn = &quot;&lt;- &quot; + host + &quot;:&quot; + port + &quot;\n\n&quot;;</span>
+<span class="nc" id="L196">            traceTagOut = &quot;-&gt; &quot; + host + &quot;:&quot; + port + &quot;\n\n&quot;;</span>
+        }
+
+        //
+        // Connect to server
+        //
+        try {
+<span class="fc" id="L203">            sock = createSocket(host, port, socketFactory, connectTimeout);</span>
+
+            if (debug) {
+                System.err.println(&quot;Connection: opening socket: &quot; + host + &quot;,&quot; + port);
+            }
+
+<span class="fc" id="L209">            inStream = new BufferedInputStream(sock.getInputStream());</span>
+<span class="fc" id="L210">            outStream = new BufferedOutputStream(sock.getOutputStream());</span>
+
+<span class="fc" id="L212">        } catch (InvocationTargetException e) {</span>
+<span class="fc" id="L213">            Throwable realException = e.getTargetException();</span>
+            // realException.printStackTrace();
+
+<span class="fc" id="L216">            CommunicationException ce =</span>
+                new CommunicationException(host + &quot;:&quot; + port);
+<span class="fc" id="L218">            ce.setRootCause(realException);</span>
+<span class="fc" id="L219">            throw ce;</span>
+<span class="fc" id="L220">        } catch (Exception e) {</span>
+            // Class.forName() seems to do more error checking
+            // and will throw IllegalArgumentException and such.
+            // That's why we need to have a catch all here and
+            // ignore generic exceptions.
+            // Also catches all IO errors generated by socket creation.
+<span class="fc" id="L226">            CommunicationException ce =</span>
+                new CommunicationException(host + &quot;:&quot; + port);
+<span class="fc" id="L228">            ce.setRootCause(e);</span>
+<span class="fc" id="L229">            throw ce;</span>
+<span class="fc" id="L230">        }</span>
+
+<span class="fc" id="L232">        worker = Obj.helper.createThread(this);</span>
+<span class="fc" id="L233">        worker.setDaemon(true);</span>
+<span class="fc" id="L234">        worker.start();</span>
+<span class="fc" id="L235">    }</span>
+
+    /*
+     * Create an InetSocketAddress using the specified hostname and port number.
+     */
+    private Object createInetSocketAddress(String host, int port)
+            throws NoSuchMethodException {
+
+        try {
+<span class="fc" id="L244">            Class&lt;?&gt; inetSocketAddressClass =</span>
+<span class="fc" id="L245">                Class.forName(&quot;java.net.InetSocketAddress&quot;);</span>
+
+<span class="fc" id="L247">            Constructor&lt;?&gt; inetSocketAddressCons =</span>
+<span class="fc" id="L248">                inetSocketAddressClass.getConstructor(new Class&lt;?&gt;[]{</span>
+                String.class, int.class});
+
+<span class="fc" id="L251">            return inetSocketAddressCons.newInstance(new Object[]{</span>
+                host, new Integer(port)});
+
+<span class="nc" id="L254">        } catch (ClassNotFoundException |</span>
+                 InstantiationException |
+                 InvocationTargetException |
+                 IllegalAccessException e) {
+<span class="nc" id="L258">            throw new NoSuchMethodException();</span>
+
+        }
+    }
+
+    /*
+     * Create a Socket object using the specified socket factory and time limit.
+     *
+     * If a timeout is supplied and unconnected sockets are supported then
+     * an unconnected socket is created and the timeout is applied when
+     * connecting the socket. If a timeout is supplied but unconnected sockets
+     * are not supported then the timeout is ignored and a connected socket
+     * is created.
+     */
+    private Socket createSocket(String host, int port, String socketFactory,
+            int connectTimeout) throws Exception {
+
+<span class="fc" id="L275">        Socket socket = null;</span>
+
+<span class="fc bfc" id="L277" title="All 2 branches covered.">        if (socketFactory != null) {</span>
+
+            // create the factory
+
+<span class="fc" id="L281">            Class&lt;?&gt; socketFactoryClass = Obj.helper.loadClass(socketFactory);</span>
+<span class="fc" id="L282">            Method getDefault =</span>
+<span class="fc" id="L283">                socketFactoryClass.getMethod(&quot;getDefault&quot;, new Class&lt;?&gt;[]{});</span>
+<span class="fc" id="L284">            Object factory = getDefault.invoke(null, new Object[]{});</span>
+
+            // create the socket
+
+<span class="fc" id="L288">            Method createSocket = null;</span>
+
+<span class="fc bfc" id="L290" title="All 2 branches covered.">            if (connectTimeout &gt; 0) {</span>
+
+                try {
+<span class="nc" id="L293">                    createSocket = socketFactoryClass.getMethod(&quot;createSocket&quot;,</span>
+                        new Class&lt;?&gt;[]{});
+
+<span class="nc" id="L296">                    Method connect = Socket.class.getMethod(&quot;connect&quot;,</span>
+<span class="nc" id="L297">                        new Class&lt;?&gt;[]{Class.forName(&quot;java.net.SocketAddress&quot;),</span>
+                        int.class});
+<span class="nc" id="L299">                    Object endpoint = createInetSocketAddress(host, port);</span>
+
+                    // unconnected socket
+<span class="nc" id="L302">                    socket =</span>
+<span class="nc" id="L303">                        (Socket)createSocket.invoke(factory, new Object[]{});</span>
+
+                    if (debug) {
+                        System.err.println(&quot;Connection: creating socket with &quot; +
+                            &quot;a timeout using supplied socket factory&quot;);
+                    }
+
+                    // connected socket
+<span class="nc" id="L311">                    connect.invoke(socket, new Object[]{</span>
+                        endpoint, new Integer(connectTimeout)});
+
+<span class="nc" id="L314">                } catch (NoSuchMethodException e) {</span>
+                    // continue (but ignore connectTimeout)
+<span class="nc" id="L316">                }</span>
+            }
+
+<span class="nc bnc" id="L319" title="All 2 branches missed.">            if (socket == null) {</span>
+<span class="nc" id="L320">                createSocket = socketFactoryClass.getMethod(&quot;createSocket&quot;,</span>
+                    new Class&lt;?&gt;[]{String.class, int.class});
+
+                if (debug) {
+                    System.err.println(&quot;Connection: creating socket using &quot; +
+                        &quot;supplied socket factory&quot;);
+                }
+                // connected socket
+<span class="nc" id="L328">                socket = (Socket) createSocket.invoke(factory,</span>
+                    new Object[]{host, new Integer(port)});
+            }
+<span class="nc" id="L331">        } else {</span>
+
+<span class="fc bfc" id="L333" title="All 2 branches covered.">            if (connectTimeout &gt; 0) {</span>
+
+                try {
+<span class="fc" id="L336">                    Constructor&lt;Socket&gt; socketCons =</span>
+<span class="fc" id="L337">                        Socket.class.getConstructor(new Class&lt;?&gt;[]{});</span>
+
+<span class="fc" id="L339">                    Method connect = Socket.class.getMethod(&quot;connect&quot;,</span>
+<span class="fc" id="L340">                        new Class&lt;?&gt;[]{Class.forName(&quot;java.net.SocketAddress&quot;),</span>
+                        int.class});
+<span class="fc" id="L342">                    Object endpoint = createInetSocketAddress(host, port);</span>
+
+<span class="fc" id="L344">                    socket = socketCons.newInstance(new Object[]{});</span>
+
+                    if (debug) {
+                        System.err.println(&quot;Connection: creating socket with &quot; +
+                            &quot;a timeout&quot;);
+                    }
+<span class="fc" id="L350">                    connect.invoke(socket, new Object[]{</span>
+                        endpoint, new Integer(connectTimeout)});
+
+<span class="nc" id="L353">                } catch (NoSuchMethodException e) {</span>
+                    // continue (but ignore connectTimeout)
+<span class="fc" id="L355">                }</span>
+            }
+
+<span class="fc bfc" id="L358" title="All 2 branches covered.">            if (socket == null) {</span>
+                if (debug) {
+                    System.err.println(&quot;Connection: creating socket&quot;);
+                }
+                // connected socket
+<span class="fc" id="L363">                socket = new Socket(host, port);</span>
+            }
+        }
+
+        // For LDAP connect timeouts on LDAP over SSL connections must treat
+        // the SSL handshake following socket connection as part of the timeout.
+        // So explicitly set a socket read timeout, trigger the SSL handshake,
+        // then reset the timeout.
+<span class="pc bpc" id="L371" title="1 of 4 branches missed.">        if (connectTimeout &gt; 0 &amp;&amp; socket instanceof SSLSocket) {</span>
+<span class="nc" id="L372">            SSLSocket sslSocket = (SSLSocket) socket;</span>
+<span class="nc" id="L373">            int socketTimeout = sslSocket.getSoTimeout();</span>
+
+<span class="nc" id="L375">            sslSocket.setSoTimeout(connectTimeout); // reuse full timeout value</span>
+<span class="nc" id="L376">            sslSocket.startHandshake();</span>
+<span class="nc" id="L377">            sslSocket.setSoTimeout(socketTimeout);</span>
+        }
+
+<span class="fc" id="L380">        return socket;</span>
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
+    //
+    // Methods to IO to the LDAP server
+    //
+    ////////////////////////////////////////////////////////////////////////////
+
+    synchronized int getMsgId() {
+<span class="fc" id="L390">        return ++outMsgId;</span>
+    }
+
+    LdapRequest writeRequest(BerEncoder ber, int msgId) throws IOException {
+<span class="nc" id="L394">        return writeRequest(ber, msgId, false /* pauseAfterReceipt */, -1);</span>
+    }
+
+    LdapRequest writeRequest(BerEncoder ber, int msgId,
+        boolean pauseAfterReceipt) throws IOException {
+<span class="fc" id="L399">        return writeRequest(ber, msgId, pauseAfterReceipt, -1);</span>
+    }
+
+    LdapRequest writeRequest(BerEncoder ber, int msgId,
+        boolean pauseAfterReceipt, int replyQueueCapacity) throws IOException {
+
+<span class="fc" id="L405">        LdapRequest req =</span>
+            new LdapRequest(msgId, pauseAfterReceipt, replyQueueCapacity);
+<span class="fc" id="L407">        addRequest(req);</span>
+
+<span class="pc bpc" id="L409" title="1 of 2 branches missed.">        if (traceFile != null) {</span>
+<span class="nc" id="L410">            Ber.dumpBER(traceFile, traceTagOut, ber.getBuf(), 0, ber.getDataLen());</span>
+        }
+
+
+        // unpause reader so that it can get response
+        // NOTE: Must do this before writing request, otherwise might
+        // create a race condition where the writer unblocks its own response
+<span class="fc" id="L417">        unpauseReader();</span>
+
+        if (debug) {
+            System.err.println(&quot;Writing request to: &quot; + outStream);
+        }
+
+        try {
+<span class="fc" id="L424">            synchronized (this) {</span>
+<span class="fc" id="L425">                outStream.write(ber.getBuf(), 0, ber.getDataLen());</span>
+<span class="fc" id="L426">                outStream.flush();</span>
+<span class="pc" id="L427">            }</span>
+<span class="nc" id="L428">        } catch (IOException e) {</span>
+<span class="nc" id="L429">            cleanup(null, true);</span>
+<span class="nc" id="L430">            throw (closureReason = e); // rethrow</span>
+<span class="fc" id="L431">        }</span>
+
+<span class="fc" id="L433">        return req;</span>
+    }
+
+    /**
+     * Reads a reply; waits until one is ready.
+     */
+    BerDecoder readReply(LdapRequest ldr)
+            throws IOException, NamingException {
+        BerDecoder rber;
+<span class="fc" id="L442">        boolean waited = false;</span>
+
+<span class="fc bfc" id="L444" title="All 4 branches covered.">        while (((rber = ldr.getReplyBer()) == null) &amp;&amp; !waited) {</span>
+            try {
+                // If socket closed, don't even try
+<span class="fc" id="L447">                synchronized (this) {</span>
+<span class="pc bpc" id="L448" title="1 of 2 branches missed.">                    if (sock == null) {</span>
+<span class="nc" id="L449">                        throw new ServiceUnavailableException(host + &quot;:&quot; + port +</span>
+                            &quot;; socket closed&quot;);
+                    }
+<span class="pc" id="L452">                }</span>
+<span class="fc" id="L453">                synchronized (ldr) {</span>
+                    // check if condition has changed since our last check
+<span class="fc" id="L455">                    rber = ldr.getReplyBer();</span>
+<span class="pc bpc" id="L456" title="1 of 2 branches missed.">                    if (rber == null) {</span>
+<span class="fc bfc" id="L457" title="All 2 branches covered.">                        if (readTimeout &gt; 0) {  // Socket read timeout is specified</span>
+
+                            // will be woken up before readTimeout only if reply is
+                            // available
+<span class="fc" id="L461">                            ldr.wait(readTimeout);</span>
+<span class="fc" id="L462">                            waited = true;</span>
+                        } else {
+<span class="fc" id="L464">                            ldr.wait(15 * 1000); // 15 second timeout</span>
+                        }
+                    } else {
+<span class="nc" id="L467">                        break;</span>
+                    }
+<span class="pc" id="L469">                }</span>
+<span class="nc" id="L470">            } catch (InterruptedException ex) {</span>
+<span class="nc" id="L471">                throw new InterruptedNamingException(</span>
+                    &quot;Interrupted during LDAP operation&quot;);
+<span class="fc" id="L473">            }</span>
+        }
+
+<span class="pc bpc" id="L476" title="1 of 4 branches missed.">        if ((rber == null) &amp;&amp; waited) {</span>
+<span class="fc" id="L477">            removeRequest(ldr);</span>
+<span class="fc" id="L478">            throw new NamingException(&quot;LDAP response read timed out, timeout used:&quot;</span>
+                            + readTimeout + &quot;ms.&quot; );
+
+        }
+<span class="fc" id="L482">        return rber;</span>
+    }
+
+
+    ////////////////////////////////////////////////////////////////////////////
+    //
+    // Methods to add, find, delete, and abandon requests made to server
+    //
+    ////////////////////////////////////////////////////////////////////////////
+
+    private synchronized void addRequest(LdapRequest ldapRequest) {
+
+<span class="fc" id="L494">        LdapRequest ldr = pendingRequests;</span>
+<span class="pc bpc" id="L495" title="1 of 2 branches missed.">        if (ldr == null) {</span>
+<span class="fc" id="L496">            pendingRequests = ldapRequest;</span>
+<span class="fc" id="L497">            ldapRequest.next = null;</span>
+        } else {
+<span class="nc" id="L499">            ldapRequest.next = pendingRequests;</span>
+<span class="nc" id="L500">            pendingRequests = ldapRequest;</span>
+        }
+<span class="fc" id="L502">    }</span>
+
+    synchronized LdapRequest findRequest(int msgId) {
+
+<span class="fc" id="L506">        LdapRequest ldr = pendingRequests;</span>
+<span class="pc bpc" id="L507" title="1 of 2 branches missed.">        while (ldr != null) {</span>
+<span class="pc bpc" id="L508" title="1 of 2 branches missed.">            if (ldr.msgId == msgId) {</span>
+<span class="fc" id="L509">                return ldr;</span>
+            }
+<span class="nc" id="L511">            ldr = ldr.next;</span>
+        }
+<span class="nc" id="L513">        return null;</span>
+
+    }
+
+    synchronized void removeRequest(LdapRequest req) {
+<span class="fc" id="L518">        LdapRequest ldr = pendingRequests;</span>
+<span class="fc" id="L519">        LdapRequest ldrprev = null;</span>
+
+<span class="fc bfc" id="L521" title="All 2 branches covered.">        while (ldr != null) {</span>
+<span class="pc bpc" id="L522" title="1 of 2 branches missed.">            if (ldr == req) {</span>
+<span class="fc" id="L523">                ldr.cancel();</span>
+
+<span class="pc bpc" id="L525" title="1 of 2 branches missed.">                if (ldrprev != null) {</span>
+<span class="nc" id="L526">                    ldrprev.next = ldr.next;</span>
+                } else {
+<span class="fc" id="L528">                    pendingRequests = ldr.next;</span>
+                }
+<span class="fc" id="L530">                ldr.next = null;</span>
+            }
+<span class="fc" id="L532">            ldrprev = ldr;</span>
+<span class="fc" id="L533">            ldr = ldr.next;</span>
+        }
+<span class="fc" id="L535">    }</span>
+
+    void abandonRequest(LdapRequest ldr, Control[] reqCtls) {
+        // Remove from queue
+<span class="fc" id="L539">        removeRequest(ldr);</span>
+
+<span class="fc" id="L541">        BerEncoder ber = new BerEncoder(256);</span>
+<span class="fc" id="L542">        int abandonMsgId = getMsgId();</span>
+
+        //
+        // build the abandon request.
+        //
+        try {
+<span class="fc" id="L548">            ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);</span>
+<span class="fc" id="L549">                ber.encodeInt(abandonMsgId);</span>
+<span class="fc" id="L550">                ber.encodeInt(ldr.msgId, LdapClient.LDAP_REQ_ABANDON);</span>
+
+<span class="pc bpc" id="L552" title="1 of 2 branches missed.">                if (v3) {</span>
+<span class="fc" id="L553">                    LdapClient.encodeControls(ber, reqCtls);</span>
+                }
+<span class="fc" id="L555">            ber.endSeq();</span>
+
+<span class="pc bpc" id="L557" title="1 of 2 branches missed.">            if (traceFile != null) {</span>
+<span class="nc" id="L558">                Ber.dumpBER(traceFile, traceTagOut, ber.getBuf(), 0,</span>
+<span class="nc" id="L559">                    ber.getDataLen());</span>
+            }
+
+<span class="fc" id="L562">            synchronized (this) {</span>
+<span class="nc" id="L563">                outStream.write(ber.getBuf(), 0, ber.getDataLen());</span>
+<span class="nc" id="L564">                outStream.flush();</span>
+<span class="pc" id="L565">            }</span>
+
+<span class="fc" id="L567">        } catch (IOException ex) {</span>
+            //System.err.println(&quot;ldap.abandon: &quot; + ex);
+<span class="nc" id="L569">        }</span>
+
+        // Don't expect any response for the abandon request.
+<span class="fc" id="L572">    }</span>
+
+    synchronized void abandonOutstandingReqs(Control[] reqCtls) {
+<span class="fc" id="L575">        LdapRequest ldr = pendingRequests;</span>
+
+<span class="pc bpc" id="L577" title="1 of 2 branches missed.">        while (ldr != null) {</span>
+<span class="nc" id="L578">            abandonRequest(ldr, reqCtls);</span>
+<span class="nc" id="L579">            pendingRequests = ldr = ldr.next;</span>
+        }
+<span class="fc" id="L581">    }</span>
+
+    ////////////////////////////////////////////////////////////////////////////
+    //
+    // Methods to unbind from server and clear up resources when object is
+    // destroyed.
+    //
+    ////////////////////////////////////////////////////////////////////////////
+
+    private void ldapUnbind(Control[] reqCtls) {
+
+<span class="fc" id="L592">        BerEncoder ber = new BerEncoder(256);</span>
+<span class="fc" id="L593">        int unbindMsgId = getMsgId();</span>
+
+        //
+        // build the unbind request.
+        //
+
+        try {
+
+<span class="fc" id="L601">            ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);</span>
+<span class="fc" id="L602">                ber.encodeInt(unbindMsgId);</span>
+                // IMPLICIT TAGS
+<span class="fc" id="L604">                ber.encodeByte(LdapClient.LDAP_REQ_UNBIND);</span>
+<span class="fc" id="L605">                ber.encodeByte(0);</span>
+
+<span class="pc bpc" id="L607" title="1 of 2 branches missed.">                if (v3) {</span>
+<span class="fc" id="L608">                    LdapClient.encodeControls(ber, reqCtls);</span>
+                }
+<span class="fc" id="L610">            ber.endSeq();</span>
+
+<span class="pc bpc" id="L612" title="1 of 2 branches missed.">            if (traceFile != null) {</span>
+<span class="nc" id="L613">                Ber.dumpBER(traceFile, traceTagOut, ber.getBuf(),</span>
+<span class="nc" id="L614">                    0, ber.getDataLen());</span>
+            }
+
+<span class="fc" id="L617">            synchronized (this) {</span>
+<span class="fc" id="L618">                outStream.write(ber.getBuf(), 0, ber.getDataLen());</span>
+<span class="fc" id="L619">                outStream.flush();</span>
+<span class="pc" id="L620">            }</span>
+
+<span class="nc" id="L622">        } catch (IOException ex) {</span>
+            //System.err.println(&quot;ldap.unbind: &quot; + ex);
+<span class="fc" id="L624">        }</span>
+
+        // Don't expect any response for the unbind request.
+<span class="fc" id="L627">    }</span>
+
+    /**
+     * @param reqCtls Possibly null request controls that accompanies the
+     *    abandon and unbind LDAP request.
+     * @param notifyParent true means to call parent LdapClient back, notifying
+     *    it that the connection has been closed; false means not to notify
+     *    parent. If LdapClient invokes cleanup(), notifyParent should be set to
+     *    false because LdapClient already knows that it is closing
+     *    the connection. If Connection invokes cleanup(), notifyParent should be
+     *    set to true because LdapClient needs to know about the closure.
+     */
+    void cleanup(Control[] reqCtls, boolean notifyParent) {
+<span class="fc" id="L640">        boolean nparent = false;</span>
+
+<span class="fc" id="L642">        synchronized (this) {</span>
+<span class="fc" id="L643">            useable = false;</span>
+
+<span class="fc bfc" id="L645" title="All 2 branches covered.">            if (sock != null) {</span>
+                if (debug) {
+                    System.err.println(&quot;Connection: closing socket: &quot; + host + &quot;,&quot; + port);
+                }
+                try {
+<span class="fc bfc" id="L650" title="All 2 branches covered.">                    if (!notifyParent) {</span>
+<span class="fc" id="L651">                        abandonOutstandingReqs(reqCtls);</span>
+                    }
+<span class="fc bfc" id="L653" title="All 2 branches covered.">                    if (bound) {</span>
+<span class="fc" id="L654">                        ldapUnbind(reqCtls);</span>
+                    }
+                } finally {
+<span class="nc" id="L657">                    try {</span>
+<span class="pc" id="L658">                        outStream.flush();</span>
+<span class="pc" id="L659">                        sock.close();</span>
+<span class="pc" id="L660">                        unpauseReader();</span>
+<span class="nc" id="L661">                    } catch (IOException ie) {</span>
+                        if (debug)
+                            System.err.println(&quot;Connection: problem closing socket: &quot; + ie);
+<span class="pc" id="L664">                    }</span>
+<span class="pc bpc" id="L665" title="2 of 4 branches missed.">                    if (!notifyParent) {</span>
+<span class="pc" id="L666">                        LdapRequest ldr = pendingRequests;</span>
+<span class="pc bpc" id="L667" title="3 of 4 branches missed.">                        while (ldr != null) {</span>
+<span class="nc" id="L668">                            ldr.cancel();</span>
+<span class="nc" id="L669">                            ldr = ldr.next;</span>
+                        }
+                    }
+<span class="pc" id="L672">                    sock = null;</span>
+<span class="fc" id="L673">                }</span>
+<span class="fc" id="L674">                nparent = notifyParent;</span>
+            }
+<span class="fc bfc" id="L676" title="All 2 branches covered.">            if (nparent) {</span>
+<span class="fc" id="L677">                LdapRequest ldr = pendingRequests;</span>
+<span class="fc bfc" id="L678" title="All 2 branches covered.">                while (ldr != null) {</span>
+
+<span class="fc" id="L680">                    synchronized (ldr) {</span>
+<span class="fc" id="L681">                        ldr.notify();</span>
+<span class="fc" id="L682">                        ldr = ldr.next;</span>
+<span class="pc" id="L683">                    }</span>
+                }
+            }
+<span class="pc" id="L686">        }</span>
+<span class="fc bfc" id="L687" title="All 2 branches covered.">        if (nparent) {</span>
+<span class="fc" id="L688">            parent.processConnectionClosure();</span>
+        }
+<span class="fc" id="L690">    }</span>
+
+
+    // Assume everything is &quot;quiet&quot;
+    // &quot;synchronize&quot; might lead to deadlock so don't synchronize method
+    // Use streamLock instead for synchronizing update to stream
+
+    synchronized public void replaceStreams(InputStream newIn, OutputStream newOut) {
+        if (debug) {
+            System.err.println(&quot;Replacing &quot; + inStream + &quot; with: &quot; + newIn);
+            System.err.println(&quot;Replacing &quot; + outStream + &quot; with: &quot; + newOut);
+        }
+
+<span class="nc" id="L703">        inStream = newIn;</span>
+
+        // Cleanup old stream
+        try {
+<span class="nc" id="L707">            outStream.flush();</span>
+<span class="nc" id="L708">        } catch (IOException ie) {</span>
+            if (debug)
+                System.err.println(&quot;Connection: cannot flush outstream: &quot; + ie);
+<span class="nc" id="L711">        }</span>
+
+        // Replace stream
+<span class="nc" id="L714">        outStream = newOut;</span>
+<span class="nc" id="L715">    }</span>
+
+    /**
+     * Used by Connection thread to read inStream into a local variable.
+     * This ensures that there is no contention between the main thread
+     * and the Connection thread when the main thread updates inStream.
+     */
+    synchronized private InputStream getInputStream() {
+<span class="fc" id="L723">        return inStream;</span>
+    }
+
+
+    ////////////////////////////////////////////////////////////////////////////
+    //
+    // Code for pausing/unpausing the reader thread ('worker')
+    //
+    ////////////////////////////////////////////////////////////////////////////
+
+    /*
+     * The main idea is to mark requests that need the reader thread to
+     * pause after getting the response. When the reader thread gets the response,
+     * it waits on a lock instead of returning to the read(). The next time a
+     * request is sent, the reader is automatically unblocked if necessary.
+     * Note that the reader must be unblocked BEFORE the request is sent.
+     * Otherwise, there is a race condition where the request is sent and
+     * the reader thread might read the response and be unblocked
+     * by writeRequest().
+     *
+     * This pause gives the main thread (StartTLS or SASL) an opportunity to
+     * update the reader's state (e.g., its streams) if necessary.
+     * The assumption is that the connection will remain quiet during this pause
+     * (i.e., no intervening requests being sent).
+     *&lt;p&gt;
+     * For dealing with StartTLS close,
+     * when the read() exits either due to EOF or an exception,
+     * the reader thread checks whether there is a new stream to read from.
+     * If so, then it reattempts the read. Otherwise, the EOF or exception
+     * is processed and the reader thread terminates.
+     * In a StartTLS close, the client first replaces the SSL IO streams with
+     * plain ones and then closes the SSL socket.
+     * If the reader thread attempts to read, or was reading, from
+     * the SSL socket (that is, it got to the read BEFORE replaceStreams()),
+     * the SSL socket close will cause the reader thread to
+     * get an EOF/exception and reexamine the input stream.
+     * If the reader thread sees a new stream, it reattempts the read.
+     * If the underlying socket is still alive, then the new read will succeed.
+     * If the underlying socket has been closed also, then the new read will
+     * fail and the reader thread exits.
+     * If the reader thread attempts to read, or was reading, from the plain
+     * socket (that is, it got to the read AFTER replaceStreams()), the
+     * SSL socket close will have no effect on the reader thread.
+     *
+     * The check for new stream is made only
+     * in the first attempt at reading a BER buffer; the reader should
+     * never be in midst of reading a buffer when a nonfatal close occurs.
+     * If this occurs, then the connection is in an inconsistent state and
+     * the safest thing to do is to shut it down.
+     */
+
+<span class="fc" id="L774">    private Object pauseLock = new Object();  // lock for reader to wait on while paused</span>
+<span class="fc" id="L775">    private boolean paused = false;           // paused state of reader</span>
+
+    /*
+     * Unpauses reader thread if it was paused
+     */
+    private void unpauseReader() throws IOException {
+<span class="fc" id="L781">        synchronized (pauseLock) {</span>
+<span class="pc bpc" id="L782" title="1 of 2 branches missed.">            if (paused) {</span>
+                if (debug) {
+                    System.err.println(&quot;Unpausing reader; read from: &quot; +
+                                        inStream);
+                }
+<span class="nc" id="L787">                paused = false;</span>
+<span class="nc" id="L788">                pauseLock.notify();</span>
+            }
+<span class="pc" id="L790">        }</span>
+<span class="fc" id="L791">    }</span>
+
+     /*
+     * Pauses reader so that it stops reading from the input stream.
+     * Reader blocks on pauseLock instead of read().
+     * MUST be called from within synchronized (pauseLock) clause.
+     */
+    private void pauseReader() throws IOException {
+        if (debug) {
+            System.err.println(&quot;Pausing reader;  was reading from: &quot; +
+                                inStream);
+        }
+<span class="nc" id="L803">        paused = true;</span>
+        try {
+<span class="nc bnc" id="L805" title="All 2 branches missed.">            while (paused) {</span>
+<span class="nc" id="L806">                pauseLock.wait(); // notified by unpauseReader</span>
+            }
+<span class="nc" id="L808">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L809">            throw new InterruptedIOException(</span>
+                    &quot;Pause/unpause reader has problems.&quot;);
+<span class="nc" id="L811">        }</span>
+<span class="nc" id="L812">    }</span>
+
+
+    ////////////////////////////////////////////////////////////////////////////
+    //
+    // The LDAP Binding thread. It does the mux/demux of multiple requests
+    // on the same TCP connection.
+    //
+    ////////////////////////////////////////////////////////////////////////////
+
+
+    public void run() {
+        byte inbuf[];   // Buffer for reading incoming bytes
+        int inMsgId;    // Message id of incoming response
+        int bytesread;  // Number of bytes in inbuf
+        int br;         // Temp; number of bytes read from stream
+        int offset;     // Offset of where to store bytes in inbuf
+        int seqlen;     // Length of ASN sequence
+        int seqlenlen;  // Number of sequence length bytes
+        boolean eos;    // End of stream
+        BerDecoder retBer;    // Decoder for ASN.1 BER data from inbuf
+<span class="fc" id="L833">        InputStream in = null;</span>
+
+        try {
+            while (true) {
+                try {
+                    // type and length (at most 128 octets for long form)
+<span class="fc" id="L839">                    inbuf = new byte[129];</span>
+
+<span class="fc" id="L841">                    offset = 0;</span>
+<span class="fc" id="L842">                    seqlen = 0;</span>
+<span class="fc" id="L843">                    seqlenlen = 0;</span>
+
+<span class="fc" id="L845">                    in = getInputStream();</span>
+
+                    // check that it is the beginning of a sequence
+<span class="fc" id="L848">                    bytesread = in.read(inbuf, offset, 1);</span>
+<span class="fc bfc" id="L849" title="All 2 branches covered.">                    if (bytesread &lt; 0) {</span>
+<span class="pc bpc" id="L850" title="1 of 2 branches missed.">                        if (in != getInputStream()) {</span>
+<span class="nc" id="L851">                            continue;   // a new stream to try</span>
+                        } else {
+<span class="fc" id="L853">                            break; // EOF</span>
+                        }
+                    }
+
+<span class="pc bpc" id="L857" title="1 of 2 branches missed.">                    if (inbuf[offset++] != (Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR))</span>
+<span class="nc" id="L858">                        continue;</span>
+
+                    // get length of sequence
+<span class="fc" id="L861">                    bytesread = in.read(inbuf, offset, 1);</span>
+<span class="pc bpc" id="L862" title="1 of 2 branches missed.">                    if (bytesread &lt; 0)</span>
+<span class="nc" id="L863">                        break; // EOF</span>
+<span class="fc" id="L864">                    seqlen = inbuf[offset++];</span>
+
+                    // if high bit is on, length is encoded in the
+                    // subsequent length bytes and the number of length bytes
+                    // is equal to &amp; 0x80 (i.e. length byte with high bit off).
+<span class="pc bpc" id="L869" title="1 of 2 branches missed.">                    if ((seqlen &amp; 0x80) == 0x80) {</span>
+<span class="nc" id="L870">                        seqlenlen = seqlen &amp; 0x7f;  // number of length bytes</span>
+
+<span class="nc" id="L872">                        bytesread = 0;</span>
+<span class="nc" id="L873">                        eos = false;</span>
+
+                        // Read all length bytes
+<span class="nc bnc" id="L876" title="All 2 branches missed.">                        while (bytesread &lt; seqlenlen) {</span>
+<span class="nc" id="L877">                            br = in.read(inbuf, offset+bytesread,</span>
+                                seqlenlen-bytesread);
+<span class="nc bnc" id="L879" title="All 2 branches missed.">                            if (br &lt; 0) {</span>
+<span class="nc" id="L880">                                eos = true;</span>
+<span class="nc" id="L881">                                break; // EOF</span>
+                            }
+<span class="nc" id="L883">                            bytesread += br;</span>
+                        }
+
+                        // end-of-stream reached before length bytes are read
+<span class="nc bnc" id="L887" title="All 2 branches missed.">                        if (eos)</span>
+<span class="nc" id="L888">                            break;  // EOF</span>
+
+                        // Add contents of length bytes to determine length
+<span class="nc" id="L891">                        seqlen = 0;</span>
+<span class="nc bnc" id="L892" title="All 2 branches missed.">                        for( int i = 0; i &lt; seqlenlen; i++) {</span>
+<span class="nc" id="L893">                            seqlen = (seqlen &lt;&lt; 8) + (inbuf[offset+i] &amp; 0xff);</span>
+                        }
+<span class="nc" id="L895">                        offset += bytesread;</span>
+                    }
+
+                    // read in seqlen bytes
+<span class="fc" id="L899">                    byte[] left = IOUtils.readFully(in, seqlen, false);</span>
+<span class="fc" id="L900">                    inbuf = Arrays.copyOf(inbuf, offset + left.length);</span>
+<span class="fc" id="L901">                    System.arraycopy(left, 0, inbuf, offset, left.length);</span>
+<span class="fc" id="L902">                    offset += left.length;</span>
+/*
+if (dump &gt; 0) {
+System.err.println(&quot;seqlen: &quot; + seqlen);
+System.err.println(&quot;bufsize: &quot; + offset);
+System.err.println(&quot;bytesleft: &quot; + bytesleft);
+System.err.println(&quot;bytesread: &quot; + bytesread);
+}
+*/
+
+
+                    try {
+<span class="fc" id="L914">                        retBer = new BerDecoder(inbuf, 0, offset);</span>
+
+<span class="pc bpc" id="L916" title="1 of 2 branches missed.">                        if (traceFile != null) {</span>
+<span class="nc" id="L917">                            Ber.dumpBER(traceFile, traceTagIn, inbuf, 0, offset);</span>
+                        }
+
+<span class="fc" id="L920">                        retBer.parseSeq(null);</span>
+<span class="fc" id="L921">                        inMsgId = retBer.parseInt();</span>
+<span class="fc" id="L922">                        retBer.reset(); // reset offset</span>
+
+<span class="fc" id="L924">                        boolean needPause = false;</span>
+
+<span class="pc bpc" id="L926" title="1 of 2 branches missed.">                        if (inMsgId == 0) {</span>
+                            // Unsolicited Notification
+<span class="nc" id="L928">                            parent.processUnsolicited(retBer);</span>
+                        } else {
+<span class="fc" id="L930">                            LdapRequest ldr = findRequest(inMsgId);</span>
+
+<span class="pc bpc" id="L932" title="1 of 2 branches missed.">                            if (ldr != null) {</span>
+
+                                /**
+                                 * Grab pauseLock before making reply available
+                                 * to ensure that reader goes into paused state
+                                 * before writer can attempt to unpause reader
+                                 */
+<span class="fc" id="L939">                                synchronized (pauseLock) {</span>
+<span class="fc" id="L940">                                    needPause = ldr.addReplyBer(retBer);</span>
+<span class="pc bpc" id="L941" title="1 of 2 branches missed.">                                    if (needPause) {</span>
+                                        /*
+                                         * Go into paused state; release
+                                         * pauseLock
+                                         */
+<span class="nc" id="L946">                                        pauseReader();</span>
+                                    }
+
+                                    // else release pauseLock
+<span class="pc" id="L950">                                }</span>
+                            } else {
+                                // System.err.println(&quot;Cannot find&quot; +
+                                //              &quot;LdapRequest for &quot; + inMsgId);
+                            }
+                        }
+<span class="nc" id="L956">                    } catch (Ber.DecodeException e) {</span>
+                        //System.err.println(&quot;Cannot parse Ber&quot;);
+<span class="fc" id="L958">                    }</span>
+<span class="fc" id="L959">                } catch (IOException ie) {</span>
+                    if (debug) {
+                        System.err.println(&quot;Connection: Inside Caught &quot; + ie);
+                        ie.printStackTrace();
+                    }
+
+<span class="pc bpc" id="L965" title="1 of 2 branches missed.">                    if (in != getInputStream()) {</span>
+                        // A new stream to try
+                        // Go to top of loop and continue
+                    } else {
+                        if (debug) {
+                            System.err.println(&quot;Connection: rethrowing &quot; + ie);
+                        }
+<span class="fc" id="L972">                        throw ie;  // rethrow exception</span>
+                    }
+<span class="pc" id="L974">                }</span>
+            }
+
+            if (debug) {
+                System.err.println(&quot;Connection: end-of-stream detected: &quot;
+                    + in);
+            }
+<span class="fc" id="L981">        } catch (IOException ex) {</span>
+            if (debug) {
+                System.err.println(&quot;Connection: Caught &quot; + ex);
+            }
+<span class="fc" id="L985">            closureReason = ex;</span>
+        } finally {
+<span class="pc" id="L987">            cleanup(null, true); // cleanup</span>
+<span class="fc" id="L988">        }</span>
+        if (debug) {
+            System.err.println(&quot;Connection: Thread Exiting&quot;);
+        }
+<span class="fc" id="L992">    }</span>
+
+
+    // This code must be uncommented to run the LdapAbandonTest.
+    /*public void sendSearchReqs(String dn, int numReqs) {
+        int i;
+        String attrs[] = null;
+        for(i = 1; i &lt;= numReqs; i++) {
+            BerEncoder ber = new BerEncoder(2048);
+
+            try {
+            ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);
+                ber.encodeInt(i);
+                ber.beginSeq(LdapClient.LDAP_REQ_SEARCH);
+                    ber.encodeString(dn == null ? &quot;&quot; : dn);
+                    ber.encodeInt(0, LdapClient.LBER_ENUMERATED);
+                    ber.encodeInt(3, LdapClient.LBER_ENUMERATED);
+                    ber.encodeInt(0);
+                    ber.encodeInt(0);
+                    ber.encodeBoolean(true);
+                    LdapClient.encodeFilter(ber, &quot;&quot;);
+                    ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);
+                        ber.encodeStringArray(attrs);
+                    ber.endSeq();
+                ber.endSeq();
+            ber.endSeq();
+            writeRequest(ber, i);
+            //System.err.println(&quot;wrote request &quot; + i);
+            } catch (Exception ex) {
+            //System.err.println(&quot;ldap.search: Caught &quot; + ex + &quot; building req&quot;);
+            }
+
+        }
+    } */
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

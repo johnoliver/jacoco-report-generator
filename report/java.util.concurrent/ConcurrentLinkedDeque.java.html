@@ -1,0 +1,1587 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ConcurrentLinkedDeque.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">java.util.concurrent</a> &gt; <span class="el_source">ConcurrentLinkedDeque.java</span></div><h1>ConcurrentLinkedDeque.java</h1><pre class="source lang-java linenums">/*
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+/*
+ * This file is available under and governed by the GNU General Public
+ * License version 2 only, as published by the Free Software Foundation.
+ * However, the following notice accompanied the original version of this
+ * file:
+ *
+ * Written by Doug Lea and Martin Buchholz with assistance from members of
+ * JCP JSR-166 Expert Group and released to the public domain, as explained
+ * at http://creativecommons.org/publicdomain/zero/1.0/
+ */
+
+package java.util.concurrent;
+
+import java.util.AbstractCollection;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Deque;
+import java.util.Iterator;
+import java.util.NoSuchElementException;
+import java.util.Queue;
+import java.util.Spliterator;
+import java.util.Spliterators;
+import java.util.function.Consumer;
+
+/**
+ * An unbounded concurrent {@linkplain Deque deque} based on linked nodes.
+ * Concurrent insertion, removal, and access operations execute safely
+ * across multiple threads.
+ * A {@code ConcurrentLinkedDeque} is an appropriate choice when
+ * many threads will share access to a common collection.
+ * Like most other concurrent collection implementations, this class
+ * does not permit the use of {@code null} elements.
+ *
+ * &lt;p&gt;Iterators and spliterators are
+ * &lt;a href=&quot;package-summary.html#Weakly&quot;&gt;&lt;i&gt;weakly consistent&lt;/i&gt;&lt;/a&gt;.
+ *
+ * &lt;p&gt;Beware that, unlike in most collections, the {@code size} method
+ * is &lt;em&gt;NOT&lt;/em&gt; a constant-time operation. Because of the
+ * asynchronous nature of these deques, determining the current number
+ * of elements requires a traversal of the elements, and so may report
+ * inaccurate results if this collection is modified during traversal.
+ * Additionally, the bulk operations {@code addAll},
+ * {@code removeAll}, {@code retainAll}, {@code containsAll},
+ * {@code equals}, and {@code toArray} are &lt;em&gt;not&lt;/em&gt; guaranteed
+ * to be performed atomically. For example, an iterator operating
+ * concurrently with an {@code addAll} operation might view only some
+ * of the added elements.
+ *
+ * &lt;p&gt;This class and its iterator implement all of the &lt;em&gt;optional&lt;/em&gt;
+ * methods of the {@link Deque} and {@link Iterator} interfaces.
+ *
+ * &lt;p&gt;Memory consistency effects: As with other concurrent collections,
+ * actions in a thread prior to placing an object into a
+ * {@code ConcurrentLinkedDeque}
+ * &lt;a href=&quot;package-summary.html#MemoryVisibility&quot;&gt;&lt;i&gt;happen-before&lt;/i&gt;&lt;/a&gt;
+ * actions subsequent to the access or removal of that element from
+ * the {@code ConcurrentLinkedDeque} in another thread.
+ *
+ * &lt;p&gt;This class is a member of the
+ * &lt;a href=&quot;{@docRoot}/../technotes/guides/collections/index.html&quot;&gt;
+ * Java Collections Framework&lt;/a&gt;.
+ *
+ * @since 1.7
+ * @author Doug Lea
+ * @author Martin Buchholz
+ * @param &lt;E&gt; the type of elements held in this collection
+ */
+public class ConcurrentLinkedDeque&lt;E&gt;
+    extends AbstractCollection&lt;E&gt;
+    implements Deque&lt;E&gt;, java.io.Serializable {
+
+    /*
+     * This is an implementation of a concurrent lock-free deque
+     * supporting interior removes but not interior insertions, as
+     * required to support the entire Deque interface.
+     *
+     * We extend the techniques developed for ConcurrentLinkedQueue and
+     * LinkedTransferQueue (see the internal docs for those classes).
+     * Understanding the ConcurrentLinkedQueue implementation is a
+     * prerequisite for understanding the implementation of this class.
+     *
+     * The data structure is a symmetrical doubly-linked &quot;GC-robust&quot;
+     * linked list of nodes.  We minimize the number of volatile writes
+     * using two techniques: advancing multiple hops with a single CAS
+     * and mixing volatile and non-volatile writes of the same memory
+     * locations.
+     *
+     * A node contains the expected E (&quot;item&quot;) and links to predecessor
+     * (&quot;prev&quot;) and successor (&quot;next&quot;) nodes:
+     *
+     * class Node&lt;E&gt; { volatile Node&lt;E&gt; prev, next; volatile E item; }
+     *
+     * A node p is considered &quot;live&quot; if it contains a non-null item
+     * (p.item != null).  When an item is CASed to null, the item is
+     * atomically logically deleted from the collection.
+     *
+     * At any time, there is precisely one &quot;first&quot; node with a null
+     * prev reference that terminates any chain of prev references
+     * starting at a live node.  Similarly there is precisely one
+     * &quot;last&quot; node terminating any chain of next references starting at
+     * a live node.  The &quot;first&quot; and &quot;last&quot; nodes may or may not be live.
+     * The &quot;first&quot; and &quot;last&quot; nodes are always mutually reachable.
+     *
+     * A new element is added atomically by CASing the null prev or
+     * next reference in the first or last node to a fresh node
+     * containing the element.  The element's node atomically becomes
+     * &quot;live&quot; at that point.
+     *
+     * A node is considered &quot;active&quot; if it is a live node, or the
+     * first or last node.  Active nodes cannot be unlinked.
+     *
+     * A &quot;self-link&quot; is a next or prev reference that is the same node:
+     *   p.prev == p  or  p.next == p
+     * Self-links are used in the node unlinking process.  Active nodes
+     * never have self-links.
+     *
+     * A node p is active if and only if:
+     *
+     * p.item != null ||
+     * (p.prev == null &amp;&amp; p.next != p) ||
+     * (p.next == null &amp;&amp; p.prev != p)
+     *
+     * The deque object has two node references, &quot;head&quot; and &quot;tail&quot;.
+     * The head and tail are only approximations to the first and last
+     * nodes of the deque.  The first node can always be found by
+     * following prev pointers from head; likewise for tail.  However,
+     * it is permissible for head and tail to be referring to deleted
+     * nodes that have been unlinked and so may not be reachable from
+     * any live node.
+     *
+     * There are 3 stages of node deletion;
+     * &quot;logical deletion&quot;, &quot;unlinking&quot;, and &quot;gc-unlinking&quot;.
+     *
+     * 1. &quot;logical deletion&quot; by CASing item to null atomically removes
+     * the element from the collection, and makes the containing node
+     * eligible for unlinking.
+     *
+     * 2. &quot;unlinking&quot; makes a deleted node unreachable from active
+     * nodes, and thus eventually reclaimable by GC.  Unlinked nodes
+     * may remain reachable indefinitely from an iterator.
+     *
+     * Physical node unlinking is merely an optimization (albeit a
+     * critical one), and so can be performed at our convenience.  At
+     * any time, the set of live nodes maintained by prev and next
+     * links are identical, that is, the live nodes found via next
+     * links from the first node is equal to the elements found via
+     * prev links from the last node.  However, this is not true for
+     * nodes that have already been logically deleted - such nodes may
+     * be reachable in one direction only.
+     *
+     * 3. &quot;gc-unlinking&quot; takes unlinking further by making active
+     * nodes unreachable from deleted nodes, making it easier for the
+     * GC to reclaim future deleted nodes.  This step makes the data
+     * structure &quot;gc-robust&quot;, as first described in detail by Boehm
+     * (http://portal.acm.org/citation.cfm?doid=503272.503282).
+     *
+     * GC-unlinked nodes may remain reachable indefinitely from an
+     * iterator, but unlike unlinked nodes, are never reachable from
+     * head or tail.
+     *
+     * Making the data structure GC-robust will eliminate the risk of
+     * unbounded memory retention with conservative GCs and is likely
+     * to improve performance with generational GCs.
+     *
+     * When a node is dequeued at either end, e.g. via poll(), we would
+     * like to break any references from the node to active nodes.  We
+     * develop further the use of self-links that was very effective in
+     * other concurrent collection classes.  The idea is to replace
+     * prev and next pointers with special values that are interpreted
+     * to mean off-the-list-at-one-end.  These are approximations, but
+     * good enough to preserve the properties we want in our
+     * traversals, e.g. we guarantee that a traversal will never visit
+     * the same element twice, but we don't guarantee whether a
+     * traversal that runs out of elements will be able to see more
+     * elements later after enqueues at that end.  Doing gc-unlinking
+     * safely is particularly tricky, since any node can be in use
+     * indefinitely (for example by an iterator).  We must ensure that
+     * the nodes pointed at by head/tail never get gc-unlinked, since
+     * head/tail are needed to get &quot;back on track&quot; by other nodes that
+     * are gc-unlinked.  gc-unlinking accounts for much of the
+     * implementation complexity.
+     *
+     * Since neither unlinking nor gc-unlinking are necessary for
+     * correctness, there are many implementation choices regarding
+     * frequency (eagerness) of these operations.  Since volatile
+     * reads are likely to be much cheaper than CASes, saving CASes by
+     * unlinking multiple adjacent nodes at a time may be a win.
+     * gc-unlinking can be performed rarely and still be effective,
+     * since it is most important that long chains of deleted nodes
+     * are occasionally broken.
+     *
+     * The actual representation we use is that p.next == p means to
+     * goto the first node (which in turn is reached by following prev
+     * pointers from head), and p.next == null &amp;&amp; p.prev == p means
+     * that the iteration is at an end and that p is a (static final)
+     * dummy node, NEXT_TERMINATOR, and not the last active node.
+     * Finishing the iteration when encountering such a TERMINATOR is
+     * good enough for read-only traversals, so such traversals can use
+     * p.next == null as the termination condition.  When we need to
+     * find the last (active) node, for enqueueing a new node, we need
+     * to check whether we have reached a TERMINATOR node; if so,
+     * restart traversal from tail.
+     *
+     * The implementation is completely directionally symmetrical,
+     * except that most public methods that iterate through the list
+     * follow next pointers (&quot;forward&quot; direction).
+     *
+     * We believe (without full proof) that all single-element deque
+     * operations (e.g., addFirst, peekLast, pollLast) are linearizable
+     * (see Herlihy and Shavit's book).  However, some combinations of
+     * operations are known not to be linearizable.  In particular,
+     * when an addFirst(A) is racing with pollFirst() removing B, it is
+     * possible for an observer iterating over the elements to observe
+     * A B C and subsequently observe A C, even though no interior
+     * removes are ever performed.  Nevertheless, iterators behave
+     * reasonably, providing the &quot;weakly consistent&quot; guarantees.
+     *
+     * Empirically, microbenchmarks suggest that this class adds about
+     * 40% overhead relative to ConcurrentLinkedQueue, which feels as
+     * good as we can hope for.
+     */
+
+    private static final long serialVersionUID = 876323262645176354L;
+
+    /**
+     * A node from which the first node on list (that is, the unique node p
+     * with p.prev == null &amp;&amp; p.next != p) can be reached in O(1) time.
+     * Invariants:
+     * - the first node is always O(1) reachable from head via prev links
+     * - all live nodes are reachable from the first node via succ()
+     * - head != null
+     * - (tmp = head).next != tmp || tmp != head
+     * - head is never gc-unlinked (but may be unlinked)
+     * Non-invariants:
+     * - head.item may or may not be null
+     * - head may not be reachable from the first or last node, or from tail
+     */
+    private transient volatile Node&lt;E&gt; head;
+
+    /**
+     * A node from which the last node on list (that is, the unique node p
+     * with p.next == null &amp;&amp; p.prev != p) can be reached in O(1) time.
+     * Invariants:
+     * - the last node is always O(1) reachable from tail via next links
+     * - all live nodes are reachable from the last node via pred()
+     * - tail != null
+     * - tail is never gc-unlinked (but may be unlinked)
+     * Non-invariants:
+     * - tail.item may or may not be null
+     * - tail may not be reachable from the first or last node, or from head
+     */
+    private transient volatile Node&lt;E&gt; tail;
+
+    private static final Node&lt;Object&gt; PREV_TERMINATOR, NEXT_TERMINATOR;
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    Node&lt;E&gt; prevTerminator() {
+<span class="fc" id="L282">        return (Node&lt;E&gt;) PREV_TERMINATOR;</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    Node&lt;E&gt; nextTerminator() {
+<span class="fc" id="L287">        return (Node&lt;E&gt;) NEXT_TERMINATOR;</span>
+    }
+
+    static final class Node&lt;E&gt; {
+        volatile Node&lt;E&gt; prev;
+        volatile E item;
+        volatile Node&lt;E&gt; next;
+
+<span class="fc" id="L295">        Node() {  // default constructor for NEXT_TERMINATOR, PREV_TERMINATOR</span>
+<span class="fc" id="L296">        }</span>
+
+        /**
+         * Constructs a new node.  Uses relaxed write because item can
+         * only be seen after publication via casNext or casPrev.
+         */
+<span class="fc" id="L302">        Node(E item) {</span>
+<span class="fc" id="L303">            UNSAFE.putObject(this, itemOffset, item);</span>
+<span class="fc" id="L304">        }</span>
+
+        boolean casItem(E cmp, E val) {
+<span class="fc" id="L307">            return UNSAFE.compareAndSwapObject(this, itemOffset, cmp, val);</span>
+        }
+
+        void lazySetNext(Node&lt;E&gt; val) {
+<span class="fc" id="L311">            UNSAFE.putOrderedObject(this, nextOffset, val);</span>
+<span class="fc" id="L312">        }</span>
+
+        boolean casNext(Node&lt;E&gt; cmp, Node&lt;E&gt; val) {
+<span class="fc" id="L315">            return UNSAFE.compareAndSwapObject(this, nextOffset, cmp, val);</span>
+        }
+
+        void lazySetPrev(Node&lt;E&gt; val) {
+<span class="fc" id="L319">            UNSAFE.putOrderedObject(this, prevOffset, val);</span>
+<span class="fc" id="L320">        }</span>
+
+        boolean casPrev(Node&lt;E&gt; cmp, Node&lt;E&gt; val) {
+<span class="fc" id="L323">            return UNSAFE.compareAndSwapObject(this, prevOffset, cmp, val);</span>
+        }
+
+        // Unsafe mechanics
+
+        private static final sun.misc.Unsafe UNSAFE;
+        private static final long prevOffset;
+        private static final long itemOffset;
+        private static final long nextOffset;
+
+        static {
+            try {
+<span class="fc" id="L335">                UNSAFE = sun.misc.Unsafe.getUnsafe();</span>
+<span class="fc" id="L336">                Class&lt;?&gt; k = Node.class;</span>
+<span class="fc" id="L337">                prevOffset = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L338">                    (k.getDeclaredField(&quot;prev&quot;));</span>
+<span class="fc" id="L339">                itemOffset = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L340">                    (k.getDeclaredField(&quot;item&quot;));</span>
+<span class="fc" id="L341">                nextOffset = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L342">                    (k.getDeclaredField(&quot;next&quot;));</span>
+<span class="nc" id="L343">            } catch (Exception e) {</span>
+<span class="nc" id="L344">                throw new Error(e);</span>
+<span class="fc" id="L345">            }</span>
+<span class="fc" id="L346">        }</span>
+    }
+
+    /**
+     * Links e as first element.
+     */
+    private void linkFirst(E e) {
+<span class="fc" id="L353">        checkNotNull(e);</span>
+<span class="fc" id="L354">        final Node&lt;E&gt; newNode = new Node&lt;E&gt;(e);</span>
+
+        restartFromHead:
+        for (;;)
+<span class="fc" id="L358">            for (Node&lt;E&gt; h = head, p = h, q;;) {</span>
+<span class="pc bpc" id="L359" title="3 of 4 branches missed.">                if ((q = p.prev) != null &amp;&amp;</span>
+                    (q = (p = q).prev) != null)
+                    // Check for head updates every other hop.
+                    // If p == q, we are sure to follow head instead.
+<span class="nc bnc" id="L363" title="All 2 branches missed.">                    p = (h != (h = head)) ? h : q;</span>
+<span class="pc bpc" id="L364" title="1 of 2 branches missed.">                else if (p.next == p) // PREV_TERMINATOR</span>
+<span class="nc" id="L365">                    continue restartFromHead;</span>
+                else {
+                    // p is first node
+<span class="fc" id="L368">                    newNode.lazySetNext(p); // CAS piggyback</span>
+<span class="pc bpc" id="L369" title="1 of 2 branches missed.">                    if (p.casPrev(null, newNode)) {</span>
+                        // Successful CAS is the linearization point
+                        // for e to become an element of this deque,
+                        // and for newNode to become &quot;live&quot;.
+<span class="pc bpc" id="L373" title="1 of 2 branches missed.">                        if (p != h) // hop two nodes at a time</span>
+<span class="nc" id="L374">                            casHead(h, newNode);  // Failure is OK.</span>
+<span class="fc" id="L375">                        return;</span>
+                    }
+                    // Lost CAS race to another thread; re-read prev
+                }
+            }
+    }
+
+    /**
+     * Links e as last element.
+     */
+    private void linkLast(E e) {
+<span class="fc" id="L386">        checkNotNull(e);</span>
+<span class="fc" id="L387">        final Node&lt;E&gt; newNode = new Node&lt;E&gt;(e);</span>
+
+        restartFromTail:
+        for (;;)
+<span class="fc" id="L391">            for (Node&lt;E&gt; t = tail, p = t, q;;) {</span>
+<span class="fc bfc" id="L392" title="All 4 branches covered.">                if ((q = p.next) != null &amp;&amp;</span>
+                    (q = (p = q).next) != null)
+                    // Check for tail updates every other hop.
+                    // If p == q, we are sure to follow tail instead.
+<span class="fc bfc" id="L396" title="All 2 branches covered.">                    p = (t != (t = tail)) ? t : q;</span>
+<span class="fc bfc" id="L397" title="All 2 branches covered.">                else if (p.prev == p) // NEXT_TERMINATOR</span>
+<span class="fc" id="L398">                    continue restartFromTail;</span>
+                else {
+                    // p is last node
+<span class="fc" id="L401">                    newNode.lazySetPrev(p); // CAS piggyback</span>
+<span class="fc bfc" id="L402" title="All 2 branches covered.">                    if (p.casNext(null, newNode)) {</span>
+                        // Successful CAS is the linearization point
+                        // for e to become an element of this deque,
+                        // and for newNode to become &quot;live&quot;.
+<span class="fc bfc" id="L406" title="All 2 branches covered.">                        if (p != t) // hop two nodes at a time</span>
+<span class="fc" id="L407">                            casTail(t, newNode);  // Failure is OK.</span>
+<span class="fc" id="L408">                        return;</span>
+                    }
+                    // Lost CAS race to another thread; re-read next
+                }
+            }
+    }
+
+    private static final int HOPS = 2;
+
+    /**
+     * Unlinks non-null node x.
+     */
+    void unlink(Node&lt;E&gt; x) {
+        // assert x != null;
+        // assert x.item == null;
+        // assert x != PREV_TERMINATOR;
+        // assert x != NEXT_TERMINATOR;
+
+<span class="fc" id="L426">        final Node&lt;E&gt; prev = x.prev;</span>
+<span class="fc" id="L427">        final Node&lt;E&gt; next = x.next;</span>
+<span class="fc bfc" id="L428" title="All 2 branches covered.">        if (prev == null) {</span>
+<span class="fc" id="L429">            unlinkFirst(x, next);</span>
+<span class="fc bfc" id="L430" title="All 2 branches covered.">        } else if (next == null) {</span>
+<span class="fc" id="L431">            unlinkLast(x, prev);</span>
+        } else {
+            // Unlink interior node.
+            //
+            // This is the common case, since a series of polls at the
+            // same end will be &quot;interior&quot; removes, except perhaps for
+            // the first one, since end nodes cannot be unlinked.
+            //
+            // At any time, all active nodes are mutually reachable by
+            // following a sequence of either next or prev pointers.
+            //
+            // Our strategy is to find the unique active predecessor
+            // and successor of x.  Try to fix up their links so that
+            // they point to each other, leaving x unreachable from
+            // active nodes.  If successful, and if x has no live
+            // predecessor/successor, we additionally try to gc-unlink,
+            // leaving active nodes unreachable from x, by rechecking
+            // that the status of predecessor and successor are
+            // unchanged and ensuring that x is not reachable from
+            // tail/head, before setting x's prev/next links to their
+            // logical approximate replacements, self/TERMINATOR.
+            Node&lt;E&gt; activePred, activeSucc;
+            boolean isFirst, isLast;
+<span class="fc" id="L454">            int hops = 1;</span>
+
+            // Find active predecessor
+<span class="fc" id="L457">            for (Node&lt;E&gt; p = prev; ; ++hops) {</span>
+<span class="fc bfc" id="L458" title="All 2 branches covered.">                if (p.item != null) {</span>
+<span class="fc" id="L459">                    activePred = p;</span>
+<span class="fc" id="L460">                    isFirst = false;</span>
+<span class="fc" id="L461">                    break;</span>
+                }
+<span class="fc" id="L463">                Node&lt;E&gt; q = p.prev;</span>
+<span class="fc bfc" id="L464" title="All 2 branches covered.">                if (q == null) {</span>
+<span class="fc bfc" id="L465" title="All 2 branches covered.">                    if (p.next == p)</span>
+<span class="fc" id="L466">                        return;</span>
+<span class="fc" id="L467">                    activePred = p;</span>
+<span class="fc" id="L468">                    isFirst = true;</span>
+<span class="fc" id="L469">                    break;</span>
+                }
+<span class="fc bfc" id="L471" title="All 2 branches covered.">                else if (p == q)</span>
+<span class="fc" id="L472">                    return;</span>
+                else
+<span class="fc" id="L474">                    p = q;</span>
+            }
+
+            // Find active successor
+<span class="fc" id="L478">            for (Node&lt;E&gt; p = next; ; ++hops) {</span>
+<span class="fc bfc" id="L479" title="All 2 branches covered.">                if (p.item != null) {</span>
+<span class="fc" id="L480">                    activeSucc = p;</span>
+<span class="fc" id="L481">                    isLast = false;</span>
+<span class="fc" id="L482">                    break;</span>
+                }
+<span class="fc" id="L484">                Node&lt;E&gt; q = p.next;</span>
+<span class="fc bfc" id="L485" title="All 2 branches covered.">                if (q == null) {</span>
+<span class="fc bfc" id="L486" title="All 2 branches covered.">                    if (p.prev == p)</span>
+<span class="fc" id="L487">                        return;</span>
+<span class="fc" id="L488">                    activeSucc = p;</span>
+<span class="fc" id="L489">                    isLast = true;</span>
+<span class="fc" id="L490">                    break;</span>
+                }
+<span class="fc bfc" id="L492" title="All 2 branches covered.">                else if (p == q)</span>
+<span class="fc" id="L493">                    return;</span>
+                else
+<span class="fc" id="L495">                    p = q;</span>
+            }
+
+            // TODO: better HOP heuristics
+<span class="fc bfc" id="L499" title="All 4 branches covered.">            if (hops &lt; HOPS</span>
+                // always squeeze out interior deleted nodes
+                &amp;&amp; (isFirst | isLast))
+<span class="fc" id="L502">                return;</span>
+
+            // Squeeze out deleted nodes between activePred and
+            // activeSucc, including x.
+<span class="fc" id="L506">            skipDeletedSuccessors(activePred);</span>
+<span class="fc" id="L507">            skipDeletedPredecessors(activeSucc);</span>
+
+            // Try to gc-unlink, if possible
+<span class="pc bpc" id="L510" title="4 of 18 branches missed.">            if ((isFirst | isLast) &amp;&amp;</span>
+
+                // Recheck expected state of predecessor and successor
+                (activePred.next == activeSucc) &amp;&amp;
+                (activeSucc.prev == activePred) &amp;&amp;
+                (isFirst ? activePred.prev == null : activePred.item != null) &amp;&amp;
+                (isLast  ? activeSucc.next == null : activeSucc.item != null)) {
+
+<span class="fc" id="L518">                updateHead(); // Ensure x is not reachable from head</span>
+<span class="fc" id="L519">                updateTail(); // Ensure x is not reachable from tail</span>
+
+                // Finally, actually gc-unlink
+<span class="pc bpc" id="L522" title="1 of 2 branches missed.">                x.lazySetPrev(isFirst ? prevTerminator() : x);</span>
+<span class="fc bfc" id="L523" title="All 2 branches covered.">                x.lazySetNext(isLast  ? nextTerminator() : x);</span>
+            }
+        }
+<span class="fc" id="L526">    }</span>
+
+    /**
+     * Unlinks non-null first node.
+     */
+    private void unlinkFirst(Node&lt;E&gt; first, Node&lt;E&gt; next) {
+        // assert first != null;
+        // assert next != null;
+        // assert first.item == null;
+<span class="fc" id="L535">        for (Node&lt;E&gt; o = null, p = next, q;;) {</span>
+<span class="fc bfc" id="L536" title="All 4 branches covered.">            if (p.item != null || (q = p.next) == null) {</span>
+<span class="pc bpc" id="L537" title="2 of 6 branches missed.">                if (o != null &amp;&amp; p.prev != p &amp;&amp; first.casNext(next, p)) {</span>
+<span class="fc" id="L538">                    skipDeletedPredecessors(p);</span>
+<span class="pc bpc" id="L539" title="3 of 8 branches missed.">                    if (first.prev == null &amp;&amp;</span>
+                        (p.next == null || p.item != null) &amp;&amp;
+                        p.prev == first) {
+
+<span class="fc" id="L543">                        updateHead(); // Ensure o is not reachable from head</span>
+<span class="fc" id="L544">                        updateTail(); // Ensure o is not reachable from tail</span>
+
+                        // Finally, actually gc-unlink
+<span class="fc" id="L547">                        o.lazySetNext(o);</span>
+<span class="fc" id="L548">                        o.lazySetPrev(prevTerminator());</span>
+                    }
+                }
+<span class="fc" id="L551">                return;</span>
+            }
+<span class="pc bpc" id="L553" title="1 of 2 branches missed.">            else if (p == q)</span>
+<span class="nc" id="L554">                return;</span>
+            else {
+<span class="fc" id="L556">                o = p;</span>
+<span class="fc" id="L557">                p = q;</span>
+            }
+        }
+    }
+
+    /**
+     * Unlinks non-null last node.
+     */
+    private void unlinkLast(Node&lt;E&gt; last, Node&lt;E&gt; prev) {
+        // assert last != null;
+        // assert prev != null;
+        // assert last.item == null;
+<span class="fc" id="L569">        for (Node&lt;E&gt; o = null, p = prev, q;;) {</span>
+<span class="fc bfc" id="L570" title="All 4 branches covered.">            if (p.item != null || (q = p.prev) == null) {</span>
+<span class="fc bfc" id="L571" title="All 6 branches covered.">                if (o != null &amp;&amp; p.next != p &amp;&amp; last.casPrev(prev, p)) {</span>
+<span class="fc" id="L572">                    skipDeletedSuccessors(p);</span>
+<span class="pc bpc" id="L573" title="1 of 8 branches missed.">                    if (last.next == null &amp;&amp;</span>
+                        (p.prev == null || p.item != null) &amp;&amp;
+                        p.next == last) {
+
+<span class="fc" id="L577">                        updateHead(); // Ensure o is not reachable from head</span>
+<span class="fc" id="L578">                        updateTail(); // Ensure o is not reachable from tail</span>
+
+                        // Finally, actually gc-unlink
+<span class="fc" id="L581">                        o.lazySetPrev(o);</span>
+<span class="fc" id="L582">                        o.lazySetNext(nextTerminator());</span>
+                    }
+                }
+<span class="fc" id="L585">                return;</span>
+            }
+<span class="fc bfc" id="L587" title="All 2 branches covered.">            else if (p == q)</span>
+<span class="fc" id="L588">                return;</span>
+            else {
+<span class="fc" id="L590">                o = p;</span>
+<span class="fc" id="L591">                p = q;</span>
+            }
+        }
+    }
+
+    /**
+     * Guarantees that any node which was unlinked before a call to
+     * this method will be unreachable from head after it returns.
+     * Does not guarantee to eliminate slack, only that head will
+     * point to a node that was active while this method was running.
+     */
+    private final void updateHead() {
+        // Either head already points to an active node, or we keep
+        // trying to cas it to the first node until it does.
+        Node&lt;E&gt; h, p, q;
+        restartFromHead:
+<span class="pc bpc" id="L607" title="2 of 4 branches missed.">        while ((h = head).item == null &amp;&amp; (p = h.prev) != null) {</span>
+            for (;;) {
+<span class="nc bnc" id="L609" title="All 4 branches missed.">                if ((q = p.prev) == null ||</span>
+                    (q = (p = q).prev) == null) {
+                    // It is possible that p is PREV_TERMINATOR,
+                    // but if so, the CAS is guaranteed to fail.
+<span class="nc bnc" id="L613" title="All 2 branches missed.">                    if (casHead(h, p))</span>
+<span class="nc" id="L614">                        return;</span>
+                    else
+                        continue restartFromHead;
+                }
+<span class="nc bnc" id="L618" title="All 2 branches missed.">                else if (h != head)</span>
+<span class="nc" id="L619">                    continue restartFromHead;</span>
+                else
+<span class="nc" id="L621">                    p = q;</span>
+            }
+        }
+<span class="fc" id="L624">    }</span>
+
+    /**
+     * Guarantees that any node which was unlinked before a call to
+     * this method will be unreachable from tail after it returns.
+     * Does not guarantee to eliminate slack, only that tail will
+     * point to a node that was active while this method was running.
+     */
+    private final void updateTail() {
+        // Either tail already points to an active node, or we keep
+        // trying to cas it to the last node until it does.
+        Node&lt;E&gt; t, p, q;
+        restartFromTail:
+<span class="fc bfc" id="L637" title="All 4 branches covered.">        while ((t = tail).item == null &amp;&amp; (p = t.next) != null) {</span>
+            for (;;) {
+<span class="fc bfc" id="L639" title="All 4 branches covered.">                if ((q = p.next) == null ||</span>
+                    (q = (p = q).next) == null) {
+                    // It is possible that p is NEXT_TERMINATOR,
+                    // but if so, the CAS is guaranteed to fail.
+<span class="fc bfc" id="L643" title="All 2 branches covered.">                    if (casTail(t, p))</span>
+<span class="fc" id="L644">                        return;</span>
+                    else
+                        continue restartFromTail;
+                }
+<span class="fc bfc" id="L648" title="All 2 branches covered.">                else if (t != tail)</span>
+<span class="fc" id="L649">                    continue restartFromTail;</span>
+                else
+<span class="fc" id="L651">                    p = q;</span>
+            }
+        }
+<span class="fc" id="L654">    }</span>
+
+    private void skipDeletedPredecessors(Node&lt;E&gt; x) {
+        whileActive:
+        do {
+<span class="fc" id="L659">            Node&lt;E&gt; prev = x.prev;</span>
+            // assert prev != null;
+            // assert x != NEXT_TERMINATOR;
+            // assert x != PREV_TERMINATOR;
+<span class="fc" id="L663">            Node&lt;E&gt; p = prev;</span>
+            findActive:
+            for (;;) {
+<span class="fc bfc" id="L666" title="All 2 branches covered.">                if (p.item != null)</span>
+<span class="fc" id="L667">                    break findActive;</span>
+<span class="fc" id="L668">                Node&lt;E&gt; q = p.prev;</span>
+<span class="fc bfc" id="L669" title="All 2 branches covered.">                if (q == null) {</span>
+<span class="fc bfc" id="L670" title="All 2 branches covered.">                    if (p.next == p)</span>
+<span class="fc" id="L671">                        continue whileActive;</span>
+                    break findActive;
+                }
+<span class="fc bfc" id="L674" title="All 2 branches covered.">                else if (p == q)</span>
+<span class="fc" id="L675">                    continue whileActive;</span>
+                else
+<span class="fc" id="L677">                    p = q;</span>
+<span class="fc" id="L678">            }</span>
+
+            // found active CAS target
+<span class="fc bfc" id="L681" title="All 4 branches covered.">            if (prev == p || x.casPrev(prev, p))</span>
+<span class="fc" id="L682">                return;</span>
+
+<span class="fc bfc" id="L684" title="All 4 branches covered.">        } while (x.item != null || x.next == null);</span>
+<span class="fc" id="L685">    }</span>
+
+    private void skipDeletedSuccessors(Node&lt;E&gt; x) {
+        whileActive:
+        do {
+<span class="fc" id="L690">            Node&lt;E&gt; next = x.next;</span>
+            // assert next != null;
+            // assert x != NEXT_TERMINATOR;
+            // assert x != PREV_TERMINATOR;
+<span class="fc" id="L694">            Node&lt;E&gt; p = next;</span>
+            findActive:
+            for (;;) {
+<span class="fc bfc" id="L697" title="All 2 branches covered.">                if (p.item != null)</span>
+<span class="fc" id="L698">                    break findActive;</span>
+<span class="fc" id="L699">                Node&lt;E&gt; q = p.next;</span>
+<span class="fc bfc" id="L700" title="All 2 branches covered.">                if (q == null) {</span>
+<span class="fc bfc" id="L701" title="All 2 branches covered.">                    if (p.prev == p)</span>
+<span class="fc" id="L702">                        continue whileActive;</span>
+                    break findActive;
+                }
+<span class="fc bfc" id="L705" title="All 2 branches covered.">                else if (p == q)</span>
+<span class="fc" id="L706">                    continue whileActive;</span>
+                else
+<span class="fc" id="L708">                    p = q;</span>
+<span class="fc" id="L709">            }</span>
+
+            // found active CAS target
+<span class="fc bfc" id="L712" title="All 4 branches covered.">            if (next == p || x.casNext(next, p))</span>
+<span class="fc" id="L713">                return;</span>
+
+<span class="pc bpc" id="L715" title="2 of 4 branches missed.">        } while (x.item != null || x.prev == null);</span>
+<span class="nc" id="L716">    }</span>
+
+    /**
+     * Returns the successor of p, or the first node if p.next has been
+     * linked to self, which will only be true if traversing with a
+     * stale pointer that is now off the list.
+     */
+    final Node&lt;E&gt; succ(Node&lt;E&gt; p) {
+        // TODO: should we skip deleted nodes here?
+<span class="fc" id="L725">        Node&lt;E&gt; q = p.next;</span>
+<span class="fc bfc" id="L726" title="All 2 branches covered.">        return (p == q) ? first() : q;</span>
+    }
+
+    /**
+     * Returns the predecessor of p, or the last node if p.prev has been
+     * linked to self, which will only be true if traversing with a
+     * stale pointer that is now off the list.
+     */
+    final Node&lt;E&gt; pred(Node&lt;E&gt; p) {
+<span class="fc" id="L735">        Node&lt;E&gt; q = p.prev;</span>
+<span class="pc bpc" id="L736" title="1 of 2 branches missed.">        return (p == q) ? last() : q;</span>
+    }
+
+    /**
+     * Returns the first node, the unique node p for which:
+     *     p.prev == null &amp;&amp; p.next != p
+     * The returned node may or may not be logically deleted.
+     * Guarantees that head is set to the returned node.
+     */
+    Node&lt;E&gt; first() {
+        restartFromHead:
+        for (;;)
+<span class="fc" id="L748">            for (Node&lt;E&gt; h = head, p = h, q;;) {</span>
+<span class="pc bpc" id="L749" title="1 of 4 branches missed.">                if ((q = p.prev) != null &amp;&amp;</span>
+                    (q = (p = q).prev) != null)
+                    // Check for head updates every other hop.
+                    // If p == q, we are sure to follow head instead.
+<span class="nc bnc" id="L753" title="All 2 branches missed.">                    p = (h != (h = head)) ? h : q;</span>
+<span class="fc bfc" id="L754" title="All 2 branches covered.">                else if (p == h</span>
+                         // It is possible that p is PREV_TERMINATOR,
+                         // but if so, the CAS is guaranteed to fail.
+<span class="pc bpc" id="L757" title="1 of 2 branches missed.">                         || casHead(h, p))</span>
+<span class="fc" id="L758">                    return p;</span>
+                else
+                    continue restartFromHead;
+            }
+    }
+
+    /**
+     * Returns the last node, the unique node p for which:
+     *     p.next == null &amp;&amp; p.prev != p
+     * The returned node may or may not be logically deleted.
+     * Guarantees that tail is set to the returned node.
+     */
+    Node&lt;E&gt; last() {
+        restartFromTail:
+        for (;;)
+<span class="fc" id="L773">            for (Node&lt;E&gt; t = tail, p = t, q;;) {</span>
+<span class="pc bpc" id="L774" title="1 of 4 branches missed.">                if ((q = p.next) != null &amp;&amp;</span>
+                    (q = (p = q).next) != null)
+                    // Check for tail updates every other hop.
+                    // If p == q, we are sure to follow tail instead.
+<span class="nc bnc" id="L778" title="All 2 branches missed.">                    p = (t != (t = tail)) ? t : q;</span>
+<span class="fc bfc" id="L779" title="All 2 branches covered.">                else if (p == t</span>
+                         // It is possible that p is NEXT_TERMINATOR,
+                         // but if so, the CAS is guaranteed to fail.
+<span class="pc bpc" id="L782" title="1 of 2 branches missed.">                         || casTail(t, p))</span>
+<span class="fc" id="L783">                    return p;</span>
+                else
+                    continue restartFromTail;
+            }
+    }
+
+    // Minor convenience utilities
+
+    /**
+     * Throws NullPointerException if argument is null.
+     *
+     * @param v the element
+     */
+    private static void checkNotNull(Object v) {
+<span class="fc bfc" id="L797" title="All 2 branches covered.">        if (v == null)</span>
+<span class="fc" id="L798">            throw new NullPointerException();</span>
+<span class="fc" id="L799">    }</span>
+
+    /**
+     * Returns element unless it is null, in which case throws
+     * NoSuchElementException.
+     *
+     * @param v the element
+     * @return the element
+     */
+    private E screenNullResult(E v) {
+<span class="fc bfc" id="L809" title="All 2 branches covered.">        if (v == null)</span>
+<span class="fc" id="L810">            throw new NoSuchElementException();</span>
+<span class="fc" id="L811">        return v;</span>
+    }
+
+    /**
+     * Creates an array list and fills it with elements of this list.
+     * Used by toArray.
+     *
+     * @return the array list
+     */
+    private ArrayList&lt;E&gt; toArrayList() {
+<span class="fc" id="L821">        ArrayList&lt;E&gt; list = new ArrayList&lt;E&gt;();</span>
+<span class="fc bfc" id="L822" title="All 2 branches covered.">        for (Node&lt;E&gt; p = first(); p != null; p = succ(p)) {</span>
+<span class="fc" id="L823">            E item = p.item;</span>
+<span class="fc bfc" id="L824" title="All 2 branches covered.">            if (item != null)</span>
+<span class="fc" id="L825">                list.add(item);</span>
+        }
+<span class="fc" id="L827">        return list;</span>
+    }
+
+    /**
+     * Constructs an empty deque.
+     */
+<span class="fc" id="L833">    public ConcurrentLinkedDeque() {</span>
+<span class="fc" id="L834">        head = tail = new Node&lt;E&gt;(null);</span>
+<span class="fc" id="L835">    }</span>
+
+    /**
+     * Constructs a deque initially containing the elements of
+     * the given collection, added in traversal order of the
+     * collection's iterator.
+     *
+     * @param c the collection of elements to initially contain
+     * @throws NullPointerException if the specified collection or any
+     *         of its elements are null
+     */
+<span class="fc" id="L846">    public ConcurrentLinkedDeque(Collection&lt;? extends E&gt; c) {</span>
+        // Copy c into a private chain of Nodes
+<span class="fc" id="L848">        Node&lt;E&gt; h = null, t = null;</span>
+<span class="fc bfc" id="L849" title="All 2 branches covered.">        for (E e : c) {</span>
+<span class="fc" id="L850">            checkNotNull(e);</span>
+<span class="fc" id="L851">            Node&lt;E&gt; newNode = new Node&lt;E&gt;(e);</span>
+<span class="fc bfc" id="L852" title="All 2 branches covered.">            if (h == null)</span>
+<span class="fc" id="L853">                h = t = newNode;</span>
+            else {
+<span class="fc" id="L855">                t.lazySetNext(newNode);</span>
+<span class="fc" id="L856">                newNode.lazySetPrev(t);</span>
+<span class="fc" id="L857">                t = newNode;</span>
+            }
+<span class="fc" id="L859">        }</span>
+<span class="fc" id="L860">        initHeadTail(h, t);</span>
+<span class="fc" id="L861">    }</span>
+
+    /**
+     * Initializes head and tail, ensuring invariants hold.
+     */
+    private void initHeadTail(Node&lt;E&gt; h, Node&lt;E&gt; t) {
+<span class="fc bfc" id="L867" title="All 2 branches covered.">        if (h == t) {</span>
+<span class="fc bfc" id="L868" title="All 2 branches covered.">            if (h == null)</span>
+<span class="fc" id="L869">                h = t = new Node&lt;E&gt;(null);</span>
+            else {
+                // Avoid edge case of a single Node with non-null item.
+<span class="fc" id="L872">                Node&lt;E&gt; newNode = new Node&lt;E&gt;(null);</span>
+<span class="fc" id="L873">                t.lazySetNext(newNode);</span>
+<span class="fc" id="L874">                newNode.lazySetPrev(t);</span>
+<span class="fc" id="L875">                t = newNode;</span>
+            }
+        }
+<span class="fc" id="L878">        head = h;</span>
+<span class="fc" id="L879">        tail = t;</span>
+<span class="fc" id="L880">    }</span>
+
+    /**
+     * Inserts the specified element at the front of this deque.
+     * As the deque is unbounded, this method will never throw
+     * {@link IllegalStateException}.
+     *
+     * @throws NullPointerException if the specified element is null
+     */
+    public void addFirst(E e) {
+<span class="fc" id="L890">        linkFirst(e);</span>
+<span class="fc" id="L891">    }</span>
+
+    /**
+     * Inserts the specified element at the end of this deque.
+     * As the deque is unbounded, this method will never throw
+     * {@link IllegalStateException}.
+     *
+     * &lt;p&gt;This method is equivalent to {@link #add}.
+     *
+     * @throws NullPointerException if the specified element is null
+     */
+    public void addLast(E e) {
+<span class="fc" id="L903">        linkLast(e);</span>
+<span class="fc" id="L904">    }</span>
+
+    /**
+     * Inserts the specified element at the front of this deque.
+     * As the deque is unbounded, this method will never return {@code false}.
+     *
+     * @return {@code true} (as specified by {@link Deque#offerFirst})
+     * @throws NullPointerException if the specified element is null
+     */
+    public boolean offerFirst(E e) {
+<span class="fc" id="L914">        linkFirst(e);</span>
+<span class="fc" id="L915">        return true;</span>
+    }
+
+    /**
+     * Inserts the specified element at the end of this deque.
+     * As the deque is unbounded, this method will never return {@code false}.
+     *
+     * &lt;p&gt;This method is equivalent to {@link #add}.
+     *
+     * @return {@code true} (as specified by {@link Deque#offerLast})
+     * @throws NullPointerException if the specified element is null
+     */
+    public boolean offerLast(E e) {
+<span class="fc" id="L928">        linkLast(e);</span>
+<span class="fc" id="L929">        return true;</span>
+    }
+
+    public E peekFirst() {
+<span class="fc bfc" id="L933" title="All 2 branches covered.">        for (Node&lt;E&gt; p = first(); p != null; p = succ(p)) {</span>
+<span class="fc" id="L934">            E item = p.item;</span>
+<span class="fc bfc" id="L935" title="All 2 branches covered.">            if (item != null)</span>
+<span class="fc" id="L936">                return item;</span>
+        }
+<span class="fc" id="L938">        return null;</span>
+    }
+
+    public E peekLast() {
+<span class="fc bfc" id="L942" title="All 2 branches covered.">        for (Node&lt;E&gt; p = last(); p != null; p = pred(p)) {</span>
+<span class="fc" id="L943">            E item = p.item;</span>
+<span class="fc bfc" id="L944" title="All 2 branches covered.">            if (item != null)</span>
+<span class="fc" id="L945">                return item;</span>
+        }
+<span class="fc" id="L947">        return null;</span>
+    }
+
+    /**
+     * @throws NoSuchElementException {@inheritDoc}
+     */
+    public E getFirst() {
+<span class="fc" id="L954">        return screenNullResult(peekFirst());</span>
+    }
+
+    /**
+     * @throws NoSuchElementException {@inheritDoc}
+     */
+    public E getLast() {
+<span class="fc" id="L961">        return screenNullResult(peekLast());</span>
+    }
+
+    public E pollFirst() {
+<span class="fc bfc" id="L965" title="All 2 branches covered.">        for (Node&lt;E&gt; p = first(); p != null; p = succ(p)) {</span>
+<span class="fc" id="L966">            E item = p.item;</span>
+<span class="fc bfc" id="L967" title="All 4 branches covered.">            if (item != null &amp;&amp; p.casItem(item, null)) {</span>
+<span class="fc" id="L968">                unlink(p);</span>
+<span class="fc" id="L969">                return item;</span>
+            }
+        }
+<span class="fc" id="L972">        return null;</span>
+    }
+
+    public E pollLast() {
+<span class="fc bfc" id="L976" title="All 2 branches covered.">        for (Node&lt;E&gt; p = last(); p != null; p = pred(p)) {</span>
+<span class="fc" id="L977">            E item = p.item;</span>
+<span class="pc bpc" id="L978" title="1 of 4 branches missed.">            if (item != null &amp;&amp; p.casItem(item, null)) {</span>
+<span class="fc" id="L979">                unlink(p);</span>
+<span class="fc" id="L980">                return item;</span>
+            }
+        }
+<span class="fc" id="L983">        return null;</span>
+    }
+
+    /**
+     * @throws NoSuchElementException {@inheritDoc}
+     */
+    public E removeFirst() {
+<span class="fc" id="L990">        return screenNullResult(pollFirst());</span>
+    }
+
+    /**
+     * @throws NoSuchElementException {@inheritDoc}
+     */
+    public E removeLast() {
+<span class="nc" id="L997">        return screenNullResult(pollLast());</span>
+    }
+
+    // *** Queue and stack methods ***
+
+    /**
+     * Inserts the specified element at the tail of this deque.
+     * As the deque is unbounded, this method will never return {@code false}.
+     *
+     * @return {@code true} (as specified by {@link Queue#offer})
+     * @throws NullPointerException if the specified element is null
+     */
+    public boolean offer(E e) {
+<span class="fc" id="L1010">        return offerLast(e);</span>
+    }
+
+    /**
+     * Inserts the specified element at the tail of this deque.
+     * As the deque is unbounded, this method will never throw
+     * {@link IllegalStateException} or return {@code false}.
+     *
+     * @return {@code true} (as specified by {@link Collection#add})
+     * @throws NullPointerException if the specified element is null
+     */
+    public boolean add(E e) {
+<span class="fc" id="L1022">        return offerLast(e);</span>
+    }
+
+<span class="fc" id="L1025">    public E poll()           { return pollFirst(); }</span>
+<span class="fc" id="L1026">    public E peek()           { return peekFirst(); }</span>
+
+    /**
+     * @throws NoSuchElementException {@inheritDoc}
+     */
+<span class="fc" id="L1031">    public E remove()         { return removeFirst(); }</span>
+
+    /**
+     * @throws NoSuchElementException {@inheritDoc}
+     */
+<span class="fc" id="L1036">    public E pop()            { return removeFirst(); }</span>
+
+    /**
+     * @throws NoSuchElementException {@inheritDoc}
+     */
+<span class="fc" id="L1041">    public E element()        { return getFirst(); }</span>
+
+    /**
+     * @throws NullPointerException {@inheritDoc}
+     */
+<span class="fc" id="L1046">    public void push(E e)     { addFirst(e); }</span>
+
+    /**
+     * Removes the first element {@code e} such that
+     * {@code o.equals(e)}, if such an element exists in this deque.
+     * If the deque does not contain the element, it is unchanged.
+     *
+     * @param o element to be removed from this deque, if present
+     * @return {@code true} if the deque contained the specified element
+     * @throws NullPointerException if the specified element is null
+     */
+    public boolean removeFirstOccurrence(Object o) {
+<span class="fc" id="L1058">        checkNotNull(o);</span>
+<span class="fc bfc" id="L1059" title="All 2 branches covered.">        for (Node&lt;E&gt; p = first(); p != null; p = succ(p)) {</span>
+<span class="fc" id="L1060">            E item = p.item;</span>
+<span class="fc bfc" id="L1061" title="All 6 branches covered.">            if (item != null &amp;&amp; o.equals(item) &amp;&amp; p.casItem(item, null)) {</span>
+<span class="fc" id="L1062">                unlink(p);</span>
+<span class="fc" id="L1063">                return true;</span>
+            }
+        }
+<span class="fc" id="L1066">        return false;</span>
+    }
+
+    /**
+     * Removes the last element {@code e} such that
+     * {@code o.equals(e)}, if such an element exists in this deque.
+     * If the deque does not contain the element, it is unchanged.
+     *
+     * @param o element to be removed from this deque, if present
+     * @return {@code true} if the deque contained the specified element
+     * @throws NullPointerException if the specified element is null
+     */
+    public boolean removeLastOccurrence(Object o) {
+<span class="fc" id="L1079">        checkNotNull(o);</span>
+<span class="fc bfc" id="L1080" title="All 2 branches covered.">        for (Node&lt;E&gt; p = last(); p != null; p = pred(p)) {</span>
+<span class="fc" id="L1081">            E item = p.item;</span>
+<span class="pc bpc" id="L1082" title="1 of 6 branches missed.">            if (item != null &amp;&amp; o.equals(item) &amp;&amp; p.casItem(item, null)) {</span>
+<span class="fc" id="L1083">                unlink(p);</span>
+<span class="fc" id="L1084">                return true;</span>
+            }
+        }
+<span class="fc" id="L1087">        return false;</span>
+    }
+
+    /**
+     * Returns {@code true} if this deque contains at least one
+     * element {@code e} such that {@code o.equals(e)}.
+     *
+     * @param o element whose presence in this deque is to be tested
+     * @return {@code true} if this deque contains the specified element
+     */
+    public boolean contains(Object o) {
+<span class="fc bfc" id="L1098" title="All 2 branches covered.">        if (o == null) return false;</span>
+<span class="fc bfc" id="L1099" title="All 2 branches covered.">        for (Node&lt;E&gt; p = first(); p != null; p = succ(p)) {</span>
+<span class="fc" id="L1100">            E item = p.item;</span>
+<span class="fc bfc" id="L1101" title="All 4 branches covered.">            if (item != null &amp;&amp; o.equals(item))</span>
+<span class="fc" id="L1102">                return true;</span>
+        }
+<span class="fc" id="L1104">        return false;</span>
+    }
+
+    /**
+     * Returns {@code true} if this collection contains no elements.
+     *
+     * @return {@code true} if this collection contains no elements
+     */
+    public boolean isEmpty() {
+<span class="fc bfc" id="L1113" title="All 2 branches covered.">        return peekFirst() == null;</span>
+    }
+
+    /**
+     * Returns the number of elements in this deque.  If this deque
+     * contains more than {@code Integer.MAX_VALUE} elements, it
+     * returns {@code Integer.MAX_VALUE}.
+     *
+     * &lt;p&gt;Beware that, unlike in most collections, this method is
+     * &lt;em&gt;NOT&lt;/em&gt; a constant-time operation. Because of the
+     * asynchronous nature of these deques, determining the current
+     * number of elements requires traversing them all to count them.
+     * Additionally, it is possible for the size to change during
+     * execution of this method, in which case the returned result
+     * will be inaccurate. Thus, this method is typically not very
+     * useful in concurrent applications.
+     *
+     * @return the number of elements in this deque
+     */
+    public int size() {
+<span class="fc" id="L1133">        int count = 0;</span>
+<span class="fc bfc" id="L1134" title="All 2 branches covered.">        for (Node&lt;E&gt; p = first(); p != null; p = succ(p))</span>
+<span class="fc bfc" id="L1135" title="All 2 branches covered.">            if (p.item != null)</span>
+                // Collection.size() spec says to max out
+<span class="pc bpc" id="L1137" title="1 of 2 branches missed.">                if (++count == Integer.MAX_VALUE)</span>
+<span class="nc" id="L1138">                    break;</span>
+<span class="fc" id="L1139">        return count;</span>
+    }
+
+    /**
+     * Removes the first element {@code e} such that
+     * {@code o.equals(e)}, if such an element exists in this deque.
+     * If the deque does not contain the element, it is unchanged.
+     *
+     * @param o element to be removed from this deque, if present
+     * @return {@code true} if the deque contained the specified element
+     * @throws NullPointerException if the specified element is null
+     */
+    public boolean remove(Object o) {
+<span class="fc" id="L1152">        return removeFirstOccurrence(o);</span>
+    }
+
+    /**
+     * Appends all of the elements in the specified collection to the end of
+     * this deque, in the order that they are returned by the specified
+     * collection's iterator.  Attempts to {@code addAll} of a deque to
+     * itself result in {@code IllegalArgumentException}.
+     *
+     * @param c the elements to be inserted into this deque
+     * @return {@code true} if this deque changed as a result of the call
+     * @throws NullPointerException if the specified collection or any
+     *         of its elements are null
+     * @throws IllegalArgumentException if the collection is this deque
+     */
+    public boolean addAll(Collection&lt;? extends E&gt; c) {
+<span class="pc bpc" id="L1168" title="1 of 2 branches missed.">        if (c == this)</span>
+            // As historically specified in AbstractQueue#addAll
+<span class="nc" id="L1170">            throw new IllegalArgumentException();</span>
+
+        // Copy c into a private chain of Nodes
+<span class="fc" id="L1173">        Node&lt;E&gt; beginningOfTheEnd = null, last = null;</span>
+<span class="fc bfc" id="L1174" title="All 2 branches covered.">        for (E e : c) {</span>
+<span class="fc" id="L1175">            checkNotNull(e);</span>
+<span class="fc" id="L1176">            Node&lt;E&gt; newNode = new Node&lt;E&gt;(e);</span>
+<span class="fc bfc" id="L1177" title="All 2 branches covered.">            if (beginningOfTheEnd == null)</span>
+<span class="fc" id="L1178">                beginningOfTheEnd = last = newNode;</span>
+            else {
+<span class="fc" id="L1180">                last.lazySetNext(newNode);</span>
+<span class="fc" id="L1181">                newNode.lazySetPrev(last);</span>
+<span class="fc" id="L1182">                last = newNode;</span>
+            }
+<span class="fc" id="L1184">        }</span>
+<span class="fc bfc" id="L1185" title="All 2 branches covered.">        if (beginningOfTheEnd == null)</span>
+<span class="fc" id="L1186">            return false;</span>
+
+        // Atomically append the chain at the tail of this collection
+        restartFromTail:
+        for (;;)
+<span class="fc" id="L1191">            for (Node&lt;E&gt; t = tail, p = t, q;;) {</span>
+<span class="pc bpc" id="L1192" title="3 of 4 branches missed.">                if ((q = p.next) != null &amp;&amp;</span>
+                    (q = (p = q).next) != null)
+                    // Check for tail updates every other hop.
+                    // If p == q, we are sure to follow tail instead.
+<span class="nc bnc" id="L1196" title="All 2 branches missed.">                    p = (t != (t = tail)) ? t : q;</span>
+<span class="pc bpc" id="L1197" title="1 of 2 branches missed.">                else if (p.prev == p) // NEXT_TERMINATOR</span>
+<span class="nc" id="L1198">                    continue restartFromTail;</span>
+                else {
+                    // p is last node
+<span class="fc" id="L1201">                    beginningOfTheEnd.lazySetPrev(p); // CAS piggyback</span>
+<span class="pc bpc" id="L1202" title="1 of 2 branches missed.">                    if (p.casNext(null, beginningOfTheEnd)) {</span>
+                        // Successful CAS is the linearization point
+                        // for all elements to be added to this deque.
+<span class="pc bpc" id="L1205" title="1 of 2 branches missed.">                        if (!casTail(t, last)) {</span>
+                            // Try a little harder to update tail,
+                            // since we may be adding many elements.
+<span class="nc" id="L1208">                            t = tail;</span>
+<span class="nc bnc" id="L1209" title="All 2 branches missed.">                            if (last.next == null)</span>
+<span class="nc" id="L1210">                                casTail(t, last);</span>
+                        }
+<span class="fc" id="L1212">                        return true;</span>
+                    }
+                    // Lost CAS race to another thread; re-read next
+                }
+            }
+    }
+
+    /**
+     * Removes all of the elements from this deque.
+     */
+    public void clear() {
+<span class="fc bfc" id="L1223" title="All 2 branches covered.">        while (pollFirst() != null)</span>
+<span class="fc" id="L1224">            ;</span>
+<span class="fc" id="L1225">    }</span>
+
+    /**
+     * Returns an array containing all of the elements in this deque, in
+     * proper sequence (from first to last element).
+     *
+     * &lt;p&gt;The returned array will be &quot;safe&quot; in that no references to it are
+     * maintained by this deque.  (In other words, this method must allocate
+     * a new array).  The caller is thus free to modify the returned array.
+     *
+     * &lt;p&gt;This method acts as bridge between array-based and collection-based
+     * APIs.
+     *
+     * @return an array containing all of the elements in this deque
+     */
+    public Object[] toArray() {
+<span class="fc" id="L1241">        return toArrayList().toArray();</span>
+    }
+
+    /**
+     * Returns an array containing all of the elements in this deque,
+     * in proper sequence (from first to last element); the runtime
+     * type of the returned array is that of the specified array.  If
+     * the deque fits in the specified array, it is returned therein.
+     * Otherwise, a new array is allocated with the runtime type of
+     * the specified array and the size of this deque.
+     *
+     * &lt;p&gt;If this deque fits in the specified array with room to spare
+     * (i.e., the array has more elements than this deque), the element in
+     * the array immediately following the end of the deque is set to
+     * {@code null}.
+     *
+     * &lt;p&gt;Like the {@link #toArray()} method, this method acts as
+     * bridge between array-based and collection-based APIs.  Further,
+     * this method allows precise control over the runtime type of the
+     * output array, and may, under certain circumstances, be used to
+     * save allocation costs.
+     *
+     * &lt;p&gt;Suppose {@code x} is a deque known to contain only strings.
+     * The following code can be used to dump the deque into a newly
+     * allocated array of {@code String}:
+     *
+     *  &lt;pre&gt; {@code String[] y = x.toArray(new String[0]);}&lt;/pre&gt;
+     *
+     * Note that {@code toArray(new Object[0])} is identical in function to
+     * {@code toArray()}.
+     *
+     * @param a the array into which the elements of the deque are to
+     *          be stored, if it is big enough; otherwise, a new array of the
+     *          same runtime type is allocated for this purpose
+     * @return an array containing all of the elements in this deque
+     * @throws ArrayStoreException if the runtime type of the specified array
+     *         is not a supertype of the runtime type of every element in
+     *         this deque
+     * @throws NullPointerException if the specified array is null
+     */
+    public &lt;T&gt; T[] toArray(T[] a) {
+<span class="fc" id="L1282">        return toArrayList().toArray(a);</span>
+    }
+
+    /**
+     * Returns an iterator over the elements in this deque in proper sequence.
+     * The elements will be returned in order from first (head) to last (tail).
+     *
+     * &lt;p&gt;The returned iterator is
+     * &lt;a href=&quot;package-summary.html#Weakly&quot;&gt;&lt;i&gt;weakly consistent&lt;/i&gt;&lt;/a&gt;.
+     *
+     * @return an iterator over the elements in this deque in proper sequence
+     */
+    public Iterator&lt;E&gt; iterator() {
+<span class="fc" id="L1295">        return new Itr();</span>
+    }
+
+    /**
+     * Returns an iterator over the elements in this deque in reverse
+     * sequential order.  The elements will be returned in order from
+     * last (tail) to first (head).
+     *
+     * &lt;p&gt;The returned iterator is
+     * &lt;a href=&quot;package-summary.html#Weakly&quot;&gt;&lt;i&gt;weakly consistent&lt;/i&gt;&lt;/a&gt;.
+     *
+     * @return an iterator over the elements in this deque in reverse order
+     */
+    public Iterator&lt;E&gt; descendingIterator() {
+<span class="nc" id="L1309">        return new DescendingItr();</span>
+    }
+
+    private abstract class AbstractItr implements Iterator&lt;E&gt; {
+        /**
+         * Next node to return item for.
+         */
+        private Node&lt;E&gt; nextNode;
+
+        /**
+         * nextItem holds on to item fields because once we claim
+         * that an element exists in hasNext(), we must return it in
+         * the following next() call even if it was in the process of
+         * being removed when hasNext() was called.
+         */
+        private E nextItem;
+
+        /**
+         * Node returned by most recent call to next. Needed by remove.
+         * Reset to null if this element is deleted by a call to remove.
+         */
+        private Node&lt;E&gt; lastRet;
+
+        abstract Node&lt;E&gt; startNode();
+        abstract Node&lt;E&gt; nextNode(Node&lt;E&gt; p);
+
+<span class="fc" id="L1335">        AbstractItr() {</span>
+<span class="fc" id="L1336">            advance();</span>
+<span class="fc" id="L1337">        }</span>
+
+        /**
+         * Sets nextNode and nextItem to next valid node, or to null
+         * if no such.
+         */
+        private void advance() {
+<span class="fc" id="L1344">            lastRet = nextNode;</span>
+
+<span class="fc bfc" id="L1346" title="All 2 branches covered.">            Node&lt;E&gt; p = (nextNode == null) ? startNode() : nextNode(nextNode);</span>
+<span class="fc" id="L1347">            for (;; p = nextNode(p)) {</span>
+<span class="fc bfc" id="L1348" title="All 2 branches covered.">                if (p == null) {</span>
+                    // p might be active end or TERMINATOR node; both are OK
+<span class="fc" id="L1350">                    nextNode = null;</span>
+<span class="fc" id="L1351">                    nextItem = null;</span>
+<span class="fc" id="L1352">                    break;</span>
+                }
+<span class="fc" id="L1354">                E item = p.item;</span>
+<span class="fc bfc" id="L1355" title="All 2 branches covered.">                if (item != null) {</span>
+<span class="fc" id="L1356">                    nextNode = p;</span>
+<span class="fc" id="L1357">                    nextItem = item;</span>
+<span class="fc" id="L1358">                    break;</span>
+                }
+            }
+<span class="fc" id="L1361">        }</span>
+
+        public boolean hasNext() {
+<span class="fc bfc" id="L1364" title="All 2 branches covered.">            return nextItem != null;</span>
+        }
+
+        public E next() {
+<span class="fc" id="L1368">            E item = nextItem;</span>
+<span class="fc bfc" id="L1369" title="All 2 branches covered.">            if (item == null) throw new NoSuchElementException();</span>
+<span class="fc" id="L1370">            advance();</span>
+<span class="fc" id="L1371">            return item;</span>
+        }
+
+        public void remove() {
+<span class="fc" id="L1375">            Node&lt;E&gt; l = lastRet;</span>
+<span class="fc bfc" id="L1376" title="All 2 branches covered.">            if (l == null) throw new IllegalStateException();</span>
+<span class="fc" id="L1377">            l.item = null;</span>
+<span class="fc" id="L1378">            unlink(l);</span>
+<span class="fc" id="L1379">            lastRet = null;</span>
+<span class="fc" id="L1380">        }</span>
+    }
+
+    /** Forward iterator */
+<span class="fc" id="L1384">    private class Itr extends AbstractItr {</span>
+<span class="fc" id="L1385">        Node&lt;E&gt; startNode() { return first(); }</span>
+<span class="fc" id="L1386">        Node&lt;E&gt; nextNode(Node&lt;E&gt; p) { return succ(p); }</span>
+    }
+
+    /** Descending iterator */
+<span class="nc" id="L1390">    private class DescendingItr extends AbstractItr {</span>
+<span class="nc" id="L1391">        Node&lt;E&gt; startNode() { return last(); }</span>
+<span class="nc" id="L1392">        Node&lt;E&gt; nextNode(Node&lt;E&gt; p) { return pred(p); }</span>
+    }
+
+    /** A customized variant of Spliterators.IteratorSpliterator */
+    static final class CLDSpliterator&lt;E&gt; implements Spliterator&lt;E&gt; {
+        static final int MAX_BATCH = 1 &lt;&lt; 25;  // max batch array size;
+        final ConcurrentLinkedDeque&lt;E&gt; queue;
+        Node&lt;E&gt; current;    // current node; null until initialized
+        int batch;          // batch size for splits
+        boolean exhausted;  // true when no more nodes
+<span class="fc" id="L1402">        CLDSpliterator(ConcurrentLinkedDeque&lt;E&gt; queue) {</span>
+<span class="fc" id="L1403">            this.queue = queue;</span>
+<span class="fc" id="L1404">        }</span>
+
+        public Spliterator&lt;E&gt; trySplit() {
+            Node&lt;E&gt; p;
+<span class="nc" id="L1408">            final ConcurrentLinkedDeque&lt;E&gt; q = this.queue;</span>
+<span class="nc" id="L1409">            int b = batch;</span>
+<span class="nc bnc" id="L1410" title="All 4 branches missed.">            int n = (b &lt;= 0) ? 1 : (b &gt;= MAX_BATCH) ? MAX_BATCH : b + 1;</span>
+<span class="nc bnc" id="L1411" title="All 4 branches missed.">            if (!exhausted &amp;&amp;</span>
+<span class="nc bnc" id="L1412" title="All 2 branches missed.">                ((p = current) != null || (p = q.first()) != null)) {</span>
+<span class="nc bnc" id="L1413" title="All 4 branches missed.">                if (p.item == null &amp;&amp; p == (p = p.next))</span>
+<span class="nc" id="L1414">                    current = p = q.first();</span>
+<span class="nc bnc" id="L1415" title="All 4 branches missed.">                if (p != null &amp;&amp; p.next != null) {</span>
+<span class="nc" id="L1416">                    Object[] a = new Object[n];</span>
+<span class="nc" id="L1417">                    int i = 0;</span>
+                    do {
+<span class="nc bnc" id="L1419" title="All 2 branches missed.">                        if ((a[i] = p.item) != null)</span>
+<span class="nc" id="L1420">                            ++i;</span>
+<span class="nc bnc" id="L1421" title="All 2 branches missed.">                        if (p == (p = p.next))</span>
+<span class="nc" id="L1422">                            p = q.first();</span>
+<span class="nc bnc" id="L1423" title="All 4 branches missed.">                    } while (p != null &amp;&amp; i &lt; n);</span>
+<span class="nc bnc" id="L1424" title="All 2 branches missed.">                    if ((current = p) == null)</span>
+<span class="nc" id="L1425">                        exhausted = true;</span>
+<span class="nc bnc" id="L1426" title="All 2 branches missed.">                    if (i &gt; 0) {</span>
+<span class="nc" id="L1427">                        batch = i;</span>
+<span class="nc" id="L1428">                        return Spliterators.spliterator</span>
+<span class="nc" id="L1429">                            (a, 0, i, Spliterator.ORDERED | Spliterator.NONNULL |</span>
+                             Spliterator.CONCURRENT);
+                    }
+                }
+            }
+<span class="nc" id="L1434">            return null;</span>
+        }
+
+        public void forEachRemaining(Consumer&lt;? super E&gt; action) {
+            Node&lt;E&gt; p;
+<span class="nc bnc" id="L1439" title="All 2 branches missed.">            if (action == null) throw new NullPointerException();</span>
+<span class="nc" id="L1440">            final ConcurrentLinkedDeque&lt;E&gt; q = this.queue;</span>
+<span class="nc bnc" id="L1441" title="All 4 branches missed.">            if (!exhausted &amp;&amp;</span>
+<span class="nc bnc" id="L1442" title="All 2 branches missed.">                ((p = current) != null || (p = q.first()) != null)) {</span>
+<span class="nc" id="L1443">                exhausted = true;</span>
+                do {
+<span class="nc" id="L1445">                    E e = p.item;</span>
+<span class="nc bnc" id="L1446" title="All 2 branches missed.">                    if (p == (p = p.next))</span>
+<span class="nc" id="L1447">                        p = q.first();</span>
+<span class="nc bnc" id="L1448" title="All 2 branches missed.">                    if (e != null)</span>
+<span class="nc" id="L1449">                        action.accept(e);</span>
+<span class="nc bnc" id="L1450" title="All 2 branches missed.">                } while (p != null);</span>
+            }
+<span class="nc" id="L1452">        }</span>
+
+        public boolean tryAdvance(Consumer&lt;? super E&gt; action) {
+            Node&lt;E&gt; p;
+<span class="nc bnc" id="L1456" title="All 2 branches missed.">            if (action == null) throw new NullPointerException();</span>
+<span class="nc" id="L1457">            final ConcurrentLinkedDeque&lt;E&gt; q = this.queue;</span>
+<span class="nc bnc" id="L1458" title="All 4 branches missed.">            if (!exhausted &amp;&amp;</span>
+<span class="nc bnc" id="L1459" title="All 2 branches missed.">                ((p = current) != null || (p = q.first()) != null)) {</span>
+                E e;
+                do {
+<span class="nc" id="L1462">                    e = p.item;</span>
+<span class="nc bnc" id="L1463" title="All 2 branches missed.">                    if (p == (p = p.next))</span>
+<span class="nc" id="L1464">                        p = q.first();</span>
+<span class="nc bnc" id="L1465" title="All 4 branches missed.">                } while (e == null &amp;&amp; p != null);</span>
+<span class="nc bnc" id="L1466" title="All 2 branches missed.">                if ((current = p) == null)</span>
+<span class="nc" id="L1467">                    exhausted = true;</span>
+<span class="nc bnc" id="L1468" title="All 2 branches missed.">                if (e != null) {</span>
+<span class="nc" id="L1469">                    action.accept(e);</span>
+<span class="nc" id="L1470">                    return true;</span>
+                }
+            }
+<span class="nc" id="L1473">            return false;</span>
+        }
+
+<span class="nc" id="L1476">        public long estimateSize() { return Long.MAX_VALUE; }</span>
+
+        public int characteristics() {
+<span class="fc" id="L1479">            return Spliterator.ORDERED | Spliterator.NONNULL |</span>
+                Spliterator.CONCURRENT;
+        }
+    }
+
+    /**
+     * Returns a {@link Spliterator} over the elements in this deque.
+     *
+     * &lt;p&gt;The returned spliterator is
+     * &lt;a href=&quot;package-summary.html#Weakly&quot;&gt;&lt;i&gt;weakly consistent&lt;/i&gt;&lt;/a&gt;.
+     *
+     * &lt;p&gt;The {@code Spliterator} reports {@link Spliterator#CONCURRENT},
+     * {@link Spliterator#ORDERED}, and {@link Spliterator#NONNULL}.
+     *
+     * @implNote
+     * The {@code Spliterator} implements {@code trySplit} to permit limited
+     * parallelism.
+     *
+     * @return a {@code Spliterator} over the elements in this deque
+     * @since 1.8
+     */
+    public Spliterator&lt;E&gt; spliterator() {
+<span class="fc" id="L1501">        return new CLDSpliterator&lt;E&gt;(this);</span>
+    }
+
+    /**
+     * Saves this deque to a stream (that is, serializes it).
+     *
+     * @param s the stream
+     * @throws java.io.IOException if an I/O error occurs
+     * @serialData All of the elements (each an {@code E}) in
+     * the proper order, followed by a null
+     */
+    private void writeObject(java.io.ObjectOutputStream s)
+        throws java.io.IOException {
+
+        // Write out any hidden stuff
+<span class="fc" id="L1516">        s.defaultWriteObject();</span>
+
+        // Write out all elements in the proper order.
+<span class="fc bfc" id="L1519" title="All 2 branches covered.">        for (Node&lt;E&gt; p = first(); p != null; p = succ(p)) {</span>
+<span class="fc" id="L1520">            E item = p.item;</span>
+<span class="fc bfc" id="L1521" title="All 2 branches covered.">            if (item != null)</span>
+<span class="fc" id="L1522">                s.writeObject(item);</span>
+        }
+
+        // Use trailing null as sentinel
+<span class="fc" id="L1526">        s.writeObject(null);</span>
+<span class="fc" id="L1527">    }</span>
+
+    /**
+     * Reconstitutes this deque from a stream (that is, deserializes it).
+     * @param s the stream
+     * @throws ClassNotFoundException if the class of a serialized object
+     *         could not be found
+     * @throws java.io.IOException if an I/O error occurs
+     */
+    private void readObject(java.io.ObjectInputStream s)
+        throws java.io.IOException, ClassNotFoundException {
+<span class="fc" id="L1538">        s.defaultReadObject();</span>
+
+        // Read in elements until trailing null sentinel found
+<span class="fc" id="L1541">        Node&lt;E&gt; h = null, t = null;</span>
+        Object item;
+<span class="fc bfc" id="L1543" title="All 2 branches covered.">        while ((item = s.readObject()) != null) {</span>
+            @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L1545">            Node&lt;E&gt; newNode = new Node&lt;E&gt;((E) item);</span>
+<span class="fc bfc" id="L1546" title="All 2 branches covered.">            if (h == null)</span>
+<span class="fc" id="L1547">                h = t = newNode;</span>
+            else {
+<span class="fc" id="L1549">                t.lazySetNext(newNode);</span>
+<span class="fc" id="L1550">                newNode.lazySetPrev(t);</span>
+<span class="fc" id="L1551">                t = newNode;</span>
+            }
+<span class="fc" id="L1553">        }</span>
+<span class="fc" id="L1554">        initHeadTail(h, t);</span>
+<span class="fc" id="L1555">    }</span>
+
+    private boolean casHead(Node&lt;E&gt; cmp, Node&lt;E&gt; val) {
+<span class="fc" id="L1558">        return UNSAFE.compareAndSwapObject(this, headOffset, cmp, val);</span>
+    }
+
+    private boolean casTail(Node&lt;E&gt; cmp, Node&lt;E&gt; val) {
+<span class="fc" id="L1562">        return UNSAFE.compareAndSwapObject(this, tailOffset, cmp, val);</span>
+    }
+
+    // Unsafe mechanics
+
+    private static final sun.misc.Unsafe UNSAFE;
+    private static final long headOffset;
+    private static final long tailOffset;
+    static {
+<span class="fc" id="L1571">        PREV_TERMINATOR = new Node&lt;Object&gt;();</span>
+<span class="fc" id="L1572">        PREV_TERMINATOR.next = PREV_TERMINATOR;</span>
+<span class="fc" id="L1573">        NEXT_TERMINATOR = new Node&lt;Object&gt;();</span>
+<span class="fc" id="L1574">        NEXT_TERMINATOR.prev = NEXT_TERMINATOR;</span>
+        try {
+<span class="fc" id="L1576">            UNSAFE = sun.misc.Unsafe.getUnsafe();</span>
+<span class="fc" id="L1577">            Class&lt;?&gt; k = ConcurrentLinkedDeque.class;</span>
+<span class="fc" id="L1578">            headOffset = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L1579">                (k.getDeclaredField(&quot;head&quot;));</span>
+<span class="fc" id="L1580">            tailOffset = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L1581">                (k.getDeclaredField(&quot;tail&quot;));</span>
+<span class="nc" id="L1582">        } catch (Exception e) {</span>
+<span class="nc" id="L1583">            throw new Error(e);</span>
+<span class="fc" id="L1584">        }</span>
+<span class="fc" id="L1585">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

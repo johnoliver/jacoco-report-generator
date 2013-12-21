@@ -1,0 +1,537 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>TCPChannel.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.rmi.transport.tcp</a> &gt; <span class="el_source">TCPChannel.java</span></div><h1>TCPChannel.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1996, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package sun.rmi.transport.tcp;
+
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.lang.ref.Reference;
+import java.lang.ref.SoftReference;
+import java.net.Socket;
+import java.rmi.ConnectIOException;
+import java.rmi.RemoteException;
+import java.security.AccessControlContext;
+import java.security.AccessController;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.ListIterator;
+import java.util.WeakHashMap;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import sun.rmi.runtime.Log;
+import sun.rmi.runtime.NewThreadAction;
+import sun.rmi.runtime.RuntimeUtil;
+import sun.rmi.transport.Channel;
+import sun.rmi.transport.Connection;
+import sun.rmi.transport.Endpoint;
+import sun.rmi.transport.TransportConstants;
+import sun.security.action.GetIntegerAction;
+import sun.security.action.GetLongAction;
+
+/**
+ * TCPChannel is the socket-based implementation of the RMI Channel
+ * abstraction.
+ *
+ * @author Ann Wollrath
+ */
+public class TCPChannel implements Channel {
+    /** endpoint for this channel */
+    private final TCPEndpoint ep;
+    /** transport for this channel */
+    private final TCPTransport tr;
+    /** list of cached connections */
+<span class="fc" id="L66">    private final List&lt;TCPConnection&gt; freeList =</span>
+        new ArrayList&lt;&gt;();
+    /** frees cached connections that have expired (guarded by freeList) */
+<span class="fc" id="L69">    private Future&lt;?&gt; reaper = null;</span>
+
+    /** using multiplexer (for bi-directional applet communication */
+<span class="fc" id="L72">    private boolean usingMultiplexer = false;</span>
+    /** connection multiplexer, if used */
+<span class="fc" id="L74">    private ConnectionMultiplexer multiplexer = null;</span>
+    /** connection acceptor (should be in TCPTransport) */
+    private ConnectionAcceptor acceptor;
+
+    /** most recently authorized AccessControlContext */
+    private AccessControlContext okContext;
+
+    /** cache of authorized AccessControlContexts */
+    private WeakHashMap&lt;AccessControlContext,
+                        Reference&lt;AccessControlContext&gt;&gt; authcache;
+
+    /** the SecurityManager which authorized okContext and authcache */
+<span class="fc" id="L86">    private SecurityManager cacheSecurityManager = null;</span>
+
+    /** client-side connection idle usage timeout */
+<span class="fc" id="L89">    private static final long idleTimeout =             // default 15 seconds</span>
+<span class="fc" id="L90">        AccessController.doPrivileged(</span>
+            new GetLongAction(&quot;sun.rmi.transport.connectionTimeout&quot;, 15000));
+
+    /** client-side connection handshake read timeout */
+<span class="fc" id="L94">    private static final int handshakeTimeout =         // default 1 minute</span>
+<span class="fc" id="L95">        AccessController.doPrivileged(</span>
+            new GetIntegerAction(&quot;sun.rmi.transport.tcp.handshakeTimeout&quot;,
+                                 60000));
+
+    /** client-side connection response read timeout (after handshake) */
+<span class="fc" id="L100">    private static final int responseTimeout =          // default infinity</span>
+<span class="fc" id="L101">        AccessController.doPrivileged(</span>
+            new GetIntegerAction(&quot;sun.rmi.transport.tcp.responseTimeout&quot;, 0));
+
+    /** thread pool for scheduling delayed tasks */
+<span class="fc" id="L105">    private static final ScheduledExecutorService scheduler =</span>
+<span class="fc" id="L106">        AccessController.doPrivileged(</span>
+<span class="fc" id="L107">            new RuntimeUtil.GetInstanceAction()).getScheduler();</span>
+
+    /**
+     * Create channel for endpoint.
+     */
+<span class="fc" id="L112">    TCPChannel(TCPTransport tr, TCPEndpoint ep) {</span>
+<span class="fc" id="L113">        this.tr = tr;</span>
+<span class="fc" id="L114">        this.ep = ep;</span>
+<span class="fc" id="L115">    }</span>
+
+    /**
+     * Return the endpoint for this channel.
+     */
+    public Endpoint getEndpoint() {
+<span class="fc" id="L121">        return ep;</span>
+    }
+
+    /**
+     * Checks if the current caller has sufficient privilege to make
+     * a connection to the remote endpoint.
+     * @exception SecurityException if caller is not allowed to use this
+     * Channel.
+     */
+    private void checkConnectPermission() throws SecurityException {
+<span class="fc" id="L131">        SecurityManager security = System.getSecurityManager();</span>
+<span class="fc bfc" id="L132" title="All 2 branches covered.">        if (security == null)</span>
+<span class="fc" id="L133">            return;</span>
+
+<span class="fc bfc" id="L135" title="All 2 branches covered.">        if (security != cacheSecurityManager) {</span>
+            // The security manager changed: flush the cache
+<span class="fc" id="L137">            okContext = null;</span>
+<span class="fc" id="L138">            authcache = new WeakHashMap&lt;AccessControlContext,</span>
+                                        Reference&lt;AccessControlContext&gt;&gt;();
+<span class="fc" id="L140">            cacheSecurityManager = security;</span>
+        }
+
+<span class="fc" id="L143">        AccessControlContext ctx = AccessController.getContext();</span>
+
+        // If ctx is the same context as last time, or if it
+        // appears in the cache, bypass the checkConnect.
+<span class="fc bfc" id="L147" title="All 2 branches covered.">        if (okContext == null ||</span>
+<span class="fc bfc" id="L148" title="All 4 branches covered.">            !(okContext.equals(ctx) || authcache.containsKey(ctx)))</span>
+        {
+<span class="fc" id="L150">            security.checkConnect(ep.getHost(), ep.getPort());</span>
+<span class="fc" id="L151">            authcache.put(ctx, new SoftReference&lt;AccessControlContext&gt;(ctx));</span>
+            // A WeakHashMap is transformed into a SoftHashSet by making
+            // each value softly refer to its own key (Peter's idea).
+        }
+<span class="fc" id="L155">        okContext = ctx;</span>
+<span class="fc" id="L156">    }</span>
+
+    /**
+     * Supplies a connection to the endpoint of the address space
+     * for which this is a channel.  The returned connection may
+     * be one retrieved from a cache of idle connections.
+     */
+    public Connection newConnection() throws RemoteException {
+        TCPConnection conn;
+
+        // loop until we find a free live connection (in which case
+        // we return) or until we run out of freelist (in which case
+        // the loop exits)
+        do {
+<span class="fc" id="L170">            conn = null;</span>
+            // try to get a free connection
+<span class="fc" id="L172">            synchronized (freeList) {</span>
+<span class="fc" id="L173">                int elementPos = freeList.size()-1;</span>
+
+<span class="fc bfc" id="L175" title="All 2 branches covered.">                if (elementPos &gt;= 0) {</span>
+                    // If there is a security manager, make sure
+                    // the caller is allowed to connect to the
+                    // requested endpoint.
+<span class="fc" id="L179">                    checkConnectPermission();</span>
+<span class="fc" id="L180">                    conn = freeList.get(elementPos);</span>
+<span class="fc" id="L181">                    freeList.remove(elementPos);</span>
+                }
+<span class="pc" id="L183">            }</span>
+
+            // at this point, conn is null iff the freelist is empty,
+            // and nonnull if a free connection of uncertain vitality
+            // has been found.
+
+<span class="fc bfc" id="L189" title="All 2 branches covered.">            if (conn != null) {</span>
+                // check to see if the connection has closed since last use
+<span class="fc bfc" id="L191" title="All 2 branches covered.">                if (!conn.isDead()) {</span>
+<span class="fc" id="L192">                    TCPTransport.tcpLog.log(Log.BRIEF, &quot;reuse connection&quot;);</span>
+<span class="fc" id="L193">                    return conn;</span>
+                }
+
+                // conn is dead, and cannot be reused (reuse =&gt; false)
+<span class="fc" id="L197">                this.free(conn, false);</span>
+            }
+<span class="fc bfc" id="L199" title="All 2 branches covered.">        } while (conn != null);</span>
+
+        // none free, so create a new connection
+<span class="fc" id="L202">        return (createConnection());</span>
+    }
+
+    /**
+     * Create a new connection to the remote endpoint of this channel.
+     * The returned connection is new.  The caller must already have
+     * passed a security checkConnect or equivalent.
+     */
+    private Connection createConnection() throws RemoteException {
+        Connection conn;
+
+<span class="fc" id="L213">        TCPTransport.tcpLog.log(Log.BRIEF, &quot;create connection&quot;);</span>
+
+<span class="pc bpc" id="L215" title="1 of 2 branches missed.">        if (!usingMultiplexer) {</span>
+<span class="fc" id="L216">            Socket sock = ep.newSocket();</span>
+<span class="fc" id="L217">            conn = new TCPConnection(this, sock);</span>
+
+            try {
+<span class="fc" id="L220">                DataOutputStream out =</span>
+<span class="fc" id="L221">                    new DataOutputStream(conn.getOutputStream());</span>
+<span class="fc" id="L222">                writeTransportHeader(out);</span>
+
+                // choose protocol (single op if not reusable socket)
+<span class="fc bfc" id="L225" title="All 2 branches covered.">                if (!conn.isReusable()) {</span>
+<span class="fc" id="L226">                    out.writeByte(TransportConstants.SingleOpProtocol);</span>
+                } else {
+<span class="fc" id="L228">                    out.writeByte(TransportConstants.StreamProtocol);</span>
+<span class="fc" id="L229">                    out.flush();</span>
+
+                    /*
+                     * Set socket read timeout to configured value for JRMP
+                     * connection handshake; this also serves to guard against
+                     * non-JRMP servers that do not respond (see 4322806).
+                     */
+<span class="fc" id="L236">                    int originalSoTimeout = 0;</span>
+                    try {
+<span class="fc" id="L238">                        originalSoTimeout = sock.getSoTimeout();</span>
+<span class="fc" id="L239">                        sock.setSoTimeout(handshakeTimeout);</span>
+<span class="nc" id="L240">                    } catch (Exception e) {</span>
+                        // if we fail to set this, ignore and proceed anyway
+<span class="fc" id="L242">                    }</span>
+
+<span class="fc" id="L244">                    DataInputStream in =</span>
+<span class="fc" id="L245">                        new DataInputStream(conn.getInputStream());</span>
+<span class="fc" id="L246">                    byte ack = in.readByte();</span>
+<span class="fc bfc" id="L247" title="All 2 branches covered.">                    if (ack != TransportConstants.ProtocolAck) {</span>
+<span class="pc bpc" id="L248" title="1 of 2 branches missed.">                        throw new ConnectIOException(</span>
+                            ack == TransportConstants.ProtocolNack ?
+                            &quot;JRMP StreamProtocol not supported by server&quot; :
+                            &quot;non-JRMP server at remote endpoint&quot;);
+                    }
+
+<span class="fc" id="L254">                    String suggestedHost = in.readUTF();</span>
+<span class="fc" id="L255">                    int    suggestedPort = in.readInt();</span>
+<span class="fc bfc" id="L256" title="All 2 branches covered.">                    if (TCPTransport.tcpLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="fc" id="L257">                        TCPTransport.tcpLog.log(Log.VERBOSE,</span>
+                            &quot;server suggested &quot; + suggestedHost + &quot;:&quot; +
+                            suggestedPort);
+                    }
+
+                    // set local host name, if unknown
+<span class="fc" id="L263">                    TCPEndpoint.setLocalHost(suggestedHost);</span>
+                    // do NOT set the default port, because we don't
+                    // know if we can't listen YET...
+
+                    // write out default endpoint to match protocol
+                    // (but it serves no purpose)
+<span class="fc" id="L269">                    TCPEndpoint localEp =</span>
+<span class="fc" id="L270">                        TCPEndpoint.getLocalEndpoint(0, null, null);</span>
+<span class="fc" id="L271">                    out.writeUTF(localEp.getHost());</span>
+<span class="fc" id="L272">                    out.writeInt(localEp.getPort());</span>
+<span class="fc bfc" id="L273" title="All 2 branches covered.">                    if (TCPTransport.tcpLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="fc" id="L274">                        TCPTransport.tcpLog.log(Log.VERBOSE, &quot;using &quot; +</span>
+<span class="fc" id="L275">                            localEp.getHost() + &quot;:&quot; + localEp.getPort());</span>
+                    }
+
+                    /*
+                     * After JRMP handshake, set socket read timeout to value
+                     * configured for the rest of the lifetime of the
+                     * connection.  NOTE: this timeout, if configured to a
+                     * finite duration, places an upper bound on the time
+                     * that a remote method call is permitted to execute.
+                     */
+                    try {
+                        /*
+                         * If socket factory had set a non-zero timeout on its
+                         * own, then restore it instead of using the property-
+                         * configured value.
+                         */
+<span class="pc bpc" id="L291" title="1 of 2 branches missed.">                        sock.setSoTimeout((originalSoTimeout != 0 ?</span>
+                                           originalSoTimeout :
+                                           responseTimeout));
+<span class="nc" id="L294">                    } catch (Exception e) {</span>
+                        // if we fail to set this, ignore and proceed anyway
+<span class="fc" id="L296">                    }</span>
+
+<span class="fc" id="L298">                    out.flush();</span>
+                }
+<span class="fc" id="L300">            } catch (IOException e) {</span>
+<span class="fc bfc" id="L301" title="All 2 branches covered.">                if (e instanceof RemoteException)</span>
+<span class="fc" id="L302">                    throw (RemoteException) e;</span>
+                else
+<span class="fc" id="L304">                    throw new ConnectIOException(</span>
+                        &quot;error during JRMP connection establishment&quot;, e);
+<span class="fc" id="L306">            }</span>
+<span class="fc" id="L307">        } else {</span>
+            try {
+<span class="nc" id="L309">                conn = multiplexer.openConnection();</span>
+<span class="nc" id="L310">            } catch (IOException e) {</span>
+<span class="nc" id="L311">                synchronized (this) {</span>
+<span class="nc" id="L312">                    usingMultiplexer = false;</span>
+<span class="nc" id="L313">                    multiplexer = null;</span>
+<span class="nc" id="L314">                }</span>
+<span class="nc" id="L315">                throw new ConnectIOException(</span>
+                    &quot;error opening virtual connection &quot; +
+                    &quot;over multiplexed connection&quot;, e);
+<span class="nc" id="L318">            }</span>
+        }
+<span class="fc" id="L320">        return conn;</span>
+    }
+
+    /**
+     * Free the connection generated by this channel.
+     * @param conn The connection
+     * @param reuse If true, the connection is in a state in which it
+     *        can be reused for another method call.
+     */
+    public void free(Connection conn, boolean reuse) {
+<span class="pc bpc" id="L330" title="1 of 2 branches missed.">        if (conn == null) return;</span>
+
+<span class="fc bfc" id="L332" title="All 4 branches covered.">        if (reuse &amp;&amp; conn.isReusable()) {</span>
+<span class="fc" id="L333">            long lastuse = System.currentTimeMillis();</span>
+<span class="fc" id="L334">            TCPConnection tcpConnection = (TCPConnection) conn;</span>
+
+<span class="fc" id="L336">            TCPTransport.tcpLog.log(Log.BRIEF, &quot;reuse connection&quot;);</span>
+
+            /*
+             * Cache connection; if reaper task for expired
+             * connections isn't scheduled, then schedule it.
+             */
+<span class="fc" id="L342">            synchronized (freeList) {</span>
+<span class="fc" id="L343">                freeList.add(tcpConnection);</span>
+<span class="fc bfc" id="L344" title="All 2 branches covered.">                if (reaper == null) {</span>
+<span class="fc" id="L345">                    TCPTransport.tcpLog.log(Log.BRIEF, &quot;create reaper&quot;);</span>
+
+<span class="fc" id="L347">                    reaper = scheduler.scheduleWithFixedDelay(</span>
+<span class="fc" id="L348">                        new Runnable() {</span>
+                            public void run() {
+<span class="fc" id="L350">                                TCPTransport.tcpLog.log(Log.VERBOSE,</span>
+                                                        &quot;wake up&quot;);
+<span class="fc" id="L352">                                freeCachedConnections();</span>
+<span class="fc" id="L353">                            }</span>
+                        }, idleTimeout, idleTimeout, TimeUnit.MILLISECONDS);
+                }
+<span class="pc" id="L356">            }</span>
+
+<span class="fc" id="L358">            tcpConnection.setLastUseTime(lastuse);</span>
+<span class="fc" id="L359">            tcpConnection.setExpiration(lastuse + idleTimeout);</span>
+<span class="fc" id="L360">        } else {</span>
+<span class="fc" id="L361">            TCPTransport.tcpLog.log(Log.BRIEF, &quot;close connection&quot;);</span>
+
+            try {
+<span class="fc" id="L364">                conn.close();</span>
+<span class="nc" id="L365">            } catch (IOException ignored) {</span>
+<span class="fc" id="L366">            }</span>
+        }
+<span class="fc" id="L368">    }</span>
+
+    /**
+     * Send transport header over stream.
+     */
+    private void writeTransportHeader(DataOutputStream out)
+        throws RemoteException
+    {
+        try {
+            // write out transport header
+<span class="fc" id="L378">            DataOutputStream dataOut =</span>
+                new DataOutputStream(out);
+<span class="fc" id="L380">            dataOut.writeInt(TransportConstants.Magic);</span>
+<span class="fc" id="L381">            dataOut.writeShort(TransportConstants.Version);</span>
+<span class="nc" id="L382">        } catch (IOException e) {</span>
+<span class="nc" id="L383">            throw new ConnectIOException(</span>
+                &quot;error writing JRMP transport header&quot;, e);
+<span class="fc" id="L385">        }</span>
+<span class="fc" id="L386">    }</span>
+
+    /**
+     * Use given connection multiplexer object to obtain new connections
+     * through this channel.
+     */
+    synchronized void useMultiplexer(ConnectionMultiplexer newMultiplexer) {
+        // for now, always just use the last one given
+<span class="nc" id="L394">        multiplexer = newMultiplexer;</span>
+
+<span class="nc" id="L396">        usingMultiplexer = true;</span>
+<span class="nc" id="L397">    }</span>
+
+    /**
+     * Accept a connection provided over a multiplexed channel.
+     */
+    void acceptMultiplexConnection(Connection conn) {
+<span class="nc bnc" id="L403" title="All 2 branches missed.">        if (acceptor == null) {</span>
+<span class="nc" id="L404">            acceptor = new ConnectionAcceptor(tr);</span>
+<span class="nc" id="L405">            acceptor.startNewAcceptor();</span>
+        }
+<span class="nc" id="L407">        acceptor.accept(conn);</span>
+<span class="nc" id="L408">    }</span>
+
+    /**
+     * Closes all the connections in the cache, whether timed out or not.
+     */
+    public void shedCache() {
+        // Build a list of connections, to avoid holding the freeList
+        // lock during (potentially long-running) close() calls.
+        Connection[] conn;
+<span class="fc" id="L417">        synchronized (freeList) {</span>
+<span class="fc" id="L418">            conn = freeList.toArray(new Connection[freeList.size()]);</span>
+<span class="fc" id="L419">            freeList.clear();</span>
+<span class="pc" id="L420">        }</span>
+
+        // Close all the connections that were free
+<span class="fc bfc" id="L423" title="All 2 branches covered.">        for (int i = conn.length; --i &gt;= 0; ) {</span>
+<span class="fc" id="L424">            Connection c = conn[i];</span>
+<span class="fc" id="L425">            conn[i] = null; // help gc</span>
+            try {
+<span class="fc" id="L427">                c.close();</span>
+<span class="nc" id="L428">            } catch (java.io.IOException e) {</span>
+                // eat exception
+<span class="fc" id="L430">            }</span>
+<span class="fc" id="L431">        }</span>
+<span class="fc" id="L432">    }</span>
+
+    private void freeCachedConnections() {
+        /*
+         * Remove each connection whose time out has expired.
+         */
+<span class="fc" id="L438">        synchronized (freeList) {</span>
+<span class="fc" id="L439">            int size = freeList.size();</span>
+
+<span class="fc bfc" id="L441" title="All 2 branches covered.">            if (size &gt; 0) {</span>
+<span class="fc" id="L442">                long time = System.currentTimeMillis();</span>
+<span class="fc" id="L443">                ListIterator&lt;TCPConnection&gt; iter = freeList.listIterator(size);</span>
+
+<span class="fc bfc" id="L445" title="All 2 branches covered.">                while (iter.hasPrevious()) {</span>
+<span class="fc" id="L446">                    TCPConnection conn = iter.previous();</span>
+<span class="fc bfc" id="L447" title="All 2 branches covered.">                    if (conn.expired(time)) {</span>
+<span class="fc" id="L448">                        TCPTransport.tcpLog.log(Log.VERBOSE,</span>
+                            &quot;connection timeout expired&quot;);
+
+                        try {
+<span class="fc" id="L452">                            conn.close();</span>
+<span class="nc" id="L453">                        } catch (java.io.IOException e) {</span>
+                            // eat exception
+<span class="fc" id="L455">                        }</span>
+<span class="fc" id="L456">                        iter.remove();</span>
+                    }
+<span class="fc" id="L458">                }</span>
+            }
+
+<span class="fc bfc" id="L461" title="All 2 branches covered.">            if (freeList.isEmpty()) {</span>
+<span class="fc" id="L462">                reaper.cancel(false);</span>
+<span class="fc" id="L463">                reaper = null;</span>
+            }
+<span class="pc" id="L465">        }</span>
+<span class="fc" id="L466">    }</span>
+}
+
+/**
+ * ConnectionAcceptor manages accepting new connections and giving them
+ * to TCPTransport's message handler on new threads.
+ *
+ * Since this object only needs to know which transport to give new
+ * connections to, it doesn't need to be per-channel as currently
+ * implemented.
+ */
+class ConnectionAcceptor implements Runnable {
+
+    /** transport that will handle message on accepted connections */
+    private TCPTransport transport;
+
+    /** queue of connections to be accepted */
+<span class="nc" id="L483">    private List&lt;Connection&gt; queue = new ArrayList&lt;&gt;();</span>
+
+    /** thread ID counter */
+<span class="nc" id="L486">    private static int threadNum = 0;</span>
+
+    /**
+     * Create a new ConnectionAcceptor that will give connections
+     * to the specified transport on a new thread.
+     */
+<span class="nc" id="L492">    public ConnectionAcceptor(TCPTransport transport) {</span>
+<span class="nc" id="L493">        this.transport = transport;</span>
+<span class="nc" id="L494">    }</span>
+
+    /**
+     * Start a new thread to accept connections.
+     */
+    public void startNewAcceptor() {
+<span class="nc" id="L500">        Thread t = AccessController.doPrivileged(</span>
+            new NewThreadAction(ConnectionAcceptor.this,
+                                &quot;Multiplex Accept-&quot; + ++ threadNum,
+                                true));
+<span class="nc" id="L504">        t.start();</span>
+<span class="nc" id="L505">    }</span>
+
+    /**
+     * Add connection to queue of connections to be accepted.
+     */
+    public void accept(Connection conn) {
+<span class="nc" id="L511">        synchronized (queue) {</span>
+<span class="nc" id="L512">            queue.add(conn);</span>
+<span class="nc" id="L513">            queue.notify();</span>
+<span class="nc" id="L514">        }</span>
+<span class="nc" id="L515">    }</span>
+
+    /**
+     * Give transport next accepted connection, when available.
+     */
+    public void run() {
+        Connection conn;
+
+<span class="nc" id="L523">        synchronized (queue) {</span>
+<span class="nc bnc" id="L524" title="All 2 branches missed.">            while (queue.size() == 0) {</span>
+                try {
+<span class="nc" id="L526">                    queue.wait();</span>
+<span class="nc" id="L527">                } catch (InterruptedException e) {</span>
+<span class="nc" id="L528">                }</span>
+            }
+<span class="nc" id="L530">            startNewAcceptor();</span>
+<span class="nc" id="L531">            conn = queue.remove(0);</span>
+<span class="nc" id="L532">        }</span>
+
+<span class="nc" id="L534">        transport.handleMessages(conn, true);</span>
+<span class="nc" id="L535">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

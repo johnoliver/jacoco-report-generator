@@ -1,0 +1,525 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>KeyTab.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.krb5.internal.ktab</a> &gt; <span class="el_source">KeyTab.java</span></div><h1>KeyTab.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2000, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+/*
+ *
+ *  (C) Copyright IBM Corp. 1999 All Rights Reserved.
+ *  Copyright 1997 The Open Group Research Institute.  All rights reserved.
+ */
+
+package sun.security.krb5.internal.ktab;
+
+import sun.security.krb5.*;
+import sun.security.krb5.internal.*;
+import sun.security.krb5.internal.crypto.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.io.IOException;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.StringTokenizer;
+import java.util.Vector;
+import sun.security.jgss.krb5.ServiceCreds;
+
+/**
+ * This class represents key table. The key table functions deal with storing
+ * and retrieving service keys for use in authentication exchanges.
+ *
+ * A KeyTab object is always constructed, if the file specified does not
+ * exist, it's still valid but empty. If there is an I/O error or file format
+ * error, it's invalid.
+ *
+ * The class is immutable on the read side (the write side is only used by
+ * the ktab tool).
+ *
+ * @author Yanni Zhang
+ */
+public class KeyTab implements KeyTabConstants {
+
+<span class="fc" id="L66">    private static final boolean DEBUG = Krb5.DEBUG;</span>
+<span class="fc" id="L67">    private static String defaultTabName = null;</span>
+
+    // Attention: Currently there is no way to remove a keytab from this map,
+    // this might lead to a memory leak.
+<span class="fc" id="L71">    private static Map&lt;String,KeyTab&gt; map = new HashMap&lt;&gt;();</span>
+
+    // KeyTab file does not exist. Note: a missing keytab is still valid
+<span class="fc" id="L74">    private boolean isMissing = false;</span>
+
+    // KeyTab file is invalid, possibly an I/O error or a file format error.
+<span class="fc" id="L77">    private boolean isValid = true;</span>
+
+    private final String tabName;
+    private long lastModified;
+<span class="fc" id="L81">    private int kt_vno = KRB5_KT_VNO;</span>
+
+<span class="fc" id="L83">    private Vector&lt;KeyTabEntry&gt; entries = new Vector&lt;&gt;();</span>
+
+    /**
+     * Constructs a KeyTab object.
+     *
+     * If there is any I/O error or format errot during the loading, the
+     * isValid flag is set to false, and all half-read entries are dismissed.
+     * @param filename path name for the keytab file, must not be null
+     */
+<span class="fc" id="L92">    private KeyTab(String filename) {</span>
+<span class="fc" id="L93">        tabName = filename;</span>
+        try {
+<span class="fc" id="L95">            lastModified = new File(tabName).lastModified();</span>
+<span class="pc" id="L96">            try (KeyTabInputStream kis =</span>
+                    new KeyTabInputStream(new FileInputStream(filename))) {
+<span class="fc" id="L98">                load(kis);</span>
+<span class="pc bpc" id="L99" title="6 of 8 branches missed.">            }</span>
+<span class="nc" id="L100">        } catch (FileNotFoundException e) {</span>
+<span class="nc" id="L101">            entries.clear();</span>
+<span class="nc" id="L102">            isMissing = true;</span>
+<span class="nc" id="L103">        } catch (Exception ioe) {</span>
+<span class="nc" id="L104">            entries.clear();</span>
+<span class="nc" id="L105">            isValid = false;</span>
+<span class="pc" id="L106">        }</span>
+<span class="fc" id="L107">    }</span>
+
+    /**
+     * Read a keytab file. Returns a new object and save it into cache when
+     * new content (modified since last read) is available. If keytab file is
+     * invalid, the old object will be returned. This is a safeguard for
+     * partial-written keytab files or non-stable network. Please note that
+     * a missing keytab is valid, which is equivalent to an empty keytab.
+     *
+     * @param s file name of keytab, must not be null
+     * @return the keytab object, can be invalid, but never null.
+     */
+    private synchronized static KeyTab getInstance0(String s) {
+<span class="fc" id="L120">        long lm = new File(s).lastModified();</span>
+<span class="fc" id="L121">        KeyTab old = map.get(s);</span>
+<span class="pc bpc" id="L122" title="2 of 6 branches missed.">        if (old != null &amp;&amp; old.isValid() &amp;&amp; old.lastModified == lm) {</span>
+<span class="fc" id="L123">            return old;</span>
+        }
+<span class="fc" id="L125">        KeyTab ktab = new KeyTab(s);</span>
+<span class="pc bpc" id="L126" title="1 of 2 branches missed.">        if (ktab.isValid()) {               // A valid new keytab</span>
+<span class="fc" id="L127">            map.put(s, ktab);</span>
+<span class="fc" id="L128">            return ktab;</span>
+<span class="nc bnc" id="L129" title="All 2 branches missed.">        } else if (old != null) {           // An existing old one</span>
+<span class="nc" id="L130">            return old;</span>
+        } else {
+<span class="nc" id="L132">            return ktab;                    // first read is invalid</span>
+        }
+    }
+
+    /**
+     * Gets a KeyTab object.
+     * @param s the key tab file name.
+     * @return the KeyTab object, never null.
+     */
+    public static KeyTab getInstance(String s) {
+<span class="pc bpc" id="L142" title="1 of 2 branches missed.">        if (s == null) {</span>
+<span class="nc" id="L143">            return getInstance();</span>
+        } else {
+<span class="fc" id="L145">            return getInstance0(normalize(s));</span>
+        }
+    }
+
+    /**
+     * Gets a KeyTab object.
+     * @param file the key tab file.
+     * @return the KeyTab object, never null.
+     */
+    public static KeyTab getInstance(File file) {
+<span class="fc bfc" id="L155" title="All 2 branches covered.">        if (file == null) {</span>
+<span class="fc" id="L156">            return getInstance();</span>
+        } else {
+<span class="fc" id="L158">            return getInstance0(file.getPath());</span>
+        }
+    }
+
+    /**
+     * Gets the default KeyTab object.
+     * @return the KeyTab object, never null.
+     */
+    public static KeyTab getInstance() {
+<span class="fc" id="L167">        return getInstance(getDefaultTabName());</span>
+    }
+
+    public boolean isMissing() {
+<span class="nc" id="L171">        return isMissing;</span>
+    }
+
+    public boolean isValid() {
+<span class="fc" id="L175">        return isValid;</span>
+    }
+
+    /**
+     * The location of keytab file will be read from the configuration file
+     * If it is not specified, consider user.home as the keytab file's
+     * default location.
+     * @return never null
+     */
+    private static String getDefaultTabName() {
+<span class="fc bfc" id="L185" title="All 2 branches covered.">        if (defaultTabName != null) {</span>
+<span class="fc" id="L186">            return defaultTabName;</span>
+        } else {
+<span class="fc" id="L188">            String kname = null;</span>
+            try {
+<span class="fc" id="L190">                String keytab_names = Config.getInstance().get</span>
+<span class="fc" id="L191">                        (&quot;libdefaults&quot;, &quot;default_keytab_name&quot;);</span>
+<span class="pc bpc" id="L192" title="1 of 2 branches missed.">                if (keytab_names != null) {</span>
+<span class="fc" id="L193">                    StringTokenizer st = new StringTokenizer(keytab_names, &quot; &quot;);</span>
+<span class="pc bpc" id="L194" title="1 of 2 branches missed.">                    while (st.hasMoreTokens()) {</span>
+<span class="fc" id="L195">                        kname = normalize(st.nextToken());</span>
+<span class="pc bpc" id="L196" title="1 of 2 branches missed.">                        if (new File(kname).exists()) {</span>
+<span class="fc" id="L197">                            break;</span>
+                        }
+                    }
+                }
+<span class="nc" id="L201">            } catch (KrbException e) {</span>
+<span class="nc" id="L202">                kname = null;</span>
+<span class="fc" id="L203">            }</span>
+
+<span class="pc bpc" id="L205" title="1 of 2 branches missed.">            if (kname == null) {</span>
+<span class="nc" id="L206">                String user_home =</span>
+<span class="nc" id="L207">                        java.security.AccessController.doPrivileged(</span>
+                        new sun.security.action.GetPropertyAction(&quot;user.home&quot;));
+
+<span class="nc bnc" id="L210" title="All 2 branches missed.">                if (user_home == null) {</span>
+<span class="nc" id="L211">                    user_home =</span>
+<span class="nc" id="L212">                        java.security.AccessController.doPrivileged(</span>
+                        new sun.security.action.GetPropertyAction(&quot;user.dir&quot;));
+                }
+
+<span class="nc" id="L216">                kname = user_home + File.separator  + &quot;krb5.keytab&quot;;</span>
+            }
+<span class="fc" id="L218">            defaultTabName = kname;</span>
+<span class="fc" id="L219">            return kname;</span>
+        }
+    }
+
+    /**
+     * Normalizes some common keytab name formats into the bare file name.
+     * For example, FILE:/etc/krb5.keytab to /etc/krb5.keytab
+     * @param name never null
+     * @return never null
+     */
+    // This method is used in this class and Krb5LoginModule
+    public static String normalize(String name) {
+        String kname;
+<span class="fc bfc" id="L232" title="All 2 branches covered.">        if ((name.length() &gt;= 5) &amp;&amp;</span>
+<span class="fc bfc" id="L233" title="All 2 branches covered.">            (name.substring(0, 5).equalsIgnoreCase(&quot;FILE:&quot;))) {</span>
+<span class="fc" id="L234">            kname = name.substring(5);</span>
+<span class="fc bfc" id="L235" title="All 2 branches covered.">        } else if ((name.length() &gt;= 9) &amp;&amp;</span>
+<span class="pc bpc" id="L236" title="1 of 2 branches missed.">                (name.substring(0, 9).equalsIgnoreCase(&quot;ANY:FILE:&quot;))) {</span>
+            // this format found in MIT's krb5.ini.
+<span class="nc" id="L238">            kname = name.substring(9);</span>
+<span class="fc bfc" id="L239" title="All 2 branches covered.">        } else if ((name.length() &gt;= 7) &amp;&amp;</span>
+<span class="pc bpc" id="L240" title="1 of 2 branches missed.">                (name.substring(0, 7).equalsIgnoreCase(&quot;SRVTAB:&quot;))) {</span>
+            // this format found in MIT's krb5.ini.
+<span class="nc" id="L242">            kname = name.substring(7);</span>
+        } else
+<span class="fc" id="L244">            kname = name;</span>
+<span class="fc" id="L245">        return kname;</span>
+    }
+
+    private void load(KeyTabInputStream kis)
+        throws IOException, RealmException {
+
+<span class="fc" id="L251">        entries.clear();</span>
+<span class="fc" id="L252">        kt_vno = kis.readVersion();</span>
+<span class="pc bpc" id="L253" title="1 of 2 branches missed.">        if (kt_vno == KRB5_KT_VNO_1) {</span>
+<span class="nc" id="L254">            kis.setNativeByteOrder();</span>
+        }
+<span class="fc" id="L256">        int entryLength = 0;</span>
+        KeyTabEntry entry;
+<span class="fc bfc" id="L258" title="All 2 branches covered.">        while (kis.available() &gt; 0) {</span>
+<span class="fc" id="L259">            entryLength = kis.readEntryLength();</span>
+<span class="fc" id="L260">            entry = kis.readEntry(entryLength, kt_vno);</span>
+<span class="pc bpc" id="L261" title="1 of 2 branches missed.">            if (DEBUG) {</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">                System.out.println(&quot;&gt;&gt;&gt; KeyTab: load() entry length: &quot; +</span>
+                        entryLength + &quot;; type: &quot; +
+                        (entry != null? entry.keyType : 0));
+            }
+<span class="pc bpc" id="L266" title="1 of 2 branches missed.">            if (entry != null)</span>
+<span class="fc" id="L267">                entries.addElement(entry);</span>
+        }
+<span class="fc" id="L269">    }</span>
+
+    /**
+     * Returns a principal name in this keytab. Used by
+     * {@link ServiceCreds#getKKeys()}.
+     */
+    public PrincipalName getOneName() {
+<span class="nc" id="L276">        int size = entries.size();</span>
+<span class="nc bnc" id="L277" title="All 2 branches missed.">        return size &gt; 0 ? entries.elementAt(size-1).service : null;</span>
+    }
+
+    /**
+     * Reads all keys for a service from the keytab file that have
+     * etypes that have been configured for use.
+     * @param service the PrincipalName of the requested service
+     * @return an array containing all the service keys, never null
+     */
+    public EncryptionKey[] readServiceKeys(PrincipalName service) {
+        KeyTabEntry entry;
+        EncryptionKey key;
+<span class="fc" id="L289">        int size = entries.size();</span>
+<span class="fc" id="L290">        ArrayList&lt;EncryptionKey&gt; keys = new ArrayList&lt;&gt;(size);</span>
+<span class="pc bpc" id="L291" title="1 of 2 branches missed.">        if (DEBUG) {</span>
+<span class="nc" id="L292">            System.out.println(&quot;Looking for keys for: &quot; + service);</span>
+        }
+<span class="fc bfc" id="L294" title="All 2 branches covered.">        for (int i = size-1; i &gt;= 0; i--) {</span>
+<span class="fc" id="L295">            entry = entries.elementAt(i);</span>
+<span class="fc bfc" id="L296" title="All 2 branches covered.">            if (entry.service.match(service)) {</span>
+<span class="fc bfc" id="L297" title="All 2 branches covered.">                if (EType.isSupported(entry.keyType)) {</span>
+<span class="fc" id="L298">                    key = new EncryptionKey(entry.keyblock,</span>
+                                        entry.keyType,
+                                        new Integer(entry.keyVersion));
+<span class="fc" id="L301">                    keys.add(key);</span>
+<span class="pc bpc" id="L302" title="1 of 2 branches missed.">                    if (DEBUG) {</span>
+<span class="nc" id="L303">                        System.out.println(&quot;Added key: &quot; + entry.keyType +</span>
+                            &quot;version: &quot; + entry.keyVersion);
+                    }
+<span class="pc bpc" id="L306" title="1 of 2 branches missed.">                } else if (DEBUG) {</span>
+<span class="nc" id="L307">                    System.out.println(&quot;Found unsupported keytype (&quot; +</span>
+                        entry.keyType + &quot;) for &quot; + service);
+                }
+            }
+        }
+<span class="fc" id="L312">        size = keys.size();</span>
+<span class="fc" id="L313">        EncryptionKey[] retVal = keys.toArray(new EncryptionKey[size]);</span>
+
+        // Sort the keys by kvno. Sometimes we must choose a single key (say,
+        // generate encrypted timestamp in AS-REQ). A key with a higher KVNO
+        // sounds like a newer one.
+<span class="fc" id="L318">        Arrays.sort(retVal, new Comparator&lt;EncryptionKey&gt;() {</span>
+            @Override
+            public int compare(EncryptionKey o1, EncryptionKey o2) {
+<span class="fc" id="L321">                return o2.getKeyVersionNumber().intValue()</span>
+<span class="fc" id="L322">                        - o1.getKeyVersionNumber().intValue();</span>
+            }
+        });
+
+<span class="fc" id="L326">        return retVal;</span>
+    }
+
+
+
+    /**
+     * Searches for the service entry in the keytab file.
+     * The etype of the key must be one that has been configured
+     * to be used.
+     * @param service the PrincipalName of the requested service.
+     * @return true if the entry is found, otherwise, return false.
+     */
+    public boolean findServiceEntry(PrincipalName service) {
+        KeyTabEntry entry;
+<span class="nc bnc" id="L340" title="All 2 branches missed.">        for (int i = 0; i &lt; entries.size(); i++) {</span>
+<span class="nc" id="L341">            entry = entries.elementAt(i);</span>
+<span class="nc bnc" id="L342" title="All 2 branches missed.">            if (entry.service.match(service)) {</span>
+<span class="nc bnc" id="L343" title="All 2 branches missed.">                if (EType.isSupported(entry.keyType)) {</span>
+<span class="nc" id="L344">                    return true;</span>
+<span class="nc bnc" id="L345" title="All 2 branches missed.">                } else if (DEBUG) {</span>
+<span class="nc" id="L346">                    System.out.println(&quot;Found unsupported keytype (&quot; +</span>
+                        entry.keyType + &quot;) for &quot; + service);
+                }
+            }
+        }
+<span class="nc" id="L351">        return false;</span>
+    }
+
+    public String tabName() {
+<span class="nc" id="L355">        return tabName;</span>
+    }
+
+    /////////////////// THE WRITE SIDE ///////////////////////
+    /////////////// only used by ktab tool //////////////////
+
+    /**
+     * Adds a new entry in the key table.
+     * @param service the service which will have a new entry in the key table.
+     * @param psswd the password which generates the key.
+     * @param kvno the kvno to use, -1 means automatic increasing
+     * @param append false if entries with old kvno would be removed.
+     * Note: if kvno is not -1, entries with the same kvno are always removed
+     */
+    public void addEntry(PrincipalName service, char[] psswd,
+            int kvno, boolean append) throws KrbException {
+<span class="fc" id="L371">        addEntry(service, service.getSalt(), psswd, kvno, append);</span>
+<span class="fc" id="L372">    }</span>
+
+    // Called by KDC test
+    public void addEntry(PrincipalName service, String salt, char[] psswd,
+            int kvno, boolean append) throws KrbException {
+
+<span class="fc" id="L378">        EncryptionKey[] encKeys = EncryptionKey.acquireSecretKeys(</span>
+            psswd, salt);
+
+        // There should be only one maximum KVNO value for all etypes, so that
+        // all added keys can have the same KVNO.
+
+<span class="fc" id="L384">        int maxKvno = 0;    // only useful when kvno == -1</span>
+<span class="fc bfc" id="L385" title="All 2 branches covered.">        for (int i = entries.size()-1; i &gt;= 0; i--) {</span>
+<span class="fc" id="L386">            KeyTabEntry e = entries.get(i);</span>
+<span class="fc bfc" id="L387" title="All 2 branches covered.">            if (e.service.match(service)) {</span>
+<span class="fc bfc" id="L388" title="All 2 branches covered.">                if (e.keyVersion &gt; maxKvno) {</span>
+<span class="fc" id="L389">                    maxKvno = e.keyVersion;</span>
+                }
+<span class="pc bpc" id="L391" title="2 of 4 branches missed.">                if (!append || e.keyVersion == kvno) {</span>
+<span class="nc" id="L392">                    entries.removeElementAt(i);</span>
+                }
+            }
+        }
+<span class="pc bpc" id="L396" title="1 of 2 branches missed.">        if (kvno == -1) {</span>
+<span class="nc" id="L397">            kvno = maxKvno + 1;</span>
+        }
+
+<span class="pc bpc" id="L400" title="1 of 4 branches missed.">        for (int i = 0; encKeys != null &amp;&amp; i &lt; encKeys.length; i++) {</span>
+<span class="fc" id="L401">            int keyType = encKeys[i].getEType();</span>
+<span class="fc" id="L402">            byte[] keyValue = encKeys[i].getBytes();</span>
+
+<span class="fc" id="L404">            KeyTabEntry newEntry = new KeyTabEntry(service,</span>
+<span class="fc" id="L405">                            service.getRealm(),</span>
+<span class="fc" id="L406">                            new KerberosTime(System.currentTimeMillis()),</span>
+                                               kvno, keyType, keyValue);
+<span class="fc" id="L408">            entries.addElement(newEntry);</span>
+        }
+<span class="fc" id="L410">    }</span>
+
+    /**
+     * Gets the list of service entries in key table.
+     * @return array of &lt;code&gt;KeyTabEntry&lt;/code&gt;.
+     */
+    public KeyTabEntry[] getEntries() {
+<span class="nc" id="L417">        KeyTabEntry[] kentries = new KeyTabEntry[entries.size()];</span>
+<span class="nc bnc" id="L418" title="All 2 branches missed.">        for (int i = 0; i &lt; kentries.length; i++) {</span>
+<span class="nc" id="L419">            kentries[i] = entries.elementAt(i);</span>
+        }
+<span class="nc" id="L421">        return kentries;</span>
+    }
+
+    /**
+     * Creates a new default key table.
+     */
+    public synchronized static KeyTab create()
+        throws IOException, RealmException {
+<span class="nc" id="L429">        String dname = getDefaultTabName();</span>
+<span class="nc" id="L430">        return create(dname);</span>
+    }
+
+    /**
+     * Creates a new default key table.
+     */
+    public synchronized static KeyTab create(String name)
+        throws IOException, RealmException {
+
+<span class="pc" id="L439">        try (KeyTabOutputStream kos =</span>
+                new KeyTabOutputStream(new FileOutputStream(name))) {
+<span class="fc" id="L441">            kos.writeVersion(KRB5_KT_VNO);</span>
+<span class="pc bpc" id="L442" title="6 of 8 branches missed.">        }</span>
+<span class="fc" id="L443">        return new KeyTab(name);</span>
+    }
+
+    /**
+     * Saves the file at the directory.
+     */
+    public synchronized void save() throws IOException {
+<span class="pc" id="L450">        try (KeyTabOutputStream kos =</span>
+                new KeyTabOutputStream(new FileOutputStream(tabName))) {
+<span class="fc" id="L452">            kos.writeVersion(kt_vno);</span>
+<span class="fc bfc" id="L453" title="All 2 branches covered.">            for (int i = 0; i &lt; entries.size(); i++) {</span>
+<span class="fc" id="L454">                kos.writeEntry(entries.elementAt(i));</span>
+            }
+<span class="pc bpc" id="L456" title="6 of 8 branches missed.">        }</span>
+<span class="fc" id="L457">    }</span>
+
+    /**
+     * Removes entries from the key table.
+     * @param service the service &lt;code&gt;PrincipalName&lt;/code&gt;.
+     * @param etype the etype to match, remove all if -1
+     * @param kvno what kvno to remove, -1 for all, -2 for old
+     * @return the number of entries deleted
+     */
+    public int deleteEntries(PrincipalName service, int etype, int kvno) {
+<span class="fc" id="L467">        int count = 0;</span>
+
+        // Remember the highest KVNO for each etype. Used for kvno == -2
+<span class="fc" id="L470">        Map&lt;Integer,Integer&gt; highest = new HashMap&lt;&gt;();</span>
+
+<span class="fc bfc" id="L472" title="All 2 branches covered.">        for (int i = entries.size()-1; i &gt;= 0; i--) {</span>
+<span class="fc" id="L473">            KeyTabEntry e = entries.get(i);</span>
+<span class="fc bfc" id="L474" title="All 2 branches covered.">            if (service.match(e.getService())) {</span>
+<span class="pc bpc" id="L475" title="1 of 4 branches missed.">                if (etype == -1 || e.keyType == etype) {</span>
+<span class="pc bpc" id="L476" title="1 of 2 branches missed.">                    if (kvno == -2) {</span>
+                        // Two rounds for kvno == -2. In the first round (here),
+                        // only find out highest KVNO for each etype
+<span class="nc bnc" id="L479" title="All 2 branches missed.">                        if (highest.containsKey(e.keyType)) {</span>
+<span class="nc" id="L480">                            int n = highest.get(e.keyType);</span>
+<span class="nc bnc" id="L481" title="All 2 branches missed.">                            if (e.keyVersion &gt; n) {</span>
+<span class="nc" id="L482">                                highest.put(e.keyType, e.keyVersion);</span>
+                            }
+<span class="nc" id="L484">                        } else {</span>
+<span class="nc" id="L485">                            highest.put(e.keyType, e.keyVersion);</span>
+                        }
+<span class="pc bpc" id="L487" title="3 of 4 branches missed.">                    } else if (kvno == -1 || e.keyVersion == kvno) {</span>
+<span class="fc" id="L488">                        entries.removeElementAt(i);</span>
+<span class="fc" id="L489">                        count++;</span>
+                    }
+                }
+            }
+        }
+
+        // Second round for kvno == -2, remove old entries
+<span class="pc bpc" id="L496" title="1 of 2 branches missed.">        if (kvno == -2) {</span>
+<span class="nc bnc" id="L497" title="All 2 branches missed.">            for (int i = entries.size()-1; i &gt;= 0; i--) {</span>
+<span class="nc" id="L498">                KeyTabEntry e = entries.get(i);</span>
+<span class="nc bnc" id="L499" title="All 2 branches missed.">                if (service.match(e.getService())) {</span>
+<span class="nc bnc" id="L500" title="All 4 branches missed.">                    if (etype == -1 || e.keyType == etype) {</span>
+<span class="nc" id="L501">                        int n = highest.get(e.keyType);</span>
+<span class="nc bnc" id="L502" title="All 2 branches missed.">                        if (e.keyVersion != n) {</span>
+<span class="nc" id="L503">                            entries.removeElementAt(i);</span>
+<span class="nc" id="L504">                            count++;</span>
+                        }
+                    }
+                }
+            }
+        }
+<span class="fc" id="L510">        return count;</span>
+    }
+
+    /**
+     * Creates key table file version.
+     * @param file the key table file.
+     * @exception IOException.
+     */
+    public synchronized void createVersion(File file) throws IOException {
+<span class="nc" id="L519">        try (KeyTabOutputStream kos =</span>
+                new KeyTabOutputStream(new FileOutputStream(file))) {
+<span class="nc" id="L521">            kos.write16(KRB5_KT_VNO);</span>
+<span class="nc bnc" id="L522" title="All 8 branches missed.">        }</span>
+<span class="nc" id="L523">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

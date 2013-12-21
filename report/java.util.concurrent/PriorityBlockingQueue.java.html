@@ -1,0 +1,1044 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>PriorityBlockingQueue.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">java.util.concurrent</a> &gt; <span class="el_source">PriorityBlockingQueue.java</span></div><h1>PriorityBlockingQueue.java</h1><pre class="source lang-java linenums">/*
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+/*
+ * This file is available under and governed by the GNU General Public
+ * License version 2 only, as published by the Free Software Foundation.
+ * However, the following notice accompanied the original version of this
+ * file:
+ *
+ * Written by Doug Lea with assistance from members of JCP JSR-166
+ * Expert Group and released to the public domain, as explained at
+ * http://creativecommons.org/publicdomain/zero/1.0/
+ */
+
+package java.util.concurrent;
+
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.AbstractQueue;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.NoSuchElementException;
+import java.util.PriorityQueue;
+import java.util.Queue;
+import java.util.SortedSet;
+import java.util.Spliterator;
+import java.util.function.Consumer;
+
+/**
+ * An unbounded {@linkplain BlockingQueue blocking queue} that uses
+ * the same ordering rules as class {@link PriorityQueue} and supplies
+ * blocking retrieval operations.  While this queue is logically
+ * unbounded, attempted additions may fail due to resource exhaustion
+ * (causing {@code OutOfMemoryError}). This class does not permit
+ * {@code null} elements.  A priority queue relying on {@linkplain
+ * Comparable natural ordering} also does not permit insertion of
+ * non-comparable objects (doing so results in
+ * {@code ClassCastException}).
+ *
+ * &lt;p&gt;This class and its iterator implement all of the
+ * &lt;em&gt;optional&lt;/em&gt; methods of the {@link Collection} and {@link
+ * Iterator} interfaces.  The Iterator provided in method {@link
+ * #iterator()} is &lt;em&gt;not&lt;/em&gt; guaranteed to traverse the elements of
+ * the PriorityBlockingQueue in any particular order. If you need
+ * ordered traversal, consider using
+ * {@code Arrays.sort(pq.toArray())}.  Also, method {@code drainTo}
+ * can be used to &lt;em&gt;remove&lt;/em&gt; some or all elements in priority
+ * order and place them in another collection.
+ *
+ * &lt;p&gt;Operations on this class make no guarantees about the ordering
+ * of elements with equal priority. If you need to enforce an
+ * ordering, you can define custom classes or comparators that use a
+ * secondary key to break ties in primary priority values.  For
+ * example, here is a class that applies first-in-first-out
+ * tie-breaking to comparable elements. To use it, you would insert a
+ * {@code new FIFOEntry(anEntry)} instead of a plain entry object.
+ *
+ *  &lt;pre&gt; {@code
+ * class FIFOEntry&lt;E extends Comparable&lt;? super E&gt;&gt;
+ *     implements Comparable&lt;FIFOEntry&lt;E&gt;&gt; {
+ *   static final AtomicLong seq = new AtomicLong(0);
+ *   final long seqNum;
+ *   final E entry;
+ *   public FIFOEntry(E entry) {
+ *     seqNum = seq.getAndIncrement();
+ *     this.entry = entry;
+ *   }
+ *   public E getEntry() { return entry; }
+ *   public int compareTo(FIFOEntry&lt;E&gt; other) {
+ *     int res = entry.compareTo(other.entry);
+ *     if (res == 0 &amp;&amp; other.entry != this.entry)
+ *       res = (seqNum &lt; other.seqNum ? -1 : 1);
+ *     return res;
+ *   }
+ * }}&lt;/pre&gt;
+ *
+ * &lt;p&gt;This class is a member of the
+ * &lt;a href=&quot;{@docRoot}/../technotes/guides/collections/index.html&quot;&gt;
+ * Java Collections Framework&lt;/a&gt;.
+ *
+ * @since 1.5
+ * @author Doug Lea
+ * @param &lt;E&gt; the type of elements held in this collection
+ */
+@SuppressWarnings(&quot;unchecked&quot;)
+public class PriorityBlockingQueue&lt;E&gt; extends AbstractQueue&lt;E&gt;
+    implements BlockingQueue&lt;E&gt;, java.io.Serializable {
+    private static final long serialVersionUID = 5595510919245408276L;
+
+    /*
+     * The implementation uses an array-based binary heap, with public
+     * operations protected with a single lock. However, allocation
+     * during resizing uses a simple spinlock (used only while not
+     * holding main lock) in order to allow takes to operate
+     * concurrently with allocation.  This avoids repeated
+     * postponement of waiting consumers and consequent element
+     * build-up. The need to back away from lock during allocation
+     * makes it impossible to simply wrap delegated
+     * java.util.PriorityQueue operations within a lock, as was done
+     * in a previous version of this class. To maintain
+     * interoperability, a plain PriorityQueue is still used during
+     * serialization, which maintains compatibility at the expense of
+     * transiently doubling overhead.
+     */
+
+    /**
+     * Default array capacity.
+     */
+    private static final int DEFAULT_INITIAL_CAPACITY = 11;
+
+    /**
+     * The maximum size of array to allocate.
+     * Some VMs reserve some header words in an array.
+     * Attempts to allocate larger arrays may result in
+     * OutOfMemoryError: Requested array size exceeds VM limit
+     */
+    private static final int MAX_ARRAY_SIZE = Integer.MAX_VALUE - 8;
+
+    /**
+     * Priority queue represented as a balanced binary heap: the two
+     * children of queue[n] are queue[2*n+1] and queue[2*(n+1)].  The
+     * priority queue is ordered by comparator, or by the elements'
+     * natural ordering, if comparator is null: For each node n in the
+     * heap and each descendant d of n, n &lt;= d.  The element with the
+     * lowest value is in queue[0], assuming the queue is nonempty.
+     */
+    private transient Object[] queue;
+
+    /**
+     * The number of elements in the priority queue.
+     */
+    private transient int size;
+
+    /**
+     * The comparator, or null if priority queue uses elements'
+     * natural ordering.
+     */
+    private transient Comparator&lt;? super E&gt; comparator;
+
+    /**
+     * Lock used for all public operations
+     */
+    private final ReentrantLock lock;
+
+    /**
+     * Condition for blocking when empty
+     */
+    private final Condition notEmpty;
+
+    /**
+     * Spinlock for allocation, acquired via CAS.
+     */
+    private transient volatile int allocationSpinLock;
+
+    /**
+     * A plain PriorityQueue used only for serialization,
+     * to maintain compatibility with previous versions
+     * of this class. Non-null only during serialization/deserialization.
+     */
+    private PriorityQueue&lt;E&gt; q;
+
+    /**
+     * Creates a {@code PriorityBlockingQueue} with the default
+     * initial capacity (11) that orders its elements according to
+     * their {@linkplain Comparable natural ordering}.
+     */
+    public PriorityBlockingQueue() {
+<span class="fc" id="L191">        this(DEFAULT_INITIAL_CAPACITY, null);</span>
+<span class="fc" id="L192">    }</span>
+
+    /**
+     * Creates a {@code PriorityBlockingQueue} with the specified
+     * initial capacity that orders its elements according to their
+     * {@linkplain Comparable natural ordering}.
+     *
+     * @param initialCapacity the initial capacity for this priority queue
+     * @throws IllegalArgumentException if {@code initialCapacity} is less
+     *         than 1
+     */
+    public PriorityBlockingQueue(int initialCapacity) {
+<span class="nc" id="L204">        this(initialCapacity, null);</span>
+<span class="nc" id="L205">    }</span>
+
+    /**
+     * Creates a {@code PriorityBlockingQueue} with the specified initial
+     * capacity that orders its elements according to the specified
+     * comparator.
+     *
+     * @param initialCapacity the initial capacity for this priority queue
+     * @param  comparator the comparator that will be used to order this
+     *         priority queue.  If {@code null}, the {@linkplain Comparable
+     *         natural ordering} of the elements will be used.
+     * @throws IllegalArgumentException if {@code initialCapacity} is less
+     *         than 1
+     */
+    public PriorityBlockingQueue(int initialCapacity,
+<span class="fc" id="L220">                                 Comparator&lt;? super E&gt; comparator) {</span>
+<span class="pc bpc" id="L221" title="1 of 2 branches missed.">        if (initialCapacity &lt; 1)</span>
+<span class="nc" id="L222">            throw new IllegalArgumentException();</span>
+<span class="fc" id="L223">        this.lock = new ReentrantLock();</span>
+<span class="fc" id="L224">        this.notEmpty = lock.newCondition();</span>
+<span class="fc" id="L225">        this.comparator = comparator;</span>
+<span class="fc" id="L226">        this.queue = new Object[initialCapacity];</span>
+<span class="fc" id="L227">    }</span>
+
+    /**
+     * Creates a {@code PriorityBlockingQueue} containing the elements
+     * in the specified collection.  If the specified collection is a
+     * {@link SortedSet} or a {@link PriorityQueue}, this
+     * priority queue will be ordered according to the same ordering.
+     * Otherwise, this priority queue will be ordered according to the
+     * {@linkplain Comparable natural ordering} of its elements.
+     *
+     * @param  c the collection whose elements are to be placed
+     *         into this priority queue
+     * @throws ClassCastException if elements of the specified collection
+     *         cannot be compared to one another according to the priority
+     *         queue's ordering
+     * @throws NullPointerException if the specified collection or any
+     *         of its elements are null
+     */
+<span class="fc" id="L245">    public PriorityBlockingQueue(Collection&lt;? extends E&gt; c) {</span>
+<span class="fc" id="L246">        this.lock = new ReentrantLock();</span>
+<span class="fc" id="L247">        this.notEmpty = lock.newCondition();</span>
+<span class="fc" id="L248">        boolean heapify = true; // true if not known to be in heap order</span>
+<span class="fc" id="L249">        boolean screen = true;  // true if must screen for nulls</span>
+<span class="pc bpc" id="L250" title="1 of 2 branches missed.">        if (c instanceof SortedSet&lt;?&gt;) {</span>
+<span class="nc" id="L251">            SortedSet&lt;? extends E&gt; ss = (SortedSet&lt;? extends E&gt;) c;</span>
+<span class="nc" id="L252">            this.comparator = (Comparator&lt;? super E&gt;) ss.comparator();</span>
+<span class="nc" id="L253">            heapify = false;</span>
+<span class="nc" id="L254">        }</span>
+<span class="pc bpc" id="L255" title="1 of 2 branches missed.">        else if (c instanceof PriorityBlockingQueue&lt;?&gt;) {</span>
+<span class="nc" id="L256">            PriorityBlockingQueue&lt;? extends E&gt; pq =</span>
+                (PriorityBlockingQueue&lt;? extends E&gt;) c;
+<span class="nc" id="L258">            this.comparator = (Comparator&lt;? super E&gt;) pq.comparator();</span>
+<span class="nc" id="L259">            screen = false;</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">            if (pq.getClass() == PriorityBlockingQueue.class) // exact match</span>
+<span class="nc" id="L261">                heapify = false;</span>
+        }
+<span class="fc" id="L263">        Object[] a = c.toArray();</span>
+<span class="fc" id="L264">        int n = a.length;</span>
+        // If c.toArray incorrectly doesn't return Object[], copy it.
+<span class="pc bpc" id="L266" title="1 of 2 branches missed.">        if (a.getClass() != Object[].class)</span>
+<span class="nc" id="L267">            a = Arrays.copyOf(a, n, Object[].class);</span>
+<span class="pc bpc" id="L268" title="3 of 6 branches missed.">        if (screen &amp;&amp; (n == 1 || this.comparator != null)) {</span>
+<span class="nc bnc" id="L269" title="All 2 branches missed.">            for (int i = 0; i &lt; n; ++i)</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">                if (a[i] == null)</span>
+<span class="nc" id="L271">                    throw new NullPointerException();</span>
+        }
+<span class="fc" id="L273">        this.queue = a;</span>
+<span class="fc" id="L274">        this.size = n;</span>
+<span class="pc bpc" id="L275" title="1 of 2 branches missed.">        if (heapify)</span>
+<span class="fc" id="L276">            heapify();</span>
+<span class="fc" id="L277">    }</span>
+
+    /**
+     * Tries to grow array to accommodate at least one more element
+     * (but normally expand by about 50%), giving up (allowing retry)
+     * on contention (which we expect to be rare). Call only while
+     * holding lock.
+     *
+     * @param array the heap array
+     * @param oldCap the length of the array
+     */
+    private void tryGrow(Object[] array, int oldCap) {
+<span class="fc" id="L289">        lock.unlock(); // must release and then re-acquire main lock</span>
+<span class="fc" id="L290">        Object[] newArray = null;</span>
+<span class="pc bpc" id="L291" title="1 of 2 branches missed.">        if (allocationSpinLock == 0 &amp;&amp;</span>
+<span class="pc bpc" id="L292" title="1 of 2 branches missed.">            UNSAFE.compareAndSwapInt(this, allocationSpinLockOffset,</span>
+                                     0, 1)) {
+            try {
+<span class="fc bfc" id="L295" title="All 2 branches covered.">                int newCap = oldCap + ((oldCap &lt; 64) ?</span>
+                                       (oldCap + 2) : // grow faster if small
+                                       (oldCap &gt;&gt; 1));
+<span class="pc bpc" id="L298" title="1 of 2 branches missed.">                if (newCap - MAX_ARRAY_SIZE &gt; 0) {    // possible overflow</span>
+<span class="nc" id="L299">                    int minCap = oldCap + 1;</span>
+<span class="nc bnc" id="L300" title="All 4 branches missed.">                    if (minCap &lt; 0 || minCap &gt; MAX_ARRAY_SIZE)</span>
+<span class="nc" id="L301">                        throw new OutOfMemoryError();</span>
+<span class="nc" id="L302">                    newCap = MAX_ARRAY_SIZE;</span>
+                }
+<span class="pc bpc" id="L304" title="2 of 4 branches missed.">                if (newCap &gt; oldCap &amp;&amp; queue == array)</span>
+<span class="fc" id="L305">                    newArray = new Object[newCap];</span>
+            } finally {
+<span class="pc" id="L307">                allocationSpinLock = 0;</span>
+<span class="fc" id="L308">            }</span>
+        }
+<span class="pc bpc" id="L310" title="1 of 2 branches missed.">        if (newArray == null) // back off if another thread is allocating</span>
+<span class="nc" id="L311">            Thread.yield();</span>
+<span class="fc" id="L312">        lock.lock();</span>
+<span class="pc bpc" id="L313" title="2 of 4 branches missed.">        if (newArray != null &amp;&amp; queue == array) {</span>
+<span class="fc" id="L314">            queue = newArray;</span>
+<span class="fc" id="L315">            System.arraycopy(array, 0, newArray, 0, oldCap);</span>
+        }
+<span class="fc" id="L317">    }</span>
+
+    /**
+     * Mechanics for poll().  Call only while holding lock.
+     */
+    private E dequeue() {
+<span class="fc" id="L323">        int n = size - 1;</span>
+<span class="fc bfc" id="L324" title="All 2 branches covered.">        if (n &lt; 0)</span>
+<span class="fc" id="L325">            return null;</span>
+        else {
+<span class="fc" id="L327">            Object[] array = queue;</span>
+<span class="fc" id="L328">            E result = (E) array[0];</span>
+<span class="fc" id="L329">            E x = (E) array[n];</span>
+<span class="fc" id="L330">            array[n] = null;</span>
+<span class="fc" id="L331">            Comparator&lt;? super E&gt; cmp = comparator;</span>
+<span class="pc bpc" id="L332" title="1 of 2 branches missed.">            if (cmp == null)</span>
+<span class="fc" id="L333">                siftDownComparable(0, x, array, n);</span>
+            else
+<span class="nc" id="L335">                siftDownUsingComparator(0, x, array, n, cmp);</span>
+<span class="fc" id="L336">            size = n;</span>
+<span class="fc" id="L337">            return result;</span>
+        }
+    }
+
+    /**
+     * Inserts item x at position k, maintaining heap invariant by
+     * promoting x up the tree until it is greater than or equal to
+     * its parent, or is the root.
+     *
+     * To simplify and speed up coercions and comparisons. the
+     * Comparable and Comparator versions are separated into different
+     * methods that are otherwise identical. (Similarly for siftDown.)
+     * These methods are static, with heap state as arguments, to
+     * simplify use in light of possible comparator exceptions.
+     *
+     * @param k the position to fill
+     * @param x the item to insert
+     * @param array the heap array
+     */
+    private static &lt;T&gt; void siftUpComparable(int k, T x, Object[] array) {
+<span class="fc" id="L357">        Comparable&lt;? super T&gt; key = (Comparable&lt;? super T&gt;) x;</span>
+<span class="fc bfc" id="L358" title="All 2 branches covered.">        while (k &gt; 0) {</span>
+<span class="fc" id="L359">            int parent = (k - 1) &gt;&gt;&gt; 1;</span>
+<span class="fc" id="L360">            Object e = array[parent];</span>
+<span class="pc bpc" id="L361" title="1 of 2 branches missed.">            if (key.compareTo((T) e) &gt;= 0)</span>
+<span class="fc" id="L362">                break;</span>
+<span class="nc" id="L363">            array[k] = e;</span>
+<span class="nc" id="L364">            k = parent;</span>
+<span class="nc" id="L365">        }</span>
+<span class="fc" id="L366">        array[k] = key;</span>
+<span class="fc" id="L367">    }</span>
+
+    private static &lt;T&gt; void siftUpUsingComparator(int k, T x, Object[] array,
+                                       Comparator&lt;? super T&gt; cmp) {
+<span class="nc bnc" id="L371" title="All 2 branches missed.">        while (k &gt; 0) {</span>
+<span class="nc" id="L372">            int parent = (k - 1) &gt;&gt;&gt; 1;</span>
+<span class="nc" id="L373">            Object e = array[parent];</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">            if (cmp.compare(x, (T) e) &gt;= 0)</span>
+<span class="nc" id="L375">                break;</span>
+<span class="nc" id="L376">            array[k] = e;</span>
+<span class="nc" id="L377">            k = parent;</span>
+<span class="nc" id="L378">        }</span>
+<span class="nc" id="L379">        array[k] = x;</span>
+<span class="nc" id="L380">    }</span>
+
+    /**
+     * Inserts item x at position k, maintaining heap invariant by
+     * demoting x down the tree repeatedly until it is less than or
+     * equal to its children or is a leaf.
+     *
+     * @param k the position to fill
+     * @param x the item to insert
+     * @param array the heap array
+     * @param n heap size
+     */
+    private static &lt;T&gt; void siftDownComparable(int k, T x, Object[] array,
+                                               int n) {
+<span class="fc bfc" id="L394" title="All 2 branches covered.">        if (n &gt; 0) {</span>
+<span class="fc" id="L395">            Comparable&lt;? super T&gt; key = (Comparable&lt;? super T&gt;)x;</span>
+<span class="fc" id="L396">            int half = n &gt;&gt;&gt; 1;           // loop while a non-leaf</span>
+<span class="fc bfc" id="L397" title="All 2 branches covered.">            while (k &lt; half) {</span>
+<span class="fc" id="L398">                int child = (k &lt;&lt; 1) + 1; // assume left child is least</span>
+<span class="fc" id="L399">                Object c = array[child];</span>
+<span class="fc" id="L400">                int right = child + 1;</span>
+<span class="fc bfc" id="L401" title="All 2 branches covered.">                if (right &lt; n &amp;&amp;</span>
+<span class="fc bfc" id="L402" title="All 2 branches covered.">                    ((Comparable&lt;? super T&gt;) c).compareTo((T) array[right]) &gt; 0)</span>
+<span class="fc" id="L403">                    c = array[child = right];</span>
+<span class="fc bfc" id="L404" title="All 2 branches covered.">                if (key.compareTo((T) c) &lt;= 0)</span>
+<span class="fc" id="L405">                    break;</span>
+<span class="fc" id="L406">                array[k] = c;</span>
+<span class="fc" id="L407">                k = child;</span>
+<span class="fc" id="L408">            }</span>
+<span class="fc" id="L409">            array[k] = key;</span>
+        }
+<span class="fc" id="L411">    }</span>
+
+    private static &lt;T&gt; void siftDownUsingComparator(int k, T x, Object[] array,
+                                                    int n,
+                                                    Comparator&lt;? super T&gt; cmp) {
+<span class="nc bnc" id="L416" title="All 2 branches missed.">        if (n &gt; 0) {</span>
+<span class="nc" id="L417">            int half = n &gt;&gt;&gt; 1;</span>
+<span class="nc bnc" id="L418" title="All 2 branches missed.">            while (k &lt; half) {</span>
+<span class="nc" id="L419">                int child = (k &lt;&lt; 1) + 1;</span>
+<span class="nc" id="L420">                Object c = array[child];</span>
+<span class="nc" id="L421">                int right = child + 1;</span>
+<span class="nc bnc" id="L422" title="All 4 branches missed.">                if (right &lt; n &amp;&amp; cmp.compare((T) c, (T) array[right]) &gt; 0)</span>
+<span class="nc" id="L423">                    c = array[child = right];</span>
+<span class="nc bnc" id="L424" title="All 2 branches missed.">                if (cmp.compare(x, (T) c) &lt;= 0)</span>
+<span class="nc" id="L425">                    break;</span>
+<span class="nc" id="L426">                array[k] = c;</span>
+<span class="nc" id="L427">                k = child;</span>
+<span class="nc" id="L428">            }</span>
+<span class="nc" id="L429">            array[k] = x;</span>
+        }
+<span class="nc" id="L431">    }</span>
+
+    /**
+     * Establishes the heap invariant (described above) in the entire tree,
+     * assuming nothing about the order of the elements prior to the call.
+     */
+    private void heapify() {
+<span class="fc" id="L438">        Object[] array = queue;</span>
+<span class="fc" id="L439">        int n = size;</span>
+<span class="fc" id="L440">        int half = (n &gt;&gt;&gt; 1) - 1;</span>
+<span class="fc" id="L441">        Comparator&lt;? super E&gt; cmp = comparator;</span>
+<span class="pc bpc" id="L442" title="1 of 2 branches missed.">        if (cmp == null) {</span>
+<span class="fc bfc" id="L443" title="All 2 branches covered.">            for (int i = half; i &gt;= 0; i--)</span>
+<span class="fc" id="L444">                siftDownComparable(i, (E) array[i], array, n);</span>
+        }
+        else {
+<span class="nc bnc" id="L447" title="All 2 branches missed.">            for (int i = half; i &gt;= 0; i--)</span>
+<span class="nc" id="L448">                siftDownUsingComparator(i, (E) array[i], array, n, cmp);</span>
+        }
+<span class="fc" id="L450">    }</span>
+
+    /**
+     * Inserts the specified element into this priority queue.
+     *
+     * @param e the element to add
+     * @return {@code true} (as specified by {@link Collection#add})
+     * @throws ClassCastException if the specified element cannot be compared
+     *         with elements currently in the priority queue according to the
+     *         priority queue's ordering
+     * @throws NullPointerException if the specified element is null
+     */
+    public boolean add(E e) {
+<span class="fc" id="L463">        return offer(e);</span>
+    }
+
+    /**
+     * Inserts the specified element into this priority queue.
+     * As the queue is unbounded, this method will never return {@code false}.
+     *
+     * @param e the element to add
+     * @return {@code true} (as specified by {@link Queue#offer})
+     * @throws ClassCastException if the specified element cannot be compared
+     *         with elements currently in the priority queue according to the
+     *         priority queue's ordering
+     * @throws NullPointerException if the specified element is null
+     */
+    public boolean offer(E e) {
+<span class="fc bfc" id="L478" title="All 2 branches covered.">        if (e == null)</span>
+<span class="fc" id="L479">            throw new NullPointerException();</span>
+<span class="fc" id="L480">        final ReentrantLock lock = this.lock;</span>
+<span class="fc" id="L481">        lock.lock();</span>
+        int n, cap;
+        Object[] array;
+<span class="fc bfc" id="L484" title="All 2 branches covered.">        while ((n = size) &gt;= (cap = (array = queue).length))</span>
+<span class="fc" id="L485">            tryGrow(array, cap);</span>
+        try {
+<span class="fc" id="L487">            Comparator&lt;? super E&gt; cmp = comparator;</span>
+<span class="pc bpc" id="L488" title="1 of 2 branches missed.">            if (cmp == null)</span>
+<span class="fc" id="L489">                siftUpComparable(n, e, array);</span>
+            else
+<span class="nc" id="L491">                siftUpUsingComparator(n, e, array, cmp);</span>
+<span class="fc" id="L492">            size = n + 1;</span>
+<span class="fc" id="L493">            notEmpty.signal();</span>
+        } finally {
+<span class="fc" id="L495">            lock.unlock();</span>
+<span class="fc" id="L496">        }</span>
+<span class="fc" id="L497">        return true;</span>
+    }
+
+    /**
+     * Inserts the specified element into this priority queue.
+     * As the queue is unbounded, this method will never block.
+     *
+     * @param e the element to add
+     * @throws ClassCastException if the specified element cannot be compared
+     *         with elements currently in the priority queue according to the
+     *         priority queue's ordering
+     * @throws NullPointerException if the specified element is null
+     */
+    public void put(E e) {
+<span class="fc" id="L511">        offer(e); // never need to block</span>
+<span class="fc" id="L512">    }</span>
+
+    /**
+     * Inserts the specified element into this priority queue.
+     * As the queue is unbounded, this method will never block or
+     * return {@code false}.
+     *
+     * @param e the element to add
+     * @param timeout This parameter is ignored as the method never blocks
+     * @param unit This parameter is ignored as the method never blocks
+     * @return {@code true} (as specified by
+     *  {@link BlockingQueue#offer(Object,long,TimeUnit) BlockingQueue.offer})
+     * @throws ClassCastException if the specified element cannot be compared
+     *         with elements currently in the priority queue according to the
+     *         priority queue's ordering
+     * @throws NullPointerException if the specified element is null
+     */
+    public boolean offer(E e, long timeout, TimeUnit unit) {
+<span class="nc" id="L530">        return offer(e); // never need to block</span>
+    }
+
+    public E poll() {
+<span class="fc" id="L534">        final ReentrantLock lock = this.lock;</span>
+<span class="fc" id="L535">        lock.lock();</span>
+        try {
+<span class="fc" id="L537">            return dequeue();</span>
+        } finally {
+<span class="pc" id="L539">            lock.unlock();</span>
+        }
+    }
+
+    public E take() throws InterruptedException {
+<span class="fc" id="L544">        final ReentrantLock lock = this.lock;</span>
+<span class="fc" id="L545">        lock.lockInterruptibly();</span>
+        E result;
+        try {
+<span class="fc bfc" id="L548" title="All 2 branches covered.">            while ( (result = dequeue()) == null)</span>
+<span class="fc" id="L549">                notEmpty.await();</span>
+        } finally {
+<span class="pc" id="L551">            lock.unlock();</span>
+<span class="fc" id="L552">        }</span>
+<span class="fc" id="L553">        return result;</span>
+    }
+
+    public E poll(long timeout, TimeUnit unit) throws InterruptedException {
+<span class="nc" id="L557">        long nanos = unit.toNanos(timeout);</span>
+<span class="nc" id="L558">        final ReentrantLock lock = this.lock;</span>
+<span class="nc" id="L559">        lock.lockInterruptibly();</span>
+        E result;
+        try {
+<span class="nc bnc" id="L562" title="All 4 branches missed.">            while ( (result = dequeue()) == null &amp;&amp; nanos &gt; 0)</span>
+<span class="nc" id="L563">                nanos = notEmpty.awaitNanos(nanos);</span>
+        } finally {
+<span class="nc" id="L565">            lock.unlock();</span>
+<span class="nc" id="L566">        }</span>
+<span class="nc" id="L567">        return result;</span>
+    }
+
+    public E peek() {
+<span class="nc" id="L571">        final ReentrantLock lock = this.lock;</span>
+<span class="nc" id="L572">        lock.lock();</span>
+        try {
+<span class="nc bnc" id="L574" title="All 2 branches missed.">            return (size == 0) ? null : (E) queue[0];</span>
+        } finally {
+<span class="nc" id="L576">            lock.unlock();</span>
+        }
+    }
+
+    /**
+     * Returns the comparator used to order the elements in this queue,
+     * or {@code null} if this queue uses the {@linkplain Comparable
+     * natural ordering} of its elements.
+     *
+     * @return the comparator used to order the elements in this queue,
+     *         or {@code null} if this queue uses the natural
+     *         ordering of its elements
+     */
+    public Comparator&lt;? super E&gt; comparator() {
+<span class="nc" id="L590">        return comparator;</span>
+    }
+
+    public int size() {
+<span class="fc" id="L594">        final ReentrantLock lock = this.lock;</span>
+<span class="fc" id="L595">        lock.lock();</span>
+        try {
+<span class="fc" id="L597">            return size;</span>
+        } finally {
+<span class="pc" id="L599">            lock.unlock();</span>
+        }
+    }
+
+    /**
+     * Always returns {@code Integer.MAX_VALUE} because
+     * a {@code PriorityBlockingQueue} is not capacity constrained.
+     * @return {@code Integer.MAX_VALUE} always
+     */
+    public int remainingCapacity() {
+<span class="nc" id="L609">        return Integer.MAX_VALUE;</span>
+    }
+
+    private int indexOf(Object o) {
+<span class="fc bfc" id="L613" title="All 2 branches covered.">        if (o != null) {</span>
+<span class="fc" id="L614">            Object[] array = queue;</span>
+<span class="fc" id="L615">            int n = size;</span>
+<span class="fc bfc" id="L616" title="All 2 branches covered.">            for (int i = 0; i &lt; n; i++)</span>
+<span class="fc bfc" id="L617" title="All 2 branches covered.">                if (o.equals(array[i]))</span>
+<span class="fc" id="L618">                    return i;</span>
+        }
+<span class="fc" id="L620">        return -1;</span>
+    }
+
+    /**
+     * Removes the ith element from queue.
+     */
+    private void removeAt(int i) {
+<span class="fc" id="L627">        Object[] array = queue;</span>
+<span class="fc" id="L628">        int n = size - 1;</span>
+<span class="fc bfc" id="L629" title="All 2 branches covered.">        if (n == i) // removed last element</span>
+<span class="fc" id="L630">            array[i] = null;</span>
+        else {
+<span class="fc" id="L632">            E moved = (E) array[n];</span>
+<span class="fc" id="L633">            array[n] = null;</span>
+<span class="fc" id="L634">            Comparator&lt;? super E&gt; cmp = comparator;</span>
+<span class="pc bpc" id="L635" title="1 of 2 branches missed.">            if (cmp == null)</span>
+<span class="fc" id="L636">                siftDownComparable(i, moved, array, n);</span>
+            else
+<span class="nc" id="L638">                siftDownUsingComparator(i, moved, array, n, cmp);</span>
+<span class="pc bpc" id="L639" title="1 of 2 branches missed.">            if (array[i] == moved) {</span>
+<span class="nc bnc" id="L640" title="All 2 branches missed.">                if (cmp == null)</span>
+<span class="nc" id="L641">                    siftUpComparable(i, moved, array);</span>
+                else
+<span class="nc" id="L643">                    siftUpUsingComparator(i, moved, array, cmp);</span>
+            }
+        }
+<span class="fc" id="L646">        size = n;</span>
+<span class="fc" id="L647">    }</span>
+
+    /**
+     * Removes a single instance of the specified element from this queue,
+     * if it is present.  More formally, removes an element {@code e} such
+     * that {@code o.equals(e)}, if this queue contains one or more such
+     * elements.  Returns {@code true} if and only if this queue contained
+     * the specified element (or equivalently, if this queue changed as a
+     * result of the call).
+     *
+     * @param o element to be removed from this queue, if present
+     * @return {@code true} if this queue changed as a result of the call
+     */
+    public boolean remove(Object o) {
+<span class="fc" id="L661">        final ReentrantLock lock = this.lock;</span>
+<span class="fc" id="L662">        lock.lock();</span>
+        try {
+<span class="fc" id="L664">            int i = indexOf(o);</span>
+<span class="fc bfc" id="L665" title="All 2 branches covered.">            if (i == -1)</span>
+<span class="fc" id="L666">                return false;</span>
+<span class="fc" id="L667">            removeAt(i);</span>
+<span class="fc" id="L668">            return true;</span>
+        } finally {
+<span class="pc" id="L670">            lock.unlock();</span>
+        }
+    }
+
+    /**
+     * Identity-based version for use in Itr.remove
+     */
+    void removeEQ(Object o) {
+<span class="nc" id="L678">        final ReentrantLock lock = this.lock;</span>
+<span class="nc" id="L679">        lock.lock();</span>
+        try {
+<span class="nc" id="L681">            Object[] array = queue;</span>
+<span class="nc bnc" id="L682" title="All 2 branches missed.">            for (int i = 0, n = size; i &lt; n; i++) {</span>
+<span class="nc bnc" id="L683" title="All 2 branches missed.">                if (o == array[i]) {</span>
+<span class="nc" id="L684">                    removeAt(i);</span>
+<span class="nc" id="L685">                    break;</span>
+                }
+            }
+        } finally {
+<span class="nc" id="L689">            lock.unlock();</span>
+<span class="nc" id="L690">        }</span>
+<span class="nc" id="L691">    }</span>
+
+    /**
+     * Returns {@code true} if this queue contains the specified element.
+     * More formally, returns {@code true} if and only if this queue contains
+     * at least one element {@code e} such that {@code o.equals(e)}.
+     *
+     * @param o object to be checked for containment in this queue
+     * @return {@code true} if this queue contains the specified element
+     */
+    public boolean contains(Object o) {
+<span class="fc" id="L702">        final ReentrantLock lock = this.lock;</span>
+<span class="fc" id="L703">        lock.lock();</span>
+        try {
+<span class="fc bfc" id="L705" title="All 2 branches covered.">            return indexOf(o) != -1;</span>
+        } finally {
+<span class="pc" id="L707">            lock.unlock();</span>
+        }
+    }
+
+    /**
+     * Returns an array containing all of the elements in this queue.
+     * The returned array elements are in no particular order.
+     *
+     * &lt;p&gt;The returned array will be &quot;safe&quot; in that no references to it are
+     * maintained by this queue.  (In other words, this method must allocate
+     * a new array).  The caller is thus free to modify the returned array.
+     *
+     * &lt;p&gt;This method acts as bridge between array-based and collection-based
+     * APIs.
+     *
+     * @return an array containing all of the elements in this queue
+     */
+    public Object[] toArray() {
+<span class="fc" id="L725">        final ReentrantLock lock = this.lock;</span>
+<span class="fc" id="L726">        lock.lock();</span>
+        try {
+<span class="fc" id="L728">            return Arrays.copyOf(queue, size);</span>
+        } finally {
+<span class="pc" id="L730">            lock.unlock();</span>
+        }
+    }
+
+    public String toString() {
+<span class="fc" id="L735">        final ReentrantLock lock = this.lock;</span>
+<span class="fc" id="L736">        lock.lock();</span>
+        try {
+<span class="fc" id="L738">            int n = size;</span>
+<span class="fc bfc" id="L739" title="All 2 branches covered.">            if (n == 0)</span>
+<span class="fc" id="L740">                return &quot;[]&quot;;</span>
+<span class="fc" id="L741">            StringBuilder sb = new StringBuilder();</span>
+<span class="fc" id="L742">            sb.append('[');</span>
+<span class="fc bfc" id="L743" title="All 2 branches covered.">            for (int i = 0; i &lt; n; ++i) {</span>
+<span class="fc" id="L744">                Object e = queue[i];</span>
+<span class="pc bpc" id="L745" title="1 of 2 branches missed.">                sb.append(e == this ? &quot;(this Collection)&quot; : e);</span>
+<span class="fc bfc" id="L746" title="All 2 branches covered.">                if (i != n - 1)</span>
+<span class="fc" id="L747">                    sb.append(',').append(' ');</span>
+            }
+<span class="fc" id="L749">            return sb.append(']').toString();</span>
+        } finally {
+<span class="pc" id="L751">            lock.unlock();</span>
+        }
+    }
+
+    /**
+     * @throws UnsupportedOperationException {@inheritDoc}
+     * @throws ClassCastException            {@inheritDoc}
+     * @throws NullPointerException          {@inheritDoc}
+     * @throws IllegalArgumentException      {@inheritDoc}
+     */
+    public int drainTo(Collection&lt;? super E&gt; c) {
+<span class="nc" id="L762">        return drainTo(c, Integer.MAX_VALUE);</span>
+    }
+
+    /**
+     * @throws UnsupportedOperationException {@inheritDoc}
+     * @throws ClassCastException            {@inheritDoc}
+     * @throws NullPointerException          {@inheritDoc}
+     * @throws IllegalArgumentException      {@inheritDoc}
+     */
+    public int drainTo(Collection&lt;? super E&gt; c, int maxElements) {
+<span class="nc bnc" id="L772" title="All 2 branches missed.">        if (c == null)</span>
+<span class="nc" id="L773">            throw new NullPointerException();</span>
+<span class="nc bnc" id="L774" title="All 2 branches missed.">        if (c == this)</span>
+<span class="nc" id="L775">            throw new IllegalArgumentException();</span>
+<span class="nc bnc" id="L776" title="All 2 branches missed.">        if (maxElements &lt;= 0)</span>
+<span class="nc" id="L777">            return 0;</span>
+<span class="nc" id="L778">        final ReentrantLock lock = this.lock;</span>
+<span class="nc" id="L779">        lock.lock();</span>
+        try {
+<span class="nc" id="L781">            int n = Math.min(size, maxElements);</span>
+<span class="nc bnc" id="L782" title="All 2 branches missed.">            for (int i = 0; i &lt; n; i++) {</span>
+<span class="nc" id="L783">                c.add((E) queue[0]); // In this order, in case add() throws.</span>
+<span class="nc" id="L784">                dequeue();</span>
+            }
+<span class="nc" id="L786">            return n;</span>
+        } finally {
+<span class="nc" id="L788">            lock.unlock();</span>
+        }
+    }
+
+    /**
+     * Atomically removes all of the elements from this queue.
+     * The queue will be empty after this call returns.
+     */
+    public void clear() {
+<span class="fc" id="L797">        final ReentrantLock lock = this.lock;</span>
+<span class="fc" id="L798">        lock.lock();</span>
+        try {
+<span class="fc" id="L800">            Object[] array = queue;</span>
+<span class="fc" id="L801">            int n = size;</span>
+<span class="fc" id="L802">            size = 0;</span>
+<span class="fc bfc" id="L803" title="All 2 branches covered.">            for (int i = 0; i &lt; n; i++)</span>
+<span class="fc" id="L804">                array[i] = null;</span>
+        } finally {
+<span class="pc" id="L806">            lock.unlock();</span>
+<span class="fc" id="L807">        }</span>
+<span class="fc" id="L808">    }</span>
+
+    /**
+     * Returns an array containing all of the elements in this queue; the
+     * runtime type of the returned array is that of the specified array.
+     * The returned array elements are in no particular order.
+     * If the queue fits in the specified array, it is returned therein.
+     * Otherwise, a new array is allocated with the runtime type of the
+     * specified array and the size of this queue.
+     *
+     * &lt;p&gt;If this queue fits in the specified array with room to spare
+     * (i.e., the array has more elements than this queue), the element in
+     * the array immediately following the end of the queue is set to
+     * {@code null}.
+     *
+     * &lt;p&gt;Like the {@link #toArray()} method, this method acts as bridge between
+     * array-based and collection-based APIs.  Further, this method allows
+     * precise control over the runtime type of the output array, and may,
+     * under certain circumstances, be used to save allocation costs.
+     *
+     * &lt;p&gt;Suppose {@code x} is a queue known to contain only strings.
+     * The following code can be used to dump the queue into a newly
+     * allocated array of {@code String}:
+     *
+     *  &lt;pre&gt; {@code String[] y = x.toArray(new String[0]);}&lt;/pre&gt;
+     *
+     * Note that {@code toArray(new Object[0])} is identical in function to
+     * {@code toArray()}.
+     *
+     * @param a the array into which the elements of the queue are to
+     *          be stored, if it is big enough; otherwise, a new array of the
+     *          same runtime type is allocated for this purpose
+     * @return an array containing all of the elements in this queue
+     * @throws ArrayStoreException if the runtime type of the specified array
+     *         is not a supertype of the runtime type of every element in
+     *         this queue
+     * @throws NullPointerException if the specified array is null
+     */
+    public &lt;T&gt; T[] toArray(T[] a) {
+<span class="fc" id="L847">        final ReentrantLock lock = this.lock;</span>
+<span class="fc" id="L848">        lock.lock();</span>
+        try {
+<span class="fc" id="L850">            int n = size;</span>
+<span class="fc bfc" id="L851" title="All 2 branches covered.">            if (a.length &lt; n)</span>
+                // Make a new array of a's runtime type, but my contents:
+<span class="fc" id="L853">                return (T[]) Arrays.copyOf(queue, size, a.getClass());</span>
+<span class="fc" id="L854">            System.arraycopy(queue, 0, a, 0, n);</span>
+<span class="fc bfc" id="L855" title="All 2 branches covered.">            if (a.length &gt; n)</span>
+<span class="fc" id="L856">                a[n] = null;</span>
+<span class="fc" id="L857">            return a;</span>
+        } finally {
+<span class="pc" id="L859">            lock.unlock();</span>
+        }
+    }
+
+    /**
+     * Returns an iterator over the elements in this queue. The
+     * iterator does not return the elements in any particular order.
+     *
+     * &lt;p&gt;The returned iterator is
+     * &lt;a href=&quot;package-summary.html#Weakly&quot;&gt;&lt;i&gt;weakly consistent&lt;/i&gt;&lt;/a&gt;.
+     *
+     * @return an iterator over the elements in this queue
+     */
+    public Iterator&lt;E&gt; iterator() {
+<span class="fc" id="L873">        return new Itr(toArray());</span>
+    }
+
+    /**
+     * Snapshot iterator that works off copy of underlying q array.
+     */
+    final class Itr implements Iterator&lt;E&gt; {
+        final Object[] array; // Array of all elements
+        int cursor;           // index of next element to return
+        int lastRet;          // index of last element, or -1 if no such
+
+<span class="fc" id="L884">        Itr(Object[] array) {</span>
+<span class="fc" id="L885">            lastRet = -1;</span>
+<span class="fc" id="L886">            this.array = array;</span>
+<span class="fc" id="L887">        }</span>
+
+        public boolean hasNext() {
+<span class="fc bfc" id="L890" title="All 2 branches covered.">            return cursor &lt; array.length;</span>
+        }
+
+        public E next() {
+<span class="fc bfc" id="L894" title="All 2 branches covered.">            if (cursor &gt;= array.length)</span>
+<span class="fc" id="L895">                throw new NoSuchElementException();</span>
+<span class="fc" id="L896">            lastRet = cursor;</span>
+<span class="fc" id="L897">            return (E)array[cursor++];</span>
+        }
+
+        public void remove() {
+<span class="pc bpc" id="L901" title="1 of 2 branches missed.">            if (lastRet &lt; 0)</span>
+<span class="fc" id="L902">                throw new IllegalStateException();</span>
+<span class="nc" id="L903">            removeEQ(array[lastRet]);</span>
+<span class="nc" id="L904">            lastRet = -1;</span>
+<span class="nc" id="L905">        }</span>
+    }
+
+    /**
+     * Saves this queue to a stream (that is, serializes it).
+     *
+     * For compatibility with previous version of this class, elements
+     * are first copied to a java.util.PriorityQueue, which is then
+     * serialized.
+     *
+     * @param s the stream
+     * @throws java.io.IOException if an I/O error occurs
+     */
+    private void writeObject(java.io.ObjectOutputStream s)
+        throws java.io.IOException {
+<span class="fc" id="L920">        lock.lock();</span>
+        try {
+            // avoid zero capacity argument
+<span class="fc" id="L923">            q = new PriorityQueue&lt;E&gt;(Math.max(size, 1), comparator);</span>
+<span class="fc" id="L924">            q.addAll(this);</span>
+<span class="fc" id="L925">            s.defaultWriteObject();</span>
+        } finally {
+<span class="pc" id="L927">            q = null;</span>
+<span class="pc" id="L928">            lock.unlock();</span>
+<span class="fc" id="L929">        }</span>
+<span class="fc" id="L930">    }</span>
+
+    /**
+     * Reconstitutes this queue from a stream (that is, deserializes it).
+     * @param s the stream
+     * @throws ClassNotFoundException if the class of a serialized object
+     *         could not be found
+     * @throws java.io.IOException if an I/O error occurs
+     */
+    private void readObject(java.io.ObjectInputStream s)
+        throws java.io.IOException, ClassNotFoundException {
+        try {
+<span class="fc" id="L942">            s.defaultReadObject();</span>
+<span class="fc" id="L943">            this.queue = new Object[q.size()];</span>
+<span class="fc" id="L944">            comparator = q.comparator();</span>
+<span class="fc" id="L945">            addAll(q);</span>
+        } finally {
+<span class="pc" id="L947">            q = null;</span>
+<span class="fc" id="L948">        }</span>
+<span class="fc" id="L949">    }</span>
+
+    // Similar to Collections.ArraySnapshotSpliterator but avoids
+    // commitment to toArray until needed
+    static final class PBQSpliterator&lt;E&gt; implements Spliterator&lt;E&gt; {
+        final PriorityBlockingQueue&lt;E&gt; queue;
+        Object[] array;
+        int index;
+        int fence;
+
+        PBQSpliterator(PriorityBlockingQueue&lt;E&gt; queue, Object[] array,
+<span class="fc" id="L960">                       int index, int fence) {</span>
+<span class="fc" id="L961">            this.queue = queue;</span>
+<span class="fc" id="L962">            this.array = array;</span>
+<span class="fc" id="L963">            this.index = index;</span>
+<span class="fc" id="L964">            this.fence = fence;</span>
+<span class="fc" id="L965">        }</span>
+
+        final int getFence() {
+            int hi;
+<span class="nc bnc" id="L969" title="All 2 branches missed.">            if ((hi = fence) &lt; 0)</span>
+<span class="nc" id="L970">                hi = fence = (array = queue.toArray()).length;</span>
+<span class="nc" id="L971">            return hi;</span>
+        }
+
+        public Spliterator&lt;E&gt; trySplit() {
+<span class="nc" id="L975">            int hi = getFence(), lo = index, mid = (lo + hi) &gt;&gt;&gt; 1;</span>
+<span class="nc bnc" id="L976" title="All 2 branches missed.">            return (lo &gt;= mid) ? null :</span>
+                new PBQSpliterator&lt;E&gt;(queue, array, lo, index = mid);
+        }
+
+        @SuppressWarnings(&quot;unchecked&quot;)
+        public void forEachRemaining(Consumer&lt;? super E&gt; action) {
+            Object[] a; int i, hi; // hoist accesses and checks from loop
+<span class="nc bnc" id="L983" title="All 2 branches missed.">            if (action == null)</span>
+<span class="nc" id="L984">                throw new NullPointerException();</span>
+<span class="nc bnc" id="L985" title="All 2 branches missed.">            if ((a = array) == null)</span>
+<span class="nc" id="L986">                fence = (a = queue.toArray()).length;</span>
+<span class="nc bnc" id="L987" title="All 6 branches missed.">            if ((hi = fence) &lt;= a.length &amp;&amp;</span>
+                (i = index) &gt;= 0 &amp;&amp; i &lt; (index = hi)) {
+<span class="nc bnc" id="L989" title="All 2 branches missed.">                do { action.accept((E)a[i]); } while (++i &lt; hi);</span>
+            }
+<span class="nc" id="L991">        }</span>
+
+        public boolean tryAdvance(Consumer&lt;? super E&gt; action) {
+<span class="nc bnc" id="L994" title="All 2 branches missed.">            if (action == null)</span>
+<span class="nc" id="L995">                throw new NullPointerException();</span>
+<span class="nc bnc" id="L996" title="All 4 branches missed.">            if (getFence() &gt; index &amp;&amp; index &gt;= 0) {</span>
+<span class="nc" id="L997">                @SuppressWarnings(&quot;unchecked&quot;) E e = (E) array[index++];</span>
+<span class="nc" id="L998">                action.accept(e);</span>
+<span class="nc" id="L999">                return true;</span>
+            }
+<span class="nc" id="L1001">            return false;</span>
+        }
+
+<span class="nc" id="L1004">        public long estimateSize() { return (long)(getFence() - index); }</span>
+
+        public int characteristics() {
+<span class="fc" id="L1007">            return Spliterator.NONNULL | Spliterator.SIZED | Spliterator.SUBSIZED;</span>
+        }
+    }
+
+    /**
+     * Returns a {@link Spliterator} over the elements in this queue.
+     *
+     * &lt;p&gt;The returned spliterator is
+     * &lt;a href=&quot;package-summary.html#Weakly&quot;&gt;&lt;i&gt;weakly consistent&lt;/i&gt;&lt;/a&gt;.
+     *
+     * &lt;p&gt;The {@code Spliterator} reports {@link Spliterator#SIZED} and
+     * {@link Spliterator#NONNULL}.
+     *
+     * @implNote
+     * The {@code Spliterator} additionally reports {@link Spliterator#SUBSIZED}.
+     *
+     * @return a {@code Spliterator} over the elements in this queue
+     * @since 1.8
+     */
+    public Spliterator&lt;E&gt; spliterator() {
+<span class="fc" id="L1027">        return new PBQSpliterator&lt;E&gt;(this, null, 0, -1);</span>
+    }
+
+    // Unsafe mechanics
+    private static final sun.misc.Unsafe UNSAFE;
+    private static final long allocationSpinLockOffset;
+    static {
+        try {
+<span class="fc" id="L1035">            UNSAFE = sun.misc.Unsafe.getUnsafe();</span>
+<span class="fc" id="L1036">            Class&lt;?&gt; k = PriorityBlockingQueue.class;</span>
+<span class="fc" id="L1037">            allocationSpinLockOffset = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L1038">                (k.getDeclaredField(&quot;allocationSpinLock&quot;));</span>
+<span class="nc" id="L1039">        } catch (Exception e) {</span>
+<span class="nc" id="L1040">            throw new Error(e);</span>
+<span class="fc" id="L1041">        }</span>
+<span class="fc" id="L1042">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

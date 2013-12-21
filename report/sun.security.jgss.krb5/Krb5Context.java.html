@@ -1,0 +1,1460 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>Krb5Context.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.jgss.krb5</a> &gt; <span class="el_source">Krb5Context.java</span></div><h1>Krb5Context.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.security.jgss.krb5;
+
+import com.sun.security.jgss.InquireType;
+import org.ietf.jgss.*;
+import sun.misc.HexDumpEncoder;
+import sun.security.jgss.GSSUtil;
+import sun.security.jgss.GSSCaller;
+import sun.security.jgss.spi.*;
+import sun.security.jgss.TokenTracker;
+import sun.security.krb5.*;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.IOException;
+import java.security.Provider;
+import java.security.AccessController;
+import java.security.AccessControlContext;
+import java.security.Key;
+import java.security.PrivilegedExceptionAction;
+import java.security.PrivilegedActionException;
+import javax.crypto.Cipher;
+import javax.security.auth.Subject;
+import javax.security.auth.kerberos.*;
+import sun.security.krb5.internal.Ticket;
+
+/**
+ * Implements the mechanism specific context class for the Kerberos v5
+ * GSS-API mechanism.
+ *
+ * @author Mayank Upadhyay
+ * @author Ram Marti
+ * @since 1.4
+ */
+class Krb5Context implements GSSContextSpi {
+
+    /*
+     * The different states that this context can be in.
+     */
+
+    private static final int STATE_NEW = 1;
+    private static final int STATE_IN_PROCESS = 2;
+    private static final int STATE_DONE = 3;
+    private static final int STATE_DELETED = 4;
+
+<span class="pc" id="L69">    private int state = STATE_NEW;</span>
+
+    public static final int SESSION_KEY = 0;
+    public static final int INITIATOR_SUBKEY = 1;
+    public static final int ACCEPTOR_SUBKEY = 2;
+
+    /*
+     * Optional features that the application can set and their default
+     * values.
+     */
+
+<span class="pc" id="L80">    private boolean credDelegState  = false;    // now only useful at client</span>
+<span class="pc" id="L81">    private boolean mutualAuthState  = true;</span>
+<span class="pc" id="L82">    private boolean replayDetState  = true;</span>
+<span class="pc" id="L83">    private boolean sequenceDetState  = true;</span>
+<span class="pc" id="L84">    private boolean confState  = true;</span>
+<span class="pc" id="L85">    private boolean integState  = true;</span>
+<span class="pc" id="L86">    private boolean delegPolicyState = false;</span>
+
+<span class="pc" id="L88">    private boolean isConstrainedDelegationTried = false;</span>
+
+    private int mySeqNumber;
+    private int peerSeqNumber;
+    private int keySrc;
+    private TokenTracker peerTokenTracker;
+
+<span class="pc" id="L95">    private CipherHelper cipherHelper = null;</span>
+
+    /*
+     * Separate locks for the sequence numbers allow the application to
+     * receive tokens at the same time that it is sending tokens. Note
+     * that the application must synchronize the generation and
+     * transmission of tokens such that tokens are processed in the same
+     * order that they are generated. This is important when sequence
+     * checking of per-message tokens is enabled.
+     */
+
+<span class="pc" id="L106">    private Object mySeqNumberLock = new Object();</span>
+<span class="pc" id="L107">    private Object peerSeqNumberLock = new Object();</span>
+
+    private EncryptionKey key;
+    private Krb5NameElement myName;
+    private Krb5NameElement peerName;
+    private int lifetime;
+    private boolean initiator;
+    private ChannelBinding channelBinding;
+
+    private Krb5CredElement myCred;
+    private Krb5CredElement delegatedCred; // Set only on acceptor side
+
+    // XXX See if the required info from these can be extracted and
+    // stored elsewhere
+    private Credentials serviceCreds;
+    private KrbApReq apReq;
+    Ticket serviceTicket;
+    final private GSSCaller caller;
+<span class="fc" id="L125">    private static final boolean DEBUG = Krb5Util.DEBUG;</span>
+
+    /**
+     * Constructor for Krb5Context to be called on the context initiator's
+     * side.
+     */
+    Krb5Context(GSSCaller caller, Krb5NameElement peerName, Krb5CredElement myCred,
+                int lifetime)
+<span class="fc" id="L133">        throws GSSException {</span>
+
+<span class="pc bpc" id="L135" title="1 of 2 branches missed.">        if (peerName == null)</span>
+<span class="nc" id="L136">            throw new IllegalArgumentException(&quot;Cannot have null peer name&quot;);</span>
+
+<span class="fc" id="L138">        this.caller = caller;</span>
+<span class="fc" id="L139">        this.peerName = peerName;</span>
+<span class="fc" id="L140">        this.myCred = myCred;</span>
+<span class="fc" id="L141">        this.lifetime = lifetime;</span>
+<span class="fc" id="L142">        this.initiator = true;</span>
+<span class="fc" id="L143">    }</span>
+
+    /**
+     * Constructor for Krb5Context to be called on the context acceptor's
+     * side.
+     */
+    Krb5Context(GSSCaller caller, Krb5CredElement myCred)
+<span class="fc" id="L150">        throws GSSException {</span>
+<span class="fc" id="L151">        this.caller = caller;</span>
+<span class="fc" id="L152">        this.myCred = myCred;</span>
+<span class="fc" id="L153">        this.initiator = false;</span>
+<span class="fc" id="L154">    }</span>
+
+    /**
+     * Constructor for Krb5Context to import a previously exported context.
+     */
+    public Krb5Context(GSSCaller caller, byte [] interProcessToken)
+<span class="nc" id="L160">        throws GSSException {</span>
+<span class="nc" id="L161">        throw new GSSException(GSSException.UNAVAILABLE,</span>
+                               -1, &quot;GSS Import Context not available&quot;);
+    }
+
+    /**
+     * Method to determine if the context can be exported and then
+     * re-imported.
+     */
+    public final boolean isTransferable() throws GSSException {
+<span class="nc" id="L170">        return false;</span>
+    }
+
+    /**
+     * The lifetime remaining for this context.
+     */
+    public final int getLifetime() {
+        // XXX Return service ticket lifetime
+<span class="nc" id="L178">        return GSSContext.INDEFINITE_LIFETIME;</span>
+    }
+
+    /*
+     * Methods that may be invoked by the GSS framework in response
+     * to an application request for setting/getting these
+     * properties.
+     *
+     * These can only be called on the initiator side.
+     *
+     * Notice that an application can only request these
+     * properties. The mechanism may or may not support them. The
+     * application must make getXXX calls after context establishment
+     * to see if the mechanism implementations on both sides support
+     * these features. requestAnonymity is an exception where the
+     * application will want to call getAnonymityState prior to sending any
+     * GSS token during context establishment.
+     *
+     * Also note that the requests can only be placed before context
+     * establishment starts. i.e. when state is STATE_NEW
+     */
+
+    /**
+     * Requests the desired lifetime. Can only be used on the context
+     * initiator's side.
+     */
+    public void requestLifetime(int lifetime) throws GSSException {
+<span class="nc bnc" id="L205" title="All 4 branches missed.">        if (state == STATE_NEW &amp;&amp; isInitiator())</span>
+<span class="nc" id="L206">            this.lifetime = lifetime;</span>
+<span class="nc" id="L207">    }</span>
+
+    /**
+     * Requests that confidentiality be available.
+     */
+    public final void requestConf(boolean value) throws GSSException {
+<span class="pc bpc" id="L213" title="2 of 4 branches missed.">        if (state == STATE_NEW &amp;&amp; isInitiator())</span>
+<span class="fc" id="L214">            confState  = value;</span>
+<span class="fc" id="L215">    }</span>
+
+    /**
+     * Is confidentiality available?
+     */
+    public final boolean getConfState() {
+<span class="fc" id="L221">        return confState;</span>
+    }
+
+    /**
+     * Requests that integrity be available.
+     */
+    public final void requestInteg(boolean value) throws GSSException {
+<span class="pc bpc" id="L228" title="2 of 4 branches missed.">        if (state == STATE_NEW &amp;&amp; isInitiator())</span>
+<span class="fc" id="L229">            integState  = value;</span>
+<span class="fc" id="L230">    }</span>
+
+    /**
+     * Is integrity available?
+     */
+    public final boolean getIntegState() {
+<span class="fc" id="L236">        return integState;</span>
+    }
+
+    /**
+     * Requests that credential delegation be done during context
+     * establishment.
+     */
+    public final void requestCredDeleg(boolean value) throws GSSException {
+<span class="pc bpc" id="L244" title="2 of 4 branches missed.">        if (state == STATE_NEW &amp;&amp; isInitiator())</span>
+<span class="fc" id="L245">            credDelegState  = value;</span>
+<span class="fc" id="L246">    }</span>
+
+    /**
+     * Is credential delegation enabled?
+     */
+    public final boolean getCredDelegState() {
+<span class="fc bfc" id="L252" title="All 2 branches covered.">        if (isInitiator()) {</span>
+<span class="fc" id="L253">            return credDelegState;</span>
+        } else {
+            // Server side deleg state is not flagged by credDelegState.
+            // It can use constrained delegation.
+<span class="fc" id="L257">            tryConstrainedDelegation();</span>
+<span class="pc bpc" id="L258" title="1 of 2 branches missed.">            return delegatedCred != null;</span>
+        }
+    }
+
+    /**
+     * Requests that mutual authentication be done during context
+     * establishment. Since this is fromm the client's perspective, it
+     * essentially requests that the server be authenticated.
+     */
+    public final void requestMutualAuth(boolean value) throws GSSException {
+<span class="pc bpc" id="L268" title="2 of 4 branches missed.">        if (state == STATE_NEW &amp;&amp; isInitiator()) {</span>
+<span class="fc" id="L269">            mutualAuthState  = value;</span>
+        }
+<span class="fc" id="L271">    }</span>
+
+    /**
+     * Is mutual authentication enabled? Since this is from the client's
+     * perspective, it essentially meas that the server is being
+     * authenticated.
+     */
+    public final boolean getMutualAuthState() {
+<span class="fc" id="L279">        return mutualAuthState;</span>
+    }
+
+    /**
+     * Requests that replay detection be done on the GSS wrap and MIC
+     * tokens.
+     */
+    public final void requestReplayDet(boolean value) throws GSSException {
+<span class="pc bpc" id="L287" title="2 of 4 branches missed.">        if (state == STATE_NEW &amp;&amp; isInitiator())</span>
+<span class="fc" id="L288">            replayDetState  = value;</span>
+<span class="fc" id="L289">    }</span>
+
+    /**
+     * Is replay detection enabled on the GSS wrap and MIC tokens?
+     * We enable replay detection if sequence checking is enabled.
+     */
+    public final boolean getReplayDetState() {
+<span class="pc bpc" id="L296" title="3 of 4 branches missed.">        return replayDetState || sequenceDetState;</span>
+    }
+
+    /**
+     * Requests that sequence checking be done on the GSS wrap and MIC
+     * tokens.
+     */
+    public final void requestSequenceDet(boolean value) throws GSSException {
+<span class="pc bpc" id="L304" title="2 of 4 branches missed.">        if (state == STATE_NEW &amp;&amp; isInitiator())</span>
+<span class="fc" id="L305">            sequenceDetState  = value;</span>
+<span class="fc" id="L306">    }</span>
+
+    /**
+     * Is sequence checking enabled on the GSS Wrap and MIC tokens?
+     * We enable sequence checking if replay detection is enabled.
+     */
+    public final boolean getSequenceDetState() {
+<span class="pc bpc" id="L313" title="3 of 4 branches missed.">        return sequenceDetState || replayDetState;</span>
+    }
+
+    /**
+     * Requests that the deleg policy be respected.
+     */
+    public final void requestDelegPolicy(boolean value) {
+<span class="pc bpc" id="L320" title="2 of 4 branches missed.">        if (state == STATE_NEW &amp;&amp; isInitiator())</span>
+<span class="fc" id="L321">            delegPolicyState = value;</span>
+<span class="fc" id="L322">    }</span>
+
+    /**
+     * Is deleg policy respected?
+     */
+    public final boolean getDelegPolicyState() {
+<span class="fc" id="L328">        return delegPolicyState;</span>
+    }
+
+    /*
+     * Anonymity is a little different in that after an application
+     * requests anonymity it will want to know whether the mechanism
+     * can support it or not, prior to sending any tokens across for
+     * context establishment. Since this is from the initiator's
+     * perspective, it essentially requests that the initiator be
+     * anonymous.
+     */
+
+    public final void requestAnonymity(boolean value) throws GSSException {
+        // Ignore silently. Application will check back with
+        // getAnonymityState.
+<span class="fc" id="L343">    }</span>
+
+    // RFC 2853 actually calls for this to be called after context
+    // establishment to get the right answer, but that is
+    // incorrect. The application may not want to send over any
+    // tokens if anonymity is not available.
+    public final boolean getAnonymityState() {
+<span class="nc" id="L350">        return false;</span>
+    }
+
+    /*
+     * Package private methods invoked by other Krb5 plugin classes.
+     */
+
+    /**
+     * Get the context specific DESCipher instance, invoked in
+     * MessageToken.init()
+     */
+    final CipherHelper getCipherHelper(EncryptionKey ckey) throws GSSException {
+<span class="fc" id="L362">         EncryptionKey cipherKey = null;</span>
+<span class="fc bfc" id="L363" title="All 2 branches covered.">         if (cipherHelper == null) {</span>
+<span class="pc bpc" id="L364" title="1 of 2 branches missed.">            cipherKey = (getKey() == null) ? ckey: getKey();</span>
+<span class="fc" id="L365">            cipherHelper = new CipherHelper(cipherKey);</span>
+         }
+<span class="fc" id="L367">         return cipherHelper;</span>
+    }
+
+    final int incrementMySequenceNumber() {
+        int retVal;
+<span class="fc" id="L372">        synchronized (mySeqNumberLock) {</span>
+<span class="fc" id="L373">            retVal = mySeqNumber;</span>
+<span class="fc" id="L374">            mySeqNumber = retVal + 1;</span>
+<span class="pc" id="L375">        }</span>
+<span class="fc" id="L376">        return retVal;</span>
+    }
+
+    final void resetMySequenceNumber(int seqNumber) {
+<span class="pc bpc" id="L380" title="1 of 2 branches missed.">        if (DEBUG) {</span>
+<span class="nc" id="L381">            System.out.println(&quot;Krb5Context setting mySeqNumber to: &quot;</span>
+                               + seqNumber);
+        }
+<span class="fc" id="L384">        synchronized (mySeqNumberLock) {</span>
+<span class="fc" id="L385">            mySeqNumber = seqNumber;</span>
+<span class="pc" id="L386">        }</span>
+<span class="fc" id="L387">    }</span>
+
+    final void resetPeerSequenceNumber(int seqNumber) {
+<span class="pc bpc" id="L390" title="1 of 2 branches missed.">        if (DEBUG) {</span>
+<span class="nc" id="L391">            System.out.println(&quot;Krb5Context setting peerSeqNumber to: &quot;</span>
+                               + seqNumber);
+        }
+<span class="fc" id="L394">        synchronized (peerSeqNumberLock) {</span>
+<span class="fc" id="L395">            peerSeqNumber = seqNumber;</span>
+<span class="fc" id="L396">            peerTokenTracker = new TokenTracker(peerSeqNumber);</span>
+<span class="pc" id="L397">        }</span>
+<span class="fc" id="L398">    }</span>
+
+    final void setKey(int keySrc, EncryptionKey key) throws GSSException {
+<span class="fc" id="L401">        this.key = key;</span>
+<span class="fc" id="L402">        this.keySrc = keySrc;</span>
+        // %%% to do: should clear old cipherHelper first
+<span class="fc" id="L404">        cipherHelper = new CipherHelper(key);  // Need to use new key</span>
+<span class="fc" id="L405">    }</span>
+
+    public final int getKeySrc() {
+<span class="fc" id="L408">        return keySrc;</span>
+    }
+
+    private final EncryptionKey getKey() {
+<span class="fc" id="L412">        return key;</span>
+    }
+
+    /**
+     * Called on the acceptor side to store the delegated credentials
+     * received in the AcceptSecContextToken.
+     */
+    final void setDelegCred(Krb5CredElement delegatedCred) {
+<span class="fc" id="L420">        this.delegatedCred = delegatedCred;</span>
+<span class="fc" id="L421">    }</span>
+
+    /*
+     * While the application can only request the following features,
+     * other classes in the package can call the actual set methods
+     * for them. They are called as context establishment tokens are
+     * received on an acceptor side and the context feature list that
+     * the initiator wants becomes known.
+     */
+
+    /*
+     * This method is also called by InitialToken.OverloadedChecksum if the
+     * TGT is not forwardable and the user requested delegation.
+     */
+    final void setCredDelegState(boolean state) {
+<span class="fc" id="L436">        credDelegState = state;</span>
+<span class="fc" id="L437">    }</span>
+
+    final void setMutualAuthState(boolean state) {
+<span class="nc" id="L440">        mutualAuthState = state;</span>
+<span class="nc" id="L441">    }</span>
+
+    final void setReplayDetState(boolean state) {
+<span class="nc" id="L444">        replayDetState = state;</span>
+<span class="nc" id="L445">    }</span>
+
+    final void setSequenceDetState(boolean state) {
+<span class="nc" id="L448">        sequenceDetState = state;</span>
+<span class="nc" id="L449">    }</span>
+
+    final void setConfState(boolean state) {
+<span class="nc" id="L452">        confState = state;</span>
+<span class="nc" id="L453">    }</span>
+
+    final void setIntegState(boolean state) {
+<span class="nc" id="L456">        integState = state;</span>
+<span class="nc" id="L457">    }</span>
+
+    final void setDelegPolicyState(boolean state) {
+<span class="fc" id="L460">        delegPolicyState = state;</span>
+<span class="fc" id="L461">    }</span>
+
+    /**
+     * Sets the channel bindings to be used during context
+     * establishment.
+     */
+    public final void setChannelBinding(ChannelBinding channelBinding)
+        throws GSSException {
+<span class="fc" id="L469">        this.channelBinding = channelBinding;</span>
+<span class="fc" id="L470">    }</span>
+
+    final ChannelBinding getChannelBinding() {
+<span class="fc" id="L473">        return channelBinding;</span>
+    }
+
+    /**
+     * Returns the mechanism oid.
+     *
+     * @return the Oid of this context
+     */
+    public final Oid getMech() {
+<span class="nc" id="L482">        return (Krb5MechFactory.GSS_KRB5_MECH_OID);</span>
+    }
+
+    /**
+     * Returns the context initiator name.
+     *
+     * @return initiator name
+     * @exception GSSException
+     */
+    public final GSSNameSpi getSrcName() throws GSSException {
+<span class="pc bpc" id="L492" title="1 of 2 branches missed.">        return (isInitiator()? myName : peerName);</span>
+    }
+
+    /**
+     * Returns the context acceptor.
+     *
+     * @return context acceptor(target) name
+     * @exception GSSException
+     */
+    public final GSSNameSpi getTargName() throws GSSException {
+<span class="nc bnc" id="L502" title="All 2 branches missed.">        return (!isInitiator()? myName : peerName);</span>
+    }
+
+    /**
+     * Returns the delegated credential for the context. This
+     * is an optional feature of contexts which not all
+     * mechanisms will support. A context can be requested to
+     * support credential delegation by using the &lt;b&gt;CRED_DELEG&lt;/b&gt;,
+     * or it can request for a constrained delegation.
+     * This is only valid on the acceptor side of the context.
+     * @return GSSCredentialSpi object for the delegated credential
+     * @exception GSSException
+     * @see GSSContext#getDelegCredState
+     */
+    public final GSSCredentialSpi getDelegCred() throws GSSException {
+<span class="pc bpc" id="L517" title="2 of 4 branches missed.">        if (state != STATE_IN_PROCESS &amp;&amp; state != STATE_DONE)</span>
+<span class="nc" id="L518">            throw new GSSException(GSSException.NO_CONTEXT);</span>
+<span class="pc bpc" id="L519" title="1 of 2 branches missed.">        if (isInitiator()) {</span>
+<span class="nc" id="L520">            throw new GSSException(GSSException.NO_CRED);</span>
+        }
+<span class="fc" id="L522">        tryConstrainedDelegation();</span>
+<span class="pc bpc" id="L523" title="1 of 2 branches missed.">        if (delegatedCred == null) {</span>
+<span class="nc" id="L524">            throw new GSSException(GSSException.NO_CRED);</span>
+        }
+<span class="fc" id="L526">        return delegatedCred;</span>
+    }
+
+    private void tryConstrainedDelegation() {
+<span class="pc bpc" id="L530" title="2 of 4 branches missed.">        if (state != STATE_IN_PROCESS &amp;&amp; state != STATE_DONE) {</span>
+<span class="nc" id="L531">            return;</span>
+        }
+        // We will only try constrained delegation once (if necessary).
+<span class="fc bfc" id="L534" title="All 2 branches covered.">        if (!isConstrainedDelegationTried) {</span>
+<span class="pc bpc" id="L535" title="1 of 2 branches missed.">            if (delegatedCred == null) {</span>
+<span class="nc bnc" id="L536" title="All 2 branches missed.">                if (DEBUG) {</span>
+<span class="nc" id="L537">                    System.out.println(&quot;&gt;&gt;&gt; Constrained deleg from &quot; + caller);</span>
+                }
+                // The constrained delegation part. The acceptor needs to have
+                // isInitiator=true in order to get a TGT, either earlier at
+                // logon stage, if useSubjectCredsOnly, or now.
+                try {
+<span class="nc" id="L543">                    delegatedCred = new Krb5ProxyCredential(</span>
+<span class="nc" id="L544">                        Krb5InitCredential.getInstance(</span>
+                            GSSCaller.CALLER_ACCEPT, myName, lifetime),
+                        peerName, serviceTicket);
+<span class="nc" id="L547">                } catch (GSSException gsse) {</span>
+                    // OK, delegatedCred is null then
+<span class="nc" id="L549">                }</span>
+            }
+<span class="fc" id="L551">            isConstrainedDelegationTried = true;</span>
+        }
+<span class="fc" id="L553">    }</span>
+    /**
+     * Tests if this is the initiator side of the context.
+     *
+     * @return boolean indicating if this is initiator (true)
+     *  or target (false)
+     */
+    public final boolean isInitiator() {
+<span class="fc" id="L561">        return initiator;</span>
+    }
+
+    /**
+     * Tests if the context can be used for per-message service.
+     * Context may allow the calls to the per-message service
+     * functions before being fully established.
+     *
+     * @return boolean indicating if per-message methods can
+     *  be called.
+     */
+    public final boolean isProtReady() {
+<span class="nc bnc" id="L573" title="All 2 branches missed.">        return (state == STATE_DONE);</span>
+    }
+
+    /**
+     * Initiator context establishment call. This method may be
+     * required to be called several times. A CONTINUE_NEEDED return
+     * call indicates that more calls are needed after the next token
+     * is received from the peer.
+     *
+     * @param is contains the token received from the peer. On the
+     *  first call it will be ignored.
+     * @return any token required to be sent to the peer
+     *    It is responsibility of the caller
+     *    to send the token to its peer for processing.
+     * @exception GSSException
+     */
+    public final byte[] initSecContext(InputStream is, int mechTokenSize)
+        throws GSSException {
+
+<span class="fc" id="L592">            byte[] retVal = null;</span>
+<span class="fc" id="L593">            InitialToken token = null;</span>
+<span class="fc" id="L594">            int errorCode = GSSException.FAILURE;</span>
+<span class="pc bpc" id="L595" title="1 of 2 branches missed.">            if (DEBUG) {</span>
+<span class="nc" id="L596">                System.out.println(&quot;Entered Krb5Context.initSecContext with &quot; +</span>
+<span class="nc" id="L597">                                   &quot;state=&quot; + printState(state));</span>
+            }
+<span class="pc bpc" id="L599" title="1 of 2 branches missed.">            if (!isInitiator()) {</span>
+<span class="nc" id="L600">                throw new GSSException(GSSException.FAILURE, -1,</span>
+                                       &quot;initSecContext on an acceptor &quot; +
+                                        &quot;GSSContext&quot;);
+            }
+
+            try {
+<span class="fc bfc" id="L606" title="All 2 branches covered.">                if (state == STATE_NEW) {</span>
+<span class="fc" id="L607">                    state = STATE_IN_PROCESS;</span>
+
+<span class="fc" id="L609">                    errorCode = GSSException.NO_CRED;</span>
+
+<span class="pc bpc" id="L611" title="1 of 2 branches missed.">                    if (myCred == null) {</span>
+<span class="nc" id="L612">                        myCred = Krb5InitCredential.getInstance(caller, myName,</span>
+                                              GSSCredential.DEFAULT_LIFETIME);
+<span class="pc bpc" id="L614" title="1 of 2 branches missed.">                    } else if (!myCred.isInitiatorCredential()) {</span>
+<span class="nc" id="L615">                        throw new GSSException(errorCode, -1,</span>
+                                           &quot;No TGT available&quot;);
+                    }
+<span class="fc" id="L618">                    myName = (Krb5NameElement) myCred.getName();</span>
+                    Credentials tgt;
+                    final Krb5ProxyCredential second;
+<span class="pc bpc" id="L621" title="1 of 2 branches missed.">                    if (myCred instanceof Krb5InitCredential) {</span>
+<span class="fc" id="L622">                        second = null;</span>
+<span class="fc" id="L623">                        tgt = ((Krb5InitCredential) myCred).getKrb5Credentials();</span>
+                    } else {
+<span class="nc" id="L625">                        second = (Krb5ProxyCredential) myCred;</span>
+<span class="nc" id="L626">                        tgt = second.self.getKrb5Credentials();</span>
+                    }
+
+<span class="fc" id="L629">                    checkPermission(peerName.getKrb5PrincipalName().getName(),</span>
+                                    &quot;initiate&quot;);
+                    /*
+                     * If useSubjectCredsonly is true then
+                     * we check whether we already have the ticket
+                     * for this service in the Subject and reuse it
+                     */
+
+                    final AccessControlContext acc =
+<span class="fc" id="L638">                        AccessController.getContext();</span>
+
+<span class="pc bpc" id="L640" title="1 of 2 branches missed.">                    if (GSSUtil.useSubjectCredsOnly(caller)) {</span>
+<span class="fc" id="L641">                        KerberosTicket kerbTicket = null;</span>
+                        try {
+                           // get service ticket from caller's subject
+<span class="fc" id="L644">                           kerbTicket = AccessController.doPrivileged(</span>
+<span class="fc" id="L645">                                new PrivilegedExceptionAction&lt;KerberosTicket&gt;() {</span>
+                                public KerberosTicket run() throws Exception {
+                                    // XXX to be cleaned
+                                    // highly consider just calling:
+                                    // Subject.getSubject
+                                    // SubjectComber.find
+                                    // instead of Krb5Util.getTicket
+<span class="pc bpc" id="L652" title="1 of 2 branches missed.">                                    return Krb5Util.getTicket(</span>
+                                        GSSCaller.CALLER_UNKNOWN,
+                                        // since it's useSubjectCredsOnly here,
+                                        // don't worry about the null
+                                        second == null ?
+<span class="pc" id="L657">                                            myName.getKrb5PrincipalName().getName():</span>
+<span class="pc" id="L658">                                            second.getName().getKrb5PrincipalName().getName(),</span>
+<span class="fc" id="L659">                                        peerName.getKrb5PrincipalName().getName(),</span>
+                                        acc);
+                                }});
+<span class="nc" id="L662">                        } catch (PrivilegedActionException e) {</span>
+<span class="nc bnc" id="L663" title="All 2 branches missed.">                            if (DEBUG) {</span>
+<span class="nc" id="L664">                                System.out.println(&quot;Attempt to obtain service&quot;</span>
+                                        + &quot; ticket from the subject failed!&quot;);
+                            }
+<span class="fc" id="L667">                        }</span>
+<span class="pc bpc" id="L668" title="1 of 2 branches missed.">                        if (kerbTicket != null) {</span>
+<span class="nc bnc" id="L669" title="All 2 branches missed.">                            if (DEBUG) {</span>
+<span class="nc" id="L670">                                System.out.println(&quot;Found service ticket in &quot; +</span>
+                                                   &quot;the subject&quot; +
+                                                   kerbTicket);
+                            }
+
+                            // convert Ticket to serviceCreds
+                            // XXX Should merge these two object types
+                            // avoid converting back and forth
+<span class="nc" id="L678">                            serviceCreds = Krb5Util.ticketToCreds(kerbTicket);</span>
+                        }
+                    }
+<span class="pc bpc" id="L681" title="1 of 2 branches missed.">                    if (serviceCreds == null) {</span>
+                        // either we did not find the serviceCreds in the
+                        // Subject or useSubjectCreds is false
+<span class="pc bpc" id="L684" title="1 of 2 branches missed.">                        if (DEBUG) {</span>
+<span class="nc" id="L685">                            System.out.println(&quot;Service ticket not found in &quot; +</span>
+                                               &quot;the subject&quot;);
+                        }
+                        // Get Service ticket using the Kerberos protocols
+<span class="pc bpc" id="L689" title="1 of 2 branches missed.">                        if (second == null) {</span>
+<span class="fc" id="L690">                            serviceCreds = Credentials.acquireServiceCreds(</span>
+<span class="fc" id="L691">                                     peerName.getKrb5PrincipalName().getName(),</span>
+                                     tgt);
+                        } else {
+<span class="nc" id="L694">                            serviceCreds = Credentials.acquireS4U2proxyCreds(</span>
+<span class="nc" id="L695">                                    peerName.getKrb5PrincipalName().getName(),</span>
+                                    second.tkt,
+<span class="nc" id="L697">                                    second.getName().getKrb5PrincipalName(),</span>
+                                    tgt);
+                        }
+<span class="pc bpc" id="L700" title="1 of 2 branches missed.">                        if (GSSUtil.useSubjectCredsOnly(caller)) {</span>
+<span class="fc" id="L701">                            final Subject subject =</span>
+<span class="fc" id="L702">                                AccessController.doPrivileged(</span>
+<span class="fc" id="L703">                                new java.security.PrivilegedAction&lt;Subject&gt;() {</span>
+                                    public Subject run() {
+<span class="fc" id="L705">                                        return (Subject.getSubject(acc));</span>
+                                    }
+                                });
+<span class="pc bpc" id="L708" title="1 of 2 branches missed.">                            if (subject != null &amp;&amp;</span>
+<span class="pc bpc" id="L709" title="1 of 2 branches missed.">                                !subject.isReadOnly()) {</span>
+                                /*
+                             * Store the service credentials as
+                             * javax.security.auth.kerberos.KerberosTicket in
+                             * the Subject. We could wait till the context is
+                             * succesfully established; however it is easier
+                             * to do here and there is no harm indoing it here.
+                             */
+<span class="fc" id="L717">                                final KerberosTicket kt =</span>
+<span class="fc" id="L718">                                    Krb5Util.credsToTicket(serviceCreds);</span>
+<span class="fc" id="L719">                                AccessController.doPrivileged (</span>
+<span class="fc" id="L720">                                    new java.security.PrivilegedAction&lt;Void&gt;() {</span>
+                                      public Void run() {
+<span class="fc" id="L722">                                        subject.getPrivateCredentials().add(kt);</span>
+<span class="fc" id="L723">                                        return null;</span>
+                                      }
+                                    });
+<span class="fc" id="L726">                            } else {</span>
+                                // log it for debugging purpose
+<span class="nc bnc" id="L728" title="All 2 branches missed.">                                if (DEBUG) {</span>
+<span class="nc" id="L729">                                    System.out.println(&quot;Subject is &quot; +</span>
+                                        &quot;readOnly;Kerberos Service &quot;+
+                                        &quot;ticket not stored&quot;);
+                                }
+                            }
+                        }
+                    }
+
+<span class="fc" id="L737">                    errorCode = GSSException.FAILURE;</span>
+<span class="fc" id="L738">                    token = new InitSecContextToken(this, tgt, serviceCreds);</span>
+<span class="fc" id="L739">                    apReq = ((InitSecContextToken)token).getKrbApReq();</span>
+<span class="fc" id="L740">                    retVal = token.encode();</span>
+<span class="fc" id="L741">                    myCred = null;</span>
+<span class="pc bpc" id="L742" title="1 of 2 branches missed.">                    if (!getMutualAuthState()) {</span>
+<span class="nc" id="L743">                        state = STATE_DONE;</span>
+                    }
+<span class="pc bpc" id="L745" title="1 of 2 branches missed.">                    if (DEBUG) {</span>
+<span class="nc" id="L746">                        System.out.println(&quot;Created InitSecContextToken:\n&quot;+</span>
+<span class="nc" id="L747">                            new HexDumpEncoder().encodeBuffer(retVal));</span>
+                    }
+<span class="pc bpc" id="L749" title="1 of 2 branches missed.">                } else if (state == STATE_IN_PROCESS) {</span>
+                    // No need to write anything;
+                    // just validate the incoming token
+<span class="fc" id="L752">                    new AcceptSecContextToken(this, serviceCreds, apReq, is);</span>
+<span class="fc" id="L753">                    serviceCreds = null;</span>
+<span class="fc" id="L754">                    apReq = null;</span>
+<span class="fc" id="L755">                    state = STATE_DONE;</span>
+                } else {
+                    // XXX Use logging API?
+<span class="nc bnc" id="L758" title="All 2 branches missed.">                    if (DEBUG) {</span>
+<span class="nc" id="L759">                        System.out.println(state);</span>
+                    }
+                }
+<span class="nc" id="L762">            } catch (KrbException e) {</span>
+<span class="nc bnc" id="L763" title="All 2 branches missed.">                if (DEBUG) {</span>
+<span class="nc" id="L764">                    e.printStackTrace();</span>
+                }
+<span class="nc" id="L766">                GSSException gssException =</span>
+<span class="nc" id="L767">                        new GSSException(errorCode, -1, e.getMessage());</span>
+<span class="nc" id="L768">                gssException.initCause(e);</span>
+<span class="nc" id="L769">                throw gssException;</span>
+<span class="nc" id="L770">            } catch (IOException e) {</span>
+<span class="nc" id="L771">                GSSException gssException =</span>
+<span class="nc" id="L772">                        new GSSException(errorCode, -1, e.getMessage());</span>
+<span class="nc" id="L773">                gssException.initCause(e);</span>
+<span class="nc" id="L774">                throw gssException;</span>
+<span class="fc" id="L775">            }</span>
+<span class="fc" id="L776">            return retVal;</span>
+        }
+
+    public final boolean isEstablished() {
+<span class="fc bfc" id="L780" title="All 2 branches covered.">        return (state == STATE_DONE);</span>
+    }
+
+    /**
+     * Acceptor's context establishment call. This method may be
+     * required to be called several times. A CONTINUE_NEEDED return
+     * call indicates that more calls are needed after the next token
+     * is received from the peer.
+     *
+     * @param is contains the token received from the peer.
+     * @return any token required to be sent to the peer
+     *    It is responsibility of the caller
+     *    to send the token to its peer for processing.
+     * @exception GSSException
+     */
+    public final byte[] acceptSecContext(InputStream is, int mechTokenSize)
+        throws GSSException {
+
+<span class="fc" id="L798">        byte[] retVal = null;</span>
+
+<span class="pc bpc" id="L800" title="1 of 2 branches missed.">        if (DEBUG) {</span>
+<span class="nc" id="L801">            System.out.println(&quot;Entered Krb5Context.acceptSecContext with &quot; +</span>
+<span class="nc" id="L802">                               &quot;state=&quot; +  printState(state));</span>
+        }
+
+<span class="pc bpc" id="L805" title="1 of 2 branches missed.">        if (isInitiator()) {</span>
+<span class="nc" id="L806">            throw new GSSException(GSSException.FAILURE, -1,</span>
+                                   &quot;acceptSecContext on an initiator &quot; +
+                                   &quot;GSSContext&quot;);
+        }
+        try {
+<span class="pc bpc" id="L811" title="1 of 2 branches missed.">            if (state == STATE_NEW) {</span>
+<span class="fc" id="L812">                state = STATE_IN_PROCESS;</span>
+<span class="pc bpc" id="L813" title="1 of 2 branches missed.">                if (myCred == null) {</span>
+<span class="nc" id="L814">                    myCred = Krb5AcceptCredential.getInstance(caller, myName);</span>
+<span class="pc bpc" id="L815" title="1 of 2 branches missed.">                } else if (!myCred.isAcceptorCredential()) {</span>
+<span class="nc" id="L816">                    throw new GSSException(GSSException.NO_CRED, -1,</span>
+                                           &quot;No Secret Key available&quot;);
+                }
+<span class="fc" id="L819">                myName = (Krb5NameElement) myCred.getName();</span>
+
+                // If there is already a bound name, check now
+<span class="fc bfc" id="L822" title="All 2 branches covered.">                if (myName != null) {</span>
+<span class="fc" id="L823">                    Krb5MechFactory.checkAcceptCredPermission(myName, myName);</span>
+                }
+
+<span class="fc" id="L826">                InitSecContextToken token = new InitSecContextToken(this,</span>
+                                                    (Krb5AcceptCredential) myCred, is);
+<span class="fc" id="L828">                PrincipalName clientName = token.getKrbApReq().getClient();</span>
+<span class="fc" id="L829">                peerName = Krb5NameElement.getInstance(clientName);</span>
+
+                // If unbound, check after the bound name is found
+<span class="fc bfc" id="L832" title="All 2 branches covered.">                if (myName == null) {</span>
+<span class="fc" id="L833">                    myName = Krb5NameElement.getInstance(</span>
+<span class="fc" id="L834">                        token.getKrbApReq().getCreds().getServer());</span>
+<span class="fc" id="L835">                    Krb5MechFactory.checkAcceptCredPermission(myName, myName);</span>
+                }
+
+<span class="pc bpc" id="L838" title="1 of 2 branches missed.">                if (getMutualAuthState()) {</span>
+<span class="fc" id="L839">                        retVal = new AcceptSecContextToken(this,</span>
+<span class="fc" id="L840">                                          token.getKrbApReq()).encode();</span>
+                }
+<span class="fc" id="L842">                serviceTicket = token.getKrbApReq().getCreds().getTicket();</span>
+<span class="fc" id="L843">                myCred = null;</span>
+<span class="fc" id="L844">                state = STATE_DONE;</span>
+<span class="fc" id="L845">            } else  {</span>
+                // XXX Use logging API?
+<span class="nc bnc" id="L847" title="All 2 branches missed.">                if (DEBUG) {</span>
+<span class="nc" id="L848">                    System.out.println(state);</span>
+                }
+            }
+<span class="fc" id="L851">        } catch (KrbException e) {</span>
+<span class="fc" id="L852">            GSSException gssException =</span>
+<span class="fc" id="L853">                new GSSException(GSSException.FAILURE, -1, e.getMessage());</span>
+<span class="fc" id="L854">            gssException.initCause(e);</span>
+<span class="fc" id="L855">            throw gssException;</span>
+<span class="nc" id="L856">        } catch (IOException e) {</span>
+<span class="nc bnc" id="L857" title="All 2 branches missed.">            if (DEBUG) {</span>
+<span class="nc" id="L858">                e.printStackTrace();</span>
+            }
+<span class="nc" id="L860">            GSSException gssException =</span>
+<span class="nc" id="L861">                new GSSException(GSSException.FAILURE, -1, e.getMessage());</span>
+<span class="nc" id="L862">            gssException.initCause(e);</span>
+<span class="nc" id="L863">            throw gssException;</span>
+<span class="fc" id="L864">        }</span>
+
+<span class="fc" id="L866">        return retVal;</span>
+    }
+
+    /**
+     * Queries the context for largest data size to accommodate
+     * the specified protection and be &lt;= maxTokSize.
+     *
+     * @param qop the quality of protection that the context will be
+     *  asked to provide.
+     * @param confReq a flag indicating whether confidentiality will be
+     *  requested or not
+     * @param outputSize the maximum size of the output token
+     * @return the maximum size for the input message that can be
+     *  provided to the wrap() method in order to guarantee that these
+     *  requirements are met.
+     * @throws GSSException
+     */
+    public final int getWrapSizeLimit(int qop, boolean confReq,
+                                       int maxTokSize) throws GSSException {
+
+<span class="nc" id="L886">        int retVal = 0;</span>
+<span class="nc bnc" id="L887" title="All 2 branches missed.">        if (cipherHelper.getProto() == 0) {</span>
+<span class="nc" id="L888">            retVal = WrapToken.getSizeLimit(qop, confReq, maxTokSize,</span>
+<span class="nc" id="L889">                                        getCipherHelper(null));</span>
+<span class="nc bnc" id="L890" title="All 2 branches missed.">        } else if (cipherHelper.getProto() == 1) {</span>
+<span class="nc" id="L891">            retVal = WrapToken_v2.getSizeLimit(qop, confReq, maxTokSize,</span>
+<span class="nc" id="L892">                                        getCipherHelper(null));</span>
+        }
+<span class="nc" id="L894">        return retVal;</span>
+    }
+
+    /*
+     * Per-message calls depend on the sequence number. The sequence number
+     * synchronization is at a finer granularity because wrap and getMIC
+     * care about the local sequence number (mySeqNumber) where are unwrap
+     * and verifyMIC care about the remote sequence number (peerSeqNumber).
+     */
+
+    public final byte[] wrap(byte inBuf[], int offset, int len,
+                             MessageProp msgProp) throws GSSException {
+<span class="pc bpc" id="L906" title="1 of 2 branches missed.">        if (DEBUG) {</span>
+<span class="nc" id="L907">            System.out.println(&quot;Krb5Context.wrap: data=[&quot;</span>
+<span class="nc" id="L908">                               + getHexBytes(inBuf, offset, len)</span>
+                               + &quot;]&quot;);
+        }
+
+<span class="pc bpc" id="L912" title="1 of 2 branches missed.">        if (state != STATE_DONE)</span>
+<span class="nc" id="L913">        throw new GSSException(GSSException.NO_CONTEXT, -1,</span>
+                               &quot;Wrap called in invalid state!&quot;);
+
+<span class="fc" id="L916">        byte[] encToken = null;</span>
+        try {
+<span class="pc bpc" id="L918" title="1 of 2 branches missed.">            if (cipherHelper.getProto() == 0) {</span>
+<span class="nc" id="L919">                WrapToken token =</span>
+                        new WrapToken(this, msgProp, inBuf, offset, len);
+<span class="nc" id="L921">                encToken = token.encode();</span>
+<span class="pc bpc" id="L922" title="1 of 2 branches missed.">            } else if (cipherHelper.getProto() == 1) {</span>
+<span class="fc" id="L923">                WrapToken_v2 token =</span>
+                        new WrapToken_v2(this, msgProp, inBuf, offset, len);
+<span class="fc" id="L925">                encToken = token.encode();</span>
+            }
+<span class="pc bpc" id="L927" title="1 of 2 branches missed.">            if (DEBUG) {</span>
+<span class="nc" id="L928">                System.out.println(&quot;Krb5Context.wrap: token=[&quot;</span>
+<span class="nc" id="L929">                                   + getHexBytes(encToken, 0, encToken.length)</span>
+                                   + &quot;]&quot;);
+            }
+<span class="fc" id="L932">            return encToken;</span>
+<span class="nc" id="L933">        } catch (IOException e) {</span>
+<span class="nc" id="L934">            encToken = null;</span>
+<span class="nc" id="L935">            GSSException gssException =</span>
+<span class="nc" id="L936">                new GSSException(GSSException.FAILURE, -1, e.getMessage());</span>
+<span class="nc" id="L937">            gssException.initCause(e);</span>
+<span class="nc" id="L938">            throw gssException;</span>
+        }
+    }
+
+    public final int wrap(byte inBuf[], int inOffset, int len,
+                          byte[] outBuf, int outOffset,
+                          MessageProp msgProp) throws GSSException {
+
+<span class="nc bnc" id="L946" title="All 2 branches missed.">        if (state != STATE_DONE)</span>
+<span class="nc" id="L947">            throw new GSSException(GSSException.NO_CONTEXT, -1,</span>
+                                   &quot;Wrap called in invalid state!&quot;);
+
+<span class="nc" id="L950">        int retVal = 0;</span>
+        try {
+<span class="nc bnc" id="L952" title="All 2 branches missed.">            if (cipherHelper.getProto() == 0) {</span>
+<span class="nc" id="L953">                WrapToken token =</span>
+                        new WrapToken(this, msgProp, inBuf, inOffset, len);
+<span class="nc" id="L955">                retVal = token.encode(outBuf, outOffset);</span>
+<span class="nc bnc" id="L956" title="All 2 branches missed.">            } else if (cipherHelper.getProto() == 1) {</span>
+<span class="nc" id="L957">                WrapToken_v2 token =</span>
+                        new WrapToken_v2(this, msgProp, inBuf, inOffset, len);
+<span class="nc" id="L959">                retVal = token.encode(outBuf, outOffset);</span>
+            }
+<span class="nc bnc" id="L961" title="All 2 branches missed.">            if (DEBUG) {</span>
+<span class="nc" id="L962">                System.out.println(&quot;Krb5Context.wrap: token=[&quot;</span>
+<span class="nc" id="L963">                                   + getHexBytes(outBuf, outOffset, retVal)</span>
+                                   + &quot;]&quot;);
+            }
+<span class="nc" id="L966">            return retVal;</span>
+<span class="nc" id="L967">        } catch (IOException e) {</span>
+<span class="nc" id="L968">            retVal = 0;</span>
+<span class="nc" id="L969">            GSSException gssException =</span>
+<span class="nc" id="L970">                new GSSException(GSSException.FAILURE, -1, e.getMessage());</span>
+<span class="nc" id="L971">            gssException.initCause(e);</span>
+<span class="nc" id="L972">            throw gssException;</span>
+        }
+    }
+
+    public final void wrap(byte inBuf[], int offset, int len,
+                           OutputStream os, MessageProp msgProp)
+        throws GSSException {
+
+<span class="nc bnc" id="L980" title="All 2 branches missed.">        if (state != STATE_DONE)</span>
+<span class="nc" id="L981">                throw new GSSException(GSSException.NO_CONTEXT, -1,</span>
+                                       &quot;Wrap called in invalid state!&quot;);
+
+<span class="nc" id="L984">        byte[] encToken = null;</span>
+        try {
+<span class="nc bnc" id="L986" title="All 2 branches missed.">            if (cipherHelper.getProto() == 0) {</span>
+<span class="nc" id="L987">                WrapToken token =</span>
+                        new WrapToken(this, msgProp, inBuf, offset, len);
+<span class="nc" id="L989">                token.encode(os);</span>
+<span class="nc bnc" id="L990" title="All 2 branches missed.">                if (DEBUG) {</span>
+<span class="nc" id="L991">                    encToken = token.encode();</span>
+                }
+<span class="nc bnc" id="L993" title="All 2 branches missed.">            } else if (cipherHelper.getProto() == 1) {</span>
+<span class="nc" id="L994">                WrapToken_v2 token =</span>
+                        new WrapToken_v2(this, msgProp, inBuf, offset, len);
+<span class="nc" id="L996">                token.encode(os);</span>
+<span class="nc bnc" id="L997" title="All 2 branches missed.">                if (DEBUG) {</span>
+<span class="nc" id="L998">                    encToken = token.encode();</span>
+                }
+            }
+<span class="nc" id="L1001">        } catch (IOException e) {</span>
+<span class="nc" id="L1002">            GSSException gssException =</span>
+<span class="nc" id="L1003">                new GSSException(GSSException.FAILURE, -1, e.getMessage());</span>
+<span class="nc" id="L1004">            gssException.initCause(e);</span>
+<span class="nc" id="L1005">            throw gssException;</span>
+<span class="nc" id="L1006">        }</span>
+
+<span class="nc bnc" id="L1008" title="All 2 branches missed.">        if (DEBUG) {</span>
+<span class="nc" id="L1009">            System.out.println(&quot;Krb5Context.wrap: token=[&quot;</span>
+<span class="nc" id="L1010">                        + getHexBytes(encToken, 0, encToken.length)</span>
+                        + &quot;]&quot;);
+        }
+<span class="nc" id="L1013">    }</span>
+
+    public final void wrap(InputStream is, OutputStream os,
+                            MessageProp msgProp) throws GSSException {
+
+        byte[] data;
+        try {
+<span class="nc" id="L1020">            data = new byte[is.available()];</span>
+<span class="nc" id="L1021">            is.read(data);</span>
+<span class="nc" id="L1022">        } catch (IOException e) {</span>
+<span class="nc" id="L1023">            GSSException gssException =</span>
+<span class="nc" id="L1024">                new GSSException(GSSException.FAILURE, -1, e.getMessage());</span>
+<span class="nc" id="L1025">            gssException.initCause(e);</span>
+<span class="nc" id="L1026">            throw gssException;</span>
+<span class="nc" id="L1027">        }</span>
+<span class="nc" id="L1028">        wrap(data, 0, data.length, os, msgProp);</span>
+<span class="nc" id="L1029">    }</span>
+
+    public final byte[] unwrap(byte inBuf[], int offset, int len,
+                               MessageProp msgProp)
+        throws GSSException {
+
+<span class="pc bpc" id="L1035" title="1 of 2 branches missed.">            if (DEBUG) {</span>
+<span class="nc" id="L1036">                System.out.println(&quot;Krb5Context.unwrap: token=[&quot;</span>
+<span class="nc" id="L1037">                                   + getHexBytes(inBuf, offset, len)</span>
+                                   + &quot;]&quot;);
+            }
+
+<span class="pc bpc" id="L1041" title="1 of 2 branches missed.">            if (state != STATE_DONE) {</span>
+<span class="nc" id="L1042">                throw new GSSException(GSSException.NO_CONTEXT, -1,</span>
+                                       &quot; Unwrap called in invalid state!&quot;);
+            }
+
+<span class="fc" id="L1046">            byte[] data = null;</span>
+<span class="pc bpc" id="L1047" title="1 of 2 branches missed.">            if (cipherHelper.getProto() == 0) {</span>
+<span class="nc" id="L1048">                WrapToken token =</span>
+                        new WrapToken(this, inBuf, offset, len, msgProp);
+<span class="nc" id="L1050">                data = token.getData();</span>
+<span class="nc" id="L1051">                setSequencingAndReplayProps(token, msgProp);</span>
+<span class="pc bpc" id="L1052" title="1 of 2 branches missed.">            } else if (cipherHelper.getProto() == 1) {</span>
+<span class="fc" id="L1053">                WrapToken_v2 token =</span>
+                        new WrapToken_v2(this, inBuf, offset, len, msgProp);
+<span class="fc" id="L1055">                data = token.getData();</span>
+<span class="fc" id="L1056">                setSequencingAndReplayProps(token, msgProp);</span>
+            }
+
+<span class="pc bpc" id="L1059" title="1 of 2 branches missed.">            if (DEBUG) {</span>
+<span class="nc" id="L1060">                System.out.println(&quot;Krb5Context.unwrap: data=[&quot;</span>
+<span class="nc" id="L1061">                                   + getHexBytes(data, 0, data.length)</span>
+                                   + &quot;]&quot;);
+            }
+
+<span class="fc" id="L1065">            return data;</span>
+        }
+
+    public final int unwrap(byte inBuf[], int inOffset, int len,
+                             byte[] outBuf, int outOffset,
+                             MessageProp msgProp) throws GSSException {
+
+<span class="nc bnc" id="L1072" title="All 2 branches missed.">        if (state != STATE_DONE)</span>
+<span class="nc" id="L1073">            throw new GSSException(GSSException.NO_CONTEXT, -1,</span>
+                                   &quot;Unwrap called in invalid state!&quot;);
+
+<span class="nc bnc" id="L1076" title="All 2 branches missed.">        if (cipherHelper.getProto() == 0) {</span>
+<span class="nc" id="L1077">            WrapToken token =</span>
+                        new WrapToken(this, inBuf, inOffset, len, msgProp);
+<span class="nc" id="L1079">            len = token.getData(outBuf, outOffset);</span>
+<span class="nc" id="L1080">            setSequencingAndReplayProps(token, msgProp);</span>
+<span class="nc bnc" id="L1081" title="All 2 branches missed.">        } else if (cipherHelper.getProto() == 1) {</span>
+<span class="nc" id="L1082">            WrapToken_v2 token =</span>
+                        new WrapToken_v2(this, inBuf, inOffset, len, msgProp);
+<span class="nc" id="L1084">            len = token.getData(outBuf, outOffset);</span>
+<span class="nc" id="L1085">            setSequencingAndReplayProps(token, msgProp);</span>
+        }
+<span class="nc" id="L1087">        return len;</span>
+    }
+
+    public final int unwrap(InputStream is,
+                            byte[] outBuf, int outOffset,
+                            MessageProp msgProp) throws GSSException {
+
+<span class="nc bnc" id="L1094" title="All 2 branches missed.">        if (state != STATE_DONE)</span>
+<span class="nc" id="L1095">            throw new GSSException(GSSException.NO_CONTEXT, -1,</span>
+                                   &quot;Unwrap called in invalid state!&quot;);
+
+<span class="nc" id="L1098">        int len = 0;</span>
+<span class="nc bnc" id="L1099" title="All 2 branches missed.">        if (cipherHelper.getProto() == 0) {</span>
+<span class="nc" id="L1100">            WrapToken token = new WrapToken(this, is, msgProp);</span>
+<span class="nc" id="L1101">            len = token.getData(outBuf, outOffset);</span>
+<span class="nc" id="L1102">            setSequencingAndReplayProps(token, msgProp);</span>
+<span class="nc bnc" id="L1103" title="All 2 branches missed.">        } else if (cipherHelper.getProto() == 1) {</span>
+<span class="nc" id="L1104">            WrapToken_v2 token = new WrapToken_v2(this, is, msgProp);</span>
+<span class="nc" id="L1105">            len = token.getData(outBuf, outOffset);</span>
+<span class="nc" id="L1106">            setSequencingAndReplayProps(token, msgProp);</span>
+        }
+<span class="nc" id="L1108">        return len;</span>
+    }
+
+
+    public final void unwrap(InputStream is, OutputStream os,
+                             MessageProp msgProp) throws GSSException {
+
+<span class="nc bnc" id="L1115" title="All 2 branches missed.">        if (state != STATE_DONE)</span>
+<span class="nc" id="L1116">            throw new GSSException(GSSException.NO_CONTEXT, -1,</span>
+                                   &quot;Unwrap called in invalid state!&quot;);
+
+<span class="nc" id="L1119">        byte[] data = null;</span>
+<span class="nc bnc" id="L1120" title="All 2 branches missed.">        if (cipherHelper.getProto() == 0) {</span>
+<span class="nc" id="L1121">            WrapToken token = new WrapToken(this, is, msgProp);</span>
+<span class="nc" id="L1122">            data = token.getData();</span>
+<span class="nc" id="L1123">            setSequencingAndReplayProps(token, msgProp);</span>
+<span class="nc bnc" id="L1124" title="All 2 branches missed.">        } else if (cipherHelper.getProto() == 1) {</span>
+<span class="nc" id="L1125">            WrapToken_v2 token = new WrapToken_v2(this, is, msgProp);</span>
+<span class="nc" id="L1126">            data = token.getData();</span>
+<span class="nc" id="L1127">            setSequencingAndReplayProps(token, msgProp);</span>
+        }
+
+        try {
+<span class="nc" id="L1131">            os.write(data);</span>
+<span class="nc" id="L1132">        } catch (IOException e) {</span>
+<span class="nc" id="L1133">            GSSException gssException =</span>
+<span class="nc" id="L1134">                new GSSException(GSSException.FAILURE, -1, e.getMessage());</span>
+<span class="nc" id="L1135">            gssException.initCause(e);</span>
+<span class="nc" id="L1136">            throw gssException;</span>
+<span class="nc" id="L1137">        }</span>
+<span class="nc" id="L1138">    }</span>
+
+    public final byte[] getMIC(byte []inMsg, int offset, int len,
+                               MessageProp msgProp)
+        throws GSSException {
+
+<span class="fc" id="L1144">            byte[] micToken = null;</span>
+            try {
+<span class="pc bpc" id="L1146" title="1 of 2 branches missed.">                if (cipherHelper.getProto() == 0) {</span>
+<span class="nc" id="L1147">                    MicToken token =</span>
+                        new MicToken(this, msgProp, inMsg, offset, len);
+<span class="nc" id="L1149">                    micToken = token.encode();</span>
+<span class="pc bpc" id="L1150" title="1 of 2 branches missed.">                } else if (cipherHelper.getProto() == 1) {</span>
+<span class="fc" id="L1151">                    MicToken_v2 token =</span>
+                        new MicToken_v2(this, msgProp, inMsg, offset, len);
+<span class="fc" id="L1153">                    micToken = token.encode();</span>
+                }
+<span class="fc" id="L1155">                return micToken;</span>
+<span class="nc" id="L1156">            } catch (IOException e) {</span>
+<span class="nc" id="L1157">                micToken = null;</span>
+<span class="nc" id="L1158">                GSSException gssException =</span>
+<span class="nc" id="L1159">                    new GSSException(GSSException.FAILURE, -1, e.getMessage());</span>
+<span class="nc" id="L1160">                gssException.initCause(e);</span>
+<span class="nc" id="L1161">                throw gssException;</span>
+            }
+        }
+
+    private int getMIC(byte []inMsg, int offset, int len,
+                       byte[] outBuf, int outOffset,
+                       MessageProp msgProp)
+        throws GSSException {
+
+<span class="nc" id="L1170">        int retVal = 0;</span>
+        try {
+<span class="nc bnc" id="L1172" title="All 2 branches missed.">            if (cipherHelper.getProto() == 0) {</span>
+<span class="nc" id="L1173">                MicToken token =</span>
+                        new MicToken(this, msgProp, inMsg, offset, len);
+<span class="nc" id="L1175">                retVal = token.encode(outBuf, outOffset);</span>
+<span class="nc bnc" id="L1176" title="All 2 branches missed.">            } else if (cipherHelper.getProto() == 1) {</span>
+<span class="nc" id="L1177">                MicToken_v2 token =</span>
+                        new MicToken_v2(this, msgProp, inMsg, offset, len);
+<span class="nc" id="L1179">                retVal = token.encode(outBuf, outOffset);</span>
+            }
+<span class="nc" id="L1181">            return retVal;</span>
+<span class="nc" id="L1182">        } catch (IOException e) {</span>
+<span class="nc" id="L1183">            retVal = 0;</span>
+<span class="nc" id="L1184">            GSSException gssException =</span>
+<span class="nc" id="L1185">                new GSSException(GSSException.FAILURE, -1, e.getMessage());</span>
+<span class="nc" id="L1186">            gssException.initCause(e);</span>
+<span class="nc" id="L1187">            throw gssException;</span>
+        }
+    }
+
+    /*
+     * Checksum calculation requires a byte[]. Hence might as well pass
+     * a byte[] into the MicToken constructor. However, writing the
+     * token can be optimized for cases where the application passed in
+     * an OutputStream.
+     */
+
+    private void getMIC(byte[] inMsg, int offset, int len,
+                        OutputStream os, MessageProp msgProp)
+        throws GSSException {
+
+        try {
+<span class="nc bnc" id="L1203" title="All 2 branches missed.">            if (cipherHelper.getProto() == 0) {</span>
+<span class="nc" id="L1204">                MicToken token =</span>
+                        new MicToken(this, msgProp, inMsg, offset, len);
+<span class="nc" id="L1206">                token.encode(os);</span>
+<span class="nc bnc" id="L1207" title="All 2 branches missed.">            } else if (cipherHelper.getProto() == 1) {</span>
+<span class="nc" id="L1208">                MicToken_v2 token =</span>
+                        new MicToken_v2(this, msgProp, inMsg, offset, len);
+<span class="nc" id="L1210">                token.encode(os);</span>
+            }
+<span class="nc" id="L1212">        } catch (IOException e) {</span>
+<span class="nc" id="L1213">            GSSException gssException =</span>
+<span class="nc" id="L1214">                new GSSException(GSSException.FAILURE, -1, e.getMessage());</span>
+<span class="nc" id="L1215">            gssException.initCause(e);</span>
+<span class="nc" id="L1216">            throw gssException;</span>
+<span class="nc" id="L1217">        }</span>
+<span class="nc" id="L1218">    }</span>
+
+    public final void getMIC(InputStream is, OutputStream os,
+                              MessageProp msgProp) throws GSSException {
+        byte[] data;
+        try {
+<span class="nc" id="L1224">            data = new byte[is.available()];</span>
+<span class="nc" id="L1225">            is.read(data);</span>
+<span class="nc" id="L1226">        } catch (IOException e) {</span>
+<span class="nc" id="L1227">            GSSException gssException =</span>
+<span class="nc" id="L1228">                new GSSException(GSSException.FAILURE, -1, e.getMessage());</span>
+<span class="nc" id="L1229">            gssException.initCause(e);</span>
+<span class="nc" id="L1230">            throw gssException;</span>
+<span class="nc" id="L1231">        }</span>
+<span class="nc" id="L1232">        getMIC(data, 0, data.length, os, msgProp);</span>
+<span class="nc" id="L1233">    }</span>
+
+    public final void verifyMIC(byte []inTok, int tokOffset, int tokLen,
+                                byte[] inMsg, int msgOffset, int msgLen,
+                                MessageProp msgProp)
+        throws GSSException {
+
+<span class="pc bpc" id="L1240" title="1 of 2 branches missed.">        if (cipherHelper.getProto() == 0) {</span>
+<span class="nc" id="L1241">            MicToken token =</span>
+                new MicToken(this, inTok, tokOffset, tokLen, msgProp);
+<span class="nc" id="L1243">            token.verify(inMsg, msgOffset, msgLen);</span>
+<span class="nc" id="L1244">            setSequencingAndReplayProps(token, msgProp);</span>
+<span class="pc bpc" id="L1245" title="1 of 2 branches missed.">        } else if (cipherHelper.getProto() == 1) {</span>
+<span class="fc" id="L1246">            MicToken_v2 token =</span>
+                new MicToken_v2(this, inTok, tokOffset, tokLen, msgProp);
+<span class="fc" id="L1248">            token.verify(inMsg, msgOffset, msgLen);</span>
+<span class="fc" id="L1249">            setSequencingAndReplayProps(token, msgProp);</span>
+        }
+<span class="fc" id="L1251">    }</span>
+
+    private void verifyMIC(InputStream is,
+                           byte[] inMsg, int msgOffset, int msgLen,
+                           MessageProp msgProp)
+        throws GSSException {
+
+<span class="nc bnc" id="L1258" title="All 2 branches missed.">        if (cipherHelper.getProto() == 0) {</span>
+<span class="nc" id="L1259">            MicToken token = new MicToken(this, is, msgProp);</span>
+<span class="nc" id="L1260">            token.verify(inMsg, msgOffset, msgLen);</span>
+<span class="nc" id="L1261">            setSequencingAndReplayProps(token, msgProp);</span>
+<span class="nc bnc" id="L1262" title="All 2 branches missed.">        } else if (cipherHelper.getProto() == 1) {</span>
+<span class="nc" id="L1263">            MicToken_v2 token = new MicToken_v2(this, is, msgProp);</span>
+<span class="nc" id="L1264">            token.verify(inMsg, msgOffset, msgLen);</span>
+<span class="nc" id="L1265">            setSequencingAndReplayProps(token, msgProp);</span>
+        }
+<span class="nc" id="L1267">    }</span>
+
+    public final void verifyMIC(InputStream is, InputStream msgStr,
+                                 MessageProp mProp) throws GSSException {
+        byte[] msg;
+        try {
+<span class="nc" id="L1273">            msg = new byte[msgStr.available()];</span>
+<span class="nc" id="L1274">            msgStr.read(msg);</span>
+<span class="nc" id="L1275">        } catch (IOException e) {</span>
+<span class="nc" id="L1276">            GSSException gssException =</span>
+<span class="nc" id="L1277">                new GSSException(GSSException.FAILURE, -1, e.getMessage());</span>
+<span class="nc" id="L1278">            gssException.initCause(e);</span>
+<span class="nc" id="L1279">            throw gssException;</span>
+<span class="nc" id="L1280">        }</span>
+<span class="nc" id="L1281">        verifyMIC(is, msg, 0, msg.length, mProp);</span>
+<span class="nc" id="L1282">    }</span>
+
+    /**
+     * Produces a token representing this context. After this call
+     * the context will no longer be usable until an import is
+     * performed on the returned token.
+     *
+     * @param os the output token will be written to this stream
+     * @exception GSSException
+     */
+    public final byte [] export() throws GSSException {
+<span class="nc" id="L1293">        throw new GSSException(GSSException.UNAVAILABLE, -1,</span>
+                               &quot;GSS Export Context not available&quot;);
+    }
+
+    /**
+     * Releases context resources and terminates the
+     * context between 2 peer.
+     *
+     * @exception GSSException with major codes NO_CONTEXT, FAILURE.
+     */
+
+    public final void dispose() throws GSSException {
+<span class="nc" id="L1305">        state = STATE_DELETED;</span>
+<span class="nc" id="L1306">        delegatedCred = null;</span>
+<span class="nc" id="L1307">    }</span>
+
+    public final Provider getProvider() {
+<span class="fc" id="L1310">        return Krb5MechFactory.PROVIDER;</span>
+    }
+
+    /**
+     * Sets replay and sequencing information for a message token received
+     * form the peer.
+     */
+    private void setSequencingAndReplayProps(MessageToken token,
+                                             MessageProp prop) {
+<span class="nc bnc" id="L1319" title="All 4 branches missed.">        if (replayDetState || sequenceDetState) {</span>
+<span class="nc" id="L1320">            int seqNum = token.getSequenceNumber();</span>
+<span class="nc" id="L1321">            peerTokenTracker.getProps(seqNum, prop);</span>
+        }
+<span class="nc" id="L1323">    }</span>
+
+    /**
+     * Sets replay and sequencing information for a message token received
+     * form the peer.
+     */
+    private void setSequencingAndReplayProps(MessageToken_v2 token,
+                                             MessageProp prop) {
+<span class="pc bpc" id="L1331" title="3 of 4 branches missed.">        if (replayDetState || sequenceDetState) {</span>
+<span class="fc" id="L1332">            int seqNum = token.getSequenceNumber();</span>
+<span class="fc" id="L1333">            peerTokenTracker.getProps(seqNum, prop);</span>
+        }
+<span class="fc" id="L1335">    }</span>
+
+    private void checkPermission(String principal, String action) {
+<span class="fc" id="L1338">        SecurityManager sm = System.getSecurityManager();</span>
+<span class="fc bfc" id="L1339" title="All 2 branches covered.">        if (sm != null) {</span>
+<span class="fc" id="L1340">            ServicePermission perm =</span>
+                new ServicePermission(principal, action);
+<span class="fc" id="L1342">            sm.checkPermission(perm);</span>
+        }
+<span class="fc" id="L1344">    }</span>
+
+    private static String getHexBytes(byte[] bytes, int pos, int len) {
+
+<span class="nc" id="L1348">        StringBuffer sb = new StringBuffer();</span>
+<span class="nc bnc" id="L1349" title="All 2 branches missed.">        for (int i = 0; i &lt; len; i++) {</span>
+
+<span class="nc" id="L1351">            int b1 = (bytes[i]&gt;&gt;4) &amp; 0x0f;</span>
+<span class="nc" id="L1352">            int b2 = bytes[i] &amp; 0x0f;</span>
+
+<span class="nc" id="L1354">            sb.append(Integer.toHexString(b1));</span>
+<span class="nc" id="L1355">            sb.append(Integer.toHexString(b2));</span>
+<span class="nc" id="L1356">            sb.append(' ');</span>
+        }
+<span class="nc" id="L1358">        return sb.toString();</span>
+    }
+
+    private static String printState(int state) {
+<span class="nc bnc" id="L1362" title="All 5 branches missed.">        switch (state) {</span>
+          case STATE_NEW:
+<span class="nc" id="L1364">                return (&quot;STATE_NEW&quot;);</span>
+          case STATE_IN_PROCESS:
+<span class="nc" id="L1366">                return (&quot;STATE_IN_PROCESS&quot;);</span>
+          case STATE_DONE:
+<span class="nc" id="L1368">                return (&quot;STATE_DONE&quot;);</span>
+          case STATE_DELETED:
+<span class="nc" id="L1370">                return (&quot;STATE_DELETED&quot;);</span>
+          default:
+<span class="nc" id="L1372">                return (&quot;Unknown state &quot; + state);</span>
+        }
+    }
+
+    GSSCaller getCaller() {
+        // Currently used by InitialToken only
+<span class="nc" id="L1378">        return caller;</span>
+    }
+
+    /**
+     * The session key returned by inquireSecContext(KRB5_INQ_SSPI_SESSION_KEY)
+     */
+    static class KerberosSessionKey implements Key {
+        private static final long serialVersionUID = 699307378954123869L;
+
+        private final EncryptionKey key;
+
+<span class="nc" id="L1389">        KerberosSessionKey(EncryptionKey key) {</span>
+<span class="nc" id="L1390">            this.key = key;</span>
+<span class="nc" id="L1391">        }</span>
+
+        @Override
+        public String getAlgorithm() {
+<span class="nc" id="L1395">            return Integer.toString(key.getEType());</span>
+        }
+
+        @Override
+        public String getFormat() {
+<span class="nc" id="L1400">            return &quot;RAW&quot;;</span>
+        }
+
+        @Override
+        public byte[] getEncoded() {
+<span class="nc" id="L1405">            return key.getBytes().clone();</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1410">            return &quot;Kerberos session key: etype: &quot; + key.getEType() + &quot;\n&quot; +</span>
+<span class="nc" id="L1411">                    new sun.misc.HexDumpEncoder().encodeBuffer(key.getBytes());</span>
+        }
+    }
+
+    /**
+     * Return the mechanism-specific attribute associated with {@code type}.
+     */
+    public Object inquireSecContext(InquireType type)
+            throws GSSException {
+<span class="nc bnc" id="L1420" title="All 2 branches missed.">        if (!isEstablished()) {</span>
+<span class="nc" id="L1421">             throw new GSSException(GSSException.NO_CONTEXT, -1,</span>
+                     &quot;Security context not established.&quot;);
+        }
+<span class="nc bnc" id="L1424" title="All 5 branches missed.">        switch (type) {</span>
+            case KRB5_GET_SESSION_KEY:
+<span class="nc" id="L1426">                return new KerberosSessionKey(key);</span>
+            case KRB5_GET_TKT_FLAGS:
+<span class="nc" id="L1428">                return tktFlags.clone();</span>
+            case KRB5_GET_AUTHZ_DATA:
+<span class="nc bnc" id="L1430" title="All 2 branches missed.">                if (isInitiator()) {</span>
+<span class="nc" id="L1431">                    throw new GSSException(GSSException.UNAVAILABLE, -1,</span>
+                            &quot;AuthzData not available on initiator side.&quot;);
+                } else {
+<span class="nc bnc" id="L1434" title="All 2 branches missed.">                    return (authzData==null)?null:authzData.clone();</span>
+                }
+            case KRB5_GET_AUTHTIME:
+<span class="nc" id="L1437">                return authTime;</span>
+        }
+<span class="nc" id="L1439">        throw new GSSException(GSSException.UNAVAILABLE, -1,</span>
+                &quot;Inquire type not supported.&quot;);
+    }
+
+    // Helpers for inquireSecContext
+    private boolean[] tktFlags;
+    private String authTime;
+    private com.sun.security.jgss.AuthorizationDataEntry[] authzData;
+
+    public void setTktFlags(boolean[] tktFlags) {
+<span class="fc" id="L1449">        this.tktFlags = tktFlags;</span>
+<span class="fc" id="L1450">    }</span>
+
+    public void setAuthTime(String authTime) {
+<span class="fc" id="L1453">        this.authTime = authTime;</span>
+<span class="fc" id="L1454">    }</span>
+
+    public void setAuthzData(com.sun.security.jgss.AuthorizationDataEntry[] authzData) {
+<span class="fc" id="L1457">        this.authzData = authzData;</span>
+<span class="fc" id="L1458">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

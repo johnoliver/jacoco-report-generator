@@ -1,0 +1,545 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>MBeanServerFileAccessController.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">com.sun.jmx.remote.security</a> &gt; <span class="el_source">MBeanServerFileAccessController.java</span></div><h1>MBeanServerFileAccessController.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2003, 2008, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package com.sun.jmx.remote.security;
+
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.security.AccessControlContext;
+import java.security.AccessController;
+import java.security.Principal;
+import java.security.PrivilegedAction;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+import java.util.Set;
+import java.util.StringTokenizer;
+import java.util.regex.Pattern;
+import javax.management.MBeanServer;
+import javax.management.ObjectName;
+import javax.security.auth.Subject;
+
+/**
+ * &lt;p&gt;An object of this class implements the MBeanServerAccessController
+ * interface and, for each of its methods, calls an appropriate checking
+ * method and then forwards the request to a wrapped MBeanServer object.
+ * The checking method may throw a SecurityException if the operation is
+ * not allowed; in this case the request is not forwarded to the
+ * wrapped object.&lt;/p&gt;
+ *
+ * &lt;p&gt;This class implements the {@link #checkRead()}, {@link #checkWrite()},
+ * {@link #checkCreate(String)}, and {@link #checkUnregister(ObjectName)}
+ * methods based on an access level properties file containing username/access
+ * level pairs. The set of username/access level pairs is passed either as a
+ * filename which denotes a properties file on disk, or directly as an instance
+ * of the {@link Properties} class.  In both cases, the name of each property
+ * represents a username, and the value of the property is the associated access
+ * level.  Thus, any given username either does not exist in the properties or
+ * has exactly one access level. The same access level can be shared by several
+ * usernames.&lt;/p&gt;
+ *
+ * &lt;p&gt;The supported access level values are {@code readonly} and
+ * {@code readwrite}.  The {@code readwrite} access level can be
+ * qualified by one or more &lt;i&gt;clauses&lt;/i&gt;, where each clause looks
+ * like &lt;code&gt;create &lt;i&gt;classNamePattern&lt;/i&gt;&lt;/code&gt; or {@code
+ * unregister}.  For example:&lt;/p&gt;
+ *
+ * &lt;pre&gt;
+ * monitorRole  readonly
+ * controlRole  readwrite \
+ *              create javax.management.timer.*,javax.management.monitor.* \
+ *              unregister
+ * &lt;/pre&gt;
+ *
+ * &lt;p&gt;(The continuation lines with {@code \} come from the parser for
+ * Properties files.)&lt;/p&gt;
+ */
+public class MBeanServerFileAccessController
+    extends MBeanServerAccessController {
+
+    static final String READONLY = &quot;readonly&quot;;
+    static final String READWRITE = &quot;readwrite&quot;;
+
+    static final String CREATE = &quot;create&quot;;
+    static final String UNREGISTER = &quot;unregister&quot;;
+
+<span class="nc" id="L91">    private enum AccessType {READ, WRITE, CREATE, UNREGISTER};</span>
+
+    private static class Access {
+        final boolean write;
+        final String[] createPatterns;
+        private boolean unregister;
+
+<span class="nc" id="L98">        Access(boolean write, boolean unregister, List&lt;String&gt; createPatternList) {</span>
+<span class="nc" id="L99">            this.write = write;</span>
+<span class="nc bnc" id="L100" title="All 2 branches missed.">            int npats = (createPatternList == null) ? 0 : createPatternList.size();</span>
+<span class="nc bnc" id="L101" title="All 2 branches missed.">            if (npats == 0)</span>
+<span class="nc" id="L102">                this.createPatterns = NO_STRINGS;</span>
+            else
+<span class="nc" id="L104">                this.createPatterns = createPatternList.toArray(new String[npats]);</span>
+<span class="nc" id="L105">            this.unregister = unregister;</span>
+<span class="nc" id="L106">        }</span>
+
+<span class="nc" id="L108">        private final String[] NO_STRINGS = new String[0];</span>
+    }
+
+    /**
+     * &lt;p&gt;Create a new MBeanServerAccessController that forwards all the
+     * MBeanServer requests to the MBeanServer set by invoking the {@link
+     * #setMBeanServer} method after doing access checks based on read and
+     * write permissions.&lt;/p&gt;
+     *
+     * &lt;p&gt;This instance is initialized from the specified properties file.&lt;/p&gt;
+     *
+     * @param accessFileName name of the file which denotes a properties
+     * file on disk containing the username/access level entries.
+     *
+     * @exception IOException if the file does not exist, is a
+     * directory rather than a regular file, or for some other
+     * reason cannot be opened for reading.
+     *
+     * @exception IllegalArgumentException if any of the supplied access
+     * level values differs from &quot;readonly&quot; or &quot;readwrite&quot;.
+     */
+    public MBeanServerFileAccessController(String accessFileName)
+        throws IOException {
+<span class="nc" id="L131">        super();</span>
+<span class="nc" id="L132">        this.accessFileName = accessFileName;</span>
+<span class="nc" id="L133">        Properties props = propertiesFromFile(accessFileName);</span>
+<span class="nc" id="L134">        parseProperties(props);</span>
+<span class="nc" id="L135">    }</span>
+
+    /**
+     * &lt;p&gt;Create a new MBeanServerAccessController that forwards all the
+     * MBeanServer requests to &lt;code&gt;mbs&lt;/code&gt; after doing access checks
+     * based on read and write permissions.&lt;/p&gt;
+     *
+     * &lt;p&gt;This instance is initialized from the specified properties file.&lt;/p&gt;
+     *
+     * @param accessFileName name of the file which denotes a properties
+     * file on disk containing the username/access level entries.
+     *
+     * @param mbs the MBeanServer object to which requests will be forwarded.
+     *
+     * @exception IOException if the file does not exist, is a
+     * directory rather than a regular file, or for some other
+     * reason cannot be opened for reading.
+     *
+     * @exception IllegalArgumentException if any of the supplied access
+     * level values differs from &quot;readonly&quot; or &quot;readwrite&quot;.
+     */
+    public MBeanServerFileAccessController(String accessFileName,
+                                           MBeanServer mbs)
+        throws IOException {
+<span class="nc" id="L159">        this(accessFileName);</span>
+<span class="nc" id="L160">        setMBeanServer(mbs);</span>
+<span class="nc" id="L161">    }</span>
+
+    /**
+     * &lt;p&gt;Create a new MBeanServerAccessController that forwards all the
+     * MBeanServer requests to the MBeanServer set by invoking the {@link
+     * #setMBeanServer} method after doing access checks based on read and
+     * write permissions.&lt;/p&gt;
+     *
+     * &lt;p&gt;This instance is initialized from the specified properties
+     * instance.  This constructor makes a copy of the properties
+     * instance and it is the copy that is consulted to check the
+     * username and access level of an incoming connection. The
+     * original properties object can be modified without affecting
+     * the copy. If the {@link #refresh} method is then called, the
+     * &lt;code&gt;MBeanServerFileAccessController&lt;/code&gt; will make a new
+     * copy of the properties object at that time.&lt;/p&gt;
+     *
+     * @param accessFileProps properties list containing the username/access
+     * level entries.
+     *
+     * @exception IllegalArgumentException if &lt;code&gt;accessFileProps&lt;/code&gt; is
+     * &lt;code&gt;null&lt;/code&gt; or if any of the supplied access level values differs
+     * from &quot;readonly&quot; or &quot;readwrite&quot;.
+     */
+    public MBeanServerFileAccessController(Properties accessFileProps)
+        throws IOException {
+<span class="nc" id="L187">        super();</span>
+<span class="nc bnc" id="L188" title="All 2 branches missed.">        if (accessFileProps == null)</span>
+<span class="nc" id="L189">            throw new IllegalArgumentException(&quot;Null properties&quot;);</span>
+<span class="nc" id="L190">        originalProps = accessFileProps;</span>
+<span class="nc" id="L191">        parseProperties(accessFileProps);</span>
+<span class="nc" id="L192">    }</span>
+
+    /**
+     * &lt;p&gt;Create a new MBeanServerAccessController that forwards all the
+     * MBeanServer requests to the MBeanServer set by invoking the {@link
+     * #setMBeanServer} method after doing access checks based on read and
+     * write permissions.&lt;/p&gt;
+     *
+     * &lt;p&gt;This instance is initialized from the specified properties
+     * instance.  This constructor makes a copy of the properties
+     * instance and it is the copy that is consulted to check the
+     * username and access level of an incoming connection. The
+     * original properties object can be modified without affecting
+     * the copy. If the {@link #refresh} method is then called, the
+     * &lt;code&gt;MBeanServerFileAccessController&lt;/code&gt; will make a new
+     * copy of the properties object at that time.&lt;/p&gt;
+     *
+     * @param accessFileProps properties list containing the username/access
+     * level entries.
+     *
+     * @param mbs the MBeanServer object to which requests will be forwarded.
+     *
+     * @exception IllegalArgumentException if &lt;code&gt;accessFileProps&lt;/code&gt; is
+     * &lt;code&gt;null&lt;/code&gt; or if any of the supplied access level values differs
+     * from &quot;readonly&quot; or &quot;readwrite&quot;.
+     */
+    public MBeanServerFileAccessController(Properties accessFileProps,
+                                           MBeanServer mbs)
+        throws IOException {
+<span class="nc" id="L221">        this(accessFileProps);</span>
+<span class="nc" id="L222">        setMBeanServer(mbs);</span>
+<span class="nc" id="L223">    }</span>
+
+    /**
+     * Check if the caller can do read operations. This method does
+     * nothing if so, otherwise throws SecurityException.
+     */
+    @Override
+    public void checkRead() {
+<span class="nc" id="L231">        checkAccess(AccessType.READ, null);</span>
+<span class="nc" id="L232">    }</span>
+
+    /**
+     * Check if the caller can do write operations.  This method does
+     * nothing if so, otherwise throws SecurityException.
+     */
+    @Override
+    public void checkWrite() {
+<span class="nc" id="L240">        checkAccess(AccessType.WRITE, null);</span>
+<span class="nc" id="L241">    }</span>
+
+    /**
+     * Check if the caller can create MBeans or instances of the given class.
+     * This method does nothing if so, otherwise throws SecurityException.
+     */
+    @Override
+    public void checkCreate(String className) {
+<span class="nc" id="L249">        checkAccess(AccessType.CREATE, className);</span>
+<span class="nc" id="L250">    }</span>
+
+    /**
+     * Check if the caller can do unregister operations.  This method does
+     * nothing if so, otherwise throws SecurityException.
+     */
+    @Override
+    public void checkUnregister(ObjectName name) {
+<span class="nc" id="L258">        checkAccess(AccessType.UNREGISTER, null);</span>
+<span class="nc" id="L259">    }</span>
+
+    /**
+     * &lt;p&gt;Refresh the set of username/access level entries.&lt;/p&gt;
+     *
+     * &lt;p&gt;If this instance was created using the
+     * {@link #MBeanServerFileAccessController(String)} or
+     * {@link #MBeanServerFileAccessController(String,MBeanServer)}
+     * constructors to specify a file from which the entries are read,
+     * the file is re-read.&lt;/p&gt;
+     *
+     * &lt;p&gt;If this instance was created using the
+     * {@link #MBeanServerFileAccessController(Properties)} or
+     * {@link #MBeanServerFileAccessController(Properties,MBeanServer)}
+     * constructors then a new copy of the &lt;code&gt;Properties&lt;/code&gt; object
+     * is made.&lt;/p&gt;
+     *
+     * @exception IOException if the file does not exist, is a
+     * directory rather than a regular file, or for some other
+     * reason cannot be opened for reading.
+     *
+     * @exception IllegalArgumentException if any of the supplied access
+     * level values differs from &quot;readonly&quot; or &quot;readwrite&quot;.
+     */
+    public synchronized void refresh() throws IOException {
+        Properties props;
+<span class="nc bnc" id="L285" title="All 2 branches missed.">        if (accessFileName == null)</span>
+<span class="nc" id="L286">            props = (Properties) originalProps;</span>
+        else
+<span class="nc" id="L288">            props = propertiesFromFile(accessFileName);</span>
+<span class="nc" id="L289">        parseProperties(props);</span>
+<span class="nc" id="L290">    }</span>
+
+    private static Properties propertiesFromFile(String fname)
+        throws IOException {
+<span class="nc" id="L294">        FileInputStream fin = new FileInputStream(fname);</span>
+        try {
+<span class="nc" id="L296">            Properties p = new Properties();</span>
+<span class="nc" id="L297">            p.load(fin);</span>
+<span class="nc" id="L298">            return p;</span>
+        } finally {
+<span class="nc" id="L300">            fin.close();</span>
+        }
+    }
+
+    private synchronized void checkAccess(AccessType requiredAccess, String arg) {
+<span class="nc" id="L305">        final AccessControlContext acc = AccessController.getContext();</span>
+<span class="nc" id="L306">        final Subject s =</span>
+<span class="nc" id="L307">            AccessController.doPrivileged(new PrivilegedAction&lt;Subject&gt;() {</span>
+                    public Subject run() {
+<span class="nc" id="L309">                        return Subject.getSubject(acc);</span>
+                    }
+                });
+<span class="nc bnc" id="L312" title="All 2 branches missed.">        if (s == null) return; /* security has not been enabled */</span>
+<span class="nc" id="L313">        final Set principals = s.getPrincipals();</span>
+<span class="nc" id="L314">        String newPropertyValue = null;</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">        for (Iterator i = principals.iterator(); i.hasNext(); ) {</span>
+<span class="nc" id="L316">            final Principal p = (Principal) i.next();</span>
+<span class="nc" id="L317">            Access access = accessMap.get(p.getName());</span>
+<span class="nc bnc" id="L318" title="All 2 branches missed.">            if (access != null) {</span>
+                boolean ok;
+<span class="nc bnc" id="L320" title="All 5 branches missed.">                switch (requiredAccess) {</span>
+                    case READ:
+<span class="nc" id="L322">                        ok = true;  // all access entries imply read</span>
+<span class="nc" id="L323">                        break;</span>
+                    case WRITE:
+<span class="nc" id="L325">                        ok = access.write;</span>
+<span class="nc" id="L326">                        break;</span>
+                    case UNREGISTER:
+<span class="nc" id="L328">                        ok = access.unregister;</span>
+<span class="nc bnc" id="L329" title="All 4 branches missed.">                        if (!ok &amp;&amp; access.write)</span>
+<span class="nc" id="L330">                            newPropertyValue = &quot;unregister&quot;;</span>
+                        break;
+                    case CREATE:
+<span class="nc" id="L333">                        ok = checkCreateAccess(access, arg);</span>
+<span class="nc bnc" id="L334" title="All 4 branches missed.">                        if (!ok &amp;&amp; access.write)</span>
+<span class="nc" id="L335">                            newPropertyValue = &quot;create &quot; + arg;</span>
+                        break;
+                    default:
+<span class="nc" id="L338">                        throw new AssertionError();</span>
+                }
+<span class="nc bnc" id="L340" title="All 2 branches missed.">                if (ok)</span>
+<span class="nc" id="L341">                    return;</span>
+            }
+<span class="nc" id="L343">        }</span>
+<span class="nc" id="L344">        SecurityException se = new SecurityException(&quot;Access denied! Invalid &quot; +</span>
+                &quot;access level for requested MBeanServer operation.&quot;);
+        // Add some more information to help people with deployments that
+        // worked before we required explicit create clauses. We're not giving
+        // any information to the bad guys, other than that the access control
+        // is based on a file, which they could have worked out from the stack
+        // trace anyway.
+<span class="nc bnc" id="L351" title="All 2 branches missed.">        if (newPropertyValue != null) {</span>
+<span class="nc" id="L352">            SecurityException se2 = new SecurityException(&quot;Access property &quot; +</span>
+                    &quot;for this identity should be similar to: &quot; + READWRITE +
+                    &quot; &quot; + newPropertyValue);
+<span class="nc" id="L355">            se.initCause(se2);</span>
+        }
+<span class="nc" id="L357">        throw se;</span>
+    }
+
+    private static boolean checkCreateAccess(Access access, String className) {
+<span class="nc bnc" id="L361" title="All 2 branches missed.">        for (String classNamePattern : access.createPatterns) {</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">            if (classNameMatch(classNamePattern, className))</span>
+<span class="nc" id="L363">                return true;</span>
+        }
+<span class="nc" id="L365">        return false;</span>
+    }
+
+    private static boolean classNameMatch(String pattern, String className) {
+        // We studiously avoided regexes when parsing the properties file,
+        // because that is done whenever the VM is started with the
+        // appropriate -Dcom.sun.management options, even if nobody ever
+        // creates an MBean.  We don't want to incur the overhead of loading
+        // all the regex code whenever those options are specified, but if we
+        // get as far as here then the VM is already running and somebody is
+        // doing the very unusual operation of remotely creating an MBean.
+        // Because that operation is so unusual, we don't try to optimize
+        // by hand-matching or by caching compiled Pattern objects.
+<span class="nc" id="L378">        StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L379">        StringTokenizer stok = new StringTokenizer(pattern, &quot;*&quot;, true);</span>
+<span class="nc bnc" id="L380" title="All 2 branches missed.">        while (stok.hasMoreTokens()) {</span>
+<span class="nc" id="L381">            String tok = stok.nextToken();</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">            if (tok.equals(&quot;*&quot;))</span>
+<span class="nc" id="L383">                sb.append(&quot;[^.]*&quot;);</span>
+            else
+<span class="nc" id="L385">                sb.append(Pattern.quote(tok));</span>
+<span class="nc" id="L386">        }</span>
+<span class="nc" id="L387">        return className.matches(sb.toString());</span>
+    }
+
+    private void parseProperties(Properties props) {
+<span class="nc" id="L391">        this.accessMap = new HashMap&lt;String, Access&gt;();</span>
+<span class="nc bnc" id="L392" title="All 2 branches missed.">        for (Map.Entry&lt;Object, Object&gt; entry : props.entrySet()) {</span>
+<span class="nc" id="L393">            String identity = (String) entry.getKey();</span>
+<span class="nc" id="L394">            String accessString = (String) entry.getValue();</span>
+<span class="nc" id="L395">            Access access = Parser.parseAccess(identity, accessString);</span>
+<span class="nc" id="L396">            accessMap.put(identity, access);</span>
+<span class="nc" id="L397">        }</span>
+<span class="nc" id="L398">    }</span>
+
+<span class="nc bnc" id="L400" title="All 2 branches missed.">    private static class Parser {</span>
+        private final static int EOS = -1;  // pseudo-codepoint &quot;end of string&quot;
+        static {
+<span class="nc bnc" id="L403" title="All 4 branches missed.">            assert !Character.isWhitespace(EOS);</span>
+<span class="nc" id="L404">        }</span>
+
+        private final String identity;  // just for better error messages
+        private final String s;  // the string we're parsing
+        private final int len;   // s.length()
+        private int i;
+        private int c;
+        // At any point, either c is s.codePointAt(i), or i == len and
+        // c is EOS.  We use int rather than char because it is conceivable
+        // (if unlikely) that a classname in a create clause might contain
+        // &quot;supplementary characters&quot;, the ones that don't fit in the original
+        // 16 bits for Unicode.
+
+<span class="nc" id="L417">        private Parser(String identity, String s) {</span>
+<span class="nc" id="L418">            this.identity = identity;</span>
+<span class="nc" id="L419">            this.s = s;</span>
+<span class="nc" id="L420">            this.len = s.length();</span>
+<span class="nc" id="L421">            this.i = 0;</span>
+<span class="nc bnc" id="L422" title="All 2 branches missed.">            if (i &lt; len)</span>
+<span class="nc" id="L423">                this.c = s.codePointAt(i);</span>
+            else
+<span class="nc" id="L425">                this.c = EOS;</span>
+<span class="nc" id="L426">        }</span>
+
+        static Access parseAccess(String identity, String s) {
+<span class="nc" id="L429">            return new Parser(identity, s).parseAccess();</span>
+        }
+
+        private Access parseAccess() {
+<span class="nc" id="L433">            skipSpace();</span>
+<span class="nc" id="L434">            String type = parseWord();</span>
+            Access access;
+<span class="nc bnc" id="L436" title="All 2 branches missed.">            if (type.equals(READONLY))</span>
+<span class="nc" id="L437">                access = new Access(false, false, null);</span>
+<span class="nc bnc" id="L438" title="All 2 branches missed.">            else if (type.equals(READWRITE))</span>
+<span class="nc" id="L439">                access = parseReadWrite();</span>
+            else {
+<span class="nc" id="L441">                throw syntax(&quot;Expected &quot; + READONLY + &quot; or &quot; + READWRITE +</span>
+                        &quot;: &quot; + type);
+            }
+<span class="nc bnc" id="L444" title="All 2 branches missed.">            if (c != EOS)</span>
+<span class="nc" id="L445">                throw syntax(&quot;Extra text at end of line&quot;);</span>
+<span class="nc" id="L446">            return access;</span>
+        }
+
+        private Access parseReadWrite() {
+<span class="nc" id="L450">            List&lt;String&gt; createClasses = new ArrayList&lt;String&gt;();</span>
+<span class="nc" id="L451">            boolean unregister = false;</span>
+            while (true) {
+<span class="nc" id="L453">                skipSpace();</span>
+<span class="nc bnc" id="L454" title="All 2 branches missed.">                if (c == EOS)</span>
+<span class="nc" id="L455">                    break;</span>
+<span class="nc" id="L456">                String type = parseWord();</span>
+<span class="nc bnc" id="L457" title="All 2 branches missed.">                if (type.equals(UNREGISTER))</span>
+<span class="nc" id="L458">                    unregister = true;</span>
+<span class="nc bnc" id="L459" title="All 2 branches missed.">                else if (type.equals(CREATE))</span>
+<span class="nc" id="L460">                    parseCreate(createClasses);</span>
+                else
+<span class="nc" id="L462">                    throw syntax(&quot;Unrecognized keyword &quot; + type);</span>
+<span class="nc" id="L463">            }</span>
+<span class="nc" id="L464">            return new Access(true, unregister, createClasses);</span>
+        }
+
+        private void parseCreate(List&lt;String&gt; createClasses) {
+            while (true) {
+<span class="nc" id="L469">                skipSpace();</span>
+<span class="nc" id="L470">                createClasses.add(parseClassName());</span>
+<span class="nc" id="L471">                skipSpace();</span>
+<span class="nc bnc" id="L472" title="All 2 branches missed.">                if (c == ',')</span>
+<span class="nc" id="L473">                    next();</span>
+                else
+                    break;
+            }
+<span class="nc" id="L477">        }</span>
+
+        private String parseClassName() {
+            // We don't check that classname components begin with suitable
+            // characters (so we accept 1.2.3 for example).  This means that
+            // there are only two states, which we can call dotOK and !dotOK
+            // according as a dot (.) is legal or not.  Initially we're in
+            // !dotOK since a classname can't start with a dot; after a dot
+            // we're in !dotOK again; and after any other characters we're in
+            // dotOK.  The classname is only accepted if we end in dotOK,
+            // so we reject an empty name or a name that ends with a dot.
+<span class="nc" id="L488">            final int start = i;</span>
+<span class="nc" id="L489">            boolean dotOK = false;</span>
+            while (true) {
+<span class="nc bnc" id="L491" title="All 2 branches missed.">                if (c == '.') {</span>
+<span class="nc bnc" id="L492" title="All 2 branches missed.">                    if (!dotOK)</span>
+<span class="nc" id="L493">                        throw syntax(&quot;Bad . in class name&quot;);</span>
+<span class="nc" id="L494">                    dotOK = false;</span>
+<span class="nc bnc" id="L495" title="All 4 branches missed.">                } else if (c == '*' || Character.isJavaIdentifierPart(c))</span>
+<span class="nc" id="L496">                    dotOK = true;</span>
+                else
+                    break;
+<span class="nc" id="L499">                next();</span>
+            }
+<span class="nc" id="L501">            String className = s.substring(start, i);</span>
+<span class="nc bnc" id="L502" title="All 2 branches missed.">            if (!dotOK)</span>
+<span class="nc" id="L503">                throw syntax(&quot;Bad class name &quot; + className);</span>
+<span class="nc" id="L504">            return className;</span>
+        }
+
+        // Advance c and i to the next character, unless already at EOS.
+        private void next() {
+<span class="nc bnc" id="L509" title="All 2 branches missed.">            if (c != EOS) {</span>
+<span class="nc" id="L510">                i += Character.charCount(c);</span>
+<span class="nc bnc" id="L511" title="All 2 branches missed.">                if (i &lt; len)</span>
+<span class="nc" id="L512">                    c = s.codePointAt(i);</span>
+                else
+<span class="nc" id="L514">                    c = EOS;</span>
+            }
+<span class="nc" id="L516">        }</span>
+
+        private void skipSpace() {
+<span class="nc bnc" id="L519" title="All 2 branches missed.">            while (Character.isWhitespace(c))</span>
+<span class="nc" id="L520">                next();</span>
+<span class="nc" id="L521">        }</span>
+
+        private String parseWord() {
+<span class="nc" id="L524">            skipSpace();</span>
+<span class="nc bnc" id="L525" title="All 2 branches missed.">            if (c == EOS)</span>
+<span class="nc" id="L526">                throw syntax(&quot;Expected word at end of line&quot;);</span>
+<span class="nc" id="L527">            final int start = i;</span>
+<span class="nc bnc" id="L528" title="All 4 branches missed.">            while (c != EOS &amp;&amp; !Character.isWhitespace(c))</span>
+<span class="nc" id="L529">                next();</span>
+<span class="nc" id="L530">            String word = s.substring(start, i);</span>
+<span class="nc" id="L531">            skipSpace();</span>
+<span class="nc" id="L532">            return word;</span>
+        }
+
+        private IllegalArgumentException syntax(String msg) {
+<span class="nc" id="L536">            return new IllegalArgumentException(</span>
+                    msg + &quot; [&quot; + identity + &quot; &quot; + s + &quot;]&quot;);
+        }
+    }
+
+    private Map&lt;String, Access&gt; accessMap;
+    private Properties originalProps;
+    private String accessFileName;
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

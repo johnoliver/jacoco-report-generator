@@ -1,0 +1,819 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ZipFile.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">java.util.zip</a> &gt; <span class="el_source">ZipFile.java</span></div><h1>ZipFile.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1995, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package java.util.zip;
+
+import java.io.Closeable;
+import java.io.InputStream;
+import java.io.IOException;
+import java.io.EOFException;
+import java.io.File;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.Enumeration;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.Spliterator;
+import java.util.Spliterators;
+import java.util.WeakHashMap;
+import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
+
+import static java.util.zip.ZipConstants64.*;
+import static java.util.zip.ZipUtils.*;
+
+/**
+ * This class is used to read entries from a zip file.
+ *
+ * &lt;p&gt; Unless otherwise noted, passing a &lt;tt&gt;null&lt;/tt&gt; argument to a constructor
+ * or method in this class will cause a {@link NullPointerException} to be
+ * thrown.
+ *
+ * @author      David Connelly
+ */
+public
+class ZipFile implements ZipConstants, Closeable {
+    private long jzfile;           // address of jzfile data
+    private final String name;     // zip file name
+    private final int total;       // total number of entries
+    private final boolean locsig;  // if zip file starts with LOCSIG (usually true)
+<span class="fc" id="L66">    private volatile boolean closeRequested = false;</span>
+
+    private static final int STORED = ZipEntry.STORED;
+    private static final int DEFLATED = ZipEntry.DEFLATED;
+
+    /**
+     * Mode flag to open a zip file for reading.
+     */
+    public static final int OPEN_READ = 0x1;
+
+    /**
+     * Mode flag to open a zip file and mark it for deletion.  The file will be
+     * deleted some time between the moment that it is opened and the moment
+     * that it is closed, but its contents will remain accessible via the
+     * &lt;tt&gt;ZipFile&lt;/tt&gt; object until either the close method is invoked or the
+     * virtual machine exits.
+     */
+    public static final int OPEN_DELETE = 0x4;
+
+    static {
+        /* Zip library is loaded from System.initializeSystemClass */
+<span class="fc" id="L87">        initIDs();</span>
+    }
+
+    private static native void initIDs();
+
+    private static final boolean usemmap;
+
+    static {
+        // A system prpperty to disable mmap use to avoid vm crash when
+        // in-use zip file is accidently overwritten by others.
+<span class="fc" id="L97">        String prop = sun.misc.VM.getSavedProperty(&quot;sun.zip.disableMemoryMapping&quot;);</span>
+<span class="pc bpc" id="L98" title="1 of 2 branches missed.">        usemmap = (prop == null ||</span>
+<span class="pc bnc" id="L99" title="All 4 branches missed.">                   !(prop.length() == 0 || prop.equalsIgnoreCase(&quot;true&quot;)));</span>
+    }
+
+    /**
+     * Opens a zip file for reading.
+     *
+     * &lt;p&gt;First, if there is a security manager, its &lt;code&gt;checkRead&lt;/code&gt;
+     * method is called with the &lt;code&gt;name&lt;/code&gt; argument as its argument
+     * to ensure the read is allowed.
+     *
+     * &lt;p&gt;The UTF-8 {@link java.nio.charset.Charset charset} is used to
+     * decode the entry names and comments.
+     *
+     * @param name the name of the zip file
+     * @throws ZipException if a ZIP format error has occurred
+     * @throws IOException if an I/O error has occurred
+     * @throws SecurityException if a security manager exists and its
+     *         &lt;code&gt;checkRead&lt;/code&gt; method doesn't allow read access to the file.
+     *
+     * @see SecurityManager#checkRead(java.lang.String)
+     */
+    public ZipFile(String name) throws IOException {
+<span class="fc" id="L121">        this(new File(name), OPEN_READ);</span>
+<span class="fc" id="L122">    }</span>
+
+    /**
+     * Opens a new &lt;code&gt;ZipFile&lt;/code&gt; to read from the specified
+     * &lt;code&gt;File&lt;/code&gt; object in the specified mode.  The mode argument
+     * must be either &lt;tt&gt;OPEN_READ&lt;/tt&gt; or &lt;tt&gt;OPEN_READ | OPEN_DELETE&lt;/tt&gt;.
+     *
+     * &lt;p&gt;First, if there is a security manager, its &lt;code&gt;checkRead&lt;/code&gt;
+     * method is called with the &lt;code&gt;name&lt;/code&gt; argument as its argument to
+     * ensure the read is allowed.
+     *
+     * &lt;p&gt;The UTF-8 {@link java.nio.charset.Charset charset} is used to
+     * decode the entry names and comments
+     *
+     * @param file the ZIP file to be opened for reading
+     * @param mode the mode in which the file is to be opened
+     * @throws ZipException if a ZIP format error has occurred
+     * @throws IOException if an I/O error has occurred
+     * @throws SecurityException if a security manager exists and
+     *         its &lt;code&gt;checkRead&lt;/code&gt; method
+     *         doesn't allow read access to the file,
+     *         or its &lt;code&gt;checkDelete&lt;/code&gt; method doesn't allow deleting
+     *         the file when the &lt;tt&gt;OPEN_DELETE&lt;/tt&gt; flag is set.
+     * @throws IllegalArgumentException if the &lt;tt&gt;mode&lt;/tt&gt; argument is invalid
+     * @see SecurityManager#checkRead(java.lang.String)
+     * @since 1.3
+     */
+    public ZipFile(File file, int mode) throws IOException {
+<span class="fc" id="L150">        this(file, mode, StandardCharsets.UTF_8);</span>
+<span class="fc" id="L151">    }</span>
+
+    /**
+     * Opens a ZIP file for reading given the specified File object.
+     *
+     * &lt;p&gt;The UTF-8 {@link java.nio.charset.Charset charset} is used to
+     * decode the entry names and comments.
+     *
+     * @param file the ZIP file to be opened for reading
+     * @throws ZipException if a ZIP format error has occurred
+     * @throws IOException if an I/O error has occurred
+     */
+    public ZipFile(File file) throws ZipException, IOException {
+<span class="fc" id="L164">        this(file, OPEN_READ);</span>
+<span class="fc" id="L165">    }</span>
+
+    private ZipCoder zc;
+
+    /**
+     * Opens a new &lt;code&gt;ZipFile&lt;/code&gt; to read from the specified
+     * &lt;code&gt;File&lt;/code&gt; object in the specified mode.  The mode argument
+     * must be either &lt;tt&gt;OPEN_READ&lt;/tt&gt; or &lt;tt&gt;OPEN_READ | OPEN_DELETE&lt;/tt&gt;.
+     *
+     * &lt;p&gt;First, if there is a security manager, its &lt;code&gt;checkRead&lt;/code&gt;
+     * method is called with the &lt;code&gt;name&lt;/code&gt; argument as its argument to
+     * ensure the read is allowed.
+     *
+     * @param file the ZIP file to be opened for reading
+     * @param mode the mode in which the file is to be opened
+     * @param charset
+     *        the {@linkplain java.nio.charset.Charset charset} to
+     *        be used to decode the ZIP entry name and comment that are not
+     *        encoded by using UTF-8 encoding (indicated by entry's general
+     *        purpose flag).
+     *
+     * @throws ZipException if a ZIP format error has occurred
+     * @throws IOException if an I/O error has occurred
+     *
+     * @throws SecurityException
+     *         if a security manager exists and its &lt;code&gt;checkRead&lt;/code&gt;
+     *         method doesn't allow read access to the file,or its
+     *         &lt;code&gt;checkDelete&lt;/code&gt; method doesn't allow deleting the
+     *         file when the &lt;tt&gt;OPEN_DELETE&lt;/tt&gt; flag is set
+     *
+     * @throws IllegalArgumentException if the &lt;tt&gt;mode&lt;/tt&gt; argument is invalid
+     *
+     * @see SecurityManager#checkRead(java.lang.String)
+     *
+     * @since 1.7
+     */
+    public ZipFile(File file, int mode, Charset charset) throws IOException
+<span class="fc" id="L202">    {</span>
+<span class="pc bpc" id="L203" title="2 of 4 branches missed.">        if (((mode &amp; OPEN_READ) == 0) ||</span>
+            ((mode &amp; ~(OPEN_READ | OPEN_DELETE)) != 0)) {
+<span class="nc" id="L205">            throw new IllegalArgumentException(&quot;Illegal mode: 0x&quot;+</span>
+<span class="nc" id="L206">                                               Integer.toHexString(mode));</span>
+        }
+<span class="fc" id="L208">        String name = file.getPath();</span>
+<span class="fc" id="L209">        SecurityManager sm = System.getSecurityManager();</span>
+<span class="fc bfc" id="L210" title="All 2 branches covered.">        if (sm != null) {</span>
+<span class="fc" id="L211">            sm.checkRead(name);</span>
+<span class="fc bfc" id="L212" title="All 2 branches covered.">            if ((mode &amp; OPEN_DELETE) != 0) {</span>
+<span class="fc" id="L213">                sm.checkDelete(name);</span>
+            }
+        }
+<span class="pc bpc" id="L216" title="1 of 2 branches missed.">        if (charset == null)</span>
+<span class="nc" id="L217">            throw new NullPointerException(&quot;charset is null&quot;);</span>
+<span class="fc" id="L218">        this.zc = ZipCoder.get(charset);</span>
+<span class="fc" id="L219">        long t0 = System.nanoTime();</span>
+<span class="fc" id="L220">        jzfile = open(name, mode, file.lastModified(), usemmap);</span>
+<span class="fc" id="L221">        sun.misc.PerfCounter.getZipFileOpenTime().addElapsedTimeFrom(t0);</span>
+<span class="fc" id="L222">        sun.misc.PerfCounter.getZipFileCount().increment();</span>
+<span class="fc" id="L223">        this.name = name;</span>
+<span class="fc" id="L224">        this.total = getTotal(jzfile);</span>
+<span class="fc" id="L225">        this.locsig = startsWithLOC(jzfile);</span>
+<span class="fc" id="L226">    }</span>
+
+    /**
+     * Opens a zip file for reading.
+     *
+     * &lt;p&gt;First, if there is a security manager, its &lt;code&gt;checkRead&lt;/code&gt;
+     * method is called with the &lt;code&gt;name&lt;/code&gt; argument as its argument
+     * to ensure the read is allowed.
+     *
+     * @param name the name of the zip file
+     * @param charset
+     *        the {@linkplain java.nio.charset.Charset charset} to
+     *        be used to decode the ZIP entry name and comment that are not
+     *        encoded by using UTF-8 encoding (indicated by entry's general
+     *        purpose flag).
+     *
+     * @throws ZipException if a ZIP format error has occurred
+     * @throws IOException if an I/O error has occurred
+     * @throws SecurityException
+     *         if a security manager exists and its &lt;code&gt;checkRead&lt;/code&gt;
+     *         method doesn't allow read access to the file
+     *
+     * @see SecurityManager#checkRead(java.lang.String)
+     *
+     * @since 1.7
+     */
+    public ZipFile(String name, Charset charset) throws IOException
+    {
+<span class="nc" id="L254">        this(new File(name), OPEN_READ, charset);</span>
+<span class="nc" id="L255">    }</span>
+
+    /**
+     * Opens a ZIP file for reading given the specified File object.
+     * @param file the ZIP file to be opened for reading
+     * @param charset
+     *        The {@linkplain java.nio.charset.Charset charset} to be
+     *        used to decode the ZIP entry name and comment (ignored if
+     *        the &lt;a href=&quot;package-summary.html#lang_encoding&quot;&gt; language
+     *        encoding bit&lt;/a&gt; of the ZIP entry's general purpose bit
+     *        flag is set).
+     *
+     * @throws ZipException if a ZIP format error has occurred
+     * @throws IOException if an I/O error has occurred
+     *
+     * @since 1.7
+     */
+    public ZipFile(File file, Charset charset) throws IOException
+    {
+<span class="nc" id="L274">        this(file, OPEN_READ, charset);</span>
+<span class="nc" id="L275">    }</span>
+
+    /**
+     * Returns the zip file comment, or null if none.
+     *
+     * @return the comment string for the zip file, or null if none
+     *
+     * @throws IllegalStateException if the zip file has been closed
+     *
+     * Since 1.7
+     */
+    public String getComment() {
+<span class="nc" id="L287">        synchronized (this) {</span>
+<span class="nc" id="L288">            ensureOpen();</span>
+<span class="nc" id="L289">            byte[] bcomm = getCommentBytes(jzfile);</span>
+<span class="nc bnc" id="L290" title="All 2 branches missed.">            if (bcomm == null)</span>
+<span class="nc" id="L291">                return null;</span>
+<span class="nc" id="L292">            return zc.toString(bcomm, bcomm.length);</span>
+<span class="nc" id="L293">        }</span>
+    }
+
+    /**
+     * Returns the zip file entry for the specified name, or null
+     * if not found.
+     *
+     * @param name the name of the entry
+     * @return the zip file entry, or null if not found
+     * @throws IllegalStateException if the zip file has been closed
+     */
+    public ZipEntry getEntry(String name) {
+<span class="pc bpc" id="L305" title="1 of 2 branches missed.">        if (name == null) {</span>
+<span class="nc" id="L306">            throw new NullPointerException(&quot;name&quot;);</span>
+        }
+<span class="fc" id="L308">        long jzentry = 0;</span>
+<span class="fc" id="L309">        synchronized (this) {</span>
+<span class="fc" id="L310">            ensureOpen();</span>
+<span class="fc" id="L311">            jzentry = getEntry(jzfile, zc.getBytes(name), true);</span>
+<span class="fc bfc" id="L312" title="All 2 branches covered.">            if (jzentry != 0) {</span>
+<span class="fc" id="L313">                ZipEntry ze = getZipEntry(name, jzentry);</span>
+<span class="fc" id="L314">                freeEntry(jzfile, jzentry);</span>
+<span class="fc" id="L315">                return ze;</span>
+            }
+<span class="fc" id="L317">        }</span>
+<span class="fc" id="L318">        return null;</span>
+    }
+
+    private static native long getEntry(long jzfile, byte[] name,
+                                        boolean addSlash);
+
+    // freeEntry releases the C jzentry struct.
+    private static native void freeEntry(long jzfile, long jzentry);
+
+    // the outstanding inputstreams that need to be closed,
+    // mapped to the inflater objects they use.
+<span class="fc" id="L329">    private final Map&lt;InputStream, Inflater&gt; streams = new WeakHashMap&lt;&gt;();</span>
+
+    /**
+     * Returns an input stream for reading the contents of the specified
+     * zip file entry.
+     *
+     * &lt;p&gt; Closing this ZIP file will, in turn, close all input
+     * streams that have been returned by invocations of this method.
+     *
+     * @param entry the zip file entry
+     * @return the input stream for reading the contents of the specified
+     * zip file entry.
+     * @throws ZipException if a ZIP format error has occurred
+     * @throws IOException if an I/O error has occurred
+     * @throws IllegalStateException if the zip file has been closed
+     */
+    public InputStream getInputStream(ZipEntry entry) throws IOException {
+<span class="pc bpc" id="L346" title="1 of 2 branches missed.">        if (entry == null) {</span>
+<span class="nc" id="L347">            throw new NullPointerException(&quot;entry&quot;);</span>
+        }
+<span class="fc" id="L349">        long jzentry = 0;</span>
+<span class="fc" id="L350">        ZipFileInputStream in = null;</span>
+<span class="fc" id="L351">        synchronized (this) {</span>
+<span class="fc" id="L352">            ensureOpen();</span>
+<span class="pc bpc" id="L353" title="3 of 4 branches missed.">            if (!zc.isUTF8() &amp;&amp; (entry.flag &amp; EFS) != 0) {</span>
+<span class="nc" id="L354">                jzentry = getEntry(jzfile, zc.getBytesUTF8(entry.name), false);</span>
+            } else {
+<span class="fc" id="L356">                jzentry = getEntry(jzfile, zc.getBytes(entry.name), false);</span>
+            }
+<span class="pc bpc" id="L358" title="1 of 2 branches missed.">            if (jzentry == 0) {</span>
+<span class="nc" id="L359">                return null;</span>
+            }
+<span class="fc" id="L361">            in = new ZipFileInputStream(jzentry);</span>
+
+<span class="pc bpc" id="L363" title="1 of 3 branches missed.">            switch (getEntryMethod(jzentry)) {</span>
+            case STORED:
+<span class="fc" id="L365">                synchronized (streams) {</span>
+<span class="fc" id="L366">                    streams.put(in, null);</span>
+<span class="pc" id="L367">                }</span>
+<span class="fc" id="L368">                return in;</span>
+            case DEFLATED:
+                // MORE: Compute good size for inflater stream:
+<span class="fc" id="L371">                long size = getEntrySize(jzentry) + 2; // Inflater likes a bit of slack</span>
+<span class="fc bfc" id="L372" title="All 2 branches covered.">                if (size &gt; 65536) size = 8192;</span>
+<span class="pc bpc" id="L373" title="1 of 2 branches missed.">                if (size &lt;= 0) size = 4096;</span>
+<span class="fc" id="L374">                Inflater inf = getInflater();</span>
+<span class="fc" id="L375">                InputStream is =</span>
+                    new ZipFileInflaterInputStream(in, inf, (int)size);
+<span class="fc" id="L377">                synchronized (streams) {</span>
+<span class="fc" id="L378">                    streams.put(is, inf);</span>
+<span class="pc" id="L379">                }</span>
+<span class="fc" id="L380">                return is;</span>
+            default:
+<span class="nc" id="L382">                throw new ZipException(&quot;invalid compression method&quot;);</span>
+            }
+<span class="nc" id="L384">        }</span>
+    }
+
+    private class ZipFileInflaterInputStream extends InflaterInputStream {
+<span class="fc" id="L388">        private volatile boolean closeRequested = false;</span>
+<span class="fc" id="L389">        private boolean eof = false;</span>
+        private final ZipFileInputStream zfin;
+
+        ZipFileInflaterInputStream(ZipFileInputStream zfin, Inflater inf,
+<span class="fc" id="L393">                int size) {</span>
+<span class="fc" id="L394">            super(zfin, inf, size);</span>
+<span class="fc" id="L395">            this.zfin = zfin;</span>
+<span class="fc" id="L396">        }</span>
+
+        public void close() throws IOException {
+<span class="fc bfc" id="L399" title="All 2 branches covered.">            if (closeRequested)</span>
+<span class="fc" id="L400">                return;</span>
+<span class="fc" id="L401">            closeRequested = true;</span>
+
+<span class="fc" id="L403">            super.close();</span>
+            Inflater inf;
+<span class="fc" id="L405">            synchronized (streams) {</span>
+<span class="fc" id="L406">                inf = streams.remove(this);</span>
+<span class="pc" id="L407">            }</span>
+<span class="fc bfc" id="L408" title="All 2 branches covered.">            if (inf != null) {</span>
+<span class="fc" id="L409">                releaseInflater(inf);</span>
+            }
+<span class="fc" id="L411">        }</span>
+
+        // Override fill() method to provide an extra &quot;dummy&quot; byte
+        // at the end of the input stream. This is required when
+        // using the &quot;nowrap&quot; Inflater option.
+        protected void fill() throws IOException {
+<span class="pc bpc" id="L417" title="1 of 2 branches missed.">            if (eof) {</span>
+<span class="nc" id="L418">                throw new EOFException(&quot;Unexpected end of ZLIB input stream&quot;);</span>
+            }
+<span class="fc" id="L420">            len = in.read(buf, 0, buf.length);</span>
+<span class="pc bpc" id="L421" title="1 of 2 branches missed.">            if (len == -1) {</span>
+<span class="nc" id="L422">                buf[0] = 0;</span>
+<span class="nc" id="L423">                len = 1;</span>
+<span class="nc" id="L424">                eof = true;</span>
+            }
+<span class="fc" id="L426">            inf.setInput(buf, 0, len);</span>
+<span class="fc" id="L427">        }</span>
+
+        public int available() throws IOException {
+<span class="pc bpc" id="L430" title="1 of 2 branches missed.">            if (closeRequested)</span>
+<span class="nc" id="L431">                return 0;</span>
+<span class="fc" id="L432">            long avail = zfin.size() - inf.getBytesWritten();</span>
+<span class="pc bpc" id="L433" title="1 of 2 branches missed.">            return (avail &gt; (long) Integer.MAX_VALUE ?</span>
+                    Integer.MAX_VALUE : (int) avail);
+        }
+
+        protected void finalize() throws Throwable {
+<span class="fc" id="L438">            close();</span>
+<span class="fc" id="L439">        }</span>
+    }
+
+    /*
+     * Gets an inflater from the list of available inflaters or allocates
+     * a new one.
+     */
+    private Inflater getInflater() {
+        Inflater inf;
+<span class="fc" id="L448">        synchronized (inflaterCache) {</span>
+<span class="fc bfc" id="L449" title="All 2 branches covered.">            while (null != (inf = inflaterCache.poll())) {</span>
+<span class="pc bpc" id="L450" title="1 of 2 branches missed.">                if (false == inf.ended()) {</span>
+<span class="fc" id="L451">                    return inf;</span>
+                }
+            }
+<span class="pc" id="L454">        }</span>
+<span class="fc" id="L455">        return new Inflater(true);</span>
+    }
+
+    /*
+     * Releases the specified inflater to the list of available inflaters.
+     */
+    private void releaseInflater(Inflater inf) {
+<span class="pc bpc" id="L462" title="1 of 2 branches missed.">        if (false == inf.ended()) {</span>
+<span class="fc" id="L463">            inf.reset();</span>
+<span class="fc" id="L464">            synchronized (inflaterCache) {</span>
+<span class="fc" id="L465">                inflaterCache.add(inf);</span>
+<span class="pc" id="L466">            }</span>
+        }
+<span class="fc" id="L468">    }</span>
+
+    // List of available Inflater objects for decompression
+<span class="fc" id="L471">    private Deque&lt;Inflater&gt; inflaterCache = new ArrayDeque&lt;&gt;();</span>
+
+    /**
+     * Returns the path name of the ZIP file.
+     * @return the path name of the ZIP file
+     */
+    public String getName() {
+<span class="fc" id="L478">        return name;</span>
+    }
+
+    private class ZipEntryIterator implements Enumeration&lt;ZipEntry&gt;, Iterator&lt;ZipEntry&gt; {
+<span class="fc" id="L482">        private int i = 0;</span>
+
+<span class="fc" id="L484">        public ZipEntryIterator() {</span>
+<span class="fc" id="L485">            ensureOpen();</span>
+<span class="fc" id="L486">        }</span>
+
+        public boolean hasMoreElements() {
+<span class="fc" id="L489">            return hasNext();</span>
+        }
+
+        public boolean hasNext() {
+<span class="fc" id="L493">            synchronized (ZipFile.this) {</span>
+<span class="fc" id="L494">                ensureOpen();</span>
+<span class="fc bfc" id="L495" title="All 2 branches covered.">                return i &lt; total;</span>
+<span class="nc" id="L496">            }</span>
+        }
+
+        public ZipEntry nextElement() {
+<span class="fc" id="L500">            return next();</span>
+        }
+
+        public ZipEntry next() {
+<span class="fc" id="L504">            synchronized (ZipFile.this) {</span>
+<span class="fc" id="L505">                ensureOpen();</span>
+<span class="pc bpc" id="L506" title="1 of 2 branches missed.">                if (i &gt;= total) {</span>
+<span class="nc" id="L507">                    throw new NoSuchElementException();</span>
+                }
+<span class="fc" id="L509">                long jzentry = getNextEntry(jzfile, i++);</span>
+<span class="pc bpc" id="L510" title="1 of 2 branches missed.">                if (jzentry == 0) {</span>
+                    String message;
+<span class="nc bnc" id="L512" title="All 2 branches missed.">                    if (closeRequested) {</span>
+<span class="nc" id="L513">                        message = &quot;ZipFile concurrently closed&quot;;</span>
+                    } else {
+<span class="nc" id="L515">                        message = getZipMessage(ZipFile.this.jzfile);</span>
+                    }
+<span class="nc" id="L517">                    throw new ZipError(&quot;jzentry == 0&quot; +</span>
+<span class="nc" id="L518">                                       &quot;,\n jzfile = &quot; + ZipFile.this.jzfile +</span>
+<span class="nc" id="L519">                                       &quot;,\n total = &quot; + ZipFile.this.total +</span>
+<span class="nc" id="L520">                                       &quot;,\n name = &quot; + ZipFile.this.name +</span>
+                                       &quot;,\n i = &quot; + i +
+                                       &quot;,\n message = &quot; + message
+                        );
+                }
+<span class="fc" id="L525">                ZipEntry ze = getZipEntry(null, jzentry);</span>
+<span class="fc" id="L526">                freeEntry(jzfile, jzentry);</span>
+<span class="fc" id="L527">                return ze;</span>
+<span class="nc" id="L528">            }</span>
+        }
+    }
+
+    /**
+     * Returns an enumeration of the ZIP file entries.
+     * @return an enumeration of the ZIP file entries
+     * @throws IllegalStateException if the zip file has been closed
+     */
+    public Enumeration&lt;? extends ZipEntry&gt; entries() {
+<span class="fc" id="L538">        return new ZipEntryIterator();</span>
+    }
+
+    /**
+     * Return an ordered {@code Stream} over the ZIP file entries.
+     * Entries appear in the {@code Stream} in the order they appear in
+     * the central directory of the ZIP file.
+     *
+     * @return an ordered {@code Stream} of entries in this ZIP file
+     * @throws IllegalStateException if the zip file has been closed
+     * @since 1.8
+     */
+    public Stream&lt;? extends ZipEntry&gt; stream() {
+<span class="nc" id="L551">        return StreamSupport.stream(Spliterators.spliterator(</span>
+<span class="nc" id="L552">                new ZipEntryIterator(), size(),</span>
+                Spliterator.ORDERED | Spliterator.DISTINCT |
+                        Spliterator.IMMUTABLE | Spliterator.NONNULL), false);
+    }
+
+    private ZipEntry getZipEntry(String name, long jzentry) {
+<span class="fc" id="L558">        ZipEntry e = new ZipEntry();</span>
+<span class="fc" id="L559">        e.flag = getEntryFlag(jzentry);  // get the flag first</span>
+<span class="fc bfc" id="L560" title="All 2 branches covered.">        if (name != null) {</span>
+<span class="fc" id="L561">            e.name = name;</span>
+        } else {
+<span class="fc" id="L563">            byte[] bname = getEntryBytes(jzentry, JZENTRY_NAME);</span>
+<span class="pc bpc" id="L564" title="3 of 4 branches missed.">            if (!zc.isUTF8() &amp;&amp; (e.flag &amp; EFS) != 0) {</span>
+<span class="nc" id="L565">                e.name = zc.toStringUTF8(bname, bname.length);</span>
+            } else {
+<span class="fc" id="L567">                e.name = zc.toString(bname, bname.length);</span>
+            }
+        }
+<span class="fc" id="L570">        e.time = dosToJavaTime(getEntryTime(jzentry));</span>
+<span class="fc" id="L571">        e.crc = getEntryCrc(jzentry);</span>
+<span class="fc" id="L572">        e.size = getEntrySize(jzentry);</span>
+<span class="fc" id="L573">        e.csize = getEntryCSize(jzentry);</span>
+<span class="fc" id="L574">        e.method = getEntryMethod(jzentry);</span>
+<span class="fc" id="L575">        e.setExtra0(getEntryBytes(jzentry, JZENTRY_EXTRA), false);</span>
+<span class="fc" id="L576">        byte[] bcomm = getEntryBytes(jzentry, JZENTRY_COMMENT);</span>
+<span class="fc bfc" id="L577" title="All 2 branches covered.">        if (bcomm == null) {</span>
+<span class="fc" id="L578">            e.comment = null;</span>
+        } else {
+<span class="pc bpc" id="L580" title="3 of 4 branches missed.">            if (!zc.isUTF8() &amp;&amp; (e.flag &amp; EFS) != 0) {</span>
+<span class="nc" id="L581">                e.comment = zc.toStringUTF8(bcomm, bcomm.length);</span>
+            } else {
+<span class="fc" id="L583">                e.comment = zc.toString(bcomm, bcomm.length);</span>
+            }
+        }
+<span class="fc" id="L586">        return e;</span>
+    }
+
+    private static native long getNextEntry(long jzfile, int i);
+
+    /**
+     * Returns the number of entries in the ZIP file.
+     * @return the number of entries in the ZIP file
+     * @throws IllegalStateException if the zip file has been closed
+     */
+    public int size() {
+<span class="fc" id="L597">        ensureOpen();</span>
+<span class="fc" id="L598">        return total;</span>
+    }
+
+    /**
+     * Closes the ZIP file.
+     * &lt;p&gt; Closing this ZIP file will close all of the input streams
+     * previously returned by invocations of the {@link #getInputStream
+     * getInputStream} method.
+     *
+     * @throws IOException if an I/O error has occurred
+     */
+    public void close() throws IOException {
+<span class="fc bfc" id="L610" title="All 2 branches covered.">        if (closeRequested)</span>
+<span class="fc" id="L611">            return;</span>
+<span class="fc" id="L612">        closeRequested = true;</span>
+
+<span class="fc" id="L614">        synchronized (this) {</span>
+            // Close streams, release their inflaters
+<span class="fc" id="L616">            synchronized (streams) {</span>
+<span class="fc bfc" id="L617" title="All 2 branches covered.">                if (false == streams.isEmpty()) {</span>
+<span class="fc" id="L618">                    Map&lt;InputStream, Inflater&gt; copy = new HashMap&lt;&gt;(streams);</span>
+<span class="fc" id="L619">                    streams.clear();</span>
+<span class="fc bfc" id="L620" title="All 2 branches covered.">                    for (Map.Entry&lt;InputStream, Inflater&gt; e : copy.entrySet()) {</span>
+<span class="fc" id="L621">                        e.getKey().close();</span>
+<span class="fc" id="L622">                        Inflater inf = e.getValue();</span>
+<span class="fc bfc" id="L623" title="All 2 branches covered.">                        if (inf != null) {</span>
+<span class="fc" id="L624">                            inf.end();</span>
+                        }
+<span class="fc" id="L626">                    }</span>
+                }
+<span class="pc" id="L628">            }</span>
+
+            // Release cached inflaters
+            Inflater inf;
+<span class="fc" id="L632">            synchronized (inflaterCache) {</span>
+<span class="fc bfc" id="L633" title="All 2 branches covered.">                while (null != (inf = inflaterCache.poll())) {</span>
+<span class="fc" id="L634">                    inf.end();</span>
+                }
+<span class="pc" id="L636">            }</span>
+
+<span class="fc bfc" id="L638" title="All 2 branches covered.">            if (jzfile != 0) {</span>
+                // Close the zip file
+<span class="fc" id="L640">                long zf = this.jzfile;</span>
+<span class="fc" id="L641">                jzfile = 0;</span>
+
+<span class="fc" id="L643">                close(zf);</span>
+            }
+<span class="pc" id="L645">        }</span>
+<span class="fc" id="L646">    }</span>
+
+    /**
+     * Ensures that the system resources held by this ZipFile object are
+     * released when there are no more references to it.
+     *
+     * &lt;p&gt;
+     * Since the time when GC would invoke this method is undetermined,
+     * it is strongly recommended that applications invoke the &lt;code&gt;close&lt;/code&gt;
+     * method as soon they have finished accessing this &lt;code&gt;ZipFile&lt;/code&gt;.
+     * This will prevent holding up system resources for an undetermined
+     * length of time.
+     *
+     * @throws IOException if an I/O error has occurred
+     * @see    java.util.zip.ZipFile#close()
+     */
+    protected void finalize() throws IOException {
+<span class="fc" id="L663">        close();</span>
+<span class="fc" id="L664">    }</span>
+
+    private static native void close(long jzfile);
+
+    private void ensureOpen() {
+<span class="fc bfc" id="L669" title="All 2 branches covered.">        if (closeRequested) {</span>
+<span class="fc" id="L670">            throw new IllegalStateException(&quot;zip file closed&quot;);</span>
+        }
+
+<span class="pc bpc" id="L673" title="1 of 2 branches missed.">        if (jzfile == 0) {</span>
+<span class="nc" id="L674">            throw new IllegalStateException(&quot;The object is not initialized.&quot;);</span>
+        }
+<span class="fc" id="L676">    }</span>
+
+    private void ensureOpenOrZipException() throws IOException {
+<span class="pc bpc" id="L679" title="1 of 2 branches missed.">        if (closeRequested) {</span>
+<span class="nc" id="L680">            throw new ZipException(&quot;ZipFile closed&quot;);</span>
+        }
+<span class="fc" id="L682">    }</span>
+
+    /*
+     * Inner class implementing the input stream used to read a
+     * (possibly compressed) zip file entry.
+     */
+   private class ZipFileInputStream extends InputStream {
+<span class="fc" id="L689">        private volatile boolean closeRequested = false;</span>
+        protected long jzentry; // address of jzentry data
+        private   long pos;     // current position within entry data
+        protected long rem;     // number of remaining bytes within entry
+        protected long size;    // uncompressed size of this entry
+
+<span class="fc" id="L695">        ZipFileInputStream(long jzentry) {</span>
+<span class="fc" id="L696">            pos = 0;</span>
+<span class="fc" id="L697">            rem = getEntryCSize(jzentry);</span>
+<span class="fc" id="L698">            size = getEntrySize(jzentry);</span>
+<span class="fc" id="L699">            this.jzentry = jzentry;</span>
+<span class="fc" id="L700">        }</span>
+
+        public int read(byte b[], int off, int len) throws IOException {
+<span class="fc bfc" id="L703" title="All 2 branches covered.">            if (rem == 0) {</span>
+<span class="fc" id="L704">                return -1;</span>
+            }
+<span class="pc bpc" id="L706" title="1 of 2 branches missed.">            if (len &lt;= 0) {</span>
+<span class="nc" id="L707">                return 0;</span>
+            }
+<span class="fc bfc" id="L709" title="All 2 branches covered.">            if (len &gt; rem) {</span>
+<span class="fc" id="L710">                len = (int) rem;</span>
+            }
+<span class="fc" id="L712">            synchronized (ZipFile.this) {</span>
+<span class="fc" id="L713">                ensureOpenOrZipException();</span>
+
+<span class="fc" id="L715">                len = ZipFile.read(ZipFile.this.jzfile, jzentry, pos, b,</span>
+                                   off, len);
+<span class="pc" id="L717">            }</span>
+<span class="pc bpc" id="L718" title="1 of 2 branches missed.">            if (len &gt; 0) {</span>
+<span class="fc" id="L719">                pos += len;</span>
+<span class="fc" id="L720">                rem -= len;</span>
+            }
+<span class="fc bfc" id="L722" title="All 2 branches covered.">            if (rem == 0) {</span>
+<span class="fc" id="L723">                close();</span>
+            }
+<span class="fc" id="L725">            return len;</span>
+        }
+
+        public int read() throws IOException {
+<span class="fc" id="L729">            byte[] b = new byte[1];</span>
+<span class="pc bpc" id="L730" title="1 of 2 branches missed.">            if (read(b, 0, 1) == 1) {</span>
+<span class="fc" id="L731">                return b[0] &amp; 0xff;</span>
+            } else {
+<span class="nc" id="L733">                return -1;</span>
+            }
+        }
+
+        public long skip(long n) {
+<span class="nc bnc" id="L738" title="All 2 branches missed.">            if (n &gt; rem)</span>
+<span class="nc" id="L739">                n = rem;</span>
+<span class="nc" id="L740">            pos += n;</span>
+<span class="nc" id="L741">            rem -= n;</span>
+<span class="nc bnc" id="L742" title="All 2 branches missed.">            if (rem == 0) {</span>
+<span class="nc" id="L743">                close();</span>
+            }
+<span class="nc" id="L745">            return n;</span>
+        }
+
+        public int available() {
+<span class="pc bpc" id="L749" title="1 of 2 branches missed.">            return rem &gt; Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) rem;</span>
+        }
+
+        public long size() {
+<span class="fc" id="L753">            return size;</span>
+        }
+
+        public void close() {
+<span class="fc bfc" id="L757" title="All 2 branches covered.">            if (closeRequested)</span>
+<span class="fc" id="L758">                return;</span>
+<span class="fc" id="L759">            closeRequested = true;</span>
+
+<span class="fc" id="L761">            rem = 0;</span>
+<span class="fc" id="L762">            synchronized (ZipFile.this) {</span>
+<span class="pc bpc" id="L763" title="2 of 4 branches missed.">                if (jzentry != 0 &amp;&amp; ZipFile.this.jzfile != 0) {</span>
+<span class="fc" id="L764">                    freeEntry(ZipFile.this.jzfile, jzentry);</span>
+<span class="fc" id="L765">                    jzentry = 0;</span>
+                }
+<span class="pc" id="L767">            }</span>
+<span class="fc" id="L768">            synchronized (streams) {</span>
+<span class="fc" id="L769">                streams.remove(this);</span>
+<span class="pc" id="L770">            }</span>
+<span class="fc" id="L771">        }</span>
+
+        protected void finalize() {
+<span class="fc" id="L774">            close();</span>
+<span class="fc" id="L775">        }</span>
+    }
+
+    static {
+<span class="fc" id="L779">        sun.misc.SharedSecrets.setJavaUtilZipFileAccess(</span>
+<span class="fc" id="L780">            new sun.misc.JavaUtilZipFileAccess() {</span>
+                public boolean startsWithLocHeader(ZipFile zip) {
+<span class="fc" id="L782">                    return zip.startsWithLocHeader();</span>
+                }
+             }
+        );
+<span class="fc" id="L786">    }</span>
+
+    /**
+     * Returns {@code true} if, and only if, the zip file begins with {@code
+     * LOCSIG}.
+     */
+    private boolean startsWithLocHeader() {
+<span class="fc" id="L793">        return locsig;</span>
+    }
+
+    private static native long open(String name, int mode, long lastModified,
+                                    boolean usemmap) throws IOException;
+    private static native int getTotal(long jzfile);
+    private static native boolean startsWithLOC(long jzfile);
+    private static native int read(long jzfile, long jzentry,
+                                   long pos, byte[] b, int off, int len);
+
+    // access to the native zentry object
+    private static native long getEntryTime(long jzentry);
+    private static native long getEntryCrc(long jzentry);
+    private static native long getEntryCSize(long jzentry);
+    private static native long getEntrySize(long jzentry);
+    private static native int getEntryMethod(long jzentry);
+    private static native int getEntryFlag(long jzentry);
+    private static native byte[] getCommentBytes(long jzfile);
+
+    private static final int JZENTRY_NAME = 0;
+    private static final int JZENTRY_EXTRA = 1;
+    private static final int JZENTRY_COMMENT = 2;
+    private static native byte[] getEntryBytes(long jzentry, int type);
+
+    private static native String getZipMessage(long jzfile);
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

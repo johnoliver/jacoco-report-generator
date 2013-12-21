@@ -1,0 +1,1647 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>LambdaForm.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">java.lang.invoke</a> &gt; <span class="el_source">LambdaForm.java</span></div><h1>LambdaForm.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2011, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package java.lang.invoke;
+
+import java.lang.annotation.*;
+import java.lang.reflect.Method;
+import java.util.Map;
+import java.util.List;
+import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.concurrent.ConcurrentHashMap;
+import sun.invoke.util.Wrapper;
+import static java.lang.invoke.MethodHandleStatics.*;
+import static java.lang.invoke.MethodHandleNatives.Constants.*;
+import java.lang.reflect.Field;
+import java.util.Objects;
+
+/**
+ * The symbolic, non-executable form of a method handle's invocation semantics.
+ * It consists of a series of names.
+ * The first N (N=arity) names are parameters,
+ * while any remaining names are temporary values.
+ * Each temporary specifies the application of a function to some arguments.
+ * The functions are method handles, while the arguments are mixes of
+ * constant values and local names.
+ * The result of the lambda is defined as one of the names, often the last one.
+ * &lt;p&gt;
+ * Here is an approximate grammar:
+ * &lt;blockquote&gt;&lt;pre&gt;{@code
+ * LambdaForm = &quot;(&quot; ArgName* &quot;)=&gt;{&quot; TempName* Result &quot;}&quot;
+ * ArgName = &quot;a&quot; N &quot;:&quot; T
+ * TempName = &quot;t&quot; N &quot;:&quot; T &quot;=&quot; Function &quot;(&quot; Argument* &quot;);&quot;
+ * Function = ConstantValue
+ * Argument = NameRef | ConstantValue
+ * Result = NameRef | &quot;void&quot;
+ * NameRef = &quot;a&quot; N | &quot;t&quot; N
+ * N = (any whole number)
+ * T = &quot;L&quot; | &quot;I&quot; | &quot;J&quot; | &quot;F&quot; | &quot;D&quot; | &quot;V&quot;
+ * }&lt;/pre&gt;&lt;/blockquote&gt;
+ * Names are numbered consecutively from left to right starting at zero.
+ * (The letters are merely a taste of syntax sugar.)
+ * Thus, the first temporary (if any) is always numbered N (where N=arity).
+ * Every occurrence of a name reference in an argument list must refer to
+ * a name previously defined within the same lambda.
+ * A lambda has a void result if and only if its result index is -1.
+ * If a temporary has the type &quot;V&quot;, it cannot be the subject of a NameRef,
+ * even though possesses a number.
+ * Note that all reference types are erased to &quot;L&quot;, which stands for {@code Object}.
+ * All subword types (boolean, byte, short, char) are erased to &quot;I&quot; which is {@code int}.
+ * The other types stand for the usual primitive types.
+ * &lt;p&gt;
+ * Function invocation closely follows the static rules of the Java verifier.
+ * Arguments and return values must exactly match when their &quot;Name&quot; types are
+ * considered.
+ * Conversions are allowed only if they do not change the erased type.
+ * &lt;ul&gt;
+ * &lt;li&gt;L = Object: casts are used freely to convert into and out of reference types
+ * &lt;li&gt;I = int: subword types are forcibly narrowed when passed as arguments (see {@code explicitCastArguments})
+ * &lt;li&gt;J = long: no implicit conversions
+ * &lt;li&gt;F = float: no implicit conversions
+ * &lt;li&gt;D = double: no implicit conversions
+ * &lt;li&gt;V = void: a function result may be void if and only if its Name is of type &quot;V&quot;
+ * &lt;/ul&gt;
+ * Although implicit conversions are not allowed, explicit ones can easily be
+ * encoded by using temporary expressions which call type-transformed identity functions.
+ * &lt;p&gt;
+ * Examples:
+ * &lt;blockquote&gt;&lt;pre&gt;{@code
+ * (a0:J)=&gt;{ a0 }
+ *     == identity(long)
+ * (a0:I)=&gt;{ t1:V = System.out#println(a0); void }
+ *     == System.out#println(int)
+ * (a0:L)=&gt;{ t1:V = System.out#println(a0); a0 }
+ *     == identity, with printing side-effect
+ * (a0:L, a1:L)=&gt;{ t2:L = BoundMethodHandle#argument(a0);
+ *                 t3:L = BoundMethodHandle#target(a0);
+ *                 t4:L = MethodHandle#invoke(t3, t2, a1); t4 }
+ *     == general invoker for unary insertArgument combination
+ * (a0:L, a1:L)=&gt;{ t2:L = FilterMethodHandle#filter(a0);
+ *                 t3:L = MethodHandle#invoke(t2, a1);
+ *                 t4:L = FilterMethodHandle#target(a0);
+ *                 t5:L = MethodHandle#invoke(t4, t3); t5 }
+ *     == general invoker for unary filterArgument combination
+ * (a0:L, a1:L)=&gt;{ ...(same as previous example)...
+ *                 t5:L = MethodHandle#invoke(t4, t3, a1); t5 }
+ *     == general invoker for unary/unary foldArgument combination
+ * (a0:L, a1:I)=&gt;{ t2:I = identity(long).asType((int)-&gt;long)(a1); t2 }
+ *     == invoker for identity method handle which performs i2l
+ * (a0:L, a1:L)=&gt;{ t2:L = BoundMethodHandle#argument(a0);
+ *                 t3:L = Class#cast(t2,a1); t3 }
+ *     == invoker for identity method handle which performs cast
+ * }&lt;/pre&gt;&lt;/blockquote&gt;
+ * &lt;p&gt;
+ * @author John Rose, JSR 292 EG
+ */
+<span class="fc bfc" id="L120" title="All 2 branches covered.">class LambdaForm {</span>
+    final int arity;
+    final int result;
+    @Stable final Name[] names;
+    final String debugName;
+    MemberName vmentry;   // low-level behavior, or null if not yet prepared
+    private boolean isCompiled;
+
+    // Caches for common structural transforms:
+    LambdaForm[] bindCache;
+
+    public static final int VOID_RESULT = -1, LAST_RESULT = -2;
+
+    LambdaForm(String debugName,
+<span class="fc" id="L134">               int arity, Name[] names, int result) {</span>
+<span class="pc bpc" id="L135" title="1 of 4 branches missed.">        assert(namesOK(arity, names));</span>
+<span class="fc" id="L136">        this.arity = arity;</span>
+<span class="fc" id="L137">        this.result = fixResult(result, names);</span>
+<span class="fc" id="L138">        this.names = names.clone();</span>
+<span class="fc" id="L139">        this.debugName = debugName;</span>
+<span class="fc" id="L140">        normalize();</span>
+<span class="fc" id="L141">    }</span>
+
+    LambdaForm(String debugName,
+               int arity, Name[] names) {
+<span class="fc" id="L145">        this(debugName,</span>
+             arity, names, LAST_RESULT);
+<span class="fc" id="L147">    }</span>
+
+    LambdaForm(String debugName,
+               Name[] formals, Name[] temps, Name result) {
+<span class="nc" id="L151">        this(debugName,</span>
+<span class="nc" id="L152">             formals.length, buildNames(formals, temps, result), LAST_RESULT);</span>
+<span class="nc" id="L153">    }</span>
+
+    private static Name[] buildNames(Name[] formals, Name[] temps, Name result) {
+<span class="nc" id="L156">        int arity = formals.length;</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">        int length = arity + temps.length + (result == null ? 0 : 1);</span>
+<span class="nc" id="L158">        Name[] names = Arrays.copyOf(formals, length);</span>
+<span class="nc" id="L159">        System.arraycopy(temps, 0, names, arity, temps.length);</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">        if (result != null)</span>
+<span class="nc" id="L161">            names[length - 1] = result;</span>
+<span class="nc" id="L162">        return names;</span>
+    }
+
+<span class="fc" id="L165">    private LambdaForm(String sig) {</span>
+        // Make a blank lambda form, which returns a constant zero or null.
+        // It is used as a template for managing the invocation of similar forms that are non-empty.
+        // Called only from getPreparedForm.
+<span class="pc bpc" id="L169" title="1 of 4 branches missed.">        assert(isValidSignature(sig));</span>
+<span class="fc" id="L170">        this.arity = signatureArity(sig);</span>
+<span class="fc bfc" id="L171" title="All 2 branches covered.">        this.result = (signatureReturn(sig) == 'V' ? -1 : arity);</span>
+<span class="fc" id="L172">        this.names = buildEmptyNames(arity, sig);</span>
+<span class="fc" id="L173">        this.debugName = &quot;LF.zero&quot;;</span>
+<span class="pc bpc" id="L174" title="1 of 4 branches missed.">        assert(nameRefsAreLegal());</span>
+<span class="pc bpc" id="L175" title="1 of 4 branches missed.">        assert(isEmpty());</span>
+<span class="pc bpc" id="L176" title="1 of 4 branches missed.">        assert(sig.equals(basicTypeSignature()));</span>
+<span class="fc" id="L177">    }</span>
+
+    private static Name[] buildEmptyNames(int arity, String basicTypeSignature) {
+<span class="pc bpc" id="L180" title="1 of 4 branches missed.">        assert(isValidSignature(basicTypeSignature));</span>
+<span class="fc" id="L181">        int resultPos = arity + 1;  // skip '_'</span>
+<span class="pc bpc" id="L182" title="2 of 4 branches missed.">        if (arity &lt; 0 || basicTypeSignature.length() != resultPos+1)</span>
+<span class="nc" id="L183">            throw new IllegalArgumentException(&quot;bad arity for &quot;+basicTypeSignature);</span>
+<span class="fc bfc" id="L184" title="All 2 branches covered.">        int numRes = (basicTypeSignature.charAt(resultPos) == 'V' ? 0 : 1);</span>
+<span class="fc" id="L185">        Name[] names = arguments(numRes, basicTypeSignature.substring(0, arity));</span>
+<span class="fc bfc" id="L186" title="All 2 branches covered.">        for (int i = 0; i &lt; numRes; i++) {</span>
+<span class="fc" id="L187">            names[arity + i] = constantZero(arity + i, basicTypeSignature.charAt(resultPos + i));</span>
+        }
+<span class="fc" id="L189">        return names;</span>
+    }
+
+    private static int fixResult(int result, Name[] names) {
+<span class="fc bfc" id="L193" title="All 2 branches covered.">        if (result &gt;= 0) {</span>
+<span class="fc bfc" id="L194" title="All 2 branches covered.">            if (names[result].type == 'V')</span>
+<span class="fc" id="L195">                return -1;</span>
+<span class="fc bfc" id="L196" title="All 2 branches covered.">        } else if (result == LAST_RESULT) {</span>
+<span class="fc" id="L197">            return names.length - 1;</span>
+        }
+<span class="fc" id="L199">        return result;</span>
+    }
+
+    private static boolean namesOK(int arity, Name[] names) {
+<span class="fc bfc" id="L203" title="All 2 branches covered.">        for (int i = 0; i &lt; names.length; i++) {</span>
+<span class="fc" id="L204">            Name n = names[i];</span>
+<span class="pc bpc" id="L205" title="2 of 4 branches missed.">            assert(n != null) : &quot;n is null&quot;;</span>
+<span class="fc bfc" id="L206" title="All 2 branches covered.">            if (i &lt; arity)</span>
+<span class="pc bpc" id="L207" title="2 of 4 branches missed.">                assert( n.isParam()) : n + &quot; is not param at &quot; + i;</span>
+            else
+<span class="pc bpc" id="L209" title="2 of 4 branches missed.">                assert(!n.isParam()) : n + &quot; is param at &quot; + i;</span>
+        }
+<span class="fc" id="L211">        return true;</span>
+    }
+
+    /** Renumber and/or replace params so that they are interned and canonically numbered. */
+    private void normalize() {
+<span class="fc" id="L216">        Name[] oldNames = null;</span>
+<span class="fc" id="L217">        int changesStart = 0;</span>
+<span class="fc bfc" id="L218" title="All 2 branches covered.">        for (int i = 0; i &lt; names.length; i++) {</span>
+<span class="fc" id="L219">            Name n = names[i];</span>
+<span class="fc bfc" id="L220" title="All 2 branches covered.">            if (!n.initIndex(i)) {</span>
+<span class="fc bfc" id="L221" title="All 2 branches covered.">                if (oldNames == null) {</span>
+<span class="fc" id="L222">                    oldNames = names.clone();</span>
+<span class="fc" id="L223">                    changesStart = i;</span>
+                }
+<span class="fc" id="L225">                names[i] = n.cloneWithIndex(i);</span>
+            }
+        }
+<span class="fc bfc" id="L228" title="All 2 branches covered.">        if (oldNames != null) {</span>
+<span class="fc" id="L229">            int startFixing = arity;</span>
+<span class="fc bfc" id="L230" title="All 2 branches covered.">            if (startFixing &lt;= changesStart)</span>
+<span class="fc" id="L231">                startFixing = changesStart+1;</span>
+<span class="fc bfc" id="L232" title="All 2 branches covered.">            for (int i = startFixing; i &lt; names.length; i++) {</span>
+<span class="fc" id="L233">                Name fixed = names[i].replaceNames(oldNames, names, changesStart, i);</span>
+<span class="fc" id="L234">                names[i] = fixed.newIndex(i);</span>
+            }
+        }
+<span class="pc bpc" id="L237" title="1 of 4 branches missed.">        assert(nameRefsAreLegal());</span>
+<span class="fc" id="L238">        int maxInterned = Math.min(arity, INTERNED_ARGUMENT_LIMIT);</span>
+<span class="fc" id="L239">        boolean needIntern = false;</span>
+<span class="fc bfc" id="L240" title="All 2 branches covered.">        for (int i = 0; i &lt; maxInterned; i++) {</span>
+<span class="fc" id="L241">            Name n = names[i], n2 = internArgument(n);</span>
+<span class="fc bfc" id="L242" title="All 2 branches covered.">            if (n != n2) {</span>
+<span class="fc" id="L243">                names[i] = n2;</span>
+<span class="fc" id="L244">                needIntern = true;</span>
+            }
+        }
+<span class="fc bfc" id="L247" title="All 2 branches covered.">        if (needIntern) {</span>
+<span class="fc bfc" id="L248" title="All 2 branches covered.">            for (int i = arity; i &lt; names.length; i++) {</span>
+<span class="fc" id="L249">                names[i].internArguments();</span>
+            }
+<span class="pc bpc" id="L251" title="1 of 4 branches missed.">            assert(nameRefsAreLegal());</span>
+        }
+<span class="fc" id="L253">    }</span>
+
+    /**
+     * Check that all embedded Name references are localizable to this lambda,
+     * and are properly ordered after their corresponding definitions.
+     * &lt;p&gt;
+     * Note that a Name can be local to multiple lambdas, as long as
+     * it possesses the same index in each use site.
+     * This allows Name references to be freely reused to construct
+     * fresh lambdas, without confusion.
+     */
+    private boolean nameRefsAreLegal() {
+<span class="pc bpc" id="L265" title="3 of 6 branches missed.">        assert(arity &gt;= 0 &amp;&amp; arity &lt;= names.length);</span>
+<span class="pc bpc" id="L266" title="3 of 6 branches missed.">        assert(result &gt;= -1 &amp;&amp; result &lt; names.length);</span>
+        // Do all names possess an index consistent with their local definition order?
+<span class="fc bfc" id="L268" title="All 2 branches covered.">        for (int i = 0; i &lt; arity; i++) {</span>
+<span class="fc" id="L269">            Name n = names[i];</span>
+<span class="pc bpc" id="L270" title="2 of 4 branches missed.">            assert(n.index() == i) : Arrays.asList(n.index(), i);</span>
+<span class="pc bpc" id="L271" title="2 of 4 branches missed.">            assert(n.isParam());</span>
+        }
+        // Also, do all local name references
+<span class="fc bfc" id="L274" title="All 2 branches covered.">        for (int i = arity; i &lt; names.length; i++) {</span>
+<span class="fc" id="L275">            Name n = names[i];</span>
+<span class="pc bpc" id="L276" title="2 of 4 branches missed.">            assert(n.index() == i);</span>
+<span class="fc bfc" id="L277" title="All 2 branches covered.">            for (Object arg : n.arguments) {</span>
+<span class="fc bfc" id="L278" title="All 2 branches covered.">                if (arg instanceof Name) {</span>
+<span class="fc" id="L279">                    Name n2 = (Name) arg;</span>
+<span class="fc" id="L280">                    int i2 = n2.index;</span>
+<span class="pc bpc" id="L281" title="3 of 6 branches missed.">                    assert(0 &lt;= i2 &amp;&amp; i2 &lt; names.length) : n.debugString() + &quot;: 0 &lt;= i2 &amp;&amp; i2 &lt; names.length: 0 &lt;= &quot; + i2 + &quot; &lt; &quot; + names.length;</span>
+<span class="pc bpc" id="L282" title="2 of 4 branches missed.">                    assert(names[i2] == n2) : Arrays.asList(&quot;-1-&quot;, i, &quot;-2-&quot;, n.debugString(), &quot;-3-&quot;, i2, &quot;-4-&quot;, n2.debugString(), &quot;-5-&quot;, names[i2].debugString(), &quot;-6-&quot;, this);</span>
+<span class="pc bpc" id="L283" title="2 of 4 branches missed.">                    assert(i2 &lt; i);  // ref must come after def!</span>
+                }
+            }
+        }
+<span class="fc" id="L287">        return true;</span>
+    }
+
+    /** Invoke this form on the given arguments. */
+    // final Object invoke(Object... args) throws Throwable {
+    //     // NYI: fit this into the fast path?
+    //     return interpretWithArguments(args);
+    // }
+
+    /** Report the return type. */
+    char returnType() {
+<span class="fc bfc" id="L298" title="All 2 branches covered.">        if (result &lt; 0)  return 'V';</span>
+<span class="fc" id="L299">        Name n = names[result];</span>
+<span class="fc" id="L300">        return n.type;</span>
+    }
+
+    /** Report the N-th argument type. */
+    char parameterType(int n) {
+<span class="pc bpc" id="L305" title="1 of 4 branches missed.">        assert(n &lt; arity);</span>
+<span class="fc" id="L306">        return names[n].type;</span>
+    }
+
+    /** Report the arity. */
+    int arity() {
+<span class="fc" id="L311">        return arity;</span>
+    }
+
+    /** Return the method type corresponding to my basic type signature. */
+    MethodType methodType() {
+<span class="fc" id="L316">        return signatureType(basicTypeSignature());</span>
+    }
+    /** Return ABC_Z, where the ABC are parameter type characters, and Z is the return type character. */
+    final String basicTypeSignature() {
+<span class="fc" id="L320">        StringBuilder buf = new StringBuilder(arity() + 3);</span>
+<span class="fc bfc" id="L321" title="All 2 branches covered.">        for (int i = 0, a = arity(); i &lt; a; i++)</span>
+<span class="fc" id="L322">            buf.append(parameterType(i));</span>
+<span class="fc" id="L323">        return buf.append('_').append(returnType()).toString();</span>
+    }
+    static int signatureArity(String sig) {
+<span class="pc bpc" id="L326" title="1 of 4 branches missed.">        assert(isValidSignature(sig));</span>
+<span class="fc" id="L327">        return sig.indexOf('_');</span>
+    }
+    static char signatureReturn(String sig) {
+<span class="fc" id="L330">        return sig.charAt(signatureArity(sig)+1);</span>
+    }
+    static boolean isValidSignature(String sig) {
+<span class="fc" id="L333">        int arity = sig.indexOf('_');</span>
+<span class="pc bpc" id="L334" title="1 of 2 branches missed.">        if (arity &lt; 0)  return false;  // must be of the form *_*</span>
+<span class="fc" id="L335">        int siglen = sig.length();</span>
+<span class="pc bpc" id="L336" title="1 of 2 branches missed.">        if (siglen != arity + 2)  return false;  // *_X</span>
+<span class="fc bfc" id="L337" title="All 2 branches covered.">        for (int i = 0; i &lt; siglen; i++) {</span>
+<span class="fc bfc" id="L338" title="All 2 branches covered.">            if (i == arity)  continue;  // skip '_'</span>
+<span class="fc" id="L339">            char c = sig.charAt(i);</span>
+<span class="fc bfc" id="L340" title="All 2 branches covered.">            if (c == 'V')</span>
+<span class="pc bpc" id="L341" title="2 of 4 branches missed.">                return (i == siglen - 1 &amp;&amp; arity == siglen - 2);</span>
+<span class="pc bpc" id="L342" title="1 of 2 branches missed.">            if (ALL_TYPES.indexOf(c) &lt; 0)  return false; // must be [LIJFD]</span>
+        }
+<span class="fc" id="L344">        return true;  // [LIJFD]*_[LIJFDV]</span>
+    }
+    static Class&lt;?&gt; typeClass(char t) {
+<span class="pc bpc" id="L347" title="1 of 7 branches missed.">        switch (t) {</span>
+<span class="fc" id="L348">        case 'I': return int.class;</span>
+<span class="fc" id="L349">        case 'J': return long.class;</span>
+<span class="fc" id="L350">        case 'F': return float.class;</span>
+<span class="fc" id="L351">        case 'D': return double.class;</span>
+<span class="fc" id="L352">        case 'L': return Object.class;</span>
+<span class="fc" id="L353">        case 'V': return void.class;</span>
+<span class="nc bnc" id="L354" title="All 2 branches missed.">        default: assert false;</span>
+        }
+<span class="nc" id="L356">        return null;</span>
+    }
+    static MethodType signatureType(String sig) {
+<span class="fc" id="L359">        Class&lt;?&gt;[] ptypes = new Class&lt;?&gt;[signatureArity(sig)];</span>
+<span class="fc bfc" id="L360" title="All 2 branches covered.">        for (int i = 0; i &lt; ptypes.length; i++)</span>
+<span class="fc" id="L361">            ptypes[i] = typeClass(sig.charAt(i));</span>
+<span class="fc" id="L362">        Class&lt;?&gt; rtype = typeClass(signatureReturn(sig));</span>
+<span class="fc" id="L363">        return MethodType.methodType(rtype, ptypes);</span>
+    }
+
+    /*
+     * Code generation issues:
+     *
+     * Compiled LFs should be reusable in general.
+     * The biggest issue is how to decide when to pull a name into
+     * the bytecode, versus loading a reified form from the MH data.
+     *
+     * For example, an asType wrapper may require execution of a cast
+     * after a call to a MH.  The target type of the cast can be placed
+     * as a constant in the LF itself.  This will force the cast type
+     * to be compiled into the bytecodes and native code for the MH.
+     * Or, the target type of the cast can be erased in the LF, and
+     * loaded from the MH data.  (Later on, if the MH as a whole is
+     * inlined, the data will flow into the inlined instance of the LF,
+     * as a constant, and the end result will be an optimal cast.)
+     *
+     * This erasure of cast types can be done with any use of
+     * reference types.  It can also be done with whole method
+     * handles.  Erasing a method handle might leave behind
+     * LF code that executes correctly for any MH of a given
+     * type, and load the required MH from the enclosing MH's data.
+     * Or, the erasure might even erase the expected MT.
+     *
+     * Also, for direct MHs, the MemberName of the target
+     * could be erased, and loaded from the containing direct MH.
+     * As a simple case, a LF for all int-valued non-static
+     * field getters would perform a cast on its input argument
+     * (to non-constant base type derived from the MemberName)
+     * and load an integer value from the input object
+     * (at a non-constant offset also derived from the MemberName).
+     * Such MN-erased LFs would be inlinable back to optimized
+     * code, whenever a constant enclosing DMH is available
+     * to supply a constant MN from its data.
+     *
+     * The main problem here is to keep LFs reasonably generic,
+     * while ensuring that hot spots will inline good instances.
+     * &quot;Reasonably generic&quot; means that we don't end up with
+     * repeated versions of bytecode or machine code that do
+     * not differ in their optimized form.  Repeated versions
+     * of machine would have the undesirable overheads of
+     * (a) redundant compilation work and (b) extra I$ pressure.
+     * To control repeated versions, we need to be ready to
+     * erase details from LFs and move them into MH data,
+     * whevener those details are not relevant to significant
+     * optimization.  &quot;Significant&quot; means optimization of
+     * code that is actually hot.
+     *
+     * Achieving this may require dynamic splitting of MHs, by replacing
+     * a generic LF with a more specialized one, on the same MH,
+     * if (a) the MH is frequently executed and (b) the MH cannot
+     * be inlined into a containing caller, such as an invokedynamic.
+     *
+     * Compiled LFs that are no longer used should be GC-able.
+     * If they contain non-BCP references, they should be properly
+     * interlinked with the class loader(s) that their embedded types
+     * depend on.  This probably means that reusable compiled LFs
+     * will be tabulated (indexed) on relevant class loaders,
+     * or else that the tables that cache them will have weak links.
+     */
+
+    /**
+     * Make this LF directly executable, as part of a MethodHandle.
+     * Invariant:  Every MH which is invoked must prepare its LF
+     * before invocation.
+     * (In principle, the JVM could do this very lazily,
+     * as a sort of pre-invocation linkage step.)
+     */
+    public void prepare() {
+<span class="pc bpc" id="L434" title="1 of 2 branches missed.">        if (COMPILE_THRESHOLD == 0) {</span>
+<span class="nc" id="L435">            compileToBytecode();</span>
+        }
+<span class="fc bfc" id="L437" title="All 2 branches covered.">        if (this.vmentry != null) {</span>
+            // already prepared (e.g., a primitive DMH invoker form)
+<span class="fc" id="L439">            return;</span>
+        }
+<span class="fc" id="L441">        LambdaForm prep = getPreparedForm(basicTypeSignature());</span>
+<span class="fc" id="L442">        this.vmentry = prep.vmentry;</span>
+        // TO DO: Maybe add invokeGeneric, invokeWithArguments
+<span class="fc" id="L444">    }</span>
+
+    /** Generate optimizable bytecode for this form. */
+    MemberName compileToBytecode() {
+<span class="fc" id="L448">        MethodType invokerType = methodType();</span>
+<span class="pc bpc" id="L449" title="1 of 6 branches missed.">        assert(vmentry == null || vmentry.getMethodType().basicType().equals(invokerType));</span>
+<span class="fc bfc" id="L450" title="All 4 branches covered.">        if (vmentry != null &amp;&amp; isCompiled) {</span>
+<span class="fc" id="L451">            return vmentry;  // already compiled somehow</span>
+        }
+        try {
+<span class="fc" id="L454">            vmentry = InvokerBytecodeGenerator.generateCustomizedCode(this, invokerType);</span>
+<span class="pc bpc" id="L455" title="1 of 2 branches missed.">            if (TRACE_INTERPRETER)</span>
+<span class="nc" id="L456">                traceInterpreter(&quot;compileToBytecode&quot;, this);</span>
+<span class="fc" id="L457">            isCompiled = true;</span>
+<span class="fc" id="L458">            return vmentry;</span>
+<span class="nc" id="L459">        } catch (Error | Exception ex) {</span>
+<span class="nc" id="L460">            throw newInternalError(&quot;compileToBytecode&quot;, ex);</span>
+        }
+    }
+
+    private static final ConcurrentHashMap&lt;String,LambdaForm&gt; PREPARED_FORMS;
+    static {
+<span class="fc" id="L466">        int   capacity   = 512;    // expect many distinct signatures over time</span>
+<span class="fc" id="L467">        float loadFactor = 0.75f;  // normal default</span>
+<span class="fc" id="L468">        int   writers    = 1;</span>
+<span class="fc" id="L469">        PREPARED_FORMS = new ConcurrentHashMap&lt;&gt;(capacity, loadFactor, writers);</span>
+    }
+
+    private static Map&lt;String,LambdaForm&gt; computeInitialPreparedForms() {
+        // Find all predefined invokers and associate them with canonical empty lambda forms.
+<span class="fc" id="L474">        HashMap&lt;String,LambdaForm&gt; forms = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L475" title="All 2 branches covered.">        for (MemberName m : MemberName.getFactory().getMethods(LambdaForm.class, false, null, null, null)) {</span>
+<span class="fc bfc" id="L476" title="All 4 branches covered.">            if (!m.isStatic() || !m.isPackage())  continue;</span>
+<span class="fc" id="L477">            MethodType mt = m.getMethodType();</span>
+<span class="fc bfc" id="L478" title="All 2 branches covered.">            if (mt.parameterCount() &gt; 0 &amp;&amp;</span>
+<span class="fc bfc" id="L479" title="All 2 branches covered.">                mt.parameterType(0) == MethodHandle.class &amp;&amp;</span>
+<span class="pc bpc" id="L480" title="1 of 2 branches missed.">                m.getName().startsWith(&quot;interpret_&quot;)) {</span>
+<span class="fc" id="L481">                String sig = basicTypeSignature(mt);</span>
+<span class="pc bpc" id="L482" title="1 of 4 branches missed.">                assert(m.getName().equals(&quot;interpret&quot; + sig.substring(sig.indexOf('_'))));</span>
+<span class="fc" id="L483">                LambdaForm form = new LambdaForm(sig);</span>
+<span class="fc" id="L484">                form.vmentry = m;</span>
+<span class="fc" id="L485">                mt.form().setCachedLambdaForm(MethodTypeForm.LF_COUNTER, form);</span>
+                // FIXME: get rid of PREPARED_FORMS; use MethodTypeForm cache only
+<span class="fc" id="L487">                forms.put(sig, form);</span>
+            }
+<span class="fc" id="L489">        }</span>
+        //System.out.println(&quot;computeInitialPreparedForms =&gt; &quot;+forms);
+<span class="fc" id="L491">        return forms;</span>
+    }
+
+    // Set this false to disable use of the interpret_L methods defined in this file.
+    private static final boolean USE_PREDEFINED_INTERPRET_METHODS = true;
+
+    // The following are predefined exact invokers.  The system must build
+    // a separate invoker for each distinct signature.
+    static Object interpret_L(MethodHandle mh) throws Throwable {
+<span class="nc" id="L500">        Object[] av = {mh};</span>
+<span class="nc" id="L501">        String sig = null;</span>
+<span class="nc bnc" id="L502" title="All 4 branches missed.">        assert(argumentTypesMatch(sig = &quot;L_L&quot;, av));</span>
+<span class="nc" id="L503">        Object res = mh.form.interpretWithArguments(av);</span>
+<span class="nc bnc" id="L504" title="All 4 branches missed.">        assert(returnTypesMatch(sig, av, res));</span>
+<span class="nc" id="L505">        return res;</span>
+    }
+    static Object interpret_L(MethodHandle mh, Object x1) throws Throwable {
+<span class="nc" id="L508">        Object[] av = {mh, x1};</span>
+<span class="nc" id="L509">        String sig = null;</span>
+<span class="nc bnc" id="L510" title="All 4 branches missed.">        assert(argumentTypesMatch(sig = &quot;LL_L&quot;, av));</span>
+<span class="nc" id="L511">        Object res = mh.form.interpretWithArguments(av);</span>
+<span class="nc bnc" id="L512" title="All 4 branches missed.">        assert(returnTypesMatch(sig, av, res));</span>
+<span class="nc" id="L513">        return res;</span>
+    }
+    static Object interpret_L(MethodHandle mh, Object x1, Object x2) throws Throwable {
+<span class="nc" id="L516">        Object[] av = {mh, x1, x2};</span>
+<span class="nc" id="L517">        String sig = null;</span>
+<span class="nc bnc" id="L518" title="All 4 branches missed.">        assert(argumentTypesMatch(sig = &quot;LLL_L&quot;, av));</span>
+<span class="nc" id="L519">        Object res = mh.form.interpretWithArguments(av);</span>
+<span class="nc bnc" id="L520" title="All 4 branches missed.">        assert(returnTypesMatch(sig, av, res));</span>
+<span class="nc" id="L521">        return res;</span>
+    }
+    private static LambdaForm getPreparedForm(String sig) {
+<span class="fc" id="L524">        MethodType mtype = signatureType(sig);</span>
+        //LambdaForm prep = PREPARED_FORMS.get(sig);
+<span class="fc" id="L526">        LambdaForm prep =  mtype.form().cachedLambdaForm(MethodTypeForm.LF_INTERPRET);</span>
+<span class="fc bfc" id="L527" title="All 2 branches covered.">        if (prep != null)  return prep;</span>
+<span class="pc bpc" id="L528" title="1 of 4 branches missed.">        assert(isValidSignature(sig));</span>
+<span class="fc" id="L529">        prep = new LambdaForm(sig);</span>
+<span class="fc" id="L530">        prep.vmentry = InvokerBytecodeGenerator.generateLambdaFormInterpreterEntryPoint(sig);</span>
+        //LambdaForm prep2 = PREPARED_FORMS.putIfAbsent(sig.intern(), prep);
+<span class="fc" id="L532">        return mtype.form().setCachedLambdaForm(MethodTypeForm.LF_INTERPRET, prep);</span>
+    }
+
+    // The next few routines are called only from assert expressions
+    // They verify that the built-in invokers process the correct raw data types.
+    private static boolean argumentTypesMatch(String sig, Object[] av) {
+<span class="nc" id="L538">        int arity = signatureArity(sig);</span>
+<span class="nc bnc" id="L539" title="All 4 branches missed.">        assert(av.length == arity) : &quot;av.length == arity: av.length=&quot; + av.length + &quot;, arity=&quot; + arity;</span>
+<span class="nc bnc" id="L540" title="All 4 branches missed.">        assert(av[0] instanceof MethodHandle) : &quot;av[0] not instace of MethodHandle: &quot; + av[0];</span>
+<span class="nc" id="L541">        MethodHandle mh = (MethodHandle) av[0];</span>
+<span class="nc" id="L542">        MethodType mt = mh.type();</span>
+<span class="nc bnc" id="L543" title="All 4 branches missed.">        assert(mt.parameterCount() == arity-1);</span>
+<span class="nc bnc" id="L544" title="All 2 branches missed.">        for (int i = 0; i &lt; av.length; i++) {</span>
+<span class="nc bnc" id="L545" title="All 2 branches missed.">            Class&lt;?&gt; pt = (i == 0 ? MethodHandle.class : mt.parameterType(i-1));</span>
+<span class="nc bnc" id="L546" title="All 4 branches missed.">            assert(valueMatches(sig.charAt(i), pt, av[i]));</span>
+        }
+<span class="nc" id="L548">        return true;</span>
+    }
+    private static boolean valueMatches(char tc, Class&lt;?&gt; type, Object x) {
+        // The following line is needed because (...)void method handles can use non-void invokers
+<span class="nc bnc" id="L552" title="All 2 branches missed.">        if (type == void.class)  tc = 'V';   // can drop any kind of value</span>
+<span class="nc bnc" id="L553" title="All 4 branches missed.">        assert tc == basicType(type) : tc + &quot; == basicType(&quot; + type + &quot;)=&quot; + basicType(type);</span>
+<span class="nc bnc" id="L554" title="All 7 branches missed.">        switch (tc) {</span>
+<span class="nc bnc" id="L555" title="All 4 branches missed.">        case 'I': assert checkInt(type, x)   : &quot;checkInt(&quot; + type + &quot;,&quot; + x +&quot;)&quot;;   break;</span>
+<span class="nc bnc" id="L556" title="All 4 branches missed.">        case 'J': assert x instanceof Long   : &quot;instanceof Long: &quot; + x;             break;</span>
+<span class="nc bnc" id="L557" title="All 4 branches missed.">        case 'F': assert x instanceof Float  : &quot;instanceof Float: &quot; + x;            break;</span>
+<span class="nc bnc" id="L558" title="All 4 branches missed.">        case 'D': assert x instanceof Double : &quot;instanceof Double: &quot; + x;           break;</span>
+<span class="nc bnc" id="L559" title="All 4 branches missed.">        case 'L': assert checkRef(type, x)   : &quot;checkRef(&quot; + type + &quot;,&quot; + x + &quot;)&quot;;  break;</span>
+<span class="nc" id="L560">        case 'V': break;  // allow anything here; will be dropped</span>
+<span class="nc bnc" id="L561" title="All 2 branches missed.">        default:  assert(false);</span>
+        }
+<span class="nc" id="L563">        return true;</span>
+    }
+    private static boolean returnTypesMatch(String sig, Object[] av, Object res) {
+<span class="nc" id="L566">        MethodHandle mh = (MethodHandle) av[0];</span>
+<span class="nc" id="L567">        return valueMatches(signatureReturn(sig), mh.type().returnType(), res);</span>
+    }
+    private static boolean checkInt(Class&lt;?&gt; type, Object x) {
+<span class="nc bnc" id="L570" title="All 4 branches missed.">        assert(x instanceof Integer);</span>
+<span class="nc bnc" id="L571" title="All 2 branches missed.">        if (type == int.class)  return true;</span>
+<span class="nc" id="L572">        Wrapper w = Wrapper.forBasicType(type);</span>
+<span class="nc bnc" id="L573" title="All 4 branches missed.">        assert(w.isSubwordOrInt());</span>
+<span class="nc" id="L574">        Object x1 = Wrapper.INT.wrap(w.wrap(x));</span>
+<span class="nc" id="L575">        return x.equals(x1);</span>
+    }
+    private static boolean checkRef(Class&lt;?&gt; type, Object x) {
+<span class="nc bnc" id="L578" title="All 4 branches missed.">        assert(!type.isPrimitive());</span>
+<span class="nc bnc" id="L579" title="All 2 branches missed.">        if (x == null)  return true;</span>
+<span class="nc bnc" id="L580" title="All 2 branches missed.">        if (type.isInterface())  return true;</span>
+<span class="nc" id="L581">        return type.isInstance(x);</span>
+    }
+
+    /** If the invocation count hits the threshold we spin bytecodes and call that subsequently. */
+    private static final int COMPILE_THRESHOLD;
+    static {
+<span class="pc bpc" id="L587" title="1 of 2 branches missed.">        if (MethodHandleStatics.COMPILE_THRESHOLD != null)</span>
+<span class="nc" id="L588">            COMPILE_THRESHOLD = MethodHandleStatics.COMPILE_THRESHOLD;</span>
+        else
+<span class="fc" id="L590">            COMPILE_THRESHOLD = 30;  // default value</span>
+    }
+<span class="fc" id="L592">    private int invocationCounter = 0;</span>
+
+    @Hidden
+    @DontInline
+    /** Interpretively invoke this form on the given arguments. */
+    Object interpretWithArguments(Object... argumentValues) throws Throwable {
+<span class="pc bpc" id="L598" title="1 of 2 branches missed.">        if (TRACE_INTERPRETER)</span>
+<span class="nc" id="L599">            return interpretWithArgumentsTracing(argumentValues);</span>
+<span class="fc" id="L600">        checkInvocationCounter();</span>
+<span class="pc bpc" id="L601" title="1 of 4 branches missed.">        assert(arityCheck(argumentValues));</span>
+<span class="fc" id="L602">        Object[] values = Arrays.copyOf(argumentValues, names.length);</span>
+<span class="fc bfc" id="L603" title="All 2 branches covered.">        for (int i = argumentValues.length; i &lt; values.length; i++) {</span>
+<span class="fc" id="L604">            values[i] = interpretName(names[i], values);</span>
+        }
+<span class="fc bfc" id="L606" title="All 2 branches covered.">        return (result &lt; 0) ? null : values[result];</span>
+    }
+
+    @Hidden
+    @DontInline
+    /** Evaluate a single Name within this form, applying its function to its arguments. */
+    Object interpretName(Name name, Object[] values) throws Throwable {
+<span class="pc bpc" id="L613" title="1 of 2 branches missed.">        if (TRACE_INTERPRETER)</span>
+<span class="nc" id="L614">            traceInterpreter(&quot;| interpretName&quot;, name.debugString(), (Object[]) null);</span>
+<span class="fc" id="L615">        Object[] arguments = Arrays.copyOf(name.arguments, name.arguments.length, Object[].class);</span>
+<span class="fc bfc" id="L616" title="All 2 branches covered.">        for (int i = 0; i &lt; arguments.length; i++) {</span>
+<span class="fc" id="L617">            Object a = arguments[i];</span>
+<span class="fc bfc" id="L618" title="All 2 branches covered.">            if (a instanceof Name) {</span>
+<span class="fc" id="L619">                int i2 = ((Name)a).index();</span>
+<span class="pc bpc" id="L620" title="1 of 4 branches missed.">                assert(names[i2] == a);</span>
+<span class="fc" id="L621">                a = values[i2];</span>
+<span class="fc" id="L622">                arguments[i] = a;</span>
+            }
+        }
+<span class="fc" id="L625">        return name.function.invokeWithArguments(arguments);</span>
+    }
+
+    private void checkInvocationCounter() {
+<span class="pc bpc" id="L629" title="2 of 4 branches missed.">        if (COMPILE_THRESHOLD != 0 &amp;&amp;</span>
+            invocationCounter &lt; COMPILE_THRESHOLD) {
+<span class="fc" id="L631">            invocationCounter++;  // benign race</span>
+<span class="fc bfc" id="L632" title="All 2 branches covered.">            if (invocationCounter &gt;= COMPILE_THRESHOLD) {</span>
+                // Replace vmentry with a bytecode version of this LF.
+<span class="fc" id="L634">                compileToBytecode();</span>
+            }
+        }
+<span class="fc" id="L637">    }</span>
+    Object interpretWithArgumentsTracing(Object... argumentValues) throws Throwable {
+<span class="nc" id="L639">        traceInterpreter(&quot;[ interpretWithArguments&quot;, this, argumentValues);</span>
+<span class="nc bnc" id="L640" title="All 2 branches missed.">        if (invocationCounter &lt; COMPILE_THRESHOLD) {</span>
+<span class="nc" id="L641">            int ctr = invocationCounter++;  // benign race</span>
+<span class="nc" id="L642">            traceInterpreter(&quot;| invocationCounter&quot;, ctr);</span>
+<span class="nc bnc" id="L643" title="All 2 branches missed.">            if (invocationCounter &gt;= COMPILE_THRESHOLD) {</span>
+<span class="nc" id="L644">                compileToBytecode();</span>
+            }
+        }
+        Object rval;
+        try {
+<span class="nc bnc" id="L649" title="All 4 branches missed.">            assert(arityCheck(argumentValues));</span>
+<span class="nc" id="L650">            Object[] values = Arrays.copyOf(argumentValues, names.length);</span>
+<span class="nc bnc" id="L651" title="All 2 branches missed.">            for (int i = argumentValues.length; i &lt; values.length; i++) {</span>
+<span class="nc" id="L652">                values[i] = interpretName(names[i], values);</span>
+            }
+<span class="nc bnc" id="L654" title="All 2 branches missed.">            rval = (result &lt; 0) ? null : values[result];</span>
+<span class="nc" id="L655">        } catch (Throwable ex) {</span>
+<span class="nc" id="L656">            traceInterpreter(&quot;] throw =&gt;&quot;, ex);</span>
+<span class="nc" id="L657">            throw ex;</span>
+<span class="nc" id="L658">        }</span>
+<span class="nc" id="L659">        traceInterpreter(&quot;] return =&gt;&quot;, rval);</span>
+<span class="nc" id="L660">        return rval;</span>
+    }
+
+    //** This transform is applied (statically) to every name.function. */
+    /*
+    private static MethodHandle eraseSubwordTypes(MethodHandle mh) {
+        MethodType mt = mh.type();
+        if (mt.hasPrimitives()) {
+            mt = mt.changeReturnType(eraseSubwordType(mt.returnType()));
+            for (int i = 0; i &lt; mt.parameterCount(); i++) {
+                mt = mt.changeParameterType(i, eraseSubwordType(mt.parameterType(i)));
+            }
+            mh = MethodHandles.explicitCastArguments(mh, mt);
+        }
+        return mh;
+    }
+    private static Class&lt;?&gt; eraseSubwordType(Class&lt;?&gt; type) {
+        if (!type.isPrimitive())  return type;
+        if (type == int.class)  return type;
+        Wrapper w = Wrapper.forPrimitiveType(type);
+        if (w.isSubwordOrInt())  return int.class;
+        return type;
+    }
+    */
+
+    static void traceInterpreter(String event, Object obj, Object... args) {
+<span class="nc bnc" id="L686" title="All 2 branches missed.">        if (TRACE_INTERPRETER) {</span>
+<span class="nc bnc" id="L687" title="All 6 branches missed.">            System.out.println(&quot;LFI: &quot;+event+&quot; &quot;+(obj != null ? obj : &quot;&quot;)+(args != null &amp;&amp; args.length != 0 ? Arrays.asList(args) : &quot;&quot;));</span>
+        }
+<span class="nc" id="L689">    }</span>
+    static void traceInterpreter(String event, Object obj) {
+<span class="nc" id="L691">        traceInterpreter(event, obj, (Object[])null);</span>
+<span class="nc" id="L692">    }</span>
+    private boolean arityCheck(Object[] argumentValues) {
+<span class="pc bpc" id="L694" title="2 of 4 branches missed.">        assert(argumentValues.length == arity) : arity+&quot;!=&quot;+Arrays.asList(argumentValues)+&quot;.length&quot;;</span>
+        // also check that the leading (receiver) argument is somehow bound to this LF:
+<span class="pc bpc" id="L696" title="2 of 4 branches missed.">        assert(argumentValues[0] instanceof MethodHandle) : &quot;not MH: &quot; + argumentValues[0];</span>
+<span class="pc bpc" id="L697" title="2 of 4 branches missed.">        assert(((MethodHandle)argumentValues[0]).internalForm() == this);</span>
+        // note:  argument #0 could also be an interface wrapper, in the future
+<span class="fc" id="L699">        return true;</span>
+    }
+
+    private boolean isEmpty() {
+<span class="fc bfc" id="L703" title="All 2 branches covered.">        if (result &lt; 0)</span>
+<span class="pc bpc" id="L704" title="1 of 2 branches missed.">            return (names.length == arity);</span>
+<span class="pc bpc" id="L705" title="2 of 4 branches missed.">        else if (result == arity &amp;&amp; names.length == arity + 1)</span>
+<span class="fc" id="L706">            return names[arity].isConstantZero();</span>
+        else
+<span class="nc" id="L708">            return false;</span>
+    }
+
+    public String toString() {
+<span class="nc" id="L712">        StringBuilder buf = new StringBuilder(debugName+&quot;=Lambda(&quot;);</span>
+<span class="nc bnc" id="L713" title="All 2 branches missed.">        for (int i = 0; i &lt; names.length; i++) {</span>
+<span class="nc bnc" id="L714" title="All 2 branches missed.">            if (i == arity)  buf.append(&quot;)=&gt;{&quot;);</span>
+<span class="nc" id="L715">            Name n = names[i];</span>
+<span class="nc bnc" id="L716" title="All 2 branches missed.">            if (i &gt;= arity)  buf.append(&quot;\n    &quot;);</span>
+<span class="nc" id="L717">            buf.append(n);</span>
+<span class="nc bnc" id="L718" title="All 2 branches missed.">            if (i &lt; arity) {</span>
+<span class="nc bnc" id="L719" title="All 2 branches missed.">                if (i+1 &lt; arity)  buf.append(&quot;,&quot;);</span>
+                continue;
+            }
+<span class="nc" id="L722">            buf.append(&quot;=&quot;).append(n.exprString());</span>
+<span class="nc" id="L723">            buf.append(&quot;;&quot;);</span>
+        }
+<span class="nc bnc" id="L725" title="All 2 branches missed.">        buf.append(result &lt; 0 ? &quot;void&quot; : names[result]).append(&quot;}&quot;);</span>
+<span class="nc bnc" id="L726" title="All 2 branches missed.">        if (TRACE_INTERPRETER) {</span>
+            // Extra verbosity:
+<span class="nc" id="L728">            buf.append(&quot;:&quot;).append(basicTypeSignature());</span>
+<span class="nc" id="L729">            buf.append(&quot;/&quot;).append(vmentry);</span>
+        }
+<span class="nc" id="L731">        return buf.toString();</span>
+    }
+
+    /**
+     * Apply immediate binding for a Name in this form indicated by its position relative to the form.
+     * The first parameter to a LambdaForm, a0:L, always represents the form's method handle, so 0 is not
+     * accepted as valid.
+     */
+    LambdaForm bindImmediate(int pos, char basicType, Object value) {
+        // must be an argument, and the types must match
+<span class="nc bnc" id="L741" title="All 10 branches missed.">        assert pos &gt; 0 &amp;&amp; pos &lt; arity &amp;&amp; names[pos].type == basicType &amp;&amp; Name.typesMatch(basicType, value);</span>
+
+<span class="nc" id="L743">        int arity2 = arity - 1;</span>
+<span class="nc" id="L744">        Name[] names2 = new Name[names.length - 1];</span>
+<span class="nc bnc" id="L745" title="All 2 branches missed.">        for (int r = 0, w = 0; r &lt; names.length; ++r, ++w) { // (r)ead from names, (w)rite to names2</span>
+<span class="nc" id="L746">            Name n = names[r];</span>
+<span class="nc bnc" id="L747" title="All 2 branches missed.">            if (n.isParam()) {</span>
+<span class="nc bnc" id="L748" title="All 2 branches missed.">                if (n.index == pos) {</span>
+                    // do not copy over the argument that is to be replaced with a literal,
+                    // but adjust the write index
+<span class="nc" id="L751">                    --w;</span>
+                } else {
+<span class="nc" id="L753">                    names2[w] = new Name(w, n.type);</span>
+                }
+            } else {
+<span class="nc" id="L756">                Object[] arguments2 = new Object[n.arguments.length];</span>
+<span class="nc bnc" id="L757" title="All 2 branches missed.">                for (int i = 0; i &lt; n.arguments.length; ++i) {</span>
+<span class="nc" id="L758">                    Object arg = n.arguments[i];</span>
+<span class="nc bnc" id="L759" title="All 2 branches missed.">                    if (arg instanceof Name) {</span>
+<span class="nc" id="L760">                        int ni = ((Name) arg).index;</span>
+<span class="nc bnc" id="L761" title="All 2 branches missed.">                        if (ni == pos) {</span>
+<span class="nc" id="L762">                            arguments2[i] = value;</span>
+<span class="nc bnc" id="L763" title="All 2 branches missed.">                        } else if (ni &lt; pos) {</span>
+                            // replacement position not yet passed
+<span class="nc" id="L765">                            arguments2[i] = names2[ni];</span>
+                        } else {
+                            // replacement position passed
+<span class="nc" id="L768">                            arguments2[i] = names2[ni - 1];</span>
+                        }
+<span class="nc" id="L770">                    } else {</span>
+<span class="nc" id="L771">                        arguments2[i] = arg;</span>
+                    }
+                }
+<span class="nc" id="L774">                names2[w] = new Name(n.function, arguments2);</span>
+<span class="nc" id="L775">                names2[w].initIndex(w);</span>
+            }
+        }
+
+<span class="nc bnc" id="L779" title="All 2 branches missed.">        int result2 = result == -1 ? -1 : result - 1;</span>
+<span class="nc" id="L780">        return new LambdaForm(debugName, arity2, names2, result2);</span>
+    }
+
+    LambdaForm bind(int namePos, BoundMethodHandle.SpeciesData oldData) {
+<span class="fc" id="L784">        Name name = names[namePos];</span>
+<span class="fc" id="L785">        BoundMethodHandle.SpeciesData newData = oldData.extendWithType(name.type);</span>
+<span class="fc" id="L786">        return bind(name, newData.getterName(names[0], oldData.fieldCount()), oldData, newData);</span>
+    }
+    LambdaForm bind(Name name, Name binding,
+                    BoundMethodHandle.SpeciesData oldData,
+                    BoundMethodHandle.SpeciesData newData) {
+<span class="fc" id="L791">        int pos = name.index;</span>
+<span class="pc bpc" id="L792" title="1 of 4 branches missed.">        assert(name.isParam());</span>
+<span class="pc bpc" id="L793" title="1 of 4 branches missed.">        assert(!binding.isParam());</span>
+<span class="pc bpc" id="L794" title="1 of 4 branches missed.">        assert(name.type == binding.type);</span>
+<span class="pc bpc" id="L795" title="3 of 8 branches missed.">        assert(0 &lt;= pos &amp;&amp; pos &lt; arity &amp;&amp; names[pos] == name);</span>
+<span class="pc bpc" id="L796" title="1 of 4 branches missed.">        assert(binding.function.memberDeclaringClassOrNull() == newData.clazz);</span>
+<span class="pc bpc" id="L797" title="1 of 4 branches missed.">        assert(oldData.getters.length == newData.getters.length-1);</span>
+<span class="fc bfc" id="L798" title="All 2 branches covered.">        if (bindCache != null) {</span>
+<span class="fc" id="L799">            LambdaForm form = bindCache[pos];</span>
+<span class="fc bfc" id="L800" title="All 2 branches covered.">            if (form != null) {</span>
+<span class="pc bpc" id="L801" title="1 of 4 branches missed.">                assert(form.contains(binding)) : &quot;form &lt;&lt; &quot; + form + &quot; &gt;&gt; does not contain binding &lt;&lt; &quot; + binding + &quot; &gt;&gt;&quot;;</span>
+<span class="fc" id="L802">                return form;</span>
+            }
+<span class="fc" id="L804">        } else {</span>
+<span class="fc" id="L805">            bindCache = new LambdaForm[arity];</span>
+        }
+<span class="pc bpc" id="L807" title="1 of 4 branches missed.">        assert(nameRefsAreLegal());</span>
+<span class="fc" id="L808">        int arity2 = arity-1;</span>
+<span class="fc" id="L809">        Name[] names2 = names.clone();</span>
+<span class="fc" id="L810">        names2[pos] = binding;  // we might move this in a moment</span>
+
+        // The newly created LF will run with a different BMH.
+        // Switch over any pre-existing BMH field references to the new BMH class.
+<span class="fc" id="L814">        int firstOldRef = -1;</span>
+<span class="fc bfc" id="L815" title="All 2 branches covered.">        for (int i = 0; i &lt; names2.length; i++) {</span>
+<span class="fc" id="L816">            Name n = names[i];</span>
+<span class="fc bfc" id="L817" title="All 2 branches covered.">            if (n.function != null &amp;&amp;</span>
+<span class="fc bfc" id="L818" title="All 2 branches covered.">                n.function.memberDeclaringClassOrNull() == oldData.clazz) {</span>
+<span class="fc" id="L819">                MethodHandle oldGetter = n.function.resolvedHandle;</span>
+<span class="fc" id="L820">                MethodHandle newGetter = null;</span>
+<span class="fc bfc" id="L821" title="All 2 branches covered.">                for (int j = 0; j &lt; oldData.getters.length; j++) {</span>
+<span class="fc bfc" id="L822" title="All 2 branches covered.">                    if (oldGetter == oldData.getters[j])</span>
+<span class="fc" id="L823">                        newGetter =  newData.getters[j];</span>
+                }
+<span class="pc bpc" id="L825" title="1 of 2 branches missed.">                if (newGetter != null) {</span>
+<span class="fc bfc" id="L826" title="All 2 branches covered.">                    if (firstOldRef &lt; 0)  firstOldRef = i;</span>
+<span class="fc" id="L827">                    Name n2 = new Name(newGetter, n.arguments);</span>
+<span class="fc" id="L828">                    names2[i] = n2;</span>
+                }
+            }
+        }
+
+        // Walk over the new list of names once, in forward order.
+        // Replace references to 'name' with 'binding'.
+        // Replace data structure references to the old BMH species with the new.
+        // This might cause a ripple effect, but it will settle in one pass.
+<span class="pc bpc" id="L837" title="1 of 6 branches missed.">        assert(firstOldRef &lt; 0 || firstOldRef &gt; pos);</span>
+<span class="fc bfc" id="L838" title="All 2 branches covered.">        for (int i = pos+1; i &lt; names2.length; i++) {</span>
+<span class="fc bfc" id="L839" title="All 2 branches covered.">            if (i &lt;= arity2)  continue;</span>
+<span class="fc" id="L840">            names2[i] = names2[i].replaceNames(names, names2, pos, i);</span>
+        }
+
+        //  (a0, a1, name=a2, a3, a4)  =&gt;  (a0, a1, a3, a4, binding)
+<span class="fc" id="L844">        int insPos = pos;</span>
+<span class="pc bpc" id="L845" title="1 of 2 branches missed.">        for (; insPos+1 &lt; names2.length; insPos++) {</span>
+<span class="fc" id="L846">            Name n = names2[insPos+1];</span>
+<span class="fc bfc" id="L847" title="All 2 branches covered.">            if (n.isSiblingBindingBefore(binding)) {</span>
+<span class="fc" id="L848">                names2[insPos] = n;</span>
+            } else {
+                break;
+            }
+        }
+<span class="fc" id="L853">        names2[insPos] = binding;</span>
+
+        // Since we moved some stuff, maybe update the result reference:
+<span class="fc" id="L856">        int result2 = result;</span>
+<span class="pc bpc" id="L857" title="1 of 2 branches missed.">        if (result2 == pos)</span>
+<span class="nc" id="L858">            result2 = insPos;</span>
+<span class="pc bpc" id="L859" title="1 of 4 branches missed.">        else if (result2 &gt; pos &amp;&amp; result2 &lt;= insPos)</span>
+<span class="nc" id="L860">            result2 -= 1;</span>
+
+<span class="fc" id="L862">        return bindCache[pos] = new LambdaForm(debugName, arity2, names2, result2);</span>
+    }
+
+    boolean contains(Name name) {
+<span class="fc" id="L866">        int pos = name.index();</span>
+<span class="pc bpc" id="L867" title="1 of 2 branches missed.">        if (pos &gt;= 0) {</span>
+<span class="nc bnc" id="L868" title="All 4 branches missed.">            return pos &lt; names.length &amp;&amp; name.equals(names[pos]);</span>
+        }
+<span class="pc bpc" id="L870" title="1 of 2 branches missed.">        for (int i = arity; i &lt; names.length; i++) {</span>
+<span class="pc bpc" id="L871" title="1 of 2 branches missed.">            if (name.equals(names[i]))</span>
+<span class="fc" id="L872">                return true;</span>
+        }
+<span class="nc" id="L874">        return false;</span>
+    }
+
+    LambdaForm addArguments(int pos, char... types) {
+<span class="pc bpc" id="L878" title="1 of 4 branches missed.">        assert(pos &lt;= arity);</span>
+<span class="fc" id="L879">        int length = names.length;</span>
+<span class="fc" id="L880">        int inTypes = types.length;</span>
+<span class="fc" id="L881">        Name[] names2 = Arrays.copyOf(names, length + inTypes);</span>
+<span class="fc" id="L882">        int arity2 = arity + inTypes;</span>
+<span class="fc" id="L883">        int result2 = result;</span>
+<span class="fc bfc" id="L884" title="All 2 branches covered.">        if (result2 &gt;= arity)</span>
+<span class="fc" id="L885">            result2 += inTypes;</span>
+        // names array has MH in slot 0; skip it.
+<span class="fc" id="L887">        int argpos = pos + 1;</span>
+        // Note:  The LF constructor will rename names2[argpos...].
+        // Make space for new arguments (shift temporaries).
+<span class="fc" id="L890">        System.arraycopy(names, argpos, names2, argpos + inTypes, length - argpos);</span>
+<span class="fc bfc" id="L891" title="All 2 branches covered.">        for (int i = 0; i &lt; inTypes; i++) {</span>
+<span class="fc" id="L892">            names2[argpos + i] = new Name(types[i]);</span>
+        }
+<span class="fc" id="L894">        return new LambdaForm(debugName, arity2, names2, result2);</span>
+    }
+
+    LambdaForm addArguments(int pos, List&lt;Class&lt;?&gt;&gt; types) {
+<span class="fc" id="L898">        char[] basicTypes = new char[types.size()];</span>
+<span class="fc bfc" id="L899" title="All 2 branches covered.">        for (int i = 0; i &lt; basicTypes.length; i++)</span>
+<span class="fc" id="L900">            basicTypes[i] = basicType(types.get(i));</span>
+<span class="fc" id="L901">        return addArguments(pos, basicTypes);</span>
+    }
+
+    LambdaForm permuteArguments(int skip, int[] reorder, char[] types) {
+        // Note:  When inArg = reorder[outArg], outArg is fed by a copy of inArg.
+        // The types are the types of the new (incoming) arguments.
+<span class="fc" id="L907">        int length = names.length;</span>
+<span class="fc" id="L908">        int inTypes = types.length;</span>
+<span class="fc" id="L909">        int outArgs = reorder.length;</span>
+<span class="pc bpc" id="L910" title="1 of 4 branches missed.">        assert(skip+outArgs == arity);</span>
+<span class="pc bpc" id="L911" title="1 of 4 branches missed.">        assert(permutedTypesMatch(reorder, types, names, skip));</span>
+<span class="fc" id="L912">        int pos = 0;</span>
+        // skip trivial first part of reordering:
+<span class="fc bfc" id="L914" title="All 4 branches covered.">        while (pos &lt; outArgs &amp;&amp; reorder[pos] == pos)  pos += 1;</span>
+<span class="fc" id="L915">        Name[] names2 = new Name[length - outArgs + inTypes];</span>
+<span class="fc" id="L916">        System.arraycopy(names, 0, names2, 0, skip+pos);</span>
+        // copy the body:
+<span class="fc" id="L918">        int bodyLength = length - arity;</span>
+<span class="fc" id="L919">        System.arraycopy(names, skip+outArgs, names2, skip+inTypes, bodyLength);</span>
+<span class="fc" id="L920">        int arity2 = names2.length - bodyLength;</span>
+<span class="fc" id="L921">        int result2 = result;</span>
+<span class="pc bpc" id="L922" title="1 of 2 branches missed.">        if (result2 &gt;= 0) {</span>
+<span class="pc bpc" id="L923" title="1 of 2 branches missed.">            if (result2 &lt; skip+outArgs) {</span>
+                // return the corresponding inArg
+<span class="nc" id="L925">                result2 = reorder[result2-skip];</span>
+            } else {
+<span class="fc" id="L927">                result2 = result2 - outArgs + inTypes;</span>
+            }
+        }
+        // rework names in the body:
+<span class="fc bfc" id="L931" title="All 2 branches covered.">        for (int j = pos; j &lt; outArgs; j++) {</span>
+<span class="fc" id="L932">            Name n = names[skip+j];</span>
+<span class="fc" id="L933">            int i = reorder[j];</span>
+            // replace names[skip+j] by names2[skip+i]
+<span class="fc" id="L935">            Name n2 = names2[skip+i];</span>
+<span class="fc bfc" id="L936" title="All 2 branches covered.">            if (n2 == null)</span>
+<span class="fc" id="L937">                names2[skip+i] = n2 = new Name(types[i]);</span>
+            else
+<span class="pc bpc" id="L939" title="2 of 4 branches missed.">                assert(n2.type == types[i]);</span>
+<span class="fc bfc" id="L940" title="All 2 branches covered.">            for (int k = arity2; k &lt; names2.length; k++) {</span>
+<span class="fc" id="L941">                names2[k] = names2[k].replaceName(n, n2);</span>
+            }
+        }
+        // some names are unused, but must be filled in
+<span class="fc bfc" id="L945" title="All 2 branches covered.">        for (int i = skip+pos; i &lt; arity2; i++) {</span>
+<span class="fc bfc" id="L946" title="All 2 branches covered.">            if (names2[i] == null)</span>
+<span class="fc" id="L947">                names2[i] = argument(i, types[i - skip]);</span>
+        }
+<span class="fc bfc" id="L949" title="All 2 branches covered.">        for (int j = arity; j &lt; names.length; j++) {</span>
+<span class="fc" id="L950">            int i = j - arity + arity2;</span>
+            // replace names2[i] by names[j]
+<span class="fc" id="L952">            Name n = names[j];</span>
+<span class="fc" id="L953">            Name n2 = names2[i];</span>
+<span class="fc bfc" id="L954" title="All 2 branches covered.">            if (n != n2) {</span>
+<span class="fc bfc" id="L955" title="All 2 branches covered.">                for (int k = i+1; k &lt; names2.length; k++) {</span>
+<span class="fc" id="L956">                    names2[k] = names2[k].replaceName(n, n2);</span>
+                }
+            }
+        }
+<span class="fc" id="L960">        return new LambdaForm(debugName, arity2, names2, result2);</span>
+    }
+
+    static boolean permutedTypesMatch(int[] reorder, char[] types, Name[] names, int skip) {
+<span class="fc" id="L964">        int inTypes = types.length;</span>
+<span class="fc" id="L965">        int outArgs = reorder.length;</span>
+<span class="fc bfc" id="L966" title="All 2 branches covered.">        for (int i = 0; i &lt; outArgs; i++) {</span>
+<span class="pc bpc" id="L967" title="2 of 4 branches missed.">            assert(names[skip+i].isParam());</span>
+<span class="pc bpc" id="L968" title="2 of 4 branches missed.">            assert(names[skip+i].type == types[reorder[i]]);</span>
+        }
+<span class="fc" id="L970">        return true;</span>
+    }
+
+<span class="fc bfc" id="L973" title="All 2 branches covered.">    static class NamedFunction {</span>
+        final MemberName member;
+        @Stable MethodHandle resolvedHandle;
+        @Stable MethodHandle invoker;
+
+        NamedFunction(MethodHandle resolvedHandle) {
+<span class="fc" id="L979">            this(resolvedHandle.internalMemberName(), resolvedHandle);</span>
+<span class="fc" id="L980">        }</span>
+<span class="fc" id="L981">        NamedFunction(MemberName member, MethodHandle resolvedHandle) {</span>
+<span class="fc" id="L982">            this.member = member;</span>
+            //resolvedHandle = eraseSubwordTypes(resolvedHandle);
+<span class="fc" id="L984">            this.resolvedHandle = resolvedHandle;</span>
+<span class="fc" id="L985">        }</span>
+<span class="fc" id="L986">        NamedFunction(MethodType basicInvokerType) {</span>
+<span class="pc bpc" id="L987" title="1 of 4 branches missed.">            assert(basicInvokerType == basicInvokerType.basicType()) : basicInvokerType;</span>
+<span class="fc bfc" id="L988" title="All 2 branches covered.">            if (basicInvokerType.parameterSlotCount() &lt; MethodType.MAX_MH_INVOKER_ARITY) {</span>
+<span class="fc" id="L989">                this.resolvedHandle = basicInvokerType.invokers().basicInvoker();</span>
+<span class="fc" id="L990">                this.member = resolvedHandle.internalMemberName();</span>
+            } else {
+                // necessary to pass BigArityTest
+<span class="fc" id="L993">                this.member = Invokers.invokeBasicMethod(basicInvokerType);</span>
+            }
+<span class="fc" id="L995">        }</span>
+
+        // The next 3 constructors are used to break circular dependencies on MH.invokeStatic, etc.
+        // Any LambdaForm containing such a member is not interpretable.
+        // This is OK, since all such LFs are prepared with special primitive vmentry points.
+        // And even without the resolvedHandle, the name can still be compiled and optimized.
+        NamedFunction(Method method) {
+<span class="fc" id="L1002">            this(new MemberName(method));</span>
+<span class="fc" id="L1003">        }</span>
+        NamedFunction(Field field) {
+<span class="nc" id="L1005">            this(new MemberName(field));</span>
+<span class="nc" id="L1006">        }</span>
+<span class="fc" id="L1007">        NamedFunction(MemberName member) {</span>
+<span class="fc" id="L1008">            this.member = member;</span>
+<span class="fc" id="L1009">            this.resolvedHandle = null;</span>
+<span class="fc" id="L1010">        }</span>
+
+        MethodHandle resolvedHandle() {
+<span class="fc bfc" id="L1013" title="All 2 branches covered.">            if (resolvedHandle == null)  resolve();</span>
+<span class="fc" id="L1014">            return resolvedHandle;</span>
+        }
+
+        void resolve() {
+<span class="fc" id="L1018">            resolvedHandle = DirectMethodHandle.make(member);</span>
+<span class="fc" id="L1019">        }</span>
+
+        @Override
+        public boolean equals(Object other) {
+<span class="fc bfc" id="L1023" title="All 2 branches covered.">            if (this == other) return true;</span>
+<span class="pc bpc" id="L1024" title="1 of 2 branches missed.">            if (other == null) return false;</span>
+<span class="pc bpc" id="L1025" title="1 of 2 branches missed.">            if (!(other instanceof NamedFunction)) return false;</span>
+<span class="fc" id="L1026">            NamedFunction that = (NamedFunction) other;</span>
+<span class="fc bfc" id="L1027" title="All 4 branches covered.">            return this.member != null &amp;&amp; this.member.equals(that.member);</span>
+        }
+
+        @Override
+        public int hashCode() {
+<span class="nc bnc" id="L1032" title="All 2 branches missed.">            if (member != null)</span>
+<span class="nc" id="L1033">                return member.hashCode();</span>
+<span class="nc" id="L1034">            return super.hashCode();</span>
+        }
+
+        // Put the predefined NamedFunction invokers into the table.
+        static void initializeInvokers() {
+<span class="fc bfc" id="L1039" title="All 2 branches covered.">            for (MemberName m : MemberName.getFactory().getMethods(NamedFunction.class, false, null, null, null)) {</span>
+<span class="fc bfc" id="L1040" title="All 4 branches covered.">                if (!m.isStatic() || !m.isPackage())  continue;</span>
+<span class="fc" id="L1041">                MethodType type = m.getMethodType();</span>
+<span class="fc bfc" id="L1042" title="All 2 branches covered.">                if (type.equals(INVOKER_METHOD_TYPE) &amp;&amp;</span>
+<span class="pc bpc" id="L1043" title="1 of 2 branches missed.">                    m.getName().startsWith(&quot;invoke_&quot;)) {</span>
+<span class="fc" id="L1044">                    String sig = m.getName().substring(&quot;invoke_&quot;.length());</span>
+<span class="fc" id="L1045">                    int arity = LambdaForm.signatureArity(sig);</span>
+<span class="fc" id="L1046">                    MethodType srcType = MethodType.genericMethodType(arity);</span>
+<span class="fc bfc" id="L1047" title="All 2 branches covered.">                    if (LambdaForm.signatureReturn(sig) == 'V')</span>
+<span class="fc" id="L1048">                        srcType = srcType.changeReturnType(void.class);</span>
+<span class="fc" id="L1049">                    MethodTypeForm typeForm = srcType.form();</span>
+<span class="fc" id="L1050">                    typeForm.namedFunctionInvoker = DirectMethodHandle.make(m);</span>
+                }
+<span class="fc" id="L1052">            }</span>
+<span class="fc" id="L1053">        }</span>
+
+        // The following are predefined NamedFunction invokers.  The system must build
+        // a separate invoker for each distinct signature.
+        /** void return type invokers. */
+        @Hidden
+        static Object invoke__V(MethodHandle mh, Object[] a) throws Throwable {
+<span class="pc bpc" id="L1060" title="2 of 4 branches missed.">            assert(a.length == 0);</span>
+<span class="fc" id="L1061">            mh.invokeBasic();</span>
+<span class="fc" id="L1062">            return null;</span>
+        }
+        @Hidden
+        static Object invoke_L_V(MethodHandle mh, Object[] a) throws Throwable {
+<span class="pc bpc" id="L1066" title="1 of 4 branches missed.">            assert(a.length == 1);</span>
+<span class="fc" id="L1067">            mh.invokeBasic(a[0]);</span>
+<span class="fc" id="L1068">            return null;</span>
+        }
+        @Hidden
+        static Object invoke_LL_V(MethodHandle mh, Object[] a) throws Throwable {
+<span class="pc bpc" id="L1072" title="1 of 4 branches missed.">            assert(a.length == 2);</span>
+<span class="fc" id="L1073">            mh.invokeBasic(a[0], a[1]);</span>
+<span class="fc" id="L1074">            return null;</span>
+        }
+        @Hidden
+        static Object invoke_LLL_V(MethodHandle mh, Object[] a) throws Throwable {
+<span class="pc bpc" id="L1078" title="1 of 4 branches missed.">            assert(a.length == 3);</span>
+<span class="fc" id="L1079">            mh.invokeBasic(a[0], a[1], a[2]);</span>
+<span class="fc" id="L1080">            return null;</span>
+        }
+        @Hidden
+        static Object invoke_LLLL_V(MethodHandle mh, Object[] a) throws Throwable {
+<span class="pc bpc" id="L1084" title="2 of 4 branches missed.">            assert(a.length == 4);</span>
+<span class="fc" id="L1085">            mh.invokeBasic(a[0], a[1], a[2], a[3]);</span>
+<span class="fc" id="L1086">            return null;</span>
+        }
+        @Hidden
+        static Object invoke_LLLLL_V(MethodHandle mh, Object[] a) throws Throwable {
+<span class="pc bpc" id="L1090" title="2 of 4 branches missed.">            assert(a.length == 5);</span>
+<span class="fc" id="L1091">            mh.invokeBasic(a[0], a[1], a[2], a[3], a[4]);</span>
+<span class="fc" id="L1092">            return null;</span>
+        }
+        /** Object return type invokers. */
+        @Hidden
+        static Object invoke__L(MethodHandle mh, Object[] a) throws Throwable {
+<span class="pc bpc" id="L1097" title="1 of 4 branches missed.">            assert(a.length == 0);</span>
+<span class="fc" id="L1098">            return mh.invokeBasic();</span>
+        }
+        @Hidden
+        static Object invoke_L_L(MethodHandle mh, Object[] a) throws Throwable {
+<span class="pc bpc" id="L1102" title="1 of 4 branches missed.">            assert(a.length == 1);</span>
+<span class="fc" id="L1103">            return mh.invokeBasic(a[0]);</span>
+        }
+        @Hidden
+        static Object invoke_LL_L(MethodHandle mh, Object[] a) throws Throwable {
+<span class="pc bpc" id="L1107" title="1 of 4 branches missed.">            assert(a.length == 2);</span>
+<span class="fc" id="L1108">            return mh.invokeBasic(a[0], a[1]);</span>
+        }
+        @Hidden
+        static Object invoke_LLL_L(MethodHandle mh, Object[] a) throws Throwable {
+<span class="pc bpc" id="L1112" title="1 of 4 branches missed.">            assert(a.length == 3);</span>
+<span class="fc" id="L1113">            return mh.invokeBasic(a[0], a[1], a[2]);</span>
+        }
+        @Hidden
+        static Object invoke_LLLL_L(MethodHandle mh, Object[] a) throws Throwable {
+<span class="pc bpc" id="L1117" title="1 of 4 branches missed.">            assert(a.length == 4);</span>
+<span class="fc" id="L1118">            return mh.invokeBasic(a[0], a[1], a[2], a[3]);</span>
+        }
+        @Hidden
+        static Object invoke_LLLLL_L(MethodHandle mh, Object[] a) throws Throwable {
+<span class="pc bpc" id="L1122" title="1 of 4 branches missed.">            assert(a.length == 5);</span>
+<span class="fc" id="L1123">            return mh.invokeBasic(a[0], a[1], a[2], a[3], a[4]);</span>
+        }
+
+<span class="fc" id="L1126">        static final MethodType INVOKER_METHOD_TYPE =</span>
+<span class="fc" id="L1127">            MethodType.methodType(Object.class, MethodHandle.class, Object[].class);</span>
+
+        private static MethodHandle computeInvoker(MethodTypeForm typeForm) {
+<span class="fc" id="L1130">            MethodHandle mh = typeForm.namedFunctionInvoker;</span>
+<span class="fc bfc" id="L1131" title="All 2 branches covered.">            if (mh != null)  return mh;</span>
+<span class="fc" id="L1132">            MemberName invoker = InvokerBytecodeGenerator.generateNamedFunctionInvoker(typeForm);  // this could take a while</span>
+<span class="fc" id="L1133">            mh = DirectMethodHandle.make(invoker);</span>
+<span class="fc" id="L1134">            MethodHandle mh2 = typeForm.namedFunctionInvoker;</span>
+<span class="pc bpc" id="L1135" title="1 of 2 branches missed.">            if (mh2 != null)  return mh2;  // benign race</span>
+<span class="pc bpc" id="L1136" title="1 of 2 branches missed.">            if (!mh.type().equals(INVOKER_METHOD_TYPE))</span>
+<span class="nc" id="L1137">                throw new InternalError(mh.debugString());</span>
+<span class="fc" id="L1138">            return typeForm.namedFunctionInvoker = mh;</span>
+        }
+
+        @Hidden
+        Object invokeWithArguments(Object... arguments) throws Throwable {
+            // If we have a cached invoker, call it right away.
+            // NOTE: The invoker always returns a reference value.
+<span class="pc bpc" id="L1145" title="1 of 2 branches missed.">            if (TRACE_INTERPRETER)  return invokeWithArgumentsTracing(arguments);</span>
+<span class="pc bpc" id="L1146" title="1 of 4 branches missed.">            assert(checkArgumentTypes(arguments, methodType()));</span>
+<span class="fc" id="L1147">            return invoker().invokeBasic(resolvedHandle(), arguments);</span>
+        }
+
+        @Hidden
+        Object invokeWithArgumentsTracing(Object[] arguments) throws Throwable {
+            Object rval;
+            try {
+<span class="nc" id="L1154">                traceInterpreter(&quot;[ call&quot;, this, arguments);</span>
+<span class="nc bnc" id="L1155" title="All 2 branches missed.">                if (invoker == null) {</span>
+<span class="nc" id="L1156">                    traceInterpreter(&quot;| getInvoker&quot;, this);</span>
+<span class="nc" id="L1157">                    invoker();</span>
+                }
+<span class="nc bnc" id="L1159" title="All 2 branches missed.">                if (resolvedHandle == null) {</span>
+<span class="nc" id="L1160">                    traceInterpreter(&quot;| resolve&quot;, this);</span>
+<span class="nc" id="L1161">                    resolvedHandle();</span>
+                }
+<span class="nc bnc" id="L1163" title="All 4 branches missed.">                assert(checkArgumentTypes(arguments, methodType()));</span>
+<span class="nc" id="L1164">                rval = invoker().invokeBasic(resolvedHandle(), arguments);</span>
+<span class="nc" id="L1165">            } catch (Throwable ex) {</span>
+<span class="nc" id="L1166">                traceInterpreter(&quot;] throw =&gt;&quot;, ex);</span>
+<span class="nc" id="L1167">                throw ex;</span>
+<span class="nc" id="L1168">            }</span>
+<span class="nc" id="L1169">            traceInterpreter(&quot;] return =&gt;&quot;, rval);</span>
+<span class="nc" id="L1170">            return rval;</span>
+        }
+
+        private MethodHandle invoker() {
+<span class="fc bfc" id="L1174" title="All 2 branches covered.">            if (invoker != null)  return invoker;</span>
+            // Get an invoker and cache it.
+<span class="fc" id="L1176">            return invoker = computeInvoker(methodType().form());</span>
+        }
+
+        private static boolean checkArgumentTypes(Object[] arguments, MethodType methodType) {
+<span class="fc" id="L1180">            if (true)  return true;  // FIXME</span>
+            MethodType dstType = methodType.form().erasedType();
+            MethodType srcType = dstType.basicType().wrap();
+            Class&lt;?&gt;[] ptypes = new Class&lt;?&gt;[arguments.length];
+            for (int i = 0; i &lt; arguments.length; i++) {
+                Object arg = arguments[i];
+                Class&lt;?&gt; ptype = arg == null ? Object.class : arg.getClass();
+                // If the dest. type is a primitive we keep the
+                // argument type.
+                ptypes[i] = dstType.parameterType(i).isPrimitive() ? ptype : Object.class;
+            }
+            MethodType argType = MethodType.methodType(srcType.returnType(), ptypes).wrap();
+            assert(argType.isConvertibleTo(srcType)) : &quot;wrong argument types: cannot convert &quot; + argType + &quot; to &quot; + srcType;
+            return true;
+        }
+
+        String basicTypeSignature() {
+            //return LambdaForm.basicTypeSignature(resolvedHandle.type());
+<span class="nc" id="L1198">            return LambdaForm.basicTypeSignature(methodType());</span>
+        }
+
+        MethodType methodType() {
+<span class="fc bfc" id="L1202" title="All 2 branches covered.">            if (resolvedHandle != null)</span>
+<span class="fc" id="L1203">                return resolvedHandle.type();</span>
+            else
+                // only for certain internal LFs during bootstrapping
+<span class="fc" id="L1206">                return member.getInvocationType();</span>
+        }
+
+        MemberName member() {
+<span class="pc bpc" id="L1210" title="1 of 4 branches missed.">            assert(assertMemberIsConsistent());</span>
+<span class="fc" id="L1211">            return member;</span>
+        }
+
+        // Called only from assert.
+        private boolean assertMemberIsConsistent() {
+<span class="fc bfc" id="L1216" title="All 2 branches covered.">            if (resolvedHandle instanceof DirectMethodHandle) {</span>
+<span class="fc" id="L1217">                MemberName m = resolvedHandle.internalMemberName();</span>
+<span class="pc bpc" id="L1218" title="2 of 4 branches missed.">                assert(m.equals(member));</span>
+            }
+<span class="fc" id="L1220">            return true;</span>
+        }
+
+        Class&lt;?&gt; memberDeclaringClassOrNull() {
+<span class="fc bfc" id="L1224" title="All 2 branches covered.">            return (member == null) ? null : member.getDeclaringClass();</span>
+        }
+
+        char returnType() {
+<span class="fc" id="L1228">            return basicType(methodType().returnType());</span>
+        }
+
+        char parameterType(int n) {
+<span class="fc" id="L1232">            return basicType(methodType().parameterType(n));</span>
+        }
+
+        int arity() {
+            //int siglen = member.getMethodType().parameterCount();
+            //if (!member.isStatic())  siglen += 1;
+            //return siglen;
+<span class="fc" id="L1239">            return methodType().parameterCount();</span>
+        }
+
+        public String toString() {
+<span class="nc bnc" id="L1243" title="All 2 branches missed.">            if (member == null)  return String.valueOf(resolvedHandle);</span>
+<span class="nc" id="L1244">            return member.getDeclaringClass().getSimpleName()+&quot;.&quot;+member.getName();</span>
+        }
+    }
+
+    void resolve() {
+<span class="nc bnc" id="L1249" title="All 2 branches missed.">        for (Name n : names) n.resolve();</span>
+<span class="nc" id="L1250">    }</span>
+
+    public static char basicType(Class&lt;?&gt; type) {
+<span class="fc" id="L1253">        char c = Wrapper.basicTypeChar(type);</span>
+<span class="fc bfc" id="L1254" title="All 2 branches covered.">        if (&quot;ZBSC&quot;.indexOf(c) &gt;= 0)  c = 'I';</span>
+<span class="pc bpc" id="L1255" title="1 of 4 branches missed.">        assert(&quot;LIJFDV&quot;.indexOf(c) &gt;= 0);</span>
+<span class="fc" id="L1256">        return c;</span>
+    }
+    public static char[] basicTypes(List&lt;Class&lt;?&gt;&gt; types) {
+<span class="fc" id="L1259">        char[] btypes = new char[types.size()];</span>
+<span class="fc bfc" id="L1260" title="All 2 branches covered.">        for (int i = 0; i &lt; btypes.length; i++) {</span>
+<span class="fc" id="L1261">            btypes[i] = basicType(types.get(i));</span>
+        }
+<span class="fc" id="L1263">        return btypes;</span>
+    }
+    public static String basicTypeSignature(MethodType type) {
+<span class="fc" id="L1266">        char[] sig = new char[type.parameterCount() + 2];</span>
+<span class="fc" id="L1267">        int sigp = 0;</span>
+<span class="fc bfc" id="L1268" title="All 2 branches covered.">        for (Class&lt;?&gt; pt : type.parameterList()) {</span>
+<span class="fc" id="L1269">            sig[sigp++] = basicType(pt);</span>
+<span class="fc" id="L1270">        }</span>
+<span class="fc" id="L1271">        sig[sigp++] = '_';</span>
+<span class="fc" id="L1272">        sig[sigp++] = basicType(type.returnType());</span>
+<span class="pc bpc" id="L1273" title="1 of 4 branches missed.">        assert(sigp == sig.length);</span>
+<span class="fc" id="L1274">        return String.valueOf(sig);</span>
+    }
+
+<span class="fc bfc" id="L1277" title="All 2 branches covered.">    static final class Name {</span>
+        final char type;
+        private short index;
+        final NamedFunction function;
+        @Stable final Object[] arguments;
+
+<span class="fc" id="L1283">        private Name(int index, char type, NamedFunction function, Object[] arguments) {</span>
+<span class="fc" id="L1284">            this.index = (short)index;</span>
+<span class="fc" id="L1285">            this.type = type;</span>
+<span class="fc" id="L1286">            this.function = function;</span>
+<span class="fc" id="L1287">            this.arguments = arguments;</span>
+<span class="pc bpc" id="L1288" title="1 of 4 branches missed.">            assert(this.index == index);</span>
+<span class="fc" id="L1289">        }</span>
+        Name(MethodHandle function, Object... arguments) {
+<span class="fc" id="L1291">            this(new NamedFunction(function), arguments);</span>
+<span class="fc" id="L1292">        }</span>
+        Name(MethodType functionType, Object... arguments) {
+<span class="fc" id="L1294">            this(new NamedFunction(functionType), arguments);</span>
+<span class="pc bpc" id="L1295" title="2 of 6 branches missed.">            assert(arguments[0] instanceof Name &amp;&amp; ((Name)arguments[0]).type == 'L');</span>
+<span class="fc" id="L1296">        }</span>
+        Name(MemberName function, Object... arguments) {
+<span class="fc" id="L1298">            this(new NamedFunction(function), arguments);</span>
+<span class="fc" id="L1299">        }</span>
+        Name(NamedFunction function, Object... arguments) {
+<span class="fc" id="L1301">            this(-1, function.returnType(), function, arguments = arguments.clone());</span>
+<span class="pc bpc" id="L1302" title="1 of 4 branches missed.">            assert(arguments.length == function.arity()) : &quot;arity mismatch: arguments.length=&quot; + arguments.length + &quot; == function.arity()=&quot; + function.arity() + &quot; in &quot; + debugString();</span>
+<span class="fc bfc" id="L1303" title="All 2 branches covered.">            for (int i = 0; i &lt; arguments.length; i++)</span>
+<span class="pc bpc" id="L1304" title="1 of 4 branches missed.">                assert(typesMatch(function.parameterType(i), arguments[i])) : &quot;types don't match: function.parameterType(&quot; + i + &quot;)=&quot; + function.parameterType(i) + &quot;, arguments[&quot; + i + &quot;]=&quot; + arguments[i] + &quot; in &quot; + debugString();</span>
+<span class="fc" id="L1305">        }</span>
+        Name(int index, char type) {
+<span class="fc" id="L1307">            this(index, type, null, null);</span>
+<span class="fc" id="L1308">        }</span>
+        Name(char type) {
+<span class="fc" id="L1310">            this(-1, type);</span>
+<span class="fc" id="L1311">        }</span>
+
+<span class="nc" id="L1313">        char type() { return type; }</span>
+<span class="fc" id="L1314">        int index() { return index; }</span>
+        boolean initIndex(int i) {
+<span class="fc bfc" id="L1316" title="All 2 branches covered.">            if (index != i) {</span>
+<span class="fc bfc" id="L1317" title="All 2 branches covered.">                if (index != -1)  return false;</span>
+<span class="fc" id="L1318">                index = (short)i;</span>
+            }
+<span class="fc" id="L1320">            return true;</span>
+        }
+
+
+        void resolve() {
+<span class="nc bnc" id="L1325" title="All 2 branches missed.">            if (function != null)</span>
+<span class="nc" id="L1326">                function.resolve();</span>
+<span class="nc" id="L1327">        }</span>
+
+        Name newIndex(int i) {
+<span class="fc bfc" id="L1330" title="All 2 branches covered.">            if (initIndex(i))  return this;</span>
+<span class="fc" id="L1331">            return cloneWithIndex(i);</span>
+        }
+        Name cloneWithIndex(int i) {
+<span class="fc bfc" id="L1334" title="All 2 branches covered.">            Object[] newArguments = (arguments == null) ? null : arguments.clone();</span>
+<span class="fc" id="L1335">            return new Name(i, type, function, newArguments);</span>
+        }
+        Name replaceName(Name oldName, Name newName) {  // FIXME: use replaceNames uniformly
+<span class="pc bpc" id="L1338" title="1 of 2 branches missed.">            if (oldName == newName)  return this;</span>
+            @SuppressWarnings(&quot;LocalVariableHidesMemberVariable&quot;)
+<span class="fc" id="L1340">            Object[] arguments = this.arguments;</span>
+<span class="pc bpc" id="L1341" title="1 of 2 branches missed.">            if (arguments == null)  return this;</span>
+<span class="fc" id="L1342">            boolean replaced = false;</span>
+<span class="fc bfc" id="L1343" title="All 2 branches covered.">            for (int j = 0; j &lt; arguments.length; j++) {</span>
+<span class="fc bfc" id="L1344" title="All 2 branches covered.">                if (arguments[j] == oldName) {</span>
+<span class="pc bpc" id="L1345" title="1 of 2 branches missed.">                    if (!replaced) {</span>
+<span class="fc" id="L1346">                        replaced = true;</span>
+<span class="fc" id="L1347">                        arguments = arguments.clone();</span>
+                    }
+<span class="fc" id="L1349">                    arguments[j] = newName;</span>
+                }
+            }
+<span class="fc bfc" id="L1352" title="All 2 branches covered.">            if (!replaced)  return this;</span>
+<span class="fc" id="L1353">            return new Name(function, arguments);</span>
+        }
+        Name replaceNames(Name[] oldNames, Name[] newNames, int start, int end) {
+            @SuppressWarnings(&quot;LocalVariableHidesMemberVariable&quot;)
+<span class="fc" id="L1357">            Object[] arguments = this.arguments;</span>
+<span class="fc" id="L1358">            boolean replaced = false;</span>
+        eachArg:
+<span class="fc bfc" id="L1360" title="All 2 branches covered.">            for (int j = 0; j &lt; arguments.length; j++) {</span>
+<span class="pc bpc" id="L1361" title="1 of 2 branches missed.">                if (arguments[j] instanceof Name) {</span>
+<span class="fc" id="L1362">                    Name n = (Name) arguments[j];</span>
+<span class="fc" id="L1363">                    int check = n.index;</span>
+                    // harmless check to see if the thing is already in newNames:
+<span class="pc bpc" id="L1365" title="2 of 6 branches missed.">                    if (check &gt;= 0 &amp;&amp; check &lt; newNames.length &amp;&amp; n == newNames[check])</span>
+<span class="fc" id="L1366">                        continue eachArg;</span>
+                    // n might not have the correct index: n != oldNames[n.index].
+<span class="pc bpc" id="L1368" title="1 of 2 branches missed.">                    for (int i = start; i &lt; end; i++) {</span>
+<span class="fc bfc" id="L1369" title="All 2 branches covered.">                        if (n == oldNames[i]) {</span>
+<span class="pc bpc" id="L1370" title="1 of 2 branches missed.">                            if (n == newNames[i])</span>
+<span class="nc" id="L1371">                                continue eachArg;</span>
+<span class="fc bfc" id="L1372" title="All 2 branches covered.">                            if (!replaced) {</span>
+<span class="fc" id="L1373">                                replaced = true;</span>
+<span class="fc" id="L1374">                                arguments = arguments.clone();</span>
+                            }
+<span class="fc" id="L1376">                            arguments[j] = newNames[i];</span>
+<span class="fc" id="L1377">                            continue eachArg;</span>
+                        }
+                    }
+                }
+            }
+<span class="fc bfc" id="L1382" title="All 2 branches covered.">            if (!replaced)  return this;</span>
+<span class="fc" id="L1383">            return new Name(function, arguments);</span>
+        }
+        void internArguments() {
+            @SuppressWarnings(&quot;LocalVariableHidesMemberVariable&quot;)
+<span class="fc" id="L1387">            Object[] arguments = this.arguments;</span>
+<span class="fc bfc" id="L1388" title="All 2 branches covered.">            for (int j = 0; j &lt; arguments.length; j++) {</span>
+<span class="pc bpc" id="L1389" title="1 of 2 branches missed.">                if (arguments[j] instanceof Name) {</span>
+<span class="fc" id="L1390">                    Name n = (Name) arguments[j];</span>
+<span class="fc bfc" id="L1391" title="All 4 branches covered.">                    if (n.isParam() &amp;&amp; n.index &lt; INTERNED_ARGUMENT_LIMIT)</span>
+<span class="fc" id="L1392">                        arguments[j] = internArgument(n);</span>
+                }
+            }
+<span class="fc" id="L1395">        }</span>
+        boolean isParam() {
+<span class="fc bfc" id="L1397" title="All 2 branches covered.">            return function == null;</span>
+        }
+        boolean isConstantZero() {
+<span class="pc bpc" id="L1400" title="3 of 6 branches missed.">            return !isParam() &amp;&amp; arguments.length == 0 &amp;&amp; function.equals(constantZero(0, type).function);</span>
+        }
+
+        public String toString() {
+<span class="nc bnc" id="L1404" title="All 4 branches missed.">            return (isParam()?&quot;a&quot;:&quot;t&quot;)+(index &gt;= 0 ? index : System.identityHashCode(this))+&quot;:&quot;+type;</span>
+        }
+        public String debugString() {
+<span class="nc" id="L1407">            String s = toString();</span>
+<span class="nc bnc" id="L1408" title="All 2 branches missed.">            return (function == null) ? s : s + &quot;=&quot; + exprString();</span>
+        }
+        public String exprString() {
+<span class="nc bnc" id="L1411" title="All 2 branches missed.">            if (function == null)  return &quot;null&quot;;</span>
+<span class="nc" id="L1412">            StringBuilder buf = new StringBuilder(function.toString());</span>
+<span class="nc" id="L1413">            buf.append(&quot;(&quot;);</span>
+<span class="nc" id="L1414">            String cma = &quot;&quot;;</span>
+<span class="nc bnc" id="L1415" title="All 2 branches missed.">            for (Object a : arguments) {</span>
+<span class="nc" id="L1416">                buf.append(cma); cma = &quot;,&quot;;</span>
+<span class="nc bnc" id="L1417" title="All 4 branches missed.">                if (a instanceof Name || a instanceof Integer)</span>
+<span class="nc" id="L1418">                    buf.append(a);</span>
+                else
+<span class="nc" id="L1420">                    buf.append(&quot;(&quot;).append(a).append(&quot;)&quot;);</span>
+            }
+<span class="nc" id="L1422">            buf.append(&quot;)&quot;);</span>
+<span class="nc" id="L1423">            return buf.toString();</span>
+        }
+
+        private static boolean typesMatch(char parameterType, Object object) {
+<span class="fc bfc" id="L1427" title="All 2 branches covered.">            if (object instanceof Name) {</span>
+<span class="pc bpc" id="L1428" title="1 of 2 branches missed.">                return ((Name)object).type == parameterType;</span>
+            }
+<span class="pc bpc" id="L1430" title="3 of 5 branches missed.">            switch (parameterType) {</span>
+<span class="fc" id="L1431">                case 'I':  return object instanceof Integer;</span>
+<span class="nc" id="L1432">                case 'J':  return object instanceof Long;</span>
+<span class="nc" id="L1433">                case 'F':  return object instanceof Float;</span>
+<span class="nc" id="L1434">                case 'D':  return object instanceof Double;</span>
+            }
+<span class="pc bpc" id="L1436" title="2 of 4 branches missed.">            assert(parameterType == 'L');</span>
+<span class="fc" id="L1437">            return true;</span>
+        }
+
+        /**
+         * Does this Name precede the given binding node in some canonical order?
+         * This predicate is used to order data bindings (via insertion sort)
+         * with some stability.
+         */
+        boolean isSiblingBindingBefore(Name binding) {
+<span class="pc bpc" id="L1446" title="1 of 4 branches missed.">            assert(!binding.isParam());</span>
+<span class="fc bfc" id="L1447" title="All 2 branches covered.">            if (isParam())  return true;</span>
+<span class="pc bpc" id="L1448" title="3 of 4 branches missed.">            if (function.equals(binding.function) &amp;&amp;</span>
+                arguments.length == binding.arguments.length) {
+<span class="nc" id="L1450">                boolean sawInt = false;</span>
+<span class="nc bnc" id="L1451" title="All 2 branches missed.">                for (int i = 0; i &lt; arguments.length; i++) {</span>
+<span class="nc" id="L1452">                    Object a1 = arguments[i];</span>
+<span class="nc" id="L1453">                    Object a2 = binding.arguments[i];</span>
+<span class="nc bnc" id="L1454" title="All 2 branches missed.">                    if (!a1.equals(a2)) {</span>
+<span class="nc bnc" id="L1455" title="All 4 branches missed.">                        if (a1 instanceof Integer &amp;&amp; a2 instanceof Integer) {</span>
+<span class="nc bnc" id="L1456" title="All 2 branches missed.">                            if (sawInt)  continue;</span>
+<span class="nc" id="L1457">                            sawInt = true;</span>
+<span class="nc bnc" id="L1458" title="All 2 branches missed.">                            if ((int)a1 &lt; (int)a2)  continue;  // still might be true</span>
+                        }
+<span class="nc" id="L1460">                        return false;</span>
+                    }
+                }
+<span class="nc" id="L1463">                return sawInt;</span>
+            }
+<span class="fc" id="L1465">            return false;</span>
+        }
+
+        public boolean equals(Name that) {
+<span class="fc bfc" id="L1469" title="All 2 branches covered.">            if (this == that)  return true;</span>
+<span class="pc bpc" id="L1470" title="1 of 2 branches missed.">            if (isParam())</span>
+                // each parameter is a unique atom
+<span class="nc" id="L1472">                return false;  // this != that</span>
+<span class="pc bpc" id="L1473" title="1 of 2 branches missed.">            return</span>
+                //this.index == that.index &amp;&amp;
+                this.type == that.type &amp;&amp;
+<span class="pc bpc" id="L1476" title="1 of 2 branches missed.">                this.function.equals(that.function) &amp;&amp;</span>
+<span class="pc bpc" id="L1477" title="1 of 2 branches missed.">                Arrays.equals(this.arguments, that.arguments);</span>
+        }
+        @Override
+        public boolean equals(Object x) {
+<span class="pc bpc" id="L1481" title="2 of 4 branches missed.">            return x instanceof Name &amp;&amp; equals((Name)x);</span>
+        }
+        @Override
+        public int hashCode() {
+<span class="nc bnc" id="L1485" title="All 2 branches missed.">            if (isParam())</span>
+<span class="nc" id="L1486">                return index | (type &lt;&lt; 8);</span>
+<span class="nc" id="L1487">            return function.hashCode() ^ Arrays.hashCode(arguments);</span>
+        }
+    }
+
+    static Name argument(int which, char type) {
+<span class="fc" id="L1492">        int tn = ALL_TYPES.indexOf(type);</span>
+<span class="pc bpc" id="L1493" title="1 of 4 branches missed.">        if (tn &lt; 0 || which &gt;= INTERNED_ARGUMENT_LIMIT)</span>
+<span class="fc" id="L1494">            return new Name(which, type);</span>
+<span class="fc" id="L1495">        return INTERNED_ARGUMENTS[tn][which];</span>
+    }
+    static Name internArgument(Name n) {
+<span class="pc bpc" id="L1498" title="1 of 4 branches missed.">        assert(n.isParam()) : &quot;not param: &quot; + n;</span>
+<span class="pc bpc" id="L1499" title="1 of 4 branches missed.">        assert(n.index &lt; INTERNED_ARGUMENT_LIMIT);</span>
+<span class="fc" id="L1500">        return argument(n.index, n.type);</span>
+    }
+    static Name[] arguments(int extra, String types) {
+<span class="fc" id="L1503">        int length = types.length();</span>
+<span class="fc" id="L1504">        Name[] names = new Name[length + extra];</span>
+<span class="fc bfc" id="L1505" title="All 2 branches covered.">        for (int i = 0; i &lt; length; i++)</span>
+<span class="fc" id="L1506">            names[i] = argument(i, types.charAt(i));</span>
+<span class="fc" id="L1507">        return names;</span>
+    }
+    static Name[] arguments(int extra, char... types) {
+<span class="nc" id="L1510">        int length = types.length;</span>
+<span class="nc" id="L1511">        Name[] names = new Name[length + extra];</span>
+<span class="nc bnc" id="L1512" title="All 2 branches missed.">        for (int i = 0; i &lt; length; i++)</span>
+<span class="nc" id="L1513">            names[i] = argument(i, types[i]);</span>
+<span class="nc" id="L1514">        return names;</span>
+    }
+    static Name[] arguments(int extra, List&lt;Class&lt;?&gt;&gt; types) {
+<span class="nc" id="L1517">        int length = types.size();</span>
+<span class="nc" id="L1518">        Name[] names = new Name[length + extra];</span>
+<span class="nc bnc" id="L1519" title="All 2 branches missed.">        for (int i = 0; i &lt; length; i++)</span>
+<span class="nc" id="L1520">            names[i] = argument(i, basicType(types.get(i)));</span>
+<span class="nc" id="L1521">        return names;</span>
+    }
+    static Name[] arguments(int extra, Class&lt;?&gt;... types) {
+<span class="nc" id="L1524">        int length = types.length;</span>
+<span class="nc" id="L1525">        Name[] names = new Name[length + extra];</span>
+<span class="nc bnc" id="L1526" title="All 2 branches missed.">        for (int i = 0; i &lt; length; i++)</span>
+<span class="nc" id="L1527">            names[i] = argument(i, basicType(types[i]));</span>
+<span class="nc" id="L1528">        return names;</span>
+    }
+    static Name[] arguments(int extra, MethodType types) {
+<span class="fc" id="L1531">        int length = types.parameterCount();</span>
+<span class="fc" id="L1532">        Name[] names = new Name[length + extra];</span>
+<span class="fc bfc" id="L1533" title="All 2 branches covered.">        for (int i = 0; i &lt; length; i++)</span>
+<span class="fc" id="L1534">            names[i] = argument(i, basicType(types.parameterType(i)));</span>
+<span class="fc" id="L1535">        return names;</span>
+    }
+    static final String ALL_TYPES = &quot;LIJFD&quot;;  // omit V, not an argument type
+    static final int INTERNED_ARGUMENT_LIMIT = 10;
+<span class="fc" id="L1539">    private static final Name[][] INTERNED_ARGUMENTS</span>
+<span class="fc" id="L1540">            = new Name[ALL_TYPES.length()][INTERNED_ARGUMENT_LIMIT];</span>
+    static {
+<span class="fc bfc" id="L1542" title="All 2 branches covered.">        for (int tn = 0; tn &lt; ALL_TYPES.length(); tn++) {</span>
+<span class="fc bfc" id="L1543" title="All 2 branches covered.">            for (int i = 0; i &lt; INTERNED_ARGUMENTS[tn].length; i++) {</span>
+<span class="fc" id="L1544">                char type = ALL_TYPES.charAt(tn);</span>
+<span class="fc" id="L1545">                INTERNED_ARGUMENTS[tn][i] = new Name(i, type);</span>
+            }
+        }
+    }
+
+<span class="fc" id="L1550">    private static final MemberName.Factory IMPL_NAMES = MemberName.getFactory();</span>
+
+    static Name constantZero(int which, char type) {
+<span class="fc" id="L1553">        return CONSTANT_ZERO[ALL_TYPES.indexOf(type)].newIndex(which);</span>
+    }
+<span class="fc" id="L1555">    private static final Name[] CONSTANT_ZERO</span>
+<span class="fc" id="L1556">            = new Name[ALL_TYPES.length()];</span>
+    static {
+<span class="fc bfc" id="L1558" title="All 2 branches covered.">        for (int tn = 0; tn &lt; ALL_TYPES.length(); tn++) {</span>
+<span class="fc" id="L1559">            char bt = ALL_TYPES.charAt(tn);</span>
+<span class="fc" id="L1560">            Wrapper wrap = Wrapper.forBasicType(bt);</span>
+<span class="fc" id="L1561">            MemberName zmem = new MemberName(LambdaForm.class, &quot;zero&quot;+bt, MethodType.methodType(wrap.primitiveType()), REF_invokeStatic);</span>
+            try {
+<span class="fc" id="L1563">                zmem = IMPL_NAMES.resolveOrFail(REF_invokeStatic, zmem, null, NoSuchMethodException.class);</span>
+<span class="nc" id="L1564">            } catch (IllegalAccessException|NoSuchMethodException ex) {</span>
+<span class="nc" id="L1565">                throw newInternalError(ex);</span>
+<span class="fc" id="L1566">            }</span>
+<span class="fc" id="L1567">            NamedFunction zcon = new NamedFunction(zmem);</span>
+<span class="fc" id="L1568">            Name n = new Name(zcon).newIndex(0);</span>
+<span class="pc bpc" id="L1569" title="1 of 4 branches missed.">            assert(n.type == ALL_TYPES.charAt(tn));</span>
+<span class="fc" id="L1570">            CONSTANT_ZERO[tn] = n;</span>
+<span class="pc bpc" id="L1571" title="1 of 4 branches missed.">            assert(n.isConstantZero());</span>
+        }
+    }
+
+    // Avoid appealing to ValueConversions at bootstrap time:
+<span class="nc" id="L1576">    private static int zeroI() { return 0; }</span>
+<span class="nc" id="L1577">    private static long zeroJ() { return 0; }</span>
+<span class="nc" id="L1578">    private static float zeroF() { return 0; }</span>
+<span class="nc" id="L1579">    private static double zeroD() { return 0; }</span>
+<span class="nc" id="L1580">    private static Object zeroL() { return null; }</span>
+
+    // Put this last, so that previous static inits can run before.
+    static {
+        if (USE_PREDEFINED_INTERPRET_METHODS)
+<span class="fc" id="L1585">            PREPARED_FORMS.putAll(computeInitialPreparedForms());</span>
+    }
+
+    /**
+     * Internal marker for byte-compiled LambdaForms.
+     */
+    /*non-public*/
+    @Target(ElementType.METHOD)
+    @Retention(RetentionPolicy.RUNTIME)
+    @interface Compiled {
+    }
+
+    /**
+     * Internal marker for LambdaForm interpreter frames.
+     */
+    /*non-public*/
+    @Target(ElementType.METHOD)
+    @Retention(RetentionPolicy.RUNTIME)
+    @interface Hidden {
+    }
+
+
+/*
+    // Smoke-test for the invokers used in this file.
+    static void testMethodHandleLinkers() throws Throwable {
+        MemberName.Factory lookup = MemberName.getFactory();
+        MemberName asList_MN = new MemberName(Arrays.class, &quot;asList&quot;,
+                                              MethodType.methodType(List.class, Object[].class),
+                                              REF_invokeStatic);
+        //MethodHandleNatives.resolve(asList_MN, null);
+        asList_MN = lookup.resolveOrFail(asList_MN, REF_invokeStatic, null, NoSuchMethodException.class);
+        System.out.println(&quot;about to call &quot;+asList_MN);
+        Object[] abc = { &quot;a&quot;, &quot;bc&quot; };
+        List&lt;?&gt; lst = (List&lt;?&gt;) MethodHandle.linkToStatic(abc, asList_MN);
+        System.out.println(&quot;lst=&quot;+lst);
+        MemberName toString_MN = new MemberName(Object.class.getMethod(&quot;toString&quot;));
+        String s1 = (String) MethodHandle.linkToVirtual(lst, toString_MN);
+        toString_MN = new MemberName(Object.class.getMethod(&quot;toString&quot;), true);
+        String s2 = (String) MethodHandle.linkToSpecial(lst, toString_MN);
+        System.out.println(&quot;[s1,s2,lst]=&quot;+Arrays.asList(s1, s2, lst.toString()));
+        MemberName toArray_MN = new MemberName(List.class.getMethod(&quot;toArray&quot;));
+        Object[] arr = (Object[]) MethodHandle.linkToInterface(lst, toArray_MN);
+        System.out.println(&quot;toArray=&quot;+Arrays.toString(arr));
+    }
+    static { try { testMethodHandleLinkers(); } catch (Throwable ex) { throw new RuntimeException(ex); } }
+    // Requires these definitions in MethodHandle:
+    static final native Object linkToStatic(Object x1, MemberName mn) throws Throwable;
+    static final native Object linkToVirtual(Object x1, MemberName mn) throws Throwable;
+    static final native Object linkToSpecial(Object x1, MemberName mn) throws Throwable;
+    static final native Object linkToInterface(Object x1, MemberName mn) throws Throwable;
+ */
+
+<span class="fc" id="L1637">    static { NamedFunction.initializeInvokers(); }</span>
+
+    // The following hack is necessary in order to suppress TRACE_INTERPRETER
+    // during execution of the static initializes of this class.
+    // Turning on TRACE_INTERPRETER too early will cause
+    // stack overflows and other misbehavior during attempts to trace events
+    // that occur during LambdaForm.&lt;clinit&gt;.
+    // Therefore, do not move this line higher in this file, and do not remove.
+<span class="fc" id="L1645">    private static final boolean TRACE_INTERPRETER = MethodHandleStatics.TRACE_INTERPRETER;</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

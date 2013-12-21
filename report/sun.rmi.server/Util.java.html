@@ -1,0 +1,467 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>Util.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.rmi.server</a> &gt; <span class="el_source">Util.java</span></div><h1>Util.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1996, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package sun.rmi.server;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.DataOutputStream;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
+import java.lang.reflect.Method;
+import java.rmi.Remote;
+import java.rmi.RemoteException;
+import java.rmi.StubNotFoundException;
+import java.rmi.registry.Registry;
+import java.rmi.server.LogStream;
+import java.rmi.server.ObjID;
+import java.rmi.server.RMIClientSocketFactory;
+import java.rmi.server.RemoteObjectInvocationHandler;
+import java.rmi.server.RemoteRef;
+import java.rmi.server.RemoteStub;
+import java.rmi.server.Skeleton;
+import java.rmi.server.SkeletonNotFoundException;
+import java.security.AccessController;
+import java.security.MessageDigest;
+import java.security.DigestOutputStream;
+import java.security.NoSuchAlgorithmException;
+import java.security.PrivilegedAction;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Map;
+import java.util.WeakHashMap;
+import sun.rmi.registry.RegistryImpl;
+import sun.rmi.runtime.Log;
+import sun.rmi.transport.LiveRef;
+import sun.rmi.transport.tcp.TCPEndpoint;
+import sun.security.action.GetBooleanAction;
+import sun.security.action.GetPropertyAction;
+
+/**
+ * A utility class with static methods for creating stubs/proxies and
+ * skeletons for remote objects.
+ */
+@SuppressWarnings(&quot;deprecation&quot;)
+public final class Util {
+
+    /** &quot;server&quot; package log level */
+<span class="fc" id="L71">    static final int logLevel = LogStream.parseLevel(</span>
+<span class="fc" id="L72">        AccessController.doPrivileged(</span>
+            new GetPropertyAction(&quot;sun.rmi.server.logLevel&quot;)));
+
+    /** server reference log */
+<span class="fc" id="L76">    public static final Log serverRefLog =</span>
+<span class="fc" id="L77">        Log.getLog(&quot;sun.rmi.server.ref&quot;, &quot;transport&quot;, Util.logLevel);</span>
+
+    /** cached value of property java.rmi.server.ignoreStubClasses */
+<span class="fc" id="L80">    private static final boolean ignoreStubClasses =</span>
+<span class="fc" id="L81">        AccessController.doPrivileged(</span>
+            new GetBooleanAction(&quot;java.rmi.server.ignoreStubClasses&quot;)).
+<span class="fc" id="L83">            booleanValue();</span>
+
+    /** cache of  impl classes that have no corresponding stub class */
+<span class="fc" id="L86">    private static final Map&lt;Class&lt;?&gt;, Void&gt; withoutStubs =</span>
+<span class="fc" id="L87">        Collections.synchronizedMap(new WeakHashMap&lt;Class&lt;?&gt;, Void&gt;(11));</span>
+
+    /** parameter types for stub constructor */
+<span class="fc" id="L90">    private static final Class&lt;?&gt;[] stubConsParamTypes = { RemoteRef.class };</span>
+
+<span class="nc" id="L92">    private Util() {</span>
+<span class="nc" id="L93">    }</span>
+
+    /**
+     * Returns a proxy for the specified implClass.
+     *
+     * If both of the following criteria is satisfied, a dynamic proxy for
+     * the specified implClass is returned (otherwise a RemoteStub instance
+     * for the specified implClass is returned):
+     *
+     *    a) either the property java.rmi.server.ignoreStubClasses is true or
+     *       a pregenerated stub class does not exist for the impl class, and
+     *    b) forceStubUse is false.
+     *
+     * If the above criteria are satisfied, this method constructs a
+     * dynamic proxy instance (that implements the remote interfaces of
+     * implClass) constructed with a RemoteObjectInvocationHandler instance
+     * constructed with the clientRef.
+     *
+     * Otherwise, this method loads the pregenerated stub class (which
+     * extends RemoteStub and implements the remote interfaces of
+     * implClass) and constructs an instance of the pregenerated stub
+     * class with the clientRef.
+     *
+     * @param implClass the class to obtain remote interfaces from
+     * @param clientRef the remote ref to use in the invocation handler
+     * @param forceStubUse if true, forces creation of a RemoteStub
+     * @throws IllegalArgumentException if implClass implements illegal
+     * remote interfaces
+     * @throws StubNotFoundException if problem locating/creating stub or
+     * creating the dynamic proxy instance
+     **/
+    public static Remote createProxy(Class&lt;?&gt; implClass,
+                                     RemoteRef clientRef,
+                                     boolean forceStubUse)
+        throws StubNotFoundException
+    {
+        Class&lt;?&gt; remoteClass;
+
+        try {
+<span class="fc" id="L132">            remoteClass = getRemoteClass(implClass);</span>
+<span class="nc" id="L133">        } catch (ClassNotFoundException ex ) {</span>
+<span class="nc" id="L134">            throw new StubNotFoundException(</span>
+                &quot;object does not implement a remote interface: &quot; +
+<span class="nc" id="L136">                implClass.getName());</span>
+<span class="fc" id="L137">        }</span>
+
+<span class="fc bfc" id="L139" title="All 4 branches covered.">        if (forceStubUse ||</span>
+<span class="fc bfc" id="L140" title="All 2 branches covered.">            !(ignoreStubClasses || !stubClassExists(remoteClass)))</span>
+        {
+<span class="fc" id="L142">            return createStub(remoteClass, clientRef);</span>
+        }
+
+<span class="fc" id="L145">        final ClassLoader loader = implClass.getClassLoader();</span>
+<span class="fc" id="L146">        final Class&lt;?&gt;[] interfaces = getRemoteInterfaces(implClass);</span>
+<span class="fc" id="L147">        final InvocationHandler handler =</span>
+            new RemoteObjectInvocationHandler(clientRef);
+
+        /* REMIND: private remote interfaces? */
+
+        try {
+<span class="fc" id="L153">            return AccessController.doPrivileged(new PrivilegedAction&lt;Remote&gt;() {</span>
+                public Remote run() {
+<span class="fc" id="L155">                    return (Remote) Proxy.newProxyInstance(loader,</span>
+                                                           interfaces,
+                                                           handler);
+                }});
+<span class="nc" id="L159">        } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L160">            throw new StubNotFoundException(&quot;unable to create proxy&quot;, e);</span>
+        }
+    }
+
+    /**
+     * Returns true if a stub class for the given impl class can be loaded,
+     * otherwise returns false.
+     *
+     * @param remoteClass the class to obtain remote interfaces from
+     */
+    private static boolean stubClassExists(Class&lt;?&gt; remoteClass) {
+<span class="fc bfc" id="L171" title="All 2 branches covered.">        if (!withoutStubs.containsKey(remoteClass)) {</span>
+            try {
+<span class="fc" id="L173">                Class.forName(remoteClass.getName() + &quot;_Stub&quot;,</span>
+                              false,
+<span class="fc" id="L175">                              remoteClass.getClassLoader());</span>
+<span class="fc" id="L176">                return true;</span>
+
+<span class="fc" id="L178">            } catch (ClassNotFoundException cnfe) {</span>
+<span class="fc" id="L179">                withoutStubs.put(remoteClass, null);</span>
+            }
+        }
+<span class="fc" id="L182">        return false;</span>
+    }
+
+    /*
+     * Returns the class/superclass that implements the remote interface.
+     * @throws ClassNotFoundException if no class is found to have a
+     * remote interface
+     */
+    private static Class&lt;?&gt; getRemoteClass(Class&lt;?&gt; cl)
+        throws ClassNotFoundException
+    {
+<span class="fc bfc" id="L193" title="All 2 branches covered.">        while (cl != null) {</span>
+<span class="fc" id="L194">            Class&lt;?&gt;[] interfaces = cl.getInterfaces();</span>
+<span class="fc bfc" id="L195" title="All 2 branches covered.">            for (int i = interfaces.length -1; i &gt;= 0; i--) {</span>
+<span class="fc bfc" id="L196" title="All 2 branches covered.">                if (Remote.class.isAssignableFrom(interfaces[i]))</span>
+<span class="fc" id="L197">                    return cl;          // this class implements remote object</span>
+            }
+<span class="fc" id="L199">            cl = cl.getSuperclass();</span>
+<span class="fc" id="L200">        }</span>
+<span class="fc" id="L201">        throw new ClassNotFoundException(</span>
+                &quot;class does not implement java.rmi.Remote&quot;);
+    }
+
+    /**
+     * Returns an array containing the remote interfaces implemented
+     * by the given class.
+     *
+     * @param   remoteClass the class to obtain remote interfaces from
+     * @throws  IllegalArgumentException if remoteClass implements
+     *          any illegal remote interfaces
+     * @throws  NullPointerException if remoteClass is null
+     */
+    private static Class&lt;?&gt;[] getRemoteInterfaces(Class&lt;?&gt; remoteClass) {
+<span class="fc" id="L215">        ArrayList&lt;Class&lt;?&gt;&gt; list = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L216">        getRemoteInterfaces(list, remoteClass);</span>
+<span class="fc" id="L217">        return list.toArray(new Class&lt;?&gt;[list.size()]);</span>
+    }
+
+    /**
+     * Fills the given array list with the remote interfaces implemented
+     * by the given class.
+     *
+     * @throws  IllegalArgumentException if the specified class implements
+     *          any illegal remote interfaces
+     * @throws  NullPointerException if the specified class or list is null
+     */
+    private static void getRemoteInterfaces(ArrayList&lt;Class&lt;?&gt;&gt; list, Class&lt;?&gt; cl) {
+<span class="fc" id="L229">        Class&lt;?&gt; superclass = cl.getSuperclass();</span>
+<span class="fc bfc" id="L230" title="All 2 branches covered.">        if (superclass != null) {</span>
+<span class="fc" id="L231">            getRemoteInterfaces(list, superclass);</span>
+        }
+
+<span class="fc" id="L234">        Class&lt;?&gt;[] interfaces = cl.getInterfaces();</span>
+<span class="fc bfc" id="L235" title="All 2 branches covered.">        for (int i = 0; i &lt; interfaces.length; i++) {</span>
+<span class="fc" id="L236">            Class&lt;?&gt; intf = interfaces[i];</span>
+            /*
+             * If it is a remote interface (if it extends from
+             * java.rmi.Remote) and is not already in the list,
+             * then add the interface to the list.
+             */
+<span class="fc bfc" id="L242" title="All 2 branches covered.">            if (Remote.class.isAssignableFrom(intf)) {</span>
+<span class="pc bpc" id="L243" title="1 of 2 branches missed.">                if (!(list.contains(intf))) {</span>
+<span class="fc" id="L244">                    Method[] methods = intf.getMethods();</span>
+<span class="fc bfc" id="L245" title="All 2 branches covered.">                    for (int j = 0; j &lt; methods.length; j++) {</span>
+<span class="fc" id="L246">                        checkMethod(methods[j]);</span>
+                    }
+<span class="fc" id="L248">                    list.add(intf);</span>
+                }
+            }
+        }
+<span class="fc" id="L252">    }</span>
+
+    /**
+     * Verifies that the supplied method has at least one declared exception
+     * type that is RemoteException or one of its superclasses.  If not,
+     * then this method throws IllegalArgumentException.
+     *
+     * @throws IllegalArgumentException if m is an illegal remote method
+     */
+    private static void checkMethod(Method m) {
+<span class="fc" id="L262">        Class&lt;?&gt;[] ex = m.getExceptionTypes();</span>
+<span class="pc bpc" id="L263" title="1 of 2 branches missed.">        for (int i = 0; i &lt; ex.length; i++) {</span>
+<span class="fc bfc" id="L264" title="All 2 branches covered.">            if (ex[i].isAssignableFrom(RemoteException.class))</span>
+<span class="fc" id="L265">                return;</span>
+        }
+<span class="nc" id="L267">        throw new IllegalArgumentException(</span>
+            &quot;illegal remote method encountered: &quot; + m);
+    }
+
+    /**
+     * Creates a RemoteStub instance for the specified class, constructed
+     * with the specified RemoteRef.  The supplied class must be the most
+     * derived class in the remote object's superclass chain that
+     * implements a remote interface.  The stub class name is the name of
+     * the specified remoteClass with the suffix &quot;_Stub&quot;.  The loading of
+     * the stub class is initiated from class loader of the specified class
+     * (which may be the bootstrap class loader).
+     **/
+    private static RemoteStub createStub(Class&lt;?&gt; remoteClass, RemoteRef ref)
+        throws StubNotFoundException
+    {
+<span class="fc" id="L283">        String stubname = remoteClass.getName() + &quot;_Stub&quot;;</span>
+
+        /* Make sure to use the local stub loader for the stub classes.
+         * When loaded by the local loader the load path can be
+         * propagated to remote clients, by the MarshalOutputStream/InStream
+         * pickle methods
+         */
+        try {
+<span class="fc" id="L291">            Class&lt;?&gt; stubcl =</span>
+<span class="fc" id="L292">                Class.forName(stubname, false, remoteClass.getClassLoader());</span>
+<span class="fc" id="L293">            Constructor&lt;?&gt; cons = stubcl.getConstructor(stubConsParamTypes);</span>
+<span class="fc" id="L294">            return (RemoteStub) cons.newInstance(new Object[] { ref });</span>
+
+<span class="fc" id="L296">        } catch (ClassNotFoundException e) {</span>
+<span class="fc" id="L297">            throw new StubNotFoundException(</span>
+                &quot;Stub class not found: &quot; + stubname, e);
+<span class="nc" id="L299">        } catch (NoSuchMethodException e) {</span>
+<span class="nc" id="L300">            throw new StubNotFoundException(</span>
+                &quot;Stub class missing constructor: &quot; + stubname, e);
+<span class="nc" id="L302">        } catch (InstantiationException e) {</span>
+<span class="nc" id="L303">            throw new StubNotFoundException(</span>
+                &quot;Can't create instance of stub class: &quot; + stubname, e);
+<span class="nc" id="L305">        } catch (IllegalAccessException e) {</span>
+<span class="nc" id="L306">            throw new StubNotFoundException(</span>
+                &quot;Stub class constructor not public: &quot; + stubname, e);
+<span class="nc" id="L308">        } catch (InvocationTargetException e) {</span>
+<span class="nc" id="L309">            throw new StubNotFoundException(</span>
+                &quot;Exception creating instance of stub class: &quot; + stubname, e);
+<span class="nc" id="L311">        } catch (ClassCastException e) {</span>
+<span class="nc" id="L312">            throw new StubNotFoundException(</span>
+                &quot;Stub class not instance of RemoteStub: &quot; + stubname, e);
+        }
+    }
+
+    /**
+     * Locate and return the Skeleton for the specified remote object
+     */
+    static Skeleton createSkeleton(Remote object)
+        throws SkeletonNotFoundException
+    {
+        Class&lt;?&gt; cl;
+        try {
+<span class="fc" id="L325">            cl = getRemoteClass(object.getClass());</span>
+<span class="nc" id="L326">        } catch (ClassNotFoundException ex ) {</span>
+<span class="nc" id="L327">            throw new SkeletonNotFoundException(</span>
+                &quot;object does not implement a remote interface: &quot; +
+<span class="nc" id="L329">                object.getClass().getName());</span>
+<span class="fc" id="L330">        }</span>
+
+        // now try to load the skeleton based ont he name of the class
+<span class="fc" id="L333">        String skelname = cl.getName() + &quot;_Skel&quot;;</span>
+        try {
+<span class="fc" id="L335">            Class&lt;?&gt; skelcl = Class.forName(skelname, false, cl.getClassLoader());</span>
+
+<span class="fc" id="L337">            return (Skeleton)skelcl.newInstance();</span>
+<span class="fc" id="L338">        } catch (ClassNotFoundException ex) {</span>
+<span class="fc" id="L339">            throw new SkeletonNotFoundException(&quot;Skeleton class not found: &quot; +</span>
+                                                skelname, ex);
+<span class="nc" id="L341">        } catch (InstantiationException ex) {</span>
+<span class="nc" id="L342">            throw new SkeletonNotFoundException(&quot;Can't create skeleton: &quot; +</span>
+                                                skelname, ex);
+<span class="nc" id="L344">        } catch (IllegalAccessException ex) {</span>
+<span class="nc" id="L345">            throw new SkeletonNotFoundException(&quot;No public constructor: &quot; +</span>
+                                                skelname, ex);
+<span class="nc" id="L347">        } catch (ClassCastException ex) {</span>
+<span class="nc" id="L348">            throw new SkeletonNotFoundException(</span>
+                &quot;Skeleton not of correct class: &quot; + skelname, ex);
+        }
+    }
+
+    /**
+     * Compute the &quot;method hash&quot; of a remote method.  The method hash
+     * is a long containing the first 64 bits of the SHA digest from
+     * the UTF encoded string of the method name and descriptor.
+     */
+    public static long computeMethodHash(Method m) {
+<span class="fc" id="L359">        long hash = 0;</span>
+<span class="fc" id="L360">        ByteArrayOutputStream sink = new ByteArrayOutputStream(127);</span>
+        try {
+<span class="fc" id="L362">            MessageDigest md = MessageDigest.getInstance(&quot;SHA&quot;);</span>
+<span class="fc" id="L363">            DataOutputStream out = new DataOutputStream(</span>
+                new DigestOutputStream(sink, md));
+
+<span class="fc" id="L366">            String s = getMethodNameAndDescriptor(m);</span>
+<span class="fc bfc" id="L367" title="All 2 branches covered.">            if (serverRefLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="fc" id="L368">                serverRefLog.log(Log.VERBOSE,</span>
+                    &quot;string used for method hash: \&quot;&quot; + s + &quot;\&quot;&quot;);
+            }
+<span class="fc" id="L371">            out.writeUTF(s);</span>
+
+            // use only the first 64 bits of the digest for the hash
+<span class="fc" id="L374">            out.flush();</span>
+<span class="fc" id="L375">            byte hasharray[] = md.digest();</span>
+<span class="fc bfc" id="L376" title="All 2 branches covered.">            for (int i = 0; i &lt; Math.min(8, hasharray.length); i++) {</span>
+<span class="fc" id="L377">                hash += ((long) (hasharray[i] &amp; 0xFF)) &lt;&lt; (i * 8);</span>
+            }
+<span class="nc" id="L379">        } catch (IOException ignore) {</span>
+            /* can't happen, but be deterministic anyway. */
+<span class="nc" id="L381">            hash = -1;</span>
+<span class="nc" id="L382">        } catch (NoSuchAlgorithmException complain) {</span>
+<span class="nc" id="L383">            throw new SecurityException(complain.getMessage());</span>
+<span class="pc" id="L384">        }</span>
+<span class="fc" id="L385">        return hash;</span>
+    }
+
+    /**
+     * Return a string consisting of the given method's name followed by
+     * its &quot;method descriptor&quot;, as appropriate for use in the computation
+     * of the &quot;method hash&quot;.
+     *
+     * See section 4.3.3 of The Java Virtual Machine Specification for
+     * the definition of a &quot;method descriptor&quot;.
+     */
+    private static String getMethodNameAndDescriptor(Method m) {
+<span class="fc" id="L397">        StringBuffer desc = new StringBuffer(m.getName());</span>
+<span class="fc" id="L398">        desc.append('(');</span>
+<span class="fc" id="L399">        Class&lt;?&gt;[] paramTypes = m.getParameterTypes();</span>
+<span class="fc bfc" id="L400" title="All 2 branches covered.">        for (int i = 0; i &lt; paramTypes.length; i++) {</span>
+<span class="fc" id="L401">            desc.append(getTypeDescriptor(paramTypes[i]));</span>
+        }
+<span class="fc" id="L403">        desc.append(')');</span>
+<span class="fc" id="L404">        Class&lt;?&gt; returnType = m.getReturnType();</span>
+<span class="fc bfc" id="L405" title="All 2 branches covered.">        if (returnType == void.class) { // optimization: handle void here</span>
+<span class="fc" id="L406">            desc.append('V');</span>
+        } else {
+<span class="fc" id="L408">            desc.append(getTypeDescriptor(returnType));</span>
+        }
+<span class="fc" id="L410">        return desc.toString();</span>
+    }
+
+    /**
+     * Get the descriptor of a particular type, as appropriate for either
+     * a parameter or return type in a method descriptor.
+     */
+    private static String getTypeDescriptor(Class&lt;?&gt; type) {
+<span class="fc bfc" id="L418" title="All 2 branches covered.">        if (type.isPrimitive()) {</span>
+<span class="fc bfc" id="L419" title="All 2 branches covered.">            if (type == int.class) {</span>
+<span class="fc" id="L420">                return &quot;I&quot;;</span>
+<span class="fc bfc" id="L421" title="All 2 branches covered.">            } else if (type == boolean.class) {</span>
+<span class="fc" id="L422">                return &quot;Z&quot;;</span>
+<span class="pc bpc" id="L423" title="1 of 2 branches missed.">            } else if (type == byte.class) {</span>
+<span class="nc" id="L424">                return &quot;B&quot;;</span>
+<span class="pc bpc" id="L425" title="1 of 2 branches missed.">            } else if (type == char.class) {</span>
+<span class="nc" id="L426">                return &quot;C&quot;;</span>
+<span class="pc bpc" id="L427" title="1 of 2 branches missed.">            } else if (type == short.class) {</span>
+<span class="nc" id="L428">                return &quot;S&quot;;</span>
+<span class="pc bpc" id="L429" title="1 of 2 branches missed.">            } else if (type == long.class) {</span>
+<span class="fc" id="L430">                return &quot;J&quot;;</span>
+<span class="nc bnc" id="L431" title="All 2 branches missed.">            } else if (type == float.class) {</span>
+<span class="nc" id="L432">                return &quot;F&quot;;</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">            } else if (type == double.class) {</span>
+<span class="nc" id="L434">                return &quot;D&quot;;</span>
+<span class="nc bnc" id="L435" title="All 2 branches missed.">            } else if (type == void.class) {</span>
+<span class="nc" id="L436">                return &quot;V&quot;;</span>
+            } else {
+<span class="nc" id="L438">                throw new Error(&quot;unrecognized primitive type: &quot; + type);</span>
+            }
+<span class="fc bfc" id="L440" title="All 2 branches covered.">        } else if (type.isArray()) {</span>
+            /*
+             * According to JLS 20.3.2, the getName() method on Class does
+             * return the VM type descriptor format for array classes (only);
+             * using that should be quicker than the otherwise obvious code:
+             *
+             *     return &quot;[&quot; + getTypeDescriptor(type.getComponentType());
+             */
+<span class="fc" id="L448">            return type.getName().replace('.', '/');</span>
+        } else {
+<span class="fc" id="L450">            return &quot;L&quot; + type.getName().replace('.', '/') + &quot;;&quot;;</span>
+        }
+    }
+
+    /**
+     * Returns the binary name of the given type without package
+     * qualification.  Nested types are treated no differently from
+     * top-level types, so for a nested type, the returned name will
+     * still be qualified with the simple name of its enclosing
+     * top-level type (and perhaps other enclosing types), the
+     * separator will be '$', etc.
+     **/
+    public static String getUnqualifiedName(Class&lt;?&gt; c) {
+<span class="fc" id="L463">        String binaryName = c.getName();</span>
+<span class="fc" id="L464">        return binaryName.substring(binaryName.lastIndexOf('.') + 1);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

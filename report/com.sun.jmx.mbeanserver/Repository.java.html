@@ -1,0 +1,679 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>Repository.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">com.sun.jmx.mbeanserver</a> &gt; <span class="el_source">Repository.java</span></div><h1>Repository.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1999, 2008, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package com.sun.jmx.mbeanserver;
+
+import com.sun.jmx.defaults.ServiceName;
+import static com.sun.jmx.defaults.JmxProperties.MBEANSERVER_LOGGER;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.logging.Level;
+import java.util.Map;
+import java.util.Set;
+import javax.management.DynamicMBean;
+import javax.management.InstanceAlreadyExistsException;
+import javax.management.InstanceNotFoundException;
+import javax.management.ObjectName;
+import javax.management.QueryExp;
+import javax.management.RuntimeOperationsException;
+
+/**
+ * This repository does not support persistency.
+ *
+ * @since 1.5
+ */
+public class Repository {
+
+    /**
+     * An interface that allows the caller to get some control
+     * over the registration.
+     * @see #addMBean
+     * @see #remove
+     */
+    public interface RegistrationContext {
+        /**
+         * Called by {@link #addMBean}.
+         * Can throw a RuntimeOperationsException to cancel the
+         * registration.
+         */
+        public void registering();
+
+        /**
+         * Called by {@link #remove}.
+         * Any exception thrown by this method will be ignored.
+         */
+        public void unregistered();
+    }
+
+    // Private fields --------------------------------------------&gt;
+
+    /**
+     * The structure for storing the objects is very basic.
+     * A Hashtable is used for storing the different domains
+     * For each domain, a hashtable contains the instances with
+     * canonical key property list string as key and named object
+     * aggregated from given object name and mbean instance as value.
+     */
+    private final Map&lt;String,Map&lt;String,NamedObject&gt;&gt; domainTb;
+
+    /**
+     * Number of elements contained in the Repository
+     */
+<span class="nc" id="L89">    private volatile int nbElements = 0;</span>
+
+    /**
+     * Domain name of the server the repository is attached to.
+     * It is quicker to store the information in the repository rather
+     * than querying the framework each time the info is required.
+     */
+    private final String domain;
+
+    /**
+     * We use a global reentrant read write lock to protect the repository.
+     * This seems safer and more efficient: we are using Maps of Maps,
+     * Guaranteing consistency while using Concurent objects at each level
+     * may be more difficult.
+     **/
+    private final ReentrantReadWriteLock lock;
+
+    // Private fields &lt;=============================================
+
+    // Private methods ---------------------------------------------&gt;
+
+    /* This class is used to match an ObjectName against a pattern. */
+    private final static class ObjectNamePattern {
+        private final String[] keys;
+        private final String[] values;
+        private final String   properties;
+        private final boolean  isPropertyListPattern;
+        private final boolean  isPropertyValuePattern;
+
+        /**
+         * The ObjectName pattern against which ObjectNames are matched.
+         **/
+        public final ObjectName pattern;
+
+        /**
+         * Builds a new ObjectNamePattern object from an ObjectName pattern.
+         * @param pattern The ObjectName pattern under examination.
+         **/
+        public ObjectNamePattern(ObjectName pattern) {
+<span class="nc" id="L128">            this(pattern.isPropertyListPattern(),</span>
+<span class="nc" id="L129">                 pattern.isPropertyValuePattern(),</span>
+<span class="nc" id="L130">                 pattern.getCanonicalKeyPropertyListString(),</span>
+<span class="nc" id="L131">                 pattern.getKeyPropertyList(),</span>
+                 pattern);
+<span class="nc" id="L133">        }</span>
+
+        /**
+         * Builds a new ObjectNamePattern object from an ObjectName pattern
+         * constituents.
+         * @param propertyListPattern pattern.isPropertyListPattern().
+         * @param propertyValuePattern pattern.isPropertyValuePattern().
+         * @param canonicalProps pattern.getCanonicalKeyPropertyListString().
+         * @param keyPropertyList pattern.getKeyPropertyList().
+         * @param pattern The ObjectName pattern under examination.
+         **/
+        ObjectNamePattern(boolean propertyListPattern,
+                          boolean propertyValuePattern,
+                          String canonicalProps,
+                          Map&lt;String,String&gt; keyPropertyList,
+<span class="nc" id="L148">                          ObjectName pattern) {</span>
+<span class="nc" id="L149">            this.isPropertyListPattern = propertyListPattern;</span>
+<span class="nc" id="L150">            this.isPropertyValuePattern = propertyValuePattern;</span>
+<span class="nc" id="L151">            this.properties = canonicalProps;</span>
+<span class="nc" id="L152">            final int len = keyPropertyList.size();</span>
+<span class="nc" id="L153">            this.keys   = new String[len];</span>
+<span class="nc" id="L154">            this.values = new String[len];</span>
+<span class="nc" id="L155">            int i = 0;</span>
+<span class="nc bnc" id="L156" title="All 2 branches missed.">            for (Map.Entry&lt;String,String&gt; entry : keyPropertyList.entrySet()) {</span>
+<span class="nc" id="L157">                keys[i]   = entry.getKey();</span>
+<span class="nc" id="L158">                values[i] = entry.getValue();</span>
+<span class="nc" id="L159">                i++;</span>
+<span class="nc" id="L160">            }</span>
+<span class="nc" id="L161">            this.pattern = pattern;</span>
+<span class="nc" id="L162">        }</span>
+
+        /**
+         * Return true if the given ObjectName matches the ObjectName pattern
+         * for which this object has been built.
+         * WARNING: domain name is not considered here because it is supposed
+         *          not to be wildcard when called. PropertyList is also
+         *          supposed not to be zero-length.
+         * @param name The ObjectName we want to match against the pattern.
+         * @return true if &lt;code&gt;name&lt;/code&gt; matches the pattern.
+         **/
+        public boolean matchKeys(ObjectName name) {
+            // If key property value pattern but not key property list
+            // pattern, then the number of key properties must be equal
+            //
+<span class="nc bnc" id="L177" title="All 4 branches missed.">            if (isPropertyValuePattern &amp;&amp;</span>
+                !isPropertyListPattern &amp;&amp;
+<span class="nc bnc" id="L179" title="All 2 branches missed.">                (name.getKeyPropertyList().size() != keys.length))</span>
+<span class="nc" id="L180">                return false;</span>
+
+            // If key property value pattern or key property list pattern,
+            // then every property inside pattern should exist in name
+            //
+<span class="nc bnc" id="L185" title="All 4 branches missed.">            if (isPropertyValuePattern || isPropertyListPattern) {</span>
+<span class="nc bnc" id="L186" title="All 2 branches missed.">                for (int i = keys.length - 1; i &gt;= 0 ; i--) {</span>
+                    // Find value in given object name for key at current
+                    // index in receiver
+                    //
+<span class="nc" id="L190">                    String v = name.getKeyProperty(keys[i]);</span>
+                    // Did we find a value for this key ?
+                    //
+<span class="nc bnc" id="L193" title="All 2 branches missed.">                    if (v == null) return false;</span>
+                    // If this property is ok (same key, same value), go to next
+                    //
+<span class="nc bnc" id="L196" title="All 2 branches missed.">                    if (isPropertyValuePattern &amp;&amp;</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">                        pattern.isPropertyValuePattern(keys[i])) {</span>
+                        // wildmatch key property values
+                        // values[i] is the pattern;
+                        // v is the string
+<span class="nc bnc" id="L201" title="All 2 branches missed.">                        if (Util.wildmatch(v,values[i]))</span>
+<span class="nc" id="L202">                            continue;</span>
+                        else
+<span class="nc" id="L204">                            return false;</span>
+                    }
+<span class="nc bnc" id="L206" title="All 2 branches missed.">                    if (v.equals(values[i])) continue;</span>
+<span class="nc" id="L207">                    return false;</span>
+                }
+<span class="nc" id="L209">                return true;</span>
+            }
+
+            // If no pattern, then canonical names must be equal
+            //
+<span class="nc" id="L214">            final String p1 = name.getCanonicalKeyPropertyListString();</span>
+<span class="nc" id="L215">            final String p2 = properties;</span>
+<span class="nc" id="L216">            return (p1.equals(p2));</span>
+        }
+    }
+
+    /**
+     * Add all the matching objects from the given hashtable in the
+     * result set for the given ObjectNamePattern
+     * Do not check whether the domains match (only check for matching
+     * key property lists - see &lt;i&gt;matchKeys()&lt;/i&gt;)
+     **/
+    private void addAllMatching(final Map&lt;String,NamedObject&gt; moiTb,
+                                final Set&lt;NamedObject&gt; result,
+                                final ObjectNamePattern pattern) {
+<span class="nc" id="L229">        synchronized (moiTb) {</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">            for (NamedObject no : moiTb.values()) {</span>
+<span class="nc" id="L231">                final ObjectName on = no.getName();</span>
+                // if all couples (property, value) are contained
+<span class="nc bnc" id="L233" title="All 2 branches missed.">                if (pattern.matchKeys(on)) result.add(no);</span>
+<span class="nc" id="L234">            }</span>
+<span class="nc" id="L235">        }</span>
+<span class="nc" id="L236">    }</span>
+
+    private void addNewDomMoi(final DynamicMBean object,
+                              final String dom,
+                              final ObjectName name,
+                              final RegistrationContext context) {
+<span class="nc" id="L242">        final Map&lt;String,NamedObject&gt; moiTb =</span>
+            new HashMap&lt;String,NamedObject&gt;();
+<span class="nc" id="L244">        final String key = name.getCanonicalKeyPropertyListString();</span>
+<span class="nc" id="L245">        addMoiToTb(object,name,key,moiTb,context);</span>
+<span class="nc" id="L246">        domainTb.put(dom, moiTb);</span>
+<span class="nc" id="L247">        nbElements++;</span>
+<span class="nc" id="L248">    }</span>
+
+    private void registering(RegistrationContext context) {
+<span class="nc bnc" id="L251" title="All 2 branches missed.">        if (context == null) return;</span>
+        try {
+<span class="nc" id="L253">            context.registering();</span>
+<span class="nc" id="L254">        } catch (RuntimeOperationsException x) {</span>
+<span class="nc" id="L255">            throw x;</span>
+<span class="nc" id="L256">        } catch (RuntimeException x) {</span>
+<span class="nc" id="L257">            throw new RuntimeOperationsException(x);</span>
+<span class="nc" id="L258">        }</span>
+<span class="nc" id="L259">    }</span>
+
+    private void unregistering(RegistrationContext context, ObjectName name) {
+<span class="nc bnc" id="L262" title="All 2 branches missed.">        if (context == null) return;</span>
+        try {
+<span class="nc" id="L264">            context.unregistered();</span>
+<span class="nc" id="L265">        } catch (Exception x) {</span>
+            // shouldn't come here...
+<span class="nc" id="L267">            MBEANSERVER_LOGGER.log(Level.FINE,</span>
+                    &quot;Unexpected exception while unregistering &quot;+name,
+                    x);
+<span class="nc" id="L270">        }</span>
+<span class="nc" id="L271">    }</span>
+
+    private void addMoiToTb(final DynamicMBean object,
+            final ObjectName name,
+            final String key,
+            final Map&lt;String,NamedObject&gt; moiTb,
+            final RegistrationContext context) {
+<span class="nc" id="L278">        registering(context);</span>
+<span class="nc" id="L279">        moiTb.put(key,new NamedObject(name, object));</span>
+<span class="nc" id="L280">    }</span>
+
+    /**
+     * Retrieves the named object contained in repository
+     * from the given objectname.
+     */
+    private NamedObject retrieveNamedObject(ObjectName name) {
+
+        // No patterns inside reposit
+<span class="nc bnc" id="L289" title="All 2 branches missed.">        if (name.isPattern()) return null;</span>
+
+        // Extract the domain name.
+<span class="nc" id="L292">        String dom = name.getDomain().intern();</span>
+
+        // Default domain case
+<span class="nc bnc" id="L295" title="All 2 branches missed.">        if (dom.length() == 0) {</span>
+<span class="nc" id="L296">            dom = domain;</span>
+        }
+
+<span class="nc" id="L299">        Map&lt;String,NamedObject&gt; moiTb = domainTb.get(dom);</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">        if (moiTb == null) {</span>
+<span class="nc" id="L301">            return null; // No domain containing registered object names</span>
+        }
+
+<span class="nc" id="L304">        return moiTb.get(name.getCanonicalKeyPropertyListString());</span>
+    }
+
+    // Private methods &lt;=============================================
+
+    // Protected methods ---------------------------------------------&gt;
+
+    // Protected methods &lt;=============================================
+
+    // Public methods ---------------------------------------------&gt;
+
+    /**
+     * Construct a new repository with the given default domain.
+     */
+    public Repository(String domain) {
+<span class="nc" id="L319">        this(domain,true);</span>
+<span class="nc" id="L320">    }</span>
+
+    /**
+     * Construct a new repository with the given default domain.
+     */
+<span class="nc" id="L325">    public Repository(String domain, boolean fairLock) {</span>
+<span class="nc" id="L326">        lock = new ReentrantReadWriteLock(fairLock);</span>
+
+<span class="nc" id="L328">        domainTb = new HashMap&lt;String,Map&lt;String,NamedObject&gt;&gt;(5);</span>
+
+<span class="nc bnc" id="L330" title="All 4 branches missed.">        if (domain != null &amp;&amp; domain.length() != 0)</span>
+<span class="nc" id="L331">            this.domain = domain.intern(); // we use == domain later on...</span>
+        else
+<span class="nc" id="L333">            this.domain = ServiceName.DOMAIN;</span>
+
+        // Creates a new hashtable for the default domain
+<span class="nc" id="L336">        domainTb.put(this.domain, new HashMap&lt;String,NamedObject&gt;());</span>
+<span class="nc" id="L337">    }</span>
+
+    /**
+     * Returns the list of domains in which any MBean is currently
+     * registered.
+     *
+     */
+    public String[] getDomains() {
+
+<span class="nc" id="L346">        lock.readLock().lock();</span>
+        final List&lt;String&gt; result;
+        try {
+            // Temporary list
+<span class="nc" id="L350">            result = new ArrayList&lt;String&gt;(domainTb.size());</span>
+            for (Map.Entry&lt;String,Map&lt;String,NamedObject&gt;&gt; entry :
+<span class="nc bnc" id="L352" title="All 2 branches missed.">                     domainTb.entrySet()) {</span>
+                // Skip domains that are in the table but have no
+                // MBean registered in them
+                // in particular the default domain may be like this
+<span class="nc" id="L356">                Map&lt;String,NamedObject&gt; t = entry.getValue();</span>
+<span class="nc bnc" id="L357" title="All 4 branches missed.">                if (t != null &amp;&amp; t.size() != 0)</span>
+<span class="nc" id="L358">                    result.add(entry.getKey());</span>
+<span class="nc" id="L359">            }</span>
+        } finally {
+<span class="nc" id="L361">            lock.readLock().unlock();</span>
+<span class="nc" id="L362">        }</span>
+
+        // Make an array from result.
+<span class="nc" id="L365">        return result.toArray(new String[result.size()]);</span>
+    }
+
+    /**
+     * Stores an MBean associated with its object name in the repository.
+     *
+     * @param object  MBean to be stored in the repository.
+     * @param name    MBean object name.
+     * @param context A registration context. If non null, the repository
+     *                will call {@link RegistrationContext#registering()
+     *                context.registering()} from within the repository
+     *                lock, when it has determined that the {@code object}
+     *                can be stored in the repository with that {@code name}.
+     *                If {@link RegistrationContext#registering()
+     *                context.registering()} throws an exception, the
+     *                operation is abandonned, the MBean is not added to the
+     *                repository, and a {@link RuntimeOperationsException}
+     *                is thrown.
+     */
+    public void addMBean(final DynamicMBean object, ObjectName name,
+            final RegistrationContext context)
+        throws InstanceAlreadyExistsException {
+
+<span class="nc bnc" id="L388" title="All 2 branches missed.">        if (MBEANSERVER_LOGGER.isLoggable(Level.FINER)) {</span>
+<span class="nc" id="L389">            MBEANSERVER_LOGGER.logp(Level.FINER, Repository.class.getName(),</span>
+                    &quot;addMBean&quot;, &quot;name = &quot; + name);
+        }
+
+        // Extract the domain name.
+<span class="nc" id="L394">        String dom = name.getDomain().intern();</span>
+<span class="nc" id="L395">        boolean to_default_domain = false;</span>
+
+        // Set domain to default if domain is empty and not already set
+<span class="nc bnc" id="L398" title="All 2 branches missed.">        if (dom.length() == 0)</span>
+<span class="nc" id="L399">            name = Util.newObjectName(domain + name.toString());</span>
+
+        // Do we have default domain ?
+<span class="nc bnc" id="L402" title="All 2 branches missed.">        if (dom == domain) {  // ES: OK (dom &amp; domain are interned)</span>
+<span class="nc" id="L403">            to_default_domain = true;</span>
+<span class="nc" id="L404">            dom = domain;</span>
+        } else {
+<span class="nc" id="L406">            to_default_domain = false;</span>
+        }
+
+        // Validate name for an object
+<span class="nc bnc" id="L410" title="All 2 branches missed.">        if (name.isPattern()) {</span>
+<span class="nc" id="L411">            throw new RuntimeOperationsException(</span>
+             new IllegalArgumentException(&quot;Repository: cannot add mbean for &quot; +
+<span class="nc" id="L413">                                          &quot;pattern name &quot; + name.toString()));</span>
+        }
+
+<span class="nc" id="L416">        lock.writeLock().lock();</span>
+        try {
+            // Domain cannot be JMImplementation if entry does not exist
+<span class="nc bnc" id="L419" title="All 2 branches missed.">            if ( !to_default_domain &amp;&amp;</span>
+<span class="nc bnc" id="L420" title="All 2 branches missed.">                    dom.equals(&quot;JMImplementation&quot;) &amp;&amp;</span>
+<span class="nc bnc" id="L421" title="All 2 branches missed.">                    domainTb.containsKey(&quot;JMImplementation&quot;)) {</span>
+<span class="nc" id="L422">                throw new RuntimeOperationsException(</span>
+                        new IllegalArgumentException(
+                        &quot;Repository: domain name cannot be JMImplementation&quot;));
+            }
+
+            // If domain does not already exist, add it to the hash table
+<span class="nc" id="L428">            final Map&lt;String,NamedObject&gt; moiTb = domainTb.get(dom);</span>
+<span class="nc bnc" id="L429" title="All 2 branches missed.">            if (moiTb == null) {</span>
+<span class="nc" id="L430">                addNewDomMoi(object, dom, name, context);</span>
+<span class="nc" id="L431">                return;</span>
+            } else {
+                // Add instance if not already present
+<span class="nc" id="L434">                String cstr = name.getCanonicalKeyPropertyListString();</span>
+<span class="nc" id="L435">                NamedObject elmt= moiTb.get(cstr);</span>
+<span class="nc bnc" id="L436" title="All 2 branches missed.">                if (elmt != null) {</span>
+<span class="nc" id="L437">                    throw new InstanceAlreadyExistsException(name.toString());</span>
+                } else {
+<span class="nc" id="L439">                    nbElements++;</span>
+<span class="nc" id="L440">                    addMoiToTb(object,name,cstr,moiTb,context);</span>
+                }
+            }
+
+        } finally {
+<span class="nc" id="L445">            lock.writeLock().unlock();</span>
+<span class="nc" id="L446">        }</span>
+<span class="nc" id="L447">    }</span>
+
+    /**
+     * Checks whether an MBean of the name specified is already stored in
+     * the repository.
+     *
+     * @param name name of the MBean to find.
+     *
+     * @return  true if the MBean is stored in the repository,
+     *          false otherwise.
+     */
+    public boolean contains(ObjectName name) {
+<span class="nc bnc" id="L459" title="All 2 branches missed.">        if (MBEANSERVER_LOGGER.isLoggable(Level.FINER)) {</span>
+<span class="nc" id="L460">            MBEANSERVER_LOGGER.logp(Level.FINER, Repository.class.getName(),</span>
+                    &quot;contains&quot;, &quot; name = &quot; + name);
+        }
+<span class="nc" id="L463">        lock.readLock().lock();</span>
+        try {
+<span class="nc bnc" id="L465" title="All 2 branches missed.">            return (retrieveNamedObject(name) != null);</span>
+        } finally {
+<span class="nc" id="L467">            lock.readLock().unlock();</span>
+        }
+    }
+
+    /**
+     * Retrieves the MBean of the name specified from the repository. The
+     * object name must match exactly.
+     *
+     * @param name name of the MBean to retrieve.
+     *
+     * @return  The retrieved MBean if it is contained in the repository,
+     *          null otherwise.
+     */
+    public DynamicMBean retrieve(ObjectName name) {
+<span class="nc bnc" id="L481" title="All 2 branches missed.">        if (MBEANSERVER_LOGGER.isLoggable(Level.FINER)) {</span>
+<span class="nc" id="L482">            MBEANSERVER_LOGGER.logp(Level.FINER, Repository.class.getName(),</span>
+                    &quot;retrieve&quot;, &quot;name = &quot; + name);
+        }
+
+        // Calls internal retrieve method to get the named object
+<span class="nc" id="L487">        lock.readLock().lock();</span>
+        try {
+<span class="nc" id="L489">            NamedObject no = retrieveNamedObject(name);</span>
+<span class="nc bnc" id="L490" title="All 2 branches missed.">            if (no == null) return null;</span>
+<span class="nc" id="L491">            else return no.getObject();</span>
+        } finally {
+<span class="nc" id="L493">            lock.readLock().unlock();</span>
+        }
+    }
+
+    /**
+     * Selects and retrieves the list of MBeans whose names match the specified
+     * object name pattern and which match the specified query expression
+     * (optionally).
+     *
+     * @param pattern The name of the MBean(s) to retrieve - may be a specific
+     * object or a name pattern allowing multiple MBeans to be selected.
+     * @param query query expression to apply when selecting objects - this
+     * parameter will be ignored when the Repository Service does not
+     * support filtering.
+     *
+     * @return  The list of MBeans selected. There may be zero, one or many
+     *          MBeans returned in the set.
+     */
+    public Set&lt;NamedObject&gt; query(ObjectName pattern, QueryExp query) {
+
+<span class="nc" id="L513">        final Set&lt;NamedObject&gt; result = new HashSet&lt;NamedObject&gt;();</span>
+
+        // The following filter cases are considered:
+        // null, &quot;&quot;, &quot;*:*&quot; : names in all domains
+        // &quot;:*&quot;, &quot;:[key=value],*&quot; : names in defaultDomain
+        // &quot;domain:*&quot;, &quot;domain:[key=value],*&quot; : names in the specified domain
+
+        // Surely one of the most frequent cases ... query on the whole world
+        ObjectName name;
+<span class="nc bnc" id="L522" title="All 2 branches missed.">        if (pattern == null ||</span>
+<span class="nc bnc" id="L523" title="All 2 branches missed.">            pattern.getCanonicalName().length() == 0 ||</span>
+<span class="nc bnc" id="L524" title="All 2 branches missed.">            pattern.equals(ObjectName.WILDCARD))</span>
+<span class="nc" id="L525">           name = ObjectName.WILDCARD;</span>
+<span class="nc" id="L526">        else name = pattern;</span>
+
+<span class="nc" id="L528">        lock.readLock().lock();</span>
+        try {
+
+            // If pattern is not a pattern, retrieve this mbean !
+<span class="nc bnc" id="L532" title="All 2 branches missed.">            if (!name.isPattern()) {</span>
+<span class="nc" id="L533">                final NamedObject no = retrieveNamedObject(name);</span>
+<span class="nc bnc" id="L534" title="All 2 branches missed.">                if (no != null) result.add(no);</span>
+<span class="nc" id="L535">                return result;</span>
+            }
+
+            // All names in all domains
+<span class="nc bnc" id="L539" title="All 2 branches missed.">            if (name == ObjectName.WILDCARD) {</span>
+<span class="nc bnc" id="L540" title="All 2 branches missed.">                for (Map&lt;String,NamedObject&gt; moiTb : domainTb.values()) {</span>
+<span class="nc" id="L541">                    result.addAll(moiTb.values());</span>
+<span class="nc" id="L542">                }</span>
+<span class="nc" id="L543">                return result;</span>
+            }
+
+<span class="nc" id="L546">            final String canonical_key_property_list_string =</span>
+<span class="nc" id="L547">                    name.getCanonicalKeyPropertyListString();</span>
+<span class="nc" id="L548">            final boolean allNames =</span>
+<span class="nc bnc" id="L549" title="All 2 branches missed.">                    (canonical_key_property_list_string.length()==0);</span>
+<span class="nc bnc" id="L550" title="All 2 branches missed.">            final ObjectNamePattern namePattern =</span>
+                (allNames?null:new ObjectNamePattern(name));
+
+            // All names in default domain
+<span class="nc bnc" id="L554" title="All 2 branches missed.">            if (name.getDomain().length() == 0) {</span>
+<span class="nc" id="L555">                final Map&lt;String,NamedObject&gt; moiTb = domainTb.get(domain);</span>
+<span class="nc bnc" id="L556" title="All 2 branches missed.">                if (allNames)</span>
+<span class="nc" id="L557">                    result.addAll(moiTb.values());</span>
+                else
+<span class="nc" id="L559">                    addAllMatching(moiTb, result, namePattern);</span>
+<span class="nc" id="L560">                return result;</span>
+            }
+
+<span class="nc bnc" id="L563" title="All 2 branches missed.">            if (!name.isDomainPattern()) {</span>
+<span class="nc" id="L564">                final Map&lt;String,NamedObject&gt; moiTb = domainTb.get(name.getDomain());</span>
+<span class="nc bnc" id="L565" title="All 2 branches missed.">                if (moiTb == null) return Collections.emptySet();</span>
+<span class="nc bnc" id="L566" title="All 2 branches missed.">                if (allNames)</span>
+<span class="nc" id="L567">                    result.addAll(moiTb.values());</span>
+                else
+<span class="nc" id="L569">                    addAllMatching(moiTb, result, namePattern);</span>
+<span class="nc" id="L570">                return result;</span>
+            }
+
+            // Pattern matching in the domain name (*, ?)
+<span class="nc" id="L574">            final String dom2Match = name.getDomain();</span>
+<span class="nc bnc" id="L575" title="All 2 branches missed.">            for (String dom : domainTb.keySet()) {</span>
+<span class="nc bnc" id="L576" title="All 2 branches missed.">                if (Util.wildmatch(dom, dom2Match)) {</span>
+<span class="nc" id="L577">                    final Map&lt;String,NamedObject&gt; moiTb = domainTb.get(dom);</span>
+<span class="nc bnc" id="L578" title="All 2 branches missed.">                    if (allNames)</span>
+<span class="nc" id="L579">                        result.addAll(moiTb.values());</span>
+                    else
+<span class="nc" id="L581">                        addAllMatching(moiTb, result, namePattern);</span>
+                }
+<span class="nc" id="L583">            }</span>
+<span class="nc" id="L584">            return result;</span>
+        } finally {
+<span class="nc" id="L586">            lock.readLock().unlock();</span>
+        }
+    }
+
+    /**
+     * Removes an MBean from the repository.
+     *
+     * @param name name of the MBean to remove.
+     * @param context A registration context. If non null, the repository
+     *                will call {@link RegistrationContext#unregistered()
+     *                context.unregistered()} from within the repository
+     *                lock, just after the mbean associated with
+     *                {@code name} is removed from the repository.
+     *                If {@link RegistrationContext#unregistered()
+     *                context.unregistered()} is not expected to throw any
+     *                exception. If it does, the exception is logged
+     *                and swallowed.
+     *
+     * @exception InstanceNotFoundException The MBean does not exist in
+     *            the repository.
+     */
+    public void remove(final ObjectName name,
+            final RegistrationContext context)
+        throws InstanceNotFoundException {
+
+        // Debugging stuff
+<span class="nc bnc" id="L612" title="All 2 branches missed.">        if (MBEANSERVER_LOGGER.isLoggable(Level.FINER)) {</span>
+<span class="nc" id="L613">            MBEANSERVER_LOGGER.logp(Level.FINER, Repository.class.getName(),</span>
+                    &quot;remove&quot;, &quot;name = &quot; + name);
+        }
+
+        // Extract domain name.
+<span class="nc" id="L618">        String dom= name.getDomain().intern();</span>
+
+        // Default domain case
+<span class="nc bnc" id="L621" title="All 2 branches missed.">        if (dom.length() == 0) dom = domain;</span>
+
+<span class="nc" id="L623">        lock.writeLock().lock();</span>
+        try {
+            // Find the domain subtable
+<span class="nc" id="L626">            final Map&lt;String,NamedObject&gt; moiTb = domainTb.get(dom);</span>
+<span class="nc bnc" id="L627" title="All 2 branches missed.">            if (moiTb == null) {</span>
+<span class="nc" id="L628">                throw new InstanceNotFoundException(name.toString());</span>
+            }
+
+            // Remove the corresponding element
+<span class="nc bnc" id="L632" title="All 2 branches missed.">            if (moiTb.remove(name.getCanonicalKeyPropertyListString())==null) {</span>
+<span class="nc" id="L633">                throw new InstanceNotFoundException(name.toString());</span>
+            }
+
+            // We removed it !
+<span class="nc" id="L637">            nbElements--;</span>
+
+            // No more object for this domain, we remove this domain hashtable
+<span class="nc bnc" id="L640" title="All 2 branches missed.">            if (moiTb.isEmpty()) {</span>
+<span class="nc" id="L641">                domainTb.remove(dom);</span>
+
+                // set a new default domain table (always present)
+                // need to reinstantiate a hashtable because of possible
+                // big buckets array size inside table, never cleared,
+                // thus the new !
+<span class="nc bnc" id="L647" title="All 2 branches missed.">                if (dom == domain) // ES: OK dom and domain are interned.</span>
+<span class="nc" id="L648">                    domainTb.put(domain, new HashMap&lt;String,NamedObject&gt;());</span>
+            }
+
+<span class="nc" id="L651">            unregistering(context,name);</span>
+
+        } finally {
+<span class="nc" id="L654">            lock.writeLock().unlock();</span>
+<span class="nc" id="L655">        }</span>
+<span class="nc" id="L656">    }</span>
+
+    /**
+     * Gets the number of MBeans stored in the repository.
+     *
+     * @return  Number of MBeans.
+     */
+    public Integer getCount() {
+<span class="nc" id="L664">        return nbElements;</span>
+    }
+
+    /**
+     * Gets the name of the domain currently used by default in the
+     * repository.
+     *
+     * @return  A string giving the name of the default domain name.
+     */
+    public String getDefaultDomain() {
+<span class="nc" id="L674">        return domain;</span>
+    }
+
+    // Public methods &lt;=============================================
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

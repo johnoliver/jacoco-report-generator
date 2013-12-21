@@ -1,0 +1,1058 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>SpinedBuffer.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">java.util.stream</a> &gt; <span class="el_source">SpinedBuffer.java</span></div><h1>SpinedBuffer.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2012, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package java.util.stream;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Objects;
+import java.util.PrimitiveIterator;
+import java.util.Spliterator;
+import java.util.Spliterators;
+import java.util.function.Consumer;
+import java.util.function.DoubleConsumer;
+import java.util.function.IntConsumer;
+import java.util.function.IntFunction;
+import java.util.function.LongConsumer;
+
+/**
+ * An ordered collection of elements.  Elements can be added, but not removed.
+ * Goes through a building phase, during which elements can be added, and a
+ * traversal phase, during which elements can be traversed in order but no
+ * further modifications are possible.
+ *
+ * &lt;p&gt; One or more arrays are used to store elements. The use of a multiple
+ * arrays has better performance characteristics than a single array used by
+ * {@link ArrayList}, as when the capacity of the list needs to be increased
+ * no copying of elements is required.  This is usually beneficial in the case
+ * where the results will be traversed a small number of times.
+ *
+ * @param &lt;E&gt; the type of elements in this list
+ * @since 1.8
+ */
+class SpinedBuffer&lt;E&gt;
+        extends AbstractSpinedBuffer
+        implements Consumer&lt;E&gt;, Iterable&lt;E&gt; {
+
+    /*
+     * We optimistically hope that all the data will fit into the first chunk,
+     * so we try to avoid inflating the spine[] and priorElementCount[] arrays
+     * prematurely.  So methods must be prepared to deal with these arrays being
+     * null.  If spine is non-null, then spineIndex points to the current chunk
+     * within the spine, otherwise it is zero.  The spine and priorElementCount
+     * arrays are always the same size, and for any i &lt;= spineIndex,
+     * priorElementCount[i] is the sum of the sizes of all the prior chunks.
+     *
+     * The curChunk pointer is always valid.  The elementIndex is the index of
+     * the next element to be written in curChunk; this may be past the end of
+     * curChunk so we have to check before writing. When we inflate the spine
+     * array, curChunk becomes the first element in it.  When we clear the
+     * buffer, we discard all chunks except the first one, which we clear,
+     * restoring it to the initial single-chunk state.
+     */
+
+    /**
+     * Chunk that we're currently writing into; may or may not be aliased with
+     * the first element of the spine.
+     */
+    protected E[] curChunk;
+
+    /**
+     * All chunks, or null if there is only one chunk.
+     */
+    protected E[][] spine;
+
+    /**
+     * Constructs an empty list with the specified initial capacity.
+     *
+     * @param  initialCapacity  the initial capacity of the list
+     * @throws IllegalArgumentException if the specified initial capacity
+     *         is negative
+     */
+    SpinedBuffer(int initialCapacity) {
+<span class="nc" id="L96">        super(initialCapacity);</span>
+<span class="nc" id="L97">        curChunk = (E[]) new Object[1 &lt;&lt; initialChunkPower];</span>
+<span class="nc" id="L98">    }</span>
+
+    /**
+     * Constructs an empty list with an initial capacity of sixteen.
+     */
+    SpinedBuffer() {
+<span class="fc" id="L104">        super();</span>
+<span class="fc" id="L105">        curChunk = (E[]) new Object[1 &lt;&lt; initialChunkPower];</span>
+<span class="fc" id="L106">    }</span>
+
+    /**
+     * Returns the current capacity of the buffer
+     */
+    protected long capacity() {
+<span class="fc bfc" id="L112" title="All 2 branches covered.">        return (spineIndex == 0)</span>
+               ? curChunk.length
+               : priorElementCount[spineIndex] + spine[spineIndex].length;
+    }
+
+    private void inflateSpine() {
+<span class="fc bfc" id="L118" title="All 2 branches covered.">        if (spine == null) {</span>
+<span class="fc" id="L119">            spine = (E[][]) new Object[MIN_SPINE_SIZE][];</span>
+<span class="fc" id="L120">            priorElementCount = new long[MIN_SPINE_SIZE];</span>
+<span class="fc" id="L121">            spine[0] = curChunk;</span>
+        }
+<span class="fc" id="L123">    }</span>
+
+    /**
+     * Ensure that the buffer has at least capacity to hold the target size
+     */
+    protected final void ensureCapacity(long targetSize) {
+<span class="fc" id="L129">        long capacity = capacity();</span>
+<span class="fc bfc" id="L130" title="All 2 branches covered.">        if (targetSize &gt; capacity) {</span>
+<span class="fc" id="L131">            inflateSpine();</span>
+<span class="fc bfc" id="L132" title="All 2 branches covered.">            for (int i=spineIndex+1; targetSize &gt; capacity; i++) {</span>
+<span class="fc bfc" id="L133" title="All 2 branches covered.">                if (i &gt;= spine.length) {</span>
+<span class="fc" id="L134">                    int newSpineSize = spine.length * 2;</span>
+<span class="fc" id="L135">                    spine = Arrays.copyOf(spine, newSpineSize);</span>
+<span class="fc" id="L136">                    priorElementCount = Arrays.copyOf(priorElementCount, newSpineSize);</span>
+                }
+<span class="fc" id="L138">                int nextChunkSize = chunkSize(i);</span>
+<span class="fc" id="L139">                spine[i] = (E[]) new Object[nextChunkSize];</span>
+<span class="fc" id="L140">                priorElementCount[i] = priorElementCount[i-1] + spine[i-1].length;</span>
+<span class="fc" id="L141">                capacity += nextChunkSize;</span>
+            }
+        }
+<span class="fc" id="L144">    }</span>
+
+    /**
+     * Force the buffer to increase its capacity.
+     */
+    protected void increaseCapacity() {
+<span class="fc" id="L150">        ensureCapacity(capacity() + 1);</span>
+<span class="fc" id="L151">    }</span>
+
+    /**
+     * Retrieve the element at the specified index.
+     */
+    public E get(long index) {
+        // @@@ can further optimize by caching last seen spineIndex,
+        // which is going to be right most of the time
+
+        // Casts to int are safe since the spine array index is the index minus
+        // the prior element count from the current spine
+<span class="pc bpc" id="L162" title="1 of 2 branches missed.">        if (spineIndex == 0) {</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">            if (index &lt; elementIndex)</span>
+<span class="nc" id="L164">                return curChunk[((int) index)];</span>
+            else
+<span class="nc" id="L166">                throw new IndexOutOfBoundsException(Long.toString(index));</span>
+        }
+
+<span class="pc bpc" id="L169" title="1 of 2 branches missed.">        if (index &gt;= count())</span>
+<span class="nc" id="L170">            throw new IndexOutOfBoundsException(Long.toString(index));</span>
+
+<span class="pc bpc" id="L172" title="1 of 2 branches missed.">        for (int j=0; j &lt;= spineIndex; j++)</span>
+<span class="fc bfc" id="L173" title="All 2 branches covered.">            if (index &lt; priorElementCount[j] + spine[j].length)</span>
+<span class="fc" id="L174">                return spine[j][((int) (index - priorElementCount[j]))];</span>
+
+<span class="nc" id="L176">        throw new IndexOutOfBoundsException(Long.toString(index));</span>
+    }
+
+    /**
+     * Copy the elements, starting at the specified offset, into the specified
+     * array.
+     */
+    public void copyInto(E[] array, int offset) {
+<span class="fc" id="L184">        long finalOffset = offset + count();</span>
+<span class="pc bpc" id="L185" title="2 of 4 branches missed.">        if (finalOffset &gt; array.length || finalOffset &lt; offset) {</span>
+<span class="nc" id="L186">            throw new IndexOutOfBoundsException(&quot;does not fit&quot;);</span>
+        }
+
+<span class="fc bfc" id="L189" title="All 2 branches covered.">        if (spineIndex == 0)</span>
+<span class="fc" id="L190">            System.arraycopy(curChunk, 0, array, offset, elementIndex);</span>
+        else {
+            // full chunks
+<span class="fc bfc" id="L193" title="All 2 branches covered.">            for (int i=0; i &lt; spineIndex; i++) {</span>
+<span class="fc" id="L194">                System.arraycopy(spine[i], 0, array, offset, spine[i].length);</span>
+<span class="fc" id="L195">                offset += spine[i].length;</span>
+            }
+<span class="pc bpc" id="L197" title="1 of 2 branches missed.">            if (elementIndex &gt; 0)</span>
+<span class="fc" id="L198">                System.arraycopy(curChunk, 0, array, offset, elementIndex);</span>
+        }
+<span class="fc" id="L200">    }</span>
+
+    /**
+     * Create a new array using the specified array factory, and copy the
+     * elements into it.
+     */
+    public E[] asArray(IntFunction&lt;E[]&gt; arrayFactory) {
+<span class="fc" id="L207">        long size = count();</span>
+<span class="pc bpc" id="L208" title="1 of 2 branches missed.">        if (size &gt;= Nodes.MAX_ARRAY_SIZE)</span>
+<span class="nc" id="L209">            throw new IllegalArgumentException(Nodes.BAD_SIZE);</span>
+<span class="fc" id="L210">        E[] result = arrayFactory.apply((int) size);</span>
+<span class="fc" id="L211">        copyInto(result, 0);</span>
+<span class="fc" id="L212">        return result;</span>
+    }
+
+    @Override
+    public void clear() {
+<span class="pc bpc" id="L217" title="1 of 2 branches missed.">        if (spine != null) {</span>
+<span class="nc" id="L218">            curChunk = spine[0];</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">            for (int i=0; i&lt;curChunk.length; i++)</span>
+<span class="nc" id="L220">                curChunk[i] = null;</span>
+<span class="nc" id="L221">            spine = null;</span>
+<span class="nc" id="L222">            priorElementCount = null;</span>
+        }
+        else {
+<span class="pc bpc" id="L225" title="1 of 2 branches missed.">            for (int i=0; i&lt;elementIndex; i++)</span>
+<span class="nc" id="L226">                curChunk[i] = null;</span>
+        }
+<span class="fc" id="L228">        elementIndex = 0;</span>
+<span class="fc" id="L229">        spineIndex = 0;</span>
+<span class="fc" id="L230">    }</span>
+
+    @Override
+    public Iterator&lt;E&gt; iterator() {
+<span class="fc" id="L234">        return Spliterators.iterator(spliterator());</span>
+    }
+
+    @Override
+    public void forEach(Consumer&lt;? super E&gt; consumer) {
+        // completed chunks, if any
+<span class="fc bfc" id="L240" title="All 2 branches covered.">        for (int j = 0; j &lt; spineIndex; j++)</span>
+<span class="fc bfc" id="L241" title="All 2 branches covered.">            for (E t : spine[j])</span>
+<span class="fc" id="L242">                consumer.accept(t);</span>
+
+        // current chunk
+<span class="fc bfc" id="L245" title="All 2 branches covered.">        for (int i=0; i&lt;elementIndex; i++)</span>
+<span class="fc" id="L246">            consumer.accept(curChunk[i]);</span>
+<span class="fc" id="L247">    }</span>
+
+    @Override
+    public void accept(E e) {
+<span class="fc bfc" id="L251" title="All 2 branches covered.">        if (elementIndex == curChunk.length) {</span>
+<span class="fc" id="L252">            inflateSpine();</span>
+<span class="fc bfc" id="L253" title="All 4 branches covered.">            if (spineIndex+1 &gt;= spine.length || spine[spineIndex+1] == null)</span>
+<span class="fc" id="L254">                increaseCapacity();</span>
+<span class="fc" id="L255">            elementIndex = 0;</span>
+<span class="fc" id="L256">            ++spineIndex;</span>
+<span class="fc" id="L257">            curChunk = spine[spineIndex];</span>
+        }
+<span class="fc" id="L259">        curChunk[elementIndex++] = e;</span>
+<span class="fc" id="L260">    }</span>
+
+    @Override
+    public String toString() {
+<span class="fc" id="L264">        List&lt;E&gt; list = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L265">        forEach(list::add);</span>
+<span class="fc" id="L266">        return &quot;SpinedBuffer:&quot; + list.toString();</span>
+    }
+
+    private static final int SPLITERATOR_CHARACTERISTICS
+            = Spliterator.SIZED | Spliterator.ORDERED | Spliterator.SUBSIZED;
+
+    /**
+     * Return a {@link Spliterator} describing the contents of the buffer.
+     */
+    public Spliterator&lt;E&gt; spliterator() {
+<span class="pc bpc" id="L276" title="1 of 2 branches missed.">        class Splitr implements Spliterator&lt;E&gt; {</span>
+            // The current spine index
+            int splSpineIndex;
+
+            // Last spine index
+            final int lastSpineIndex;
+
+            // The current element index into the current spine
+            int splElementIndex;
+
+            // Last spine's last element index + 1
+            final int lastSpineElementFence;
+
+            // When splSpineIndex &gt;= lastSpineIndex and
+            // splElementIndex &gt;= lastSpineElementFence then
+            // this spliterator is fully traversed
+            // tryAdvance can set splSpineIndex &gt; spineIndex if the last spine is full
+
+            // The current spine array
+            E[] splChunk;
+
+            Splitr(int firstSpineIndex, int lastSpineIndex,
+<span class="fc" id="L298">                   int firstSpineElementIndex, int lastSpineElementFence) {</span>
+<span class="fc" id="L299">                this.splSpineIndex = firstSpineIndex;</span>
+<span class="fc" id="L300">                this.lastSpineIndex = lastSpineIndex;</span>
+<span class="fc" id="L301">                this.splElementIndex = firstSpineElementIndex;</span>
+<span class="fc" id="L302">                this.lastSpineElementFence = lastSpineElementFence;</span>
+<span class="pc bpc" id="L303" title="3 of 8 branches missed.">                assert spine != null || firstSpineIndex == 0 &amp;&amp; lastSpineIndex == 0;</span>
+<span class="fc bfc" id="L304" title="All 2 branches covered.">                splChunk = (spine == null) ? curChunk : spine[firstSpineIndex];</span>
+<span class="fc" id="L305">            }</span>
+
+            @Override
+            public long estimateSize() {
+<span class="fc bfc" id="L309" title="All 2 branches covered.">                return (splSpineIndex == lastSpineIndex)</span>
+                       ? (long) lastSpineElementFence - splElementIndex
+                       : // # of elements prior to end -
+                       priorElementCount[lastSpineIndex] + lastSpineElementFence -
+                       // # of elements prior to current
+                       priorElementCount[splSpineIndex] - splElementIndex;
+            }
+
+            @Override
+            public int characteristics() {
+<span class="fc" id="L319">                return SPLITERATOR_CHARACTERISTICS;</span>
+            }
+
+            @Override
+            public boolean tryAdvance(Consumer&lt;? super E&gt; consumer) {
+<span class="fc" id="L324">                Objects.requireNonNull(consumer);</span>
+
+<span class="pc bpc" id="L326" title="1 of 6 branches missed.">                if (splSpineIndex &lt; lastSpineIndex</span>
+                    || (splSpineIndex == lastSpineIndex &amp;&amp; splElementIndex &lt; lastSpineElementFence)) {
+<span class="fc" id="L328">                    consumer.accept(splChunk[splElementIndex++]);</span>
+
+<span class="fc bfc" id="L330" title="All 2 branches covered.">                    if (splElementIndex == splChunk.length) {</span>
+<span class="fc" id="L331">                        splElementIndex = 0;</span>
+<span class="fc" id="L332">                        ++splSpineIndex;</span>
+<span class="pc bpc" id="L333" title="2 of 4 branches missed.">                        if (spine != null &amp;&amp; splSpineIndex &lt;= lastSpineIndex)</span>
+<span class="fc" id="L334">                            splChunk = spine[splSpineIndex];</span>
+                    }
+<span class="fc" id="L336">                    return true;</span>
+                }
+<span class="fc" id="L338">                return false;</span>
+            }
+
+            @Override
+            public void forEachRemaining(Consumer&lt;? super E&gt; consumer) {
+<span class="fc" id="L343">                Objects.requireNonNull(consumer);</span>
+
+<span class="pc bpc" id="L345" title="1 of 6 branches missed.">                if (splSpineIndex &lt; lastSpineIndex</span>
+                    || (splSpineIndex == lastSpineIndex &amp;&amp; splElementIndex &lt; lastSpineElementFence)) {
+<span class="fc" id="L347">                    int i = splElementIndex;</span>
+                    // completed chunks, if any
+<span class="fc bfc" id="L349" title="All 2 branches covered.">                    for (int sp = splSpineIndex; sp &lt; lastSpineIndex; sp++) {</span>
+<span class="fc" id="L350">                        E[] chunk = spine[sp];</span>
+<span class="fc bfc" id="L351" title="All 2 branches covered.">                        for (; i &lt; chunk.length; i++) {</span>
+<span class="fc" id="L352">                            consumer.accept(chunk[i]);</span>
+                        }
+<span class="fc" id="L354">                        i = 0;</span>
+                    }
+                    // last (or current uncompleted) chunk
+<span class="fc bfc" id="L357" title="All 2 branches covered.">                    E[] chunk = (splSpineIndex == lastSpineIndex) ? splChunk : spine[lastSpineIndex];</span>
+<span class="fc" id="L358">                    int hElementIndex = lastSpineElementFence;</span>
+<span class="fc bfc" id="L359" title="All 2 branches covered.">                    for (; i &lt; hElementIndex; i++) {</span>
+<span class="fc" id="L360">                        consumer.accept(chunk[i]);</span>
+                    }
+                    // mark consumed
+<span class="fc" id="L363">                    splSpineIndex = lastSpineIndex;</span>
+<span class="fc" id="L364">                    splElementIndex = lastSpineElementFence;</span>
+                }
+<span class="fc" id="L366">            }</span>
+
+            @Override
+            public Spliterator&lt;E&gt; trySplit() {
+<span class="nc bnc" id="L370" title="All 2 branches missed.">                if (splSpineIndex &lt; lastSpineIndex) {</span>
+                    // split just before last chunk (if it is full this means 50:50 split)
+<span class="nc" id="L372">                    Spliterator&lt;E&gt; ret = new Splitr(splSpineIndex, lastSpineIndex - 1,</span>
+                                                    splElementIndex, spine[lastSpineIndex-1].length);
+                    // position to start of last chunk
+<span class="nc" id="L375">                    splSpineIndex = lastSpineIndex;</span>
+<span class="nc" id="L376">                    splElementIndex = 0;</span>
+<span class="nc" id="L377">                    splChunk = spine[splSpineIndex];</span>
+<span class="nc" id="L378">                    return ret;</span>
+                }
+<span class="nc bnc" id="L380" title="All 2 branches missed.">                else if (splSpineIndex == lastSpineIndex) {</span>
+<span class="nc" id="L381">                    int t = (lastSpineElementFence - splElementIndex) / 2;</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">                    if (t == 0)</span>
+<span class="nc" id="L383">                        return null;</span>
+                    else {
+<span class="nc" id="L385">                        Spliterator&lt;E&gt; ret = Arrays.spliterator(splChunk, splElementIndex, splElementIndex + t);</span>
+<span class="nc" id="L386">                        splElementIndex += t;</span>
+<span class="nc" id="L387">                        return ret;</span>
+                    }
+                }
+                else {
+<span class="nc" id="L391">                    return null;</span>
+                }
+            }
+        }
+<span class="fc" id="L395">        return new Splitr(0, spineIndex, 0, elementIndex);</span>
+    }
+
+    /**
+     * An ordered collection of primitive values.  Elements can be added, but
+     * not removed. Goes through a building phase, during which elements can be
+     * added, and a traversal phase, during which elements can be traversed in
+     * order but no further modifications are possible.
+     *
+     * &lt;p&gt; One or more arrays are used to store elements. The use of a multiple
+     * arrays has better performance characteristics than a single array used by
+     * {@link ArrayList}, as when the capacity of the list needs to be increased
+     * no copying of elements is required.  This is usually beneficial in the case
+     * where the results will be traversed a small number of times.
+     *
+     * @param &lt;E&gt; the wrapper type for this primitive type
+     * @param &lt;T_ARR&gt; the array type for this primitive type
+     * @param &lt;T_CONS&gt; the Consumer type for this primitive type
+     */
+    abstract static class OfPrimitive&lt;E, T_ARR, T_CONS&gt;
+            extends AbstractSpinedBuffer implements Iterable&lt;E&gt; {
+
+        /*
+         * We optimistically hope that all the data will fit into the first chunk,
+         * so we try to avoid inflating the spine[] and priorElementCount[] arrays
+         * prematurely.  So methods must be prepared to deal with these arrays being
+         * null.  If spine is non-null, then spineIndex points to the current chunk
+         * within the spine, otherwise it is zero.  The spine and priorElementCount
+         * arrays are always the same size, and for any i &lt;= spineIndex,
+         * priorElementCount[i] is the sum of the sizes of all the prior chunks.
+         *
+         * The curChunk pointer is always valid.  The elementIndex is the index of
+         * the next element to be written in curChunk; this may be past the end of
+         * curChunk so we have to check before writing. When we inflate the spine
+         * array, curChunk becomes the first element in it.  When we clear the
+         * buffer, we discard all chunks except the first one, which we clear,
+         * restoring it to the initial single-chunk state.
+         */
+
+        // The chunk we're currently writing into
+        T_ARR curChunk;
+
+        // All chunks, or null if there is only one chunk
+        T_ARR[] spine;
+
+        /**
+         * Constructs an empty list with the specified initial capacity.
+         *
+         * @param  initialCapacity  the initial capacity of the list
+         * @throws IllegalArgumentException if the specified initial capacity
+         *         is negative
+         */
+        OfPrimitive(int initialCapacity) {
+<span class="nc" id="L448">            super(initialCapacity);</span>
+<span class="nc" id="L449">            curChunk = newArray(1 &lt;&lt; initialChunkPower);</span>
+<span class="nc" id="L450">        }</span>
+
+        /**
+         * Constructs an empty list with an initial capacity of sixteen.
+         */
+        OfPrimitive() {
+<span class="fc" id="L456">            super();</span>
+<span class="fc" id="L457">            curChunk = newArray(1 &lt;&lt; initialChunkPower);</span>
+<span class="fc" id="L458">        }</span>
+
+        @Override
+        public abstract Iterator&lt;E&gt; iterator();
+
+        @Override
+        public abstract void forEach(Consumer&lt;? super E&gt; consumer);
+
+        /** Create a new array-of-array of the proper type and size */
+        protected abstract T_ARR[] newArrayArray(int size);
+
+        /** Create a new array of the proper type and size */
+        public abstract T_ARR newArray(int size);
+
+        /** Get the length of an array */
+        protected abstract int arrayLength(T_ARR array);
+
+        /** Iterate an array with the provided consumer */
+        protected abstract void arrayForEach(T_ARR array, int from, int to,
+                                             T_CONS consumer);
+
+        protected long capacity() {
+<span class="fc bfc" id="L480" title="All 2 branches covered.">            return (spineIndex == 0)</span>
+<span class="fc" id="L481">                   ? arrayLength(curChunk)</span>
+<span class="fc" id="L482">                   : priorElementCount[spineIndex] + arrayLength(spine[spineIndex]);</span>
+        }
+
+        private void inflateSpine() {
+<span class="fc bfc" id="L486" title="All 2 branches covered.">            if (spine == null) {</span>
+<span class="fc" id="L487">                spine = newArrayArray(MIN_SPINE_SIZE);</span>
+<span class="fc" id="L488">                priorElementCount = new long[MIN_SPINE_SIZE];</span>
+<span class="fc" id="L489">                spine[0] = curChunk;</span>
+            }
+<span class="fc" id="L491">        }</span>
+
+        protected final void ensureCapacity(long targetSize) {
+<span class="fc" id="L494">            long capacity = capacity();</span>
+<span class="fc bfc" id="L495" title="All 2 branches covered.">            if (targetSize &gt; capacity) {</span>
+<span class="fc" id="L496">                inflateSpine();</span>
+<span class="fc bfc" id="L497" title="All 2 branches covered.">                for (int i=spineIndex+1; targetSize &gt; capacity; i++) {</span>
+<span class="fc bfc" id="L498" title="All 2 branches covered.">                    if (i &gt;= spine.length) {</span>
+<span class="fc" id="L499">                        int newSpineSize = spine.length * 2;</span>
+<span class="fc" id="L500">                        spine = Arrays.copyOf(spine, newSpineSize);</span>
+<span class="fc" id="L501">                        priorElementCount = Arrays.copyOf(priorElementCount, newSpineSize);</span>
+                    }
+<span class="fc" id="L503">                    int nextChunkSize = chunkSize(i);</span>
+<span class="fc" id="L504">                    spine[i] = newArray(nextChunkSize);</span>
+<span class="fc" id="L505">                    priorElementCount[i] = priorElementCount[i-1] + arrayLength(spine[i - 1]);</span>
+<span class="fc" id="L506">                    capacity += nextChunkSize;</span>
+                }
+            }
+<span class="fc" id="L509">        }</span>
+
+        protected void increaseCapacity() {
+<span class="fc" id="L512">            ensureCapacity(capacity() + 1);</span>
+<span class="fc" id="L513">        }</span>
+
+        protected int chunkFor(long index) {
+<span class="pc bpc" id="L516" title="1 of 2 branches missed.">            if (spineIndex == 0) {</span>
+<span class="nc bnc" id="L517" title="All 2 branches missed.">                if (index &lt; elementIndex)</span>
+<span class="nc" id="L518">                    return 0;</span>
+                else
+<span class="nc" id="L520">                    throw new IndexOutOfBoundsException(Long.toString(index));</span>
+            }
+
+<span class="pc bpc" id="L523" title="1 of 2 branches missed.">            if (index &gt;= count())</span>
+<span class="nc" id="L524">                throw new IndexOutOfBoundsException(Long.toString(index));</span>
+
+<span class="pc bpc" id="L526" title="1 of 2 branches missed.">            for (int j=0; j &lt;= spineIndex; j++)</span>
+<span class="fc bfc" id="L527" title="All 2 branches covered.">                if (index &lt; priorElementCount[j] + arrayLength(spine[j]))</span>
+<span class="fc" id="L528">                    return j;</span>
+
+<span class="nc" id="L530">            throw new IndexOutOfBoundsException(Long.toString(index));</span>
+        }
+
+        public void copyInto(T_ARR array, int offset) {
+<span class="fc" id="L534">            long finalOffset = offset + count();</span>
+<span class="pc bpc" id="L535" title="2 of 4 branches missed.">            if (finalOffset &gt; arrayLength(array) || finalOffset &lt; offset) {</span>
+<span class="nc" id="L536">                throw new IndexOutOfBoundsException(&quot;does not fit&quot;);</span>
+            }
+
+<span class="fc bfc" id="L539" title="All 2 branches covered.">            if (spineIndex == 0)</span>
+<span class="fc" id="L540">                System.arraycopy(curChunk, 0, array, offset, elementIndex);</span>
+            else {
+                // full chunks
+<span class="fc bfc" id="L543" title="All 2 branches covered.">                for (int i=0; i &lt; spineIndex; i++) {</span>
+<span class="fc" id="L544">                    System.arraycopy(spine[i], 0, array, offset, arrayLength(spine[i]));</span>
+<span class="fc" id="L545">                    offset += arrayLength(spine[i]);</span>
+                }
+<span class="pc bpc" id="L547" title="1 of 2 branches missed.">                if (elementIndex &gt; 0)</span>
+<span class="fc" id="L548">                    System.arraycopy(curChunk, 0, array, offset, elementIndex);</span>
+            }
+<span class="fc" id="L550">        }</span>
+
+        public T_ARR asPrimitiveArray() {
+<span class="fc" id="L553">            long size = count();</span>
+<span class="pc bpc" id="L554" title="1 of 2 branches missed.">            if (size &gt;= Nodes.MAX_ARRAY_SIZE)</span>
+<span class="nc" id="L555">                throw new IllegalArgumentException(Nodes.BAD_SIZE);</span>
+<span class="fc" id="L556">            T_ARR result = newArray((int) size);</span>
+<span class="fc" id="L557">            copyInto(result, 0);</span>
+<span class="fc" id="L558">            return result;</span>
+        }
+
+        protected void preAccept() {
+<span class="fc bfc" id="L562" title="All 2 branches covered.">            if (elementIndex == arrayLength(curChunk)) {</span>
+<span class="fc" id="L563">                inflateSpine();</span>
+<span class="fc bfc" id="L564" title="All 4 branches covered.">                if (spineIndex+1 &gt;= spine.length || spine[spineIndex+1] == null)</span>
+<span class="fc" id="L565">                    increaseCapacity();</span>
+<span class="fc" id="L566">                elementIndex = 0;</span>
+<span class="fc" id="L567">                ++spineIndex;</span>
+<span class="fc" id="L568">                curChunk = spine[spineIndex];</span>
+            }
+<span class="fc" id="L570">        }</span>
+
+        public void clear() {
+<span class="pc bpc" id="L573" title="1 of 2 branches missed.">            if (spine != null) {</span>
+<span class="nc" id="L574">                curChunk = spine[0];</span>
+<span class="nc" id="L575">                spine = null;</span>
+<span class="nc" id="L576">                priorElementCount = null;</span>
+            }
+<span class="fc" id="L578">            elementIndex = 0;</span>
+<span class="fc" id="L579">            spineIndex = 0;</span>
+<span class="fc" id="L580">        }</span>
+
+        @SuppressWarnings(&quot;overloads&quot;)
+        public void forEach(T_CONS consumer) {
+            // completed chunks, if any
+<span class="fc bfc" id="L585" title="All 2 branches covered.">            for (int j = 0; j &lt; spineIndex; j++)</span>
+<span class="fc" id="L586">                arrayForEach(spine[j], 0, arrayLength(spine[j]), consumer);</span>
+
+            // current chunk
+<span class="fc" id="L589">            arrayForEach(curChunk, 0, elementIndex, consumer);</span>
+<span class="fc" id="L590">        }</span>
+
+<span class="pc bpc" id="L592" title="1 of 2 branches missed.">        abstract class BaseSpliterator&lt;T_SPLITR extends Spliterator.OfPrimitive&lt;E, T_CONS, T_SPLITR&gt;&gt;</span>
+                implements Spliterator.OfPrimitive&lt;E, T_CONS, T_SPLITR&gt; {
+            // The current spine index
+            int splSpineIndex;
+
+            // Last spine index
+            final int lastSpineIndex;
+
+            // The current element index into the current spine
+            int splElementIndex;
+
+            // Last spine's last element index + 1
+            final int lastSpineElementFence;
+
+            // When splSpineIndex &gt;= lastSpineIndex and
+            // splElementIndex &gt;= lastSpineElementFence then
+            // this spliterator is fully traversed
+            // tryAdvance can set splSpineIndex &gt; spineIndex if the last spine is full
+
+            // The current spine array
+            T_ARR splChunk;
+
+            BaseSpliterator(int firstSpineIndex, int lastSpineIndex,
+<span class="fc" id="L615">                            int firstSpineElementIndex, int lastSpineElementFence) {</span>
+<span class="fc" id="L616">                this.splSpineIndex = firstSpineIndex;</span>
+<span class="fc" id="L617">                this.lastSpineIndex = lastSpineIndex;</span>
+<span class="fc" id="L618">                this.splElementIndex = firstSpineElementIndex;</span>
+<span class="fc" id="L619">                this.lastSpineElementFence = lastSpineElementFence;</span>
+<span class="pc bpc" id="L620" title="3 of 8 branches missed.">                assert spine != null || firstSpineIndex == 0 &amp;&amp; lastSpineIndex == 0;</span>
+<span class="fc bfc" id="L621" title="All 2 branches covered.">                splChunk = (spine == null) ? curChunk : spine[firstSpineIndex];</span>
+<span class="fc" id="L622">            }</span>
+
+            abstract T_SPLITR newSpliterator(int firstSpineIndex, int lastSpineIndex,
+                                             int firstSpineElementIndex, int lastSpineElementFence);
+
+            abstract void arrayForOne(T_ARR array, int index, T_CONS consumer);
+
+            abstract T_SPLITR arraySpliterator(T_ARR array, int offset, int len);
+
+            @Override
+            public long estimateSize() {
+<span class="fc bfc" id="L633" title="All 2 branches covered.">                return (splSpineIndex == lastSpineIndex)</span>
+                       ? (long) lastSpineElementFence - splElementIndex
+                       : // # of elements prior to end -
+                       priorElementCount[lastSpineIndex] + lastSpineElementFence -
+                       // # of elements prior to current
+                       priorElementCount[splSpineIndex] - splElementIndex;
+            }
+
+            @Override
+            public int characteristics() {
+<span class="fc" id="L643">                return SPLITERATOR_CHARACTERISTICS;</span>
+            }
+
+            @Override
+            public boolean tryAdvance(T_CONS consumer) {
+<span class="fc" id="L648">                Objects.requireNonNull(consumer);</span>
+
+<span class="pc bpc" id="L650" title="1 of 6 branches missed.">                if (splSpineIndex &lt; lastSpineIndex</span>
+                    || (splSpineIndex == lastSpineIndex &amp;&amp; splElementIndex &lt; lastSpineElementFence)) {
+<span class="fc" id="L652">                    arrayForOne(splChunk, splElementIndex++, consumer);</span>
+
+<span class="fc bfc" id="L654" title="All 2 branches covered.">                    if (splElementIndex == arrayLength(splChunk)) {</span>
+<span class="fc" id="L655">                        splElementIndex = 0;</span>
+<span class="fc" id="L656">                        ++splSpineIndex;</span>
+<span class="pc bpc" id="L657" title="2 of 4 branches missed.">                        if (spine != null &amp;&amp; splSpineIndex &lt;= lastSpineIndex)</span>
+<span class="fc" id="L658">                            splChunk = spine[splSpineIndex];</span>
+                    }
+<span class="fc" id="L660">                    return true;</span>
+                }
+<span class="fc" id="L662">                return false;</span>
+            }
+
+            @Override
+            public void forEachRemaining(T_CONS consumer) {
+<span class="fc" id="L667">                Objects.requireNonNull(consumer);</span>
+
+<span class="pc bpc" id="L669" title="1 of 6 branches missed.">                if (splSpineIndex &lt; lastSpineIndex</span>
+                    || (splSpineIndex == lastSpineIndex &amp;&amp; splElementIndex &lt; lastSpineElementFence)) {
+<span class="fc" id="L671">                    int i = splElementIndex;</span>
+                    // completed chunks, if any
+<span class="fc bfc" id="L673" title="All 2 branches covered.">                    for (int sp = splSpineIndex; sp &lt; lastSpineIndex; sp++) {</span>
+<span class="fc" id="L674">                        T_ARR chunk = spine[sp];</span>
+<span class="fc" id="L675">                        arrayForEach(chunk, i, arrayLength(chunk), consumer);</span>
+<span class="fc" id="L676">                        i = 0;</span>
+                    }
+                    // last (or current uncompleted) chunk
+<span class="fc bfc" id="L679" title="All 2 branches covered.">                    T_ARR chunk = (splSpineIndex == lastSpineIndex) ? splChunk : spine[lastSpineIndex];</span>
+<span class="fc" id="L680">                    arrayForEach(chunk, i, lastSpineElementFence, consumer);</span>
+                    // mark consumed
+<span class="fc" id="L682">                    splSpineIndex = lastSpineIndex;</span>
+<span class="fc" id="L683">                    splElementIndex = lastSpineElementFence;</span>
+                }
+<span class="fc" id="L685">            }</span>
+
+            @Override
+            public T_SPLITR trySplit() {
+<span class="fc bfc" id="L689" title="All 2 branches covered.">                if (splSpineIndex &lt; lastSpineIndex) {</span>
+                    // split just before last chunk (if it is full this means 50:50 split)
+<span class="fc" id="L691">                    T_SPLITR ret = newSpliterator(splSpineIndex, lastSpineIndex - 1,</span>
+<span class="fc" id="L692">                                                  splElementIndex, arrayLength(spine[lastSpineIndex - 1]));</span>
+                    // position us to start of last chunk
+<span class="fc" id="L694">                    splSpineIndex = lastSpineIndex;</span>
+<span class="fc" id="L695">                    splElementIndex = 0;</span>
+<span class="fc" id="L696">                    splChunk = spine[splSpineIndex];</span>
+<span class="fc" id="L697">                    return ret;</span>
+                }
+<span class="pc bpc" id="L699" title="1 of 2 branches missed.">                else if (splSpineIndex == lastSpineIndex) {</span>
+<span class="fc" id="L700">                    int t = (lastSpineElementFence - splElementIndex) / 2;</span>
+<span class="pc bpc" id="L701" title="1 of 2 branches missed.">                    if (t == 0)</span>
+<span class="nc" id="L702">                        return null;</span>
+                    else {
+<span class="fc" id="L704">                        T_SPLITR ret = arraySpliterator(splChunk, splElementIndex, t);</span>
+<span class="fc" id="L705">                        splElementIndex += t;</span>
+<span class="fc" id="L706">                        return ret;</span>
+                    }
+                }
+                else {
+<span class="nc" id="L710">                    return null;</span>
+                }
+            }
+        }
+    }
+
+    /**
+     * An ordered collection of {@code int} values.
+     */
+    static class OfInt extends SpinedBuffer.OfPrimitive&lt;Integer, int[], IntConsumer&gt;
+            implements IntConsumer {
+<span class="fc" id="L721">        OfInt() { }</span>
+
+        OfInt(int initialCapacity) {
+<span class="nc" id="L724">            super(initialCapacity);</span>
+<span class="nc" id="L725">        }</span>
+
+        @Override
+        public void forEach(Consumer&lt;? super Integer&gt; consumer) {
+<span class="nc bnc" id="L729" title="All 2 branches missed.">            if (consumer instanceof IntConsumer) {</span>
+<span class="nc" id="L730">                forEach((IntConsumer) consumer);</span>
+            }
+            else {
+<span class="nc bnc" id="L733" title="All 2 branches missed.">                if (Tripwire.ENABLED)</span>
+<span class="nc" id="L734">                    Tripwire.trip(getClass(), &quot;{0} calling SpinedBuffer.OfInt.forEach(Consumer)&quot;);</span>
+<span class="nc" id="L735">                spliterator().forEachRemaining(consumer);</span>
+            }
+<span class="nc" id="L737">        }</span>
+
+        @Override
+        protected int[][] newArrayArray(int size) {
+<span class="fc" id="L741">            return new int[size][];</span>
+        }
+
+        @Override
+        public int[] newArray(int size) {
+<span class="fc" id="L746">            return new int[size];</span>
+        }
+
+        @Override
+        protected int arrayLength(int[] array) {
+<span class="fc" id="L751">            return array.length;</span>
+        }
+
+        @Override
+        protected void arrayForEach(int[] array,
+                                    int from, int to,
+                                    IntConsumer consumer) {
+<span class="fc bfc" id="L758" title="All 2 branches covered.">            for (int i = from; i &lt; to; i++)</span>
+<span class="fc" id="L759">                consumer.accept(array[i]);</span>
+<span class="fc" id="L760">        }</span>
+
+        @Override
+        public void accept(int i) {
+<span class="fc" id="L764">            preAccept();</span>
+<span class="fc" id="L765">            curChunk[elementIndex++] = i;</span>
+<span class="fc" id="L766">        }</span>
+
+        public int get(long index) {
+            // Casts to int are safe since the spine array index is the index minus
+            // the prior element count from the current spine
+<span class="fc" id="L771">            int ch = chunkFor(index);</span>
+<span class="pc bpc" id="L772" title="3 of 4 branches missed.">            if (spineIndex == 0 &amp;&amp; ch == 0)</span>
+<span class="nc" id="L773">                return curChunk[(int) index];</span>
+            else
+<span class="fc" id="L775">                return spine[ch][(int) (index - priorElementCount[ch])];</span>
+        }
+
+        @Override
+        public PrimitiveIterator.OfInt iterator() {
+<span class="fc" id="L780">            return Spliterators.iterator(spliterator());</span>
+        }
+
+        public Spliterator.OfInt spliterator() {
+            class Splitr extends BaseSpliterator&lt;Spliterator.OfInt&gt;
+                    implements Spliterator.OfInt {
+                Splitr(int firstSpineIndex, int lastSpineIndex,
+<span class="fc" id="L787">                       int firstSpineElementIndex, int lastSpineElementFence) {</span>
+<span class="fc" id="L788">                    super(firstSpineIndex, lastSpineIndex,</span>
+                          firstSpineElementIndex, lastSpineElementFence);
+<span class="fc" id="L790">                }</span>
+
+                @Override
+                Splitr newSpliterator(int firstSpineIndex, int lastSpineIndex,
+                                      int firstSpineElementIndex, int lastSpineElementFence) {
+<span class="fc" id="L795">                    return new Splitr(firstSpineIndex, lastSpineIndex,</span>
+                                      firstSpineElementIndex, lastSpineElementFence);
+                }
+
+                @Override
+                void arrayForOne(int[] array, int index, IntConsumer consumer) {
+<span class="fc" id="L801">                    consumer.accept(array[index]);</span>
+<span class="fc" id="L802">                }</span>
+
+                @Override
+                Spliterator.OfInt arraySpliterator(int[] array, int offset, int len) {
+<span class="fc" id="L806">                    return Arrays.spliterator(array, offset, offset+len);</span>
+                }
+            }
+<span class="fc" id="L809">            return new Splitr(0, spineIndex, 0, elementIndex);</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="fc" id="L814">            int[] array = asPrimitiveArray();</span>
+<span class="fc bfc" id="L815" title="All 2 branches covered.">            if (array.length &lt; 200) {</span>
+<span class="fc" id="L816">                return String.format(&quot;%s[length=%d, chunks=%d]%s&quot;,</span>
+<span class="fc" id="L817">                                     getClass().getSimpleName(), array.length,</span>
+<span class="fc" id="L818">                                     spineIndex, Arrays.toString(array));</span>
+            }
+            else {
+<span class="fc" id="L821">                int[] array2 = Arrays.copyOf(array, 200);</span>
+<span class="fc" id="L822">                return String.format(&quot;%s[length=%d, chunks=%d]%s...&quot;,</span>
+<span class="fc" id="L823">                                     getClass().getSimpleName(), array.length,</span>
+<span class="fc" id="L824">                                     spineIndex, Arrays.toString(array2));</span>
+            }
+        }
+    }
+
+    /**
+     * An ordered collection of {@code long} values.
+     */
+    static class OfLong extends SpinedBuffer.OfPrimitive&lt;Long, long[], LongConsumer&gt;
+            implements LongConsumer {
+<span class="fc" id="L834">        OfLong() { }</span>
+
+        OfLong(int initialCapacity) {
+<span class="nc" id="L837">            super(initialCapacity);</span>
+<span class="nc" id="L838">        }</span>
+
+        @Override
+        public void forEach(Consumer&lt;? super Long&gt; consumer) {
+<span class="nc bnc" id="L842" title="All 2 branches missed.">            if (consumer instanceof LongConsumer) {</span>
+<span class="nc" id="L843">                forEach((LongConsumer) consumer);</span>
+            }
+            else {
+<span class="nc bnc" id="L846" title="All 2 branches missed.">                if (Tripwire.ENABLED)</span>
+<span class="nc" id="L847">                    Tripwire.trip(getClass(), &quot;{0} calling SpinedBuffer.OfLong.forEach(Consumer)&quot;);</span>
+<span class="nc" id="L848">                spliterator().forEachRemaining(consumer);</span>
+            }
+<span class="nc" id="L850">        }</span>
+
+        @Override
+        protected long[][] newArrayArray(int size) {
+<span class="fc" id="L854">            return new long[size][];</span>
+        }
+
+        @Override
+        public long[] newArray(int size) {
+<span class="fc" id="L859">            return new long[size];</span>
+        }
+
+        @Override
+        protected int arrayLength(long[] array) {
+<span class="fc" id="L864">            return array.length;</span>
+        }
+
+        @Override
+        protected void arrayForEach(long[] array,
+                                    int from, int to,
+                                    LongConsumer consumer) {
+<span class="fc bfc" id="L871" title="All 2 branches covered.">            for (int i = from; i &lt; to; i++)</span>
+<span class="fc" id="L872">                consumer.accept(array[i]);</span>
+<span class="fc" id="L873">        }</span>
+
+        @Override
+        public void accept(long i) {
+<span class="fc" id="L877">            preAccept();</span>
+<span class="fc" id="L878">            curChunk[elementIndex++] = i;</span>
+<span class="fc" id="L879">        }</span>
+
+        public long get(long index) {
+            // Casts to int are safe since the spine array index is the index minus
+            // the prior element count from the current spine
+<span class="fc" id="L884">            int ch = chunkFor(index);</span>
+<span class="pc bpc" id="L885" title="3 of 4 branches missed.">            if (spineIndex == 0 &amp;&amp; ch == 0)</span>
+<span class="nc" id="L886">                return curChunk[(int) index];</span>
+            else
+<span class="fc" id="L888">                return spine[ch][(int) (index - priorElementCount[ch])];</span>
+        }
+
+        @Override
+        public PrimitiveIterator.OfLong iterator() {
+<span class="fc" id="L893">            return Spliterators.iterator(spliterator());</span>
+        }
+
+
+        public Spliterator.OfLong spliterator() {
+            class Splitr extends BaseSpliterator&lt;Spliterator.OfLong&gt;
+                    implements Spliterator.OfLong {
+                Splitr(int firstSpineIndex, int lastSpineIndex,
+<span class="fc" id="L901">                       int firstSpineElementIndex, int lastSpineElementFence) {</span>
+<span class="fc" id="L902">                    super(firstSpineIndex, lastSpineIndex,</span>
+                          firstSpineElementIndex, lastSpineElementFence);
+<span class="fc" id="L904">                }</span>
+
+                @Override
+                Splitr newSpliterator(int firstSpineIndex, int lastSpineIndex,
+                                      int firstSpineElementIndex, int lastSpineElementFence) {
+<span class="fc" id="L909">                    return new Splitr(firstSpineIndex, lastSpineIndex,</span>
+                                      firstSpineElementIndex, lastSpineElementFence);
+                }
+
+                @Override
+                void arrayForOne(long[] array, int index, LongConsumer consumer) {
+<span class="fc" id="L915">                    consumer.accept(array[index]);</span>
+<span class="fc" id="L916">                }</span>
+
+                @Override
+                Spliterator.OfLong arraySpliterator(long[] array, int offset, int len) {
+<span class="fc" id="L920">                    return Arrays.spliterator(array, offset, offset+len);</span>
+                }
+            }
+<span class="fc" id="L923">            return new Splitr(0, spineIndex, 0, elementIndex);</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="fc" id="L928">            long[] array = asPrimitiveArray();</span>
+<span class="fc bfc" id="L929" title="All 2 branches covered.">            if (array.length &lt; 200) {</span>
+<span class="fc" id="L930">                return String.format(&quot;%s[length=%d, chunks=%d]%s&quot;,</span>
+<span class="fc" id="L931">                                     getClass().getSimpleName(), array.length,</span>
+<span class="fc" id="L932">                                     spineIndex, Arrays.toString(array));</span>
+            }
+            else {
+<span class="fc" id="L935">                long[] array2 = Arrays.copyOf(array, 200);</span>
+<span class="fc" id="L936">                return String.format(&quot;%s[length=%d, chunks=%d]%s...&quot;,</span>
+<span class="fc" id="L937">                                     getClass().getSimpleName(), array.length,</span>
+<span class="fc" id="L938">                                     spineIndex, Arrays.toString(array2));</span>
+            }
+        }
+    }
+
+    /**
+     * An ordered collection of {@code double} values.
+     */
+    static class OfDouble
+            extends SpinedBuffer.OfPrimitive&lt;Double, double[], DoubleConsumer&gt;
+            implements DoubleConsumer {
+<span class="fc" id="L949">        OfDouble() { }</span>
+
+        OfDouble(int initialCapacity) {
+<span class="nc" id="L952">            super(initialCapacity);</span>
+<span class="nc" id="L953">        }</span>
+
+        @Override
+        public void forEach(Consumer&lt;? super Double&gt; consumer) {
+<span class="nc bnc" id="L957" title="All 2 branches missed.">            if (consumer instanceof DoubleConsumer) {</span>
+<span class="nc" id="L958">                forEach((DoubleConsumer) consumer);</span>
+            }
+            else {
+<span class="nc bnc" id="L961" title="All 2 branches missed.">                if (Tripwire.ENABLED)</span>
+<span class="nc" id="L962">                    Tripwire.trip(getClass(), &quot;{0} calling SpinedBuffer.OfDouble.forEach(Consumer)&quot;);</span>
+<span class="nc" id="L963">                spliterator().forEachRemaining(consumer);</span>
+            }
+<span class="nc" id="L965">        }</span>
+
+        @Override
+        protected double[][] newArrayArray(int size) {
+<span class="fc" id="L969">            return new double[size][];</span>
+        }
+
+        @Override
+        public double[] newArray(int size) {
+<span class="fc" id="L974">            return new double[size];</span>
+        }
+
+        @Override
+        protected int arrayLength(double[] array) {
+<span class="fc" id="L979">            return array.length;</span>
+        }
+
+        @Override
+        protected void arrayForEach(double[] array,
+                                    int from, int to,
+                                    DoubleConsumer consumer) {
+<span class="fc bfc" id="L986" title="All 2 branches covered.">            for (int i = from; i &lt; to; i++)</span>
+<span class="fc" id="L987">                consumer.accept(array[i]);</span>
+<span class="fc" id="L988">        }</span>
+
+        @Override
+        public void accept(double i) {
+<span class="fc" id="L992">            preAccept();</span>
+<span class="fc" id="L993">            curChunk[elementIndex++] = i;</span>
+<span class="fc" id="L994">        }</span>
+
+        public double get(long index) {
+            // Casts to int are safe since the spine array index is the index minus
+            // the prior element count from the current spine
+<span class="fc" id="L999">            int ch = chunkFor(index);</span>
+<span class="pc bpc" id="L1000" title="3 of 4 branches missed.">            if (spineIndex == 0 &amp;&amp; ch == 0)</span>
+<span class="nc" id="L1001">                return curChunk[(int) index];</span>
+            else
+<span class="fc" id="L1003">                return spine[ch][(int) (index - priorElementCount[ch])];</span>
+        }
+
+        @Override
+        public PrimitiveIterator.OfDouble iterator() {
+<span class="fc" id="L1008">            return Spliterators.iterator(spliterator());</span>
+        }
+
+        public Spliterator.OfDouble spliterator() {
+            class Splitr extends BaseSpliterator&lt;Spliterator.OfDouble&gt;
+                    implements Spliterator.OfDouble {
+                Splitr(int firstSpineIndex, int lastSpineIndex,
+<span class="fc" id="L1015">                       int firstSpineElementIndex, int lastSpineElementFence) {</span>
+<span class="fc" id="L1016">                    super(firstSpineIndex, lastSpineIndex,</span>
+                          firstSpineElementIndex, lastSpineElementFence);
+<span class="fc" id="L1018">                }</span>
+
+                @Override
+                Splitr newSpliterator(int firstSpineIndex, int lastSpineIndex,
+                                      int firstSpineElementIndex, int lastSpineElementFence) {
+<span class="fc" id="L1023">                    return new Splitr(firstSpineIndex, lastSpineIndex,</span>
+                                      firstSpineElementIndex, lastSpineElementFence);
+                }
+
+                @Override
+                void arrayForOne(double[] array, int index, DoubleConsumer consumer) {
+<span class="fc" id="L1029">                    consumer.accept(array[index]);</span>
+<span class="fc" id="L1030">                }</span>
+
+                @Override
+                Spliterator.OfDouble arraySpliterator(double[] array, int offset, int len) {
+<span class="fc" id="L1034">                    return Arrays.spliterator(array, offset, offset+len);</span>
+                }
+            }
+<span class="fc" id="L1037">            return new Splitr(0, spineIndex, 0, elementIndex);</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="fc" id="L1042">            double[] array = asPrimitiveArray();</span>
+<span class="fc bfc" id="L1043" title="All 2 branches covered.">            if (array.length &lt; 200) {</span>
+<span class="fc" id="L1044">                return String.format(&quot;%s[length=%d, chunks=%d]%s&quot;,</span>
+<span class="fc" id="L1045">                                     getClass().getSimpleName(), array.length,</span>
+<span class="fc" id="L1046">                                     spineIndex, Arrays.toString(array));</span>
+            }
+            else {
+<span class="fc" id="L1049">                double[] array2 = Arrays.copyOf(array, 200);</span>
+<span class="fc" id="L1050">                return String.format(&quot;%s[length=%d, chunks=%d]%s...&quot;,</span>
+<span class="fc" id="L1051">                                     getClass().getSimpleName(), array.length,</span>
+<span class="fc" id="L1052">                                     spineIndex, Arrays.toString(array2));</span>
+            }
+        }
+    }
+}
+
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

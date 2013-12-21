@@ -1,0 +1,501 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>GlyphList.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.font</a> &gt; <span class="el_source">GlyphList.java</span></div><h1>GlyphList.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2000, 2006, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.font;
+
+import java.awt.Font;
+import java.awt.font.GlyphVector;
+import java.awt.font.FontRenderContext;
+import sun.java2d.loops.FontInfo;
+
+/*
+ * This class represents a list of actual renderable glyphs.
+ * It can be constructed from a number of text sources, representing
+ * the various ways in which a programmer can ask a Graphics2D object
+ * to render some text.  Once constructed, it provides a way of iterating
+ * through the device metrics and graybits of the individual glyphs that
+ * need to be rendered to the screen.
+ *
+ * Note that this class holds pointers to native data which must be
+ * disposed.  It is not marked as finalizable since it is intended
+ * to be very lightweight and finalization is a comparitively expensive
+ * procedure.  The caller must specifically use try{} finally{} to
+ * manually ensure that the object is disposed after use, otherwise
+ * native data structures might be leaked.
+ *
+ * Here is a code sample for using this class:
+ *
+ * public void drawString(String str, FontInfo info, float x, float y) {
+ *     GlyphList gl = GlyphList.getInstance();
+ *     try {
+ *         gl.setFromString(info, str, x, y);
+ *         int strbounds[] = gl.getBounds();
+ *         int numglyphs = gl.getNumGlyphs();
+ *         for (int i = 0; i &lt; numglyphs; i++) {
+ *             gl.setGlyphIndex(i);
+ *             int metrics[] = gl.getMetrics();
+ *             byte bits[] = gl.getGrayBits();
+ *             int glyphx = metrics[0];
+ *             int glyphy = metrics[1];
+ *             int glyphw = metrics[2];
+ *             int glyphh = metrics[3];
+ *             int off = 0;
+ *             for (int j = 0; j &lt; glyphh; j++) {
+ *                 for (int i = 0; i &lt; glyphw; i++) {
+ *                     int dx = glyphx + i;
+ *                     int dy = glyphy + j;
+ *                     int alpha = bits[off++];
+ *                     drawPixel(alpha, dx, dy);
+ *                 }
+ *             }
+ *         }
+ *     } finally {
+ *         gl.dispose();
+ *     }
+ * }
+ */
+public final class GlyphList {
+    private static final int MINGRAYLENGTH = 1024;
+    private static final int MAXGRAYLENGTH = 8192;
+    private static final int DEFAULT_LENGTH = 32;
+
+    int glyphindex;
+    int metrics[];
+    byte graybits[];
+
+    /* A reference to the strike is needed for the case when the GlyphList
+     * may be added to a queue for batch processing, (e.g. OpenGL) and we need
+     * to be completely certain that the strike is still valid when the glyphs
+     * images are later referenced.  This does mean that if such code discards
+     * GlyphList and places only the data it contains on the queue, that the
+     * strike needs to be part of that data held by a strong reference.
+     * In the cases of drawString() and drawChars(), this is a single strike,
+     * although it may be a composite strike.  In the case of
+     * drawGlyphVector() it may be a single strike, or a list of strikes.
+     */
+    Object strikelist; // hold multiple strikes during rendering of complex gv
+
+    /* In normal usage, the same GlyphList will get recycled, so
+     * it makes sense to allocate arrays that will get reused along with
+     * it, rather than generating garbage. Garbage will be generated only
+     * in MP envts where multiple threads are executing. Throughput should
+     * still be higher in those cases.
+     */
+<span class="nc" id="L106">    int len = 0;</span>
+<span class="nc" id="L107">    int maxLen = 0;</span>
+<span class="nc" id="L108">    int maxPosLen = 0;</span>
+    int glyphData[];
+    char chData[];
+    long images[];
+    float positions[];
+    float x, y;
+    float gposx, gposy;
+    boolean usePositions;
+
+    /* lcdRGBOrder is used only by LCD text rendering. Its here because
+     * the Graphics may have a different hint value than the one used
+     * by a GlyphVector, so it has to be stored here - and is obtained
+     * from the right FontInfo. Another approach would have been to have
+     * install a separate pipe for that case but that's a lot of extra
+     * code when a simple boolean will suffice. The overhead to non-LCD
+     * text is a redundant boolean assign per call.
+     */
+    boolean lcdRGBOrder;
+
+    /*
+     * lcdSubPixPos is used only by LCD text rendering. Its here because
+     * the Graphics may have a different hint value than the one used
+     * by a GlyphVector, so it has to be stored here - and is obtained
+     * from the right FontInfo. Its also needed by the code which
+     * calculates glyph positions which already needs to access this
+     * GlyphList and would otherwise need the FontInfo.
+     * This is true only if LCD text and fractional metrics hints
+     * are selected on the graphics.
+     * When this is true and the glyph positions as determined by the
+     * advances are non-integral, it requests adjustment of the positions.
+     * Setting this for surfaces which do not support it through accelerated
+     * loops may cause a slow-down as software loops are invoked instead.
+     */
+    boolean lcdSubPixPos;
+
+    /* This scheme creates a singleton GlyphList which is checked out
+     * for use. Callers who find its checked out create one that after use
+     * is discarded. This means that in a MT-rendering environment,
+     * there's no need to synchronise except for that one instance.
+     * Fewer threads will then need to synchronise, perhaps helping
+     * throughput on a MP system. If for some reason the reusable
+     * GlyphList is checked out for a long time (or never returned?) then
+     * we would end up always creating new ones. That situation should not
+     * occur and if if did, it would just lead to some extra garbage being
+     * created.
+     */
+<span class="nc" id="L154">    private static GlyphList reusableGL = new GlyphList();</span>
+    private static boolean inUse;
+
+
+    void ensureCapacity(int len) {
+      /* Note len must not be -ve! only setFromChars should be capable
+       * of passing down a -ve len, and this guards against it.
+       */
+<span class="nc bnc" id="L162" title="All 2 branches missed.">        if (len &lt; 0) {</span>
+<span class="nc" id="L163">          len = 0;</span>
+        }
+<span class="nc bnc" id="L165" title="All 4 branches missed.">        if (usePositions &amp;&amp; len &gt; maxPosLen) {</span>
+<span class="nc" id="L166">            positions = new float[len * 2 + 2];</span>
+<span class="nc" id="L167">            maxPosLen = len;</span>
+        }
+
+<span class="nc bnc" id="L170" title="All 4 branches missed.">        if (maxLen == 0 || len &gt; maxLen) {</span>
+<span class="nc" id="L171">            glyphData = new int[len];</span>
+<span class="nc" id="L172">            chData = new char[len];</span>
+<span class="nc" id="L173">            images = new long[len];</span>
+<span class="nc" id="L174">            maxLen = len;</span>
+        }
+<span class="nc" id="L176">    }</span>
+
+<span class="nc" id="L178">    private GlyphList() {</span>
+//         ensureCapacity(DEFAULT_LENGTH);
+<span class="nc" id="L180">    }</span>
+
+//     private GlyphList(int arraylen) {
+//          ensureCapacity(arraylen);
+//     }
+
+    public static GlyphList getInstance() {
+        /* The following heuristic is that if the reusable instance is
+         * in use, it probably still will be in a micro-second, so avoid
+         * synchronising on the class and just allocate a new instance.
+         * The cost is one extra boolean test for the normal case, and some
+         * small number of cases where we allocate an extra object when
+         * in fact the reusable one would be freed very soon.
+         */
+<span class="nc bnc" id="L194" title="All 2 branches missed.">        if (inUse) {</span>
+<span class="nc" id="L195">            return new GlyphList();</span>
+        } else {
+<span class="nc" id="L197">            synchronized(GlyphList.class) {</span>
+<span class="nc bnc" id="L198" title="All 2 branches missed.">                if (inUse) {</span>
+<span class="nc" id="L199">                    return new GlyphList();</span>
+                } else {
+<span class="nc" id="L201">                    inUse = true;</span>
+<span class="nc" id="L202">                    return reusableGL;</span>
+                }
+<span class="nc" id="L204">            }</span>
+        }
+    }
+
+    /* In some cases the caller may be able to estimate the size of
+     * array needed, and it will usually be long enough. This avoids
+     * the unnecessary reallocation that occurs if our default
+     * values are too small. This is useful because this object
+     * will be discarded so the re-allocation overhead is high.
+     */
+//     public static GlyphList getInstance(int sz) {
+//      if (inUse) {
+//          return new GlyphList(sz);
+//      } else {
+//          synchronized(GlyphList.class) {
+//              if (inUse) {
+//                  return new GlyphList();
+//              } else {
+//                  inUse = true;
+//                  return reusableGL;
+//              }
+//          }
+//      }
+//     }
+
+    /* GlyphList is in an invalid state until setFrom* method is called.
+     * After obtaining a new GlyphList it is the caller's responsibility
+     * that one of these methods is executed before handing off the
+     * GlyphList
+     */
+
+    public boolean setFromString(FontInfo info, String str, float x, float y) {
+<span class="nc" id="L236">        this.x = x;</span>
+<span class="nc" id="L237">        this.y = y;</span>
+<span class="nc" id="L238">        this.strikelist = info.fontStrike;</span>
+<span class="nc" id="L239">        this.lcdRGBOrder = info.lcdRGBOrder;</span>
+<span class="nc" id="L240">        this.lcdSubPixPos = info.lcdSubPixPos;</span>
+<span class="nc" id="L241">        len = str.length();</span>
+<span class="nc" id="L242">        ensureCapacity(len);</span>
+<span class="nc" id="L243">        str.getChars(0, len, chData, 0);</span>
+<span class="nc" id="L244">        return mapChars(info, len);</span>
+    }
+
+    public boolean setFromChars(FontInfo info, char[] chars, int off, int alen,
+                                float x, float y) {
+<span class="nc" id="L249">        this.x = x;</span>
+<span class="nc" id="L250">        this.y = y;</span>
+<span class="nc" id="L251">        this.strikelist = info.fontStrike;</span>
+<span class="nc" id="L252">        this.lcdRGBOrder = info.lcdRGBOrder;</span>
+<span class="nc" id="L253">        this.lcdSubPixPos = info.lcdSubPixPos;</span>
+<span class="nc" id="L254">        len = alen;</span>
+<span class="nc bnc" id="L255" title="All 2 branches missed.">        if (alen &lt; 0) {</span>
+<span class="nc" id="L256">            len = 0;</span>
+        } else {
+<span class="nc" id="L258">            len = alen;</span>
+        }
+<span class="nc" id="L260">        ensureCapacity(len);</span>
+<span class="nc" id="L261">        System.arraycopy(chars, off, chData, 0, len);</span>
+<span class="nc" id="L262">        return mapChars(info, len);</span>
+    }
+
+    private final boolean mapChars(FontInfo info, int len) {
+        /* REMIND.Is it worthwhile for the iteration to convert
+         * chars to glyph ids to directly map to images?
+         */
+<span class="nc bnc" id="L269" title="All 2 branches missed.">        if (info.font2D.getMapper().charsToGlyphsNS(len, chData, glyphData)) {</span>
+<span class="nc" id="L270">            return false;</span>
+        }
+<span class="nc" id="L272">        info.fontStrike.getGlyphImagePtrs(glyphData, images, len);</span>
+<span class="nc" id="L273">        glyphindex = -1;</span>
+<span class="nc" id="L274">        return true;</span>
+    }
+
+
+    public void setFromGlyphVector(FontInfo info, GlyphVector gv,
+                                   float x, float y) {
+<span class="nc" id="L280">        this.x = x;</span>
+<span class="nc" id="L281">        this.y = y;</span>
+<span class="nc" id="L282">        this.lcdRGBOrder = info.lcdRGBOrder;</span>
+<span class="nc" id="L283">        this.lcdSubPixPos = info.lcdSubPixPos;</span>
+        /* A GV may be rendered in different Graphics. It is possible it is
+         * used for one case where LCD text is available, and another where
+         * it is not. Pass in the &quot;info&quot;. to ensure get a suitable one.
+         */
+<span class="nc" id="L288">        StandardGlyphVector sgv = StandardGlyphVector.getStandardGV(gv, info);</span>
+        // call before ensureCapacity :-
+<span class="nc" id="L290">        usePositions = sgv.needsPositions(info.devTx);</span>
+<span class="nc" id="L291">        len = sgv.getNumGlyphs();</span>
+<span class="nc" id="L292">        ensureCapacity(len);</span>
+<span class="nc bnc" id="L293" title="All 2 branches missed.">        strikelist = sgv.setupGlyphImages(images,</span>
+                                          usePositions ? positions : null,
+                                          info.devTx);
+<span class="nc" id="L296">        glyphindex = -1;</span>
+<span class="nc" id="L297">    }</span>
+
+    public int[] getBounds() {
+        /* We co-opt the 5 element array that holds per glyph metrics in order
+         * to return the bounds. So a caller must copy the data out of the
+         * array before calling any other methods on this GlyphList
+         */
+<span class="nc bnc" id="L304" title="All 2 branches missed.">        if (glyphindex &gt;= 0) {</span>
+<span class="nc" id="L305">            throw new InternalError(&quot;calling getBounds after setGlyphIndex&quot;);</span>
+        }
+<span class="nc bnc" id="L307" title="All 2 branches missed.">        if (metrics == null) {</span>
+<span class="nc" id="L308">            metrics = new int[5];</span>
+        }
+        /* gposx and gposy are used to accumulate the advance.
+         * Add 0.5f for consistent rounding to pixel position. */
+<span class="nc" id="L312">        gposx = x + 0.5f;</span>
+<span class="nc" id="L313">        gposy = y + 0.5f;</span>
+<span class="nc" id="L314">        fillBounds(metrics);</span>
+<span class="nc" id="L315">        return metrics;</span>
+    }
+
+    /* This method now assumes &quot;state&quot;, so must be called 0-&gt;len
+     * The metrics it returns are accumulated on the fly
+     * So it could be renamed &quot;nextGlyph()&quot;.
+     * Note that a laid out GlyphVector which has assigned glyph positions
+     * doesn't have this stricture..
+     */
+    public void setGlyphIndex(int i) {
+<span class="nc" id="L325">        glyphindex = i;</span>
+<span class="nc" id="L326">        float gx =</span>
+<span class="nc" id="L327">            StrikeCache.unsafe.getFloat(images[i]+StrikeCache.topLeftXOffset);</span>
+<span class="nc" id="L328">        float gy =</span>
+<span class="nc" id="L329">            StrikeCache.unsafe.getFloat(images[i]+StrikeCache.topLeftYOffset);</span>
+
+<span class="nc bnc" id="L331" title="All 2 branches missed.">        if (usePositions) {</span>
+<span class="nc" id="L332">            metrics[0] = (int)Math.floor(positions[(i&lt;&lt;1)]   + gposx + gx);</span>
+<span class="nc" id="L333">            metrics[1] = (int)Math.floor(positions[(i&lt;&lt;1)+1] + gposy + gy);</span>
+        } else {
+<span class="nc" id="L335">            metrics[0] = (int)Math.floor(gposx + gx);</span>
+<span class="nc" id="L336">            metrics[1] = (int)Math.floor(gposy + gy);</span>
+            /* gposx and gposy are used to accumulate the advance */
+<span class="nc" id="L338">            gposx += StrikeCache.unsafe.getFloat</span>
+<span class="nc" id="L339">                (images[i]+StrikeCache.xAdvanceOffset);</span>
+<span class="nc" id="L340">            gposy += StrikeCache.unsafe.getFloat</span>
+<span class="nc" id="L341">                (images[i]+StrikeCache.yAdvanceOffset);</span>
+        }
+<span class="nc" id="L343">        metrics[2] =</span>
+<span class="nc" id="L344">            StrikeCache.unsafe.getChar(images[i]+StrikeCache.widthOffset);</span>
+<span class="nc" id="L345">        metrics[3] =</span>
+<span class="nc" id="L346">            StrikeCache.unsafe.getChar(images[i]+StrikeCache.heightOffset);</span>
+<span class="nc" id="L347">        metrics[4] =</span>
+<span class="nc" id="L348">            StrikeCache.unsafe.getChar(images[i]+StrikeCache.rowBytesOffset);</span>
+<span class="nc" id="L349">    }</span>
+
+    public int[] getMetrics() {
+<span class="nc" id="L352">        return metrics;</span>
+    }
+
+    public byte[] getGrayBits() {
+<span class="nc" id="L356">        int len = metrics[4] * metrics[3];</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">        if (graybits == null) {</span>
+<span class="nc" id="L358">            graybits = new byte[Math.max(len, MINGRAYLENGTH)];</span>
+        } else {
+<span class="nc bnc" id="L360" title="All 2 branches missed.">            if (len &gt; graybits.length) {</span>
+<span class="nc" id="L361">                graybits = new byte[len];</span>
+            }
+        }
+<span class="nc" id="L364">        long pixelDataAddress =</span>
+<span class="nc" id="L365">            StrikeCache.unsafe.getAddress(images[glyphindex] +</span>
+                                          StrikeCache.pixelDataOffset);
+
+<span class="nc bnc" id="L368" title="All 2 branches missed.">        if (pixelDataAddress == 0L) {</span>
+<span class="nc" id="L369">            return graybits;</span>
+        }
+        /* unsafe is supposed to be fast, but I doubt if this loop can beat
+         * a native call which does a getPrimitiveArrayCritical and a
+         * memcpy for the typical amount of image data (30-150 bytes)
+         * Consider a native method if there is a performance problem (which
+         * I haven't seen so far).
+         */
+<span class="nc bnc" id="L377" title="All 2 branches missed.">        for (int i=0; i&lt;len; i++) {</span>
+<span class="nc" id="L378">            graybits[i] = StrikeCache.unsafe.getByte(pixelDataAddress+i);</span>
+        }
+<span class="nc" id="L380">        return graybits;</span>
+    }
+
+    public long[] getImages() {
+<span class="nc" id="L384">        return images;</span>
+    }
+
+    public boolean usePositions() {
+<span class="nc" id="L388">        return usePositions;</span>
+    }
+
+    public float[] getPositions() {
+<span class="nc" id="L392">        return positions;</span>
+    }
+
+    public float getX() {
+<span class="nc" id="L396">        return x;</span>
+    }
+
+    public float getY() {
+<span class="nc" id="L400">        return y;</span>
+    }
+
+    public Object getStrike() {
+<span class="nc" id="L404">        return strikelist;</span>
+    }
+
+    public boolean isSubPixPos() {
+<span class="nc" id="L408">        return lcdSubPixPos;</span>
+    }
+
+    public boolean isRGBOrder() {
+<span class="nc" id="L412">        return lcdRGBOrder;</span>
+    }
+
+    /* There's a reference equality test overhead here, but it allows us
+     * to avoid synchronizing for GL's that will just be GC'd. This
+     * helps MP throughput.
+     */
+    public void dispose() {
+<span class="nc bnc" id="L420" title="All 2 branches missed.">        if (this == reusableGL) {</span>
+<span class="nc bnc" id="L421" title="All 4 branches missed.">            if (graybits != null &amp;&amp; graybits.length &gt; MAXGRAYLENGTH) {</span>
+<span class="nc" id="L422">                graybits = null;</span>
+            }
+<span class="nc" id="L424">            usePositions = false;</span>
+<span class="nc" id="L425">            strikelist = null; // remove reference to the strike list</span>
+<span class="nc" id="L426">            inUse = false;</span>
+        }
+<span class="nc" id="L428">    }</span>
+
+    /* The value here is for use by the rendering engine as it reflects
+     * the number of glyphs in the array to be blitted. Surrogates pairs
+     * may have two slots (the second of these being a dummy entry of the
+     * invisible glyph), whereas an application client would expect only
+     * one glyph. In other words don't propagate this value up to client code.
+     *
+     * {dlf} an application client should have _no_ expectations about the
+     * number of glyphs per char.  This ultimately depends on the font
+     * technology and layout process used, which in general clients will
+     * know nothing about.
+     */
+    public int getNumGlyphs() {
+<span class="nc" id="L442">        return len;</span>
+    }
+
+    /* We re-do all this work as we iterate through the glyphs
+     * but it seems unavoidable without re-working the Java TextRenderers.
+     */
+    private void fillBounds(int[] bounds) {
+        /* Faster to access local variables in the for loop? */
+<span class="nc" id="L450">        int xOffset = StrikeCache.topLeftXOffset;</span>
+<span class="nc" id="L451">        int yOffset = StrikeCache.topLeftYOffset;</span>
+<span class="nc" id="L452">        int wOffset = StrikeCache.widthOffset;</span>
+<span class="nc" id="L453">        int hOffset = StrikeCache.heightOffset;</span>
+<span class="nc" id="L454">        int xAdvOffset = StrikeCache.xAdvanceOffset;</span>
+<span class="nc" id="L455">        int yAdvOffset = StrikeCache.yAdvanceOffset;</span>
+
+<span class="nc bnc" id="L457" title="All 2 branches missed.">        if (len == 0) {</span>
+<span class="nc" id="L458">            bounds[0] = bounds[1] = bounds[2] = bounds[3] = 0;</span>
+<span class="nc" id="L459">            return;</span>
+        }
+        float bx0, by0, bx1, by1;
+<span class="nc" id="L462">        bx0 = by0 = Float.POSITIVE_INFINITY;</span>
+<span class="nc" id="L463">        bx1 = by1 = Float.NEGATIVE_INFINITY;</span>
+
+<span class="nc" id="L465">        int posIndex = 0;</span>
+<span class="nc" id="L466">        float glx = x + 0.5f;</span>
+<span class="nc" id="L467">        float gly = y + 0.5f;</span>
+        char gw, gh;
+        float gx, gy, gx0, gy0, gx1, gy1;
+<span class="nc bnc" id="L470" title="All 2 branches missed.">        for (int i=0; i&lt;len; i++) {</span>
+<span class="nc" id="L471">            gx = StrikeCache.unsafe.getFloat(images[i]+xOffset);</span>
+<span class="nc" id="L472">            gy = StrikeCache.unsafe.getFloat(images[i]+yOffset);</span>
+<span class="nc" id="L473">            gw = StrikeCache.unsafe.getChar(images[i]+wOffset);</span>
+<span class="nc" id="L474">            gh = StrikeCache.unsafe.getChar(images[i]+hOffset);</span>
+
+<span class="nc bnc" id="L476" title="All 2 branches missed.">            if (usePositions) {</span>
+<span class="nc" id="L477">                gx0 = positions[posIndex++] + gx + glx;</span>
+<span class="nc" id="L478">                gy0 = positions[posIndex++] + gy + gly;</span>
+            } else {
+<span class="nc" id="L480">                gx0 = glx + gx;</span>
+<span class="nc" id="L481">                gy0 = gly + gy;</span>
+<span class="nc" id="L482">                glx += StrikeCache.unsafe.getFloat(images[i]+xAdvOffset);</span>
+<span class="nc" id="L483">                gly += StrikeCache.unsafe.getFloat(images[i]+yAdvOffset);</span>
+            }
+<span class="nc" id="L485">            gx1 = gx0 + gw;</span>
+<span class="nc" id="L486">            gy1 = gy0 + gh;</span>
+<span class="nc bnc" id="L487" title="All 2 branches missed.">            if (bx0 &gt; gx0) bx0 = gx0;</span>
+<span class="nc bnc" id="L488" title="All 2 branches missed.">            if (by0 &gt; gy0) by0 = gy0;</span>
+<span class="nc bnc" id="L489" title="All 2 branches missed.">            if (bx1 &lt; gx1) bx1 = gx1;</span>
+<span class="nc bnc" id="L490" title="All 2 branches missed.">            if (by1 &lt; gy1) by1 = gy1;</span>
+        }
+        /* floor is safe and correct because all glyph widths, heights
+         * and offsets are integers
+         */
+<span class="nc" id="L495">        bounds[0] = (int)Math.floor(bx0);</span>
+<span class="nc" id="L496">        bounds[1] = (int)Math.floor(by0);</span>
+<span class="nc" id="L497">        bounds[2] = (int)Math.floor(bx1);</span>
+<span class="nc" id="L498">        bounds[3] = (int)Math.floor(by1);</span>
+<span class="nc" id="L499">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

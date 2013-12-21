@@ -1,0 +1,793 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>HttpsClient.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.net.www.protocol.https</a> &gt; <span class="el_source">HttpsClient.java</span></div><h1>HttpsClient.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2001, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+
+package sun.net.www.protocol.https;
+
+import java.io.IOException;
+import java.io.UnsupportedEncodingException;
+import java.io.PrintStream;
+import java.io.BufferedOutputStream;
+import java.net.InetAddress;
+import java.net.Socket;
+import java.net.SocketException;
+import java.net.URL;
+import java.net.UnknownHostException;
+import java.net.InetSocketAddress;
+import java.net.Proxy;
+import java.security.Principal;
+import java.security.cert.*;
+import java.util.StringTokenizer;
+import java.util.Vector;
+import java.security.AccessController;
+
+import javax.security.auth.x500.X500Principal;
+
+import javax.net.ssl.*;
+import sun.net.www.http.HttpClient;
+import sun.net.www.protocol.http.HttpURLConnection;
+import sun.security.action.*;
+
+import sun.security.util.HostnameChecker;
+import sun.security.ssl.SSLSocketImpl;
+
+import sun.util.logging.PlatformLogger;
+import static sun.net.www.protocol.http.HttpURLConnection.TunnelState.*;
+
+
+/**
+ * This class provides HTTPS client URL support, building on the standard
+ * &quot;sun.net.www&quot; HTTP protocol handler.  HTTPS is the same protocol as HTTP,
+ * but differs in the transport layer which it uses:  &lt;UL&gt;
+ *
+ *      &lt;LI&gt;There's a &lt;em&gt;Secure Sockets Layer&lt;/em&gt; between TCP
+ *      and the HTTP protocol code.
+ *
+ *      &lt;LI&gt;It uses a different default TCP port.
+ *
+ *      &lt;LI&gt;It doesn't use application level proxies, which can see and
+ *      manipulate HTTP user level data, compromising privacy.  It uses
+ *      low level tunneling instead, which hides HTTP protocol and data
+ *      from all third parties.  (Traffic analysis is still possible).
+ *
+ *      &lt;LI&gt;It does basic server authentication, to protect
+ *      against &quot;URL spoofing&quot; attacks.  This involves deciding
+ *      whether the X.509 certificate chain identifying the server
+ *      is trusted, and verifying that the name of the server is
+ *      found in the certificate.  (The application may enable an
+ *      anonymous SSL cipher suite, and such checks are not done
+ *      for anonymous ciphers.)
+ *
+ *      &lt;LI&gt;It exposes key SSL session attributes, specifically the
+ *      cipher suite in use and the server's X509 certificates, to
+ *      application software which knows about this protocol handler.
+ *
+ *      &lt;/UL&gt;
+ *
+ * &lt;P&gt; System properties used include:  &lt;UL&gt;
+ *
+ *      &lt;LI&gt;&lt;em&gt;https.proxyHost&lt;/em&gt; ... the host supporting SSL
+ *      tunneling using the conventional CONNECT syntax
+ *
+ *      &lt;LI&gt;&lt;em&gt;https.proxyPort&lt;/em&gt; ... port to use on proxyHost
+ *
+ *      &lt;LI&gt;&lt;em&gt;https.cipherSuites&lt;/em&gt; ... comma separated list of
+ *      SSL cipher suite names to enable.
+ *
+ *      &lt;LI&gt;&lt;em&gt;http.nonProxyHosts&lt;/em&gt; ...
+ *
+ *      &lt;/UL&gt;
+ *
+ * @author David Brownell
+ * @author Bill Foote
+ */
+
+// final for export control reasons (access to APIs); remove with care
+<span class="pc bpc" id="L108" title="1 of 2 branches missed.">final class HttpsClient extends HttpClient</span>
+    implements HandshakeCompletedListener
+{
+    // STATIC STATE and ACCESSORS THERETO
+
+    // HTTPS uses a different default port number than HTTP.
+    private static final int    httpsPortNumber = 443;
+
+    // default HostnameVerifier class canonical name
+    private static final String defaultHVCanonicalName =
+            &quot;javax.net.ssl.HttpsURLConnection.DefaultHostnameVerifier&quot;;
+
+    /** Returns the default HTTPS port (443) */
+    @Override
+<span class="fc" id="L122">    protected int getDefaultPort() { return httpsPortNumber; }</span>
+
+    private HostnameVerifier hv;
+    private SSLSocketFactory sslSocketFactory;
+
+    // HttpClient.proxyDisabled will always be false, because we don't
+    // use an application-level HTTP proxy.  We might tunnel through
+    // our http proxy, though.
+
+
+    // INSTANCE DATA
+
+    // last negotiated SSL session
+    private SSLSession  session;
+
+    private String [] getCipherSuites() {
+        //
+        // If ciphers are assigned, sort them into an array.
+        //
+        String ciphers [];
+<span class="fc" id="L142">        String cipherString = AccessController.doPrivileged(</span>
+                new GetPropertyAction(&quot;https.cipherSuites&quot;));
+
+<span class="pc bpc" id="L145" title="1 of 4 branches missed.">        if (cipherString == null || &quot;&quot;.equals(cipherString)) {</span>
+<span class="fc" id="L146">            ciphers = null;</span>
+        } else {
+            StringTokenizer     tokenizer;
+<span class="fc" id="L149">            Vector&lt;String&gt;      v = new Vector&lt;String&gt;();</span>
+
+<span class="fc" id="L151">            tokenizer = new StringTokenizer(cipherString, &quot;,&quot;);</span>
+<span class="fc bfc" id="L152" title="All 2 branches covered.">            while (tokenizer.hasMoreTokens())</span>
+<span class="fc" id="L153">                v.addElement(tokenizer.nextToken());</span>
+<span class="fc" id="L154">            ciphers = new String [v.size()];</span>
+<span class="fc bfc" id="L155" title="All 2 branches covered.">            for (int i = 0; i &lt; ciphers.length; i++)</span>
+<span class="fc" id="L156">                ciphers [i] = v.elementAt(i);</span>
+        }
+<span class="fc" id="L158">        return ciphers;</span>
+    }
+
+    private String [] getProtocols() {
+        //
+        // If protocols are assigned, sort them into an array.
+        //
+        String protocols [];
+<span class="fc" id="L166">        String protocolString = AccessController.doPrivileged(</span>
+                new GetPropertyAction(&quot;https.protocols&quot;));
+
+<span class="pc bpc" id="L169" title="1 of 4 branches missed.">        if (protocolString == null || &quot;&quot;.equals(protocolString)) {</span>
+<span class="fc" id="L170">            protocols = null;</span>
+        } else {
+            StringTokenizer     tokenizer;
+<span class="fc" id="L173">            Vector&lt;String&gt;      v = new Vector&lt;String&gt;();</span>
+
+<span class="fc" id="L175">            tokenizer = new StringTokenizer(protocolString, &quot;,&quot;);</span>
+<span class="fc bfc" id="L176" title="All 2 branches covered.">            while (tokenizer.hasMoreTokens())</span>
+<span class="fc" id="L177">                v.addElement(tokenizer.nextToken());</span>
+<span class="fc" id="L178">            protocols = new String [v.size()];</span>
+<span class="fc bfc" id="L179" title="All 2 branches covered.">            for (int i = 0; i &lt; protocols.length; i++) {</span>
+<span class="fc" id="L180">                protocols [i] = v.elementAt(i);</span>
+            }
+        }
+<span class="fc" id="L183">        return protocols;</span>
+    }
+
+    private String getUserAgent() {
+<span class="nc" id="L187">        String userAgent = java.security.AccessController.doPrivileged(</span>
+                new sun.security.action.GetPropertyAction(&quot;https.agent&quot;));
+<span class="nc bnc" id="L189" title="All 4 branches missed.">        if (userAgent == null || userAgent.length() == 0) {</span>
+<span class="nc" id="L190">            userAgent = &quot;JSSE&quot;;</span>
+        }
+<span class="nc" id="L192">        return userAgent;</span>
+    }
+
+    // should remove once HttpClient.newHttpProxy is putback
+    private static Proxy newHttpProxy(String proxyHost, int proxyPort) {
+<span class="fc" id="L197">        InetSocketAddress saddr = null;</span>
+<span class="fc" id="L198">        final String phost = proxyHost;</span>
+<span class="pc bpc" id="L199" title="1 of 2 branches missed.">        final int pport = proxyPort &lt; 0 ? httpsPortNumber : proxyPort;</span>
+        try {
+<span class="fc" id="L201">            saddr = java.security.AccessController.doPrivileged(new</span>
+<span class="fc" id="L202">                java.security.PrivilegedExceptionAction&lt;InetSocketAddress&gt;() {</span>
+                public InetSocketAddress run() {
+<span class="fc" id="L204">                    return new InetSocketAddress(phost, pport);</span>
+                }});
+<span class="nc" id="L206">        } catch (java.security.PrivilegedActionException pae) {</span>
+<span class="fc" id="L207">        }</span>
+<span class="fc" id="L208">        return new Proxy(Proxy.Type.HTTP, saddr);</span>
+    }
+
+    // CONSTRUCTOR, FACTORY
+
+
+    /**
+     * Create an HTTPS client URL.  Traffic will be tunneled through any
+     * intermediate nodes rather than proxied, so that confidentiality
+     * of data exchanged can be preserved.  However, note that all the
+     * anonymous SSL flavors are subject to &quot;person-in-the-middle&quot;
+     * attacks against confidentiality.  If you enable use of those
+     * flavors, you may be giving up the protection you get through
+     * SSL tunneling.
+     *
+     * Use New to get new HttpsClient. This constructor is meant to be
+     * used only by New method. New properly checks for URL spoofing.
+     *
+     * @param URL https URL with which a connection must be established
+     */
+    private HttpsClient(SSLSocketFactory sf, URL url)
+    throws IOException
+    {
+        // HttpClient-level proxying is always disabled,
+        // because we override doConnect to do tunneling instead.
+<span class="nc" id="L233">        this(sf, url, (String)null, -1);</span>
+<span class="nc" id="L234">    }</span>
+
+    /**
+     *  Create an HTTPS client URL.  Traffic will be tunneled through
+     * the specified proxy server.
+     */
+    HttpsClient(SSLSocketFactory sf, URL url, String proxyHost, int proxyPort)
+        throws IOException {
+<span class="nc" id="L242">        this(sf, url, proxyHost, proxyPort, -1);</span>
+<span class="nc" id="L243">    }</span>
+
+    /**
+     *  Create an HTTPS client URL.  Traffic will be tunneled through
+     * the specified proxy server, with a connect timeout
+     */
+    HttpsClient(SSLSocketFactory sf, URL url, String proxyHost, int proxyPort,
+                int connectTimeout)
+        throws IOException {
+<span class="nc bnc" id="L252" title="All 2 branches missed.">        this(sf, url,</span>
+             (proxyHost == null? null:
+<span class="nc" id="L254">                HttpsClient.newHttpProxy(proxyHost, proxyPort)),</span>
+                connectTimeout);
+<span class="nc" id="L256">    }</span>
+
+    /**
+     *  Same as previous constructor except using a Proxy
+     */
+    HttpsClient(SSLSocketFactory sf, URL url, Proxy proxy,
+                int connectTimeout)
+<span class="fc" id="L263">        throws IOException {</span>
+<span class="fc" id="L264">        this.proxy = proxy;</span>
+<span class="fc" id="L265">        setSSLSocketFactory(sf);</span>
+<span class="fc" id="L266">        this.proxyDisabled = true;</span>
+
+<span class="fc" id="L268">        this.host = url.getHost();</span>
+<span class="fc" id="L269">        this.url = url;</span>
+<span class="fc" id="L270">        port = url.getPort();</span>
+<span class="fc bfc" id="L271" title="All 2 branches covered.">        if (port == -1) {</span>
+<span class="fc" id="L272">            port = getDefaultPort();</span>
+        }
+<span class="fc" id="L274">        setConnectTimeout(connectTimeout);</span>
+<span class="fc" id="L275">        openServer();</span>
+<span class="fc" id="L276">    }</span>
+
+
+    // This code largely ripped off from HttpClient.New, and
+    // it uses the same keepalive cache.
+
+    static HttpClient New(SSLSocketFactory sf, URL url, HostnameVerifier hv,
+                          HttpURLConnection httpuc)
+            throws IOException {
+<span class="nc" id="L285">        return HttpsClient.New(sf, url, hv, true, httpuc);</span>
+    }
+
+    /** See HttpClient for the model for this method. */
+    static HttpClient New(SSLSocketFactory sf, URL url,
+            HostnameVerifier hv, boolean useCache,
+            HttpURLConnection httpuc) throws IOException {
+<span class="fc" id="L292">        return HttpsClient.New(sf, url, hv, (String)null, -1, useCache, httpuc);</span>
+    }
+
+    /**
+     * Get a HTTPS client to the URL.  Traffic will be tunneled through
+     * the specified proxy server.
+     */
+    static HttpClient New(SSLSocketFactory sf, URL url, HostnameVerifier hv,
+                           String proxyHost, int proxyPort,
+                           HttpURLConnection httpuc) throws IOException {
+<span class="nc" id="L302">        return HttpsClient.New(sf, url, hv, proxyHost, proxyPort, true, httpuc);</span>
+    }
+
+    static HttpClient New(SSLSocketFactory sf, URL url, HostnameVerifier hv,
+                           String proxyHost, int proxyPort, boolean useCache,
+                           HttpURLConnection httpuc)
+        throws IOException {
+<span class="fc" id="L309">        return HttpsClient.New(sf, url, hv, proxyHost, proxyPort, useCache, -1,</span>
+                               httpuc);
+    }
+
+    static HttpClient New(SSLSocketFactory sf, URL url, HostnameVerifier hv,
+                          String proxyHost, int proxyPort, boolean useCache,
+                          int connectTimeout, HttpURLConnection httpuc)
+        throws IOException {
+
+<span class="fc bfc" id="L318" title="All 2 branches covered.">        return HttpsClient.New(sf, url, hv,</span>
+                               (proxyHost == null? null :
+<span class="fc" id="L320">                                HttpsClient.newHttpProxy(proxyHost, proxyPort)),</span>
+                               useCache, connectTimeout, httpuc);
+    }
+
+    static HttpClient New(SSLSocketFactory sf, URL url, HostnameVerifier hv,
+                          Proxy p, boolean useCache,
+                          int connectTimeout, HttpURLConnection httpuc)
+        throws IOException
+    {
+<span class="fc bfc" id="L329" title="All 2 branches covered.">        if (p == null) {</span>
+<span class="fc" id="L330">            p = Proxy.NO_PROXY;</span>
+        }
+<span class="fc" id="L332">        HttpsClient ret = null;</span>
+<span class="fc bfc" id="L333" title="All 2 branches covered.">        if (useCache) {</span>
+            /* see if one's already around */
+<span class="fc" id="L335">            ret = (HttpsClient) kac.get(url, sf);</span>
+<span class="pc bpc" id="L336" title="1 of 4 branches missed.">            if (ret != null &amp;&amp; httpuc != null &amp;&amp;</span>
+<span class="pc bpc" id="L337" title="1 of 2 branches missed.">                httpuc.streaming() &amp;&amp;</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">                httpuc.getRequestMethod() == &quot;POST&quot;) {</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">                if (!ret.available())</span>
+<span class="nc" id="L340">                    ret = null;</span>
+            }
+
+<span class="fc bfc" id="L343" title="All 2 branches covered.">            if (ret != null) {</span>
+<span class="pc bpc" id="L344" title="6 of 8 branches missed.">                if ((ret.proxy != null &amp;&amp; ret.proxy.equals(p)) ||</span>
+                    (ret.proxy == null &amp;&amp; p == null)) {
+<span class="fc" id="L346">                    synchronized (ret) {</span>
+<span class="fc" id="L347">                        ret.cachedHttpClient = true;</span>
+<span class="pc bpc" id="L348" title="2 of 4 branches missed.">                        assert ret.inCache;</span>
+<span class="fc" id="L349">                        ret.inCache = false;</span>
+<span class="pc bpc" id="L350" title="2 of 4 branches missed.">                        if (httpuc != null &amp;&amp; ret.needsTunneling())</span>
+<span class="nc" id="L351">                            httpuc.setTunnelState(TUNNELING);</span>
+<span class="fc" id="L352">                        PlatformLogger logger = HttpURLConnection.getHttpLogger();</span>
+<span class="pc bpc" id="L353" title="1 of 2 branches missed.">                        if (logger.isLoggable(PlatformLogger.Level.FINEST)) {</span>
+<span class="nc" id="L354">                            logger.finest(&quot;KeepAlive stream retrieved from the cache, &quot; + ret);</span>
+                        }
+<span class="pc" id="L356">                    }</span>
+                } else {
+                    // We cannot return this connection to the cache as it's
+                    // KeepAliveTimeout will get reset. We simply close the connection.
+                    // This should be fine as it is very rare that a connection
+                    // to the same host will not use the same proxy.
+<span class="nc" id="L362">                    synchronized(ret) {</span>
+<span class="nc" id="L363">                        ret.inCache = false;</span>
+<span class="nc" id="L364">                        ret.closeServer();</span>
+<span class="nc" id="L365">                    }</span>
+<span class="nc" id="L366">                    ret = null;</span>
+                }
+            }
+        }
+<span class="fc bfc" id="L370" title="All 2 branches covered.">        if (ret == null) {</span>
+<span class="fc" id="L371">            ret = new HttpsClient(sf, url, p, connectTimeout);</span>
+        } else {
+<span class="fc" id="L373">            SecurityManager security = System.getSecurityManager();</span>
+<span class="pc bpc" id="L374" title="1 of 2 branches missed.">            if (security != null) {</span>
+<span class="nc bnc" id="L375" title="All 4 branches missed.">                if (ret.proxy == Proxy.NO_PROXY || ret.proxy == null) {</span>
+<span class="nc" id="L376">                    security.checkConnect(InetAddress.getByName(url.getHost()).getHostAddress(), url.getPort());</span>
+                } else {
+<span class="nc" id="L378">                    security.checkConnect(url.getHost(), url.getPort());</span>
+                }
+            }
+<span class="fc" id="L381">            ret.url = url;</span>
+        }
+<span class="fc" id="L383">        ret.setHostnameVerifier(hv);</span>
+
+<span class="fc" id="L385">        return ret;</span>
+    }
+
+    // METHODS
+    void setHostnameVerifier(HostnameVerifier hv) {
+<span class="fc" id="L390">        this.hv = hv;</span>
+<span class="fc" id="L391">    }</span>
+
+    void setSSLSocketFactory(SSLSocketFactory sf) {
+<span class="fc" id="L394">        sslSocketFactory = sf;</span>
+<span class="fc" id="L395">    }</span>
+
+    SSLSocketFactory getSSLSocketFactory() {
+<span class="nc" id="L398">        return sslSocketFactory;</span>
+    }
+
+    /**
+     * The following method, createSocket, is defined in NetworkClient
+     * and overridden here so that the socket facroty is used to create
+     * new sockets.
+     */
+    @Override
+    protected Socket createSocket() throws IOException {
+        try {
+<span class="fc" id="L409">            return sslSocketFactory.createSocket();</span>
+<span class="fc" id="L410">        } catch (SocketException se) {</span>
+            //
+            // bug 6771432
+            // javax.net.SocketFactory throws a SocketException with an
+            // UnsupportedOperationException as its cause to indicate that
+            // unconnected sockets have not been implemented.
+            //
+<span class="fc" id="L417">            Throwable t = se.getCause();</span>
+<span class="pc bpc" id="L418" title="2 of 4 branches missed.">            if (t != null &amp;&amp; t instanceof UnsupportedOperationException) {</span>
+<span class="fc" id="L419">                return super.createSocket();</span>
+            } else {
+<span class="nc" id="L421">                throw se;</span>
+            }
+        }
+    }
+
+
+    @Override
+    public boolean needsTunneling() {
+<span class="pc bpc" id="L429" title="1 of 4 branches missed.">        return (proxy != null &amp;&amp; proxy.type() != Proxy.Type.DIRECT</span>
+<span class="pc bpc" id="L430" title="1 of 2 branches missed.">                &amp;&amp; proxy.type() != Proxy.Type.SOCKS);</span>
+    }
+
+    @Override
+    public void afterConnect() throws IOException, UnknownHostException {
+<span class="fc bfc" id="L435" title="All 2 branches covered.">        if (!isCachedConnection()) {</span>
+<span class="fc" id="L436">            SSLSocket s = null;</span>
+<span class="fc" id="L437">            SSLSocketFactory factory = sslSocketFactory;</span>
+            try {
+<span class="fc bfc" id="L439" title="All 2 branches covered.">                if (!(serverSocket instanceof SSLSocket)) {</span>
+<span class="fc" id="L440">                    s = (SSLSocket)factory.createSocket(serverSocket,</span>
+                                                        host, port, true);
+                } else {
+<span class="fc" id="L443">                    s = (SSLSocket)serverSocket;</span>
+<span class="pc bpc" id="L444" title="1 of 2 branches missed.">                    if (s instanceof SSLSocketImpl) {</span>
+<span class="fc" id="L445">                        ((SSLSocketImpl)s).setHost(host);</span>
+                    }
+                }
+<span class="nc" id="L448">            } catch (IOException ex) {</span>
+                // If we fail to connect through the tunnel, try it
+                // locally, as a last resort.  If this doesn't work,
+                // throw the original exception.
+                try {
+<span class="nc" id="L453">                    s = (SSLSocket)factory.createSocket(host, port);</span>
+<span class="nc" id="L454">                } catch (IOException ignored) {</span>
+<span class="nc" id="L455">                    throw ex;</span>
+<span class="nc" id="L456">                }</span>
+<span class="fc" id="L457">            }</span>
+
+            //
+            // Force handshaking, so that we get any authentication.
+            // Register a handshake callback so our session state tracks any
+            // later session renegotiations.
+            //
+<span class="fc" id="L464">            String [] protocols = getProtocols();</span>
+<span class="fc" id="L465">            String [] ciphers = getCipherSuites();</span>
+<span class="fc bfc" id="L466" title="All 2 branches covered.">            if (protocols != null) {</span>
+<span class="fc" id="L467">                s.setEnabledProtocols(protocols);</span>
+            }
+<span class="fc bfc" id="L469" title="All 2 branches covered.">            if (ciphers != null) {</span>
+<span class="fc" id="L470">                s.setEnabledCipherSuites(ciphers);</span>
+            }
+<span class="fc" id="L472">            s.addHandshakeCompletedListener(this);</span>
+
+            // We have two hostname verification approaches. One is in
+            // SSL/TLS socket layer, where the algorithm is configured with
+            // SSLParameters.setEndpointIdentificationAlgorithm(), and the
+            // hostname verification is done by X509ExtendedTrustManager when
+            // the algorithm is &quot;HTTPS&quot;. The other one is in HTTPS layer,
+            // where the algorithm is customized by
+            // HttpsURLConnection.setHostnameVerifier(), and the hostname
+            // verification is done by HostnameVerifier when the default
+            // rules for hostname verification fail.
+            //
+            // The relationship between two hostname verification approaches
+            // likes the following:
+            //
+            //               |             EIA algorithm
+            //               +----------------------------------------------
+            //               |     null      |   HTTPS    |   LDAP/other   |
+            // -------------------------------------------------------------
+            //     |         |1              |2           |3               |
+            // HNV | default | Set HTTPS EIA | use EIA    | HTTPS          |
+            //     |--------------------------------------------------------
+            //     | non -   |4              |5           |6               |
+            //     | default | HTTPS/HNV     | use EIA    | HTTPS/HNV      |
+            // -------------------------------------------------------------
+            //
+            // Abbreviation:
+            //     EIA: the endpoint identification algorithm in SSL/TLS
+            //           socket layer
+            //     HNV: the hostname verification object in HTTPS layer
+            // Notes:
+            //     case 1. default HNV and EIA is null
+            //           Set EIA as HTTPS, hostname check done in SSL/TLS
+            //           layer.
+            //     case 2. default HNV and EIA is HTTPS
+            //           Use existing EIA, hostname check done in SSL/TLS
+            //           layer.
+            //     case 3. default HNV and EIA is other than HTTPS
+            //           Use existing EIA, EIA check done in SSL/TLS
+            //           layer, then do HTTPS check in HTTPS layer.
+            //     case 4. non-default HNV and EIA is null
+            //           No EIA, no EIA check done in SSL/TLS layer, then do
+            //           HTTPS check in HTTPS layer using HNV as override.
+            //     case 5. non-default HNV and EIA is HTTPS
+            //           Use existing EIA, hostname check done in SSL/TLS
+            //           layer. No HNV override possible. We will review this
+            //           decision and may update the architecture for JDK 7.
+            //     case 6. non-default HNV and EIA is other than HTTPS
+            //           Use existing EIA, EIA check done in SSL/TLS layer,
+            //           then do HTTPS check in HTTPS layer as override.
+<span class="fc" id="L522">            boolean needToCheckSpoofing = true;</span>
+<span class="fc" id="L523">            String identification =</span>
+<span class="fc" id="L524">                s.getSSLParameters().getEndpointIdentificationAlgorithm();</span>
+<span class="pc bpc" id="L525" title="3 of 4 branches missed.">            if (identification != null &amp;&amp; identification.length() != 0) {</span>
+<span class="nc bnc" id="L526" title="All 2 branches missed.">                if (identification.equalsIgnoreCase(&quot;HTTPS&quot;)) {</span>
+                    // Do not check server identity again out of SSLSocket,
+                    // the endpoint will be identified during TLS handshaking
+                    // in SSLSocket.
+<span class="nc" id="L530">                    needToCheckSpoofing = false;</span>
+                }   // else, we don't understand the identification algorithm,
+                    // need to check URL spoofing here.
+            } else {
+<span class="fc" id="L534">                boolean isDefaultHostnameVerifier = false;</span>
+
+                // We prefer to let the SSLSocket do the spoof checks, but if
+                // the application has specified a HostnameVerifier (HNV),
+                // we will always use that.
+<span class="pc bpc" id="L539" title="1 of 2 branches missed.">                if (hv != null) {</span>
+<span class="fc" id="L540">                    String canonicalName = hv.getClass().getCanonicalName();</span>
+<span class="fc bfc" id="L541" title="All 2 branches covered.">                    if (canonicalName != null &amp;&amp;</span>
+<span class="fc bfc" id="L542" title="All 2 branches covered.">                    canonicalName.equalsIgnoreCase(defaultHVCanonicalName)) {</span>
+<span class="fc" id="L543">                        isDefaultHostnameVerifier = true;</span>
+                    }
+<span class="fc" id="L545">                } else {</span>
+                    // Unlikely to happen! As the behavior is the same as the
+                    // default hostname verifier, so we prefer to let the
+                    // SSLSocket do the spoof checks.
+<span class="nc" id="L549">                    isDefaultHostnameVerifier = true;</span>
+                }
+
+<span class="fc bfc" id="L552" title="All 2 branches covered.">                if (isDefaultHostnameVerifier) {</span>
+                    // If the HNV is the default from HttpsURLConnection, we
+                    // will do the spoof checks in SSLSocket.
+<span class="fc" id="L555">                    SSLParameters paramaters = s.getSSLParameters();</span>
+<span class="fc" id="L556">                    paramaters.setEndpointIdentificationAlgorithm(&quot;HTTPS&quot;);</span>
+<span class="fc" id="L557">                    s.setSSLParameters(paramaters);</span>
+
+<span class="fc" id="L559">                    needToCheckSpoofing = false;</span>
+                }
+            }
+
+<span class="fc" id="L563">            s.startHandshake();</span>
+<span class="fc" id="L564">            session = s.getSession();</span>
+            // change the serverSocket and serverOutput
+<span class="fc" id="L566">            serverSocket = s;</span>
+            try {
+<span class="fc" id="L568">                serverOutput = new PrintStream(</span>
+<span class="fc" id="L569">                    new BufferedOutputStream(serverSocket.getOutputStream()),</span>
+                    false, encoding);
+<span class="nc" id="L571">            } catch (UnsupportedEncodingException e) {</span>
+<span class="nc" id="L572">                throw new InternalError(encoding+&quot; encoding not found&quot;);</span>
+<span class="fc" id="L573">            }</span>
+
+            // check URL spoofing if it has not been checked under handshaking
+<span class="fc bfc" id="L576" title="All 2 branches covered.">            if (needToCheckSpoofing) {</span>
+<span class="fc" id="L577">                checkURLSpoofing(hv);</span>
+            }
+<span class="fc" id="L579">        } else {</span>
+            // if we are reusing a cached https session,
+            // we don't need to do handshaking etc. But we do need to
+            // set the ssl session
+<span class="fc" id="L583">            session = ((SSLSocket)serverSocket).getSession();</span>
+        }
+<span class="fc" id="L585">    }</span>
+
+    // Server identity checking is done according to RFC 2818: HTTP over TLS
+    // Section 3.1 Server Identity
+    private void checkURLSpoofing(HostnameVerifier hostnameVerifier)
+            throws IOException {
+        //
+        // Get authenticated server name, if any
+        //
+<span class="fc" id="L594">        String host = url.getHost();</span>
+
+        // if IPv6 strip off the &quot;[]&quot;
+<span class="pc bpc" id="L597" title="4 of 6 branches missed.">        if (host != null &amp;&amp; host.startsWith(&quot;[&quot;) &amp;&amp; host.endsWith(&quot;]&quot;)) {</span>
+<span class="nc" id="L598">            host = host.substring(1, host.length()-1);</span>
+        }
+
+<span class="fc" id="L601">        Certificate[] peerCerts = null;</span>
+<span class="fc" id="L602">        String cipher = session.getCipherSuite();</span>
+        try {
+<span class="nc" id="L604">            HostnameChecker checker = HostnameChecker.getInstance(</span>
+                                                HostnameChecker.TYPE_TLS);
+
+            // Use ciphersuite to determine whether Kerberos is present.
+<span class="nc bnc" id="L608" title="All 2 branches missed.">            if (cipher.startsWith(&quot;TLS_KRB5&quot;)) {</span>
+<span class="nc bnc" id="L609" title="All 2 branches missed.">                if (!HostnameChecker.match(host, getPeerPrincipal())) {</span>
+<span class="nc" id="L610">                    throw new SSLPeerUnverifiedException(&quot;Hostname checker&quot; +</span>
+                                &quot; failed for Kerberos&quot;);
+                }
+            } else { // X.509
+
+                // get the subject's certificate
+<span class="nc" id="L616">                peerCerts = session.getPeerCertificates();</span>
+
+                X509Certificate peerCert;
+<span class="nc bnc" id="L619" title="All 2 branches missed.">                if (peerCerts[0] instanceof</span>
+                        java.security.cert.X509Certificate) {
+<span class="nc" id="L621">                    peerCert = (java.security.cert.X509Certificate)peerCerts[0];</span>
+                } else {
+<span class="nc" id="L623">                    throw new SSLPeerUnverifiedException(&quot;&quot;);</span>
+                }
+<span class="nc" id="L625">                checker.match(host, peerCert);</span>
+            }
+
+            // if it doesn't throw an exception, we passed. Return.
+<span class="nc" id="L629">            return;</span>
+
+<span class="fc" id="L631">        } catch (SSLPeerUnverifiedException e) {</span>
+
+            //
+            // client explicitly changed default policy and enabled
+            // anonymous ciphers; we can't check the standard policy
+            //
+            // ignore
+<span class="fc" id="L638">        } catch (java.security.cert.CertificateException cpe) {</span>
+            // ignore
+<span class="fc" id="L640">        }</span>
+
+<span class="pc bpc" id="L642" title="1 of 4 branches missed.">        if ((cipher != null) &amp;&amp; (cipher.indexOf(&quot;_anon_&quot;) != -1)) {</span>
+<span class="fc" id="L643">            return;</span>
+<span class="pc bpc" id="L644" title="1 of 2 branches missed.">        } else if ((hostnameVerifier != null) &amp;&amp;</span>
+<span class="pc bpc" id="L645" title="1 of 2 branches missed.">                   (hostnameVerifier.verify(host, session))) {</span>
+<span class="fc" id="L646">            return;</span>
+        }
+
+<span class="nc" id="L649">        serverSocket.close();</span>
+<span class="nc" id="L650">        session.invalidate();</span>
+
+<span class="nc" id="L652">        throw new IOException(&quot;HTTPS hostname wrong:  should be &lt;&quot;</span>
+<span class="nc" id="L653">                              + url.getHost() + &quot;&gt;&quot;);</span>
+    }
+
+    @Override
+    protected void putInKeepAliveCache() {
+<span class="pc bpc" id="L658" title="1 of 2 branches missed.">        if (inCache) {</span>
+<span class="nc bnc" id="L659" title="All 2 branches missed.">            assert false : &quot;Duplicate put to keep alive cache&quot;;</span>
+<span class="nc" id="L660">            return;</span>
+        }
+<span class="fc" id="L662">        inCache = true;</span>
+<span class="fc" id="L663">        kac.put(url, sslSocketFactory, this);</span>
+<span class="fc" id="L664">    }</span>
+
+    /*
+     * Close an idle connection to this URL (if it exists in the cache).
+     */
+    @Override
+    public void closeIdleConnection() {
+<span class="fc" id="L671">        HttpClient http = kac.get(url, sslSocketFactory);</span>
+<span class="pc bpc" id="L672" title="1 of 2 branches missed.">        if (http != null) {</span>
+<span class="nc" id="L673">            http.closeServer();</span>
+        }
+<span class="fc" id="L675">    }</span>
+
+    /**
+     * Returns the cipher suite in use on this connection.
+     */
+    String getCipherSuite() {
+<span class="fc" id="L681">        return session.getCipherSuite();</span>
+    }
+
+    /**
+     * Returns the certificate chain the client sent to the
+     * server, or null if the client did not authenticate.
+     */
+    public java.security.cert.Certificate [] getLocalCertificates() {
+<span class="fc" id="L689">        return session.getLocalCertificates();</span>
+    }
+
+    /**
+     * Returns the certificate chain with which the server
+     * authenticated itself, or throw a SSLPeerUnverifiedException
+     * if the server did not authenticate.
+     */
+    java.security.cert.Certificate [] getServerCertificates()
+            throws SSLPeerUnverifiedException
+    {
+<span class="fc" id="L700">        return session.getPeerCertificates();</span>
+    }
+
+    /**
+     * Returns the X.509 certificate chain with which the server
+     * authenticated itself, or null if the server did not authenticate.
+     */
+    javax.security.cert.X509Certificate [] getServerCertificateChain()
+            throws SSLPeerUnverifiedException
+    {
+<span class="fc" id="L710">        return session.getPeerCertificateChain();</span>
+    }
+
+    /**
+     * Returns the principal with which the server authenticated
+     * itself, or throw a SSLPeerUnverifiedException if the
+     * server did not authenticate.
+     */
+    Principal getPeerPrincipal()
+            throws SSLPeerUnverifiedException
+    {
+        Principal principal;
+        try {
+<span class="nc" id="L723">            principal = session.getPeerPrincipal();</span>
+<span class="nc" id="L724">        } catch (AbstractMethodError e) {</span>
+            // if the provider does not support it, fallback to peer certs.
+            // return the X500Principal of the end-entity cert.
+<span class="nc" id="L727">            java.security.cert.Certificate[] certs =</span>
+<span class="nc" id="L728">                        session.getPeerCertificates();</span>
+<span class="nc" id="L729">            principal = ((X509Certificate)certs[0]).getSubjectX500Principal();</span>
+<span class="nc" id="L730">        }</span>
+<span class="nc" id="L731">        return principal;</span>
+    }
+
+    /**
+     * Returns the principal the client sent to the
+     * server, or null if the client did not authenticate.
+     */
+    Principal getLocalPrincipal()
+    {
+        Principal principal;
+        try {
+<span class="nc" id="L742">            principal = session.getLocalPrincipal();</span>
+<span class="nc" id="L743">        } catch (AbstractMethodError e) {</span>
+<span class="nc" id="L744">            principal = null;</span>
+            // if the provider does not support it, fallback to local certs.
+            // return the X500Principal of the end-entity cert.
+<span class="nc" id="L747">            java.security.cert.Certificate[] certs =</span>
+<span class="nc" id="L748">                        session.getLocalCertificates();</span>
+<span class="nc bnc" id="L749" title="All 2 branches missed.">            if (certs != null) {</span>
+<span class="nc" id="L750">                principal = ((X509Certificate)certs[0]).getSubjectX500Principal();</span>
+            }
+<span class="nc" id="L752">        }</span>
+<span class="nc" id="L753">        return principal;</span>
+    }
+
+    /**
+     * This method implements the SSL HandshakeCompleted callback,
+     * remembering the resulting session so that it may be queried
+     * for the current cipher suite and peer certificates.  Servers
+     * sometimes re-initiate handshaking, so the session in use on
+     * a given connection may change.  When sessions change, so may
+     * peer identities and cipher suites.
+     */
+    public void handshakeCompleted(HandshakeCompletedEvent event)
+    {
+<span class="fc" id="L766">        session = event.getSession();</span>
+<span class="fc" id="L767">    }</span>
+
+    /**
+     * @return the proxy host being used for this client, or null
+     *          if we're not going through a proxy
+     */
+    @Override
+    public String getProxyHostUsed() {
+<span class="fc bfc" id="L775" title="All 2 branches covered.">        if (!needsTunneling()) {</span>
+<span class="fc" id="L776">            return null;</span>
+        } else {
+<span class="fc" id="L778">            return super.getProxyHostUsed();</span>
+        }
+    }
+
+    /**
+     * @return the proxy port being used for this client.  Meaningless
+     *          if getProxyHostUsed() gives null.
+     */
+    @Override
+    public int getProxyPortUsed() {
+<span class="pc bpc" id="L788" title="1 of 4 branches missed.">        return (proxy == null || proxy.type() == Proxy.Type.DIRECT ||</span>
+<span class="pc bpc" id="L789" title="1 of 2 branches missed.">                proxy.type() == Proxy.Type.SOCKS)? -1:</span>
+<span class="fc" id="L790">            ((InetSocketAddress)proxy.address()).getPort();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

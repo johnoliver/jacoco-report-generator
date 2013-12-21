@@ -1,0 +1,1831 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>JPEGImageReader.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">com.sun.imageio.plugins.jpeg</a> &gt; <span class="el_source">JPEGImageReader.java</span></div><h1>JPEGImageReader.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2000, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package com.sun.imageio.plugins.jpeg;
+
+import javax.imageio.IIOException;
+import javax.imageio.ImageReader;
+import javax.imageio.ImageReadParam;
+import javax.imageio.ImageTypeSpecifier;
+import javax.imageio.metadata.IIOMetadata;
+import javax.imageio.spi.ImageReaderSpi;
+import javax.imageio.stream.ImageInputStream;
+import javax.imageio.plugins.jpeg.JPEGImageReadParam;
+import javax.imageio.plugins.jpeg.JPEGQTable;
+import javax.imageio.plugins.jpeg.JPEGHuffmanTable;
+
+import java.awt.Point;
+import java.awt.Rectangle;
+import java.awt.color.ColorSpace;
+import java.awt.color.ICC_Profile;
+import java.awt.color.ICC_ColorSpace;
+import java.awt.color.CMMException;
+import java.awt.image.BufferedImage;
+import java.awt.image.Raster;
+import java.awt.image.WritableRaster;
+import java.awt.image.DataBuffer;
+import java.awt.image.DataBufferByte;
+import java.awt.image.ColorModel;
+import java.awt.image.IndexColorModel;
+import java.awt.image.ColorConvertOp;
+import java.io.IOException;
+import java.util.List;
+import java.util.Iterator;
+import java.util.ArrayList;
+import java.util.NoSuchElementException;
+
+import sun.java2d.Disposer;
+import sun.java2d.DisposerRecord;
+
+public class JPEGImageReader extends ImageReader {
+
+<span class="nc" id="L64">    private boolean debug = false;</span>
+
+    /**
+     * The following variable contains a pointer to the IJG library
+     * structure for this reader.  It is assigned in the constructor
+     * and then is passed in to every native call.  It is set to 0
+     * by dispose to avoid disposing twice.
+     */
+<span class="nc" id="L72">    private long structPointer = 0;</span>
+
+    /** The input stream we read from */
+<span class="nc" id="L75">    private ImageInputStream iis = null;</span>
+
+    /**
+     * List of stream positions for images, reinitialized every time
+     * a new input source is set.
+     */
+<span class="nc" id="L81">    private List imagePositions = null;</span>
+
+    /**
+     * The number of images in the stream, or 0.
+     */
+<span class="nc" id="L86">    private int numImages = 0;</span>
+
+    static {
+<span class="nc" id="L89">        java.security.AccessController.doPrivileged(</span>
+<span class="nc" id="L90">            new java.security.PrivilegedAction&lt;Void&gt;() {</span>
+                public Void run() {
+<span class="nc" id="L92">                    System.loadLibrary(&quot;jpeg&quot;);</span>
+<span class="nc" id="L93">                    return null;</span>
+                }
+            });
+<span class="nc" id="L96">        initReaderIDs(ImageInputStream.class,</span>
+                      JPEGQTable.class,
+                      JPEGHuffmanTable.class);
+<span class="nc" id="L99">    }</span>
+
+    // The following warnings are converted to strings when used
+    // as keys to get localized resources from JPEGImageReaderResources
+    // and its children.
+
+    /**
+     * Warning code to be passed to warningOccurred to indicate
+     * that the EOI marker is missing from the end of the stream.
+     * This usually signals that the stream is corrupted, but
+     * everything up to the last MCU should be usable.
+     */
+    protected static final int WARNING_NO_EOI = 0;
+
+    /**
+     * Warning code to be passed to warningOccurred to indicate
+     * that a JFIF segment was encountered inside a JFXX JPEG
+     * thumbnail and is being ignored.
+     */
+    protected static final int WARNING_NO_JFIF_IN_THUMB = 1;
+
+    /**
+     * Warning code to be passed to warningOccurred to indicate
+     * that embedded ICC profile is invalid and will be ignored.
+     */
+    protected static final int WARNING_IGNORE_INVALID_ICC = 2;
+
+    private static final int MAX_WARNING = WARNING_IGNORE_INVALID_ICC;
+
+    /**
+     * Image index of image for which header information
+     * is available.
+     */
+<span class="nc" id="L132">    private int currentImage = -1;</span>
+
+    // The following is copied out from C after reading the header.
+    // Unlike metadata, which may never be retrieved, we need this
+    // if we are to read an image at all.
+
+    /** Set by setImageData native code callback */
+    private int width;
+    /** Set by setImageData native code callback */
+    private int height;
+    /**
+     * Set by setImageData native code callback.  A modified
+     * IJG+NIFTY colorspace code.
+     */
+    private int colorSpaceCode;
+    /**
+     * Set by setImageData native code callback.  A modified
+     * IJG+NIFTY colorspace code.
+     */
+    private int outColorSpaceCode;
+    /** Set by setImageData native code callback */
+    private int numComponents;
+    /** Set by setImageData native code callback */
+<span class="nc" id="L155">    private ColorSpace iccCS = null;</span>
+
+
+    /** If we need to post-convert in Java, convert with this op */
+<span class="nc" id="L159">    private ColorConvertOp convert = null;</span>
+
+    /** The image we are going to fill */
+<span class="nc" id="L162">    private BufferedImage image = null;</span>
+
+    /** An intermediate Raster to hold decoded data */
+<span class="nc" id="L165">    private WritableRaster raster = null;</span>
+
+    /** A view of our target Raster that we can setRect to */
+<span class="nc" id="L168">    private WritableRaster target = null;</span>
+
+    /** The databuffer for the above Raster */
+<span class="nc" id="L171">    private DataBufferByte buffer = null;</span>
+
+    /** The region in the destination where we will write pixels */
+<span class="nc" id="L174">    private Rectangle destROI = null;</span>
+
+    /** The list of destination bands, if any */
+<span class="nc" id="L177">    private int [] destinationBands = null;</span>
+
+    /** Stream metadata, cached, even when the stream is changed. */
+<span class="nc" id="L180">    private JPEGMetadata streamMetadata = null;</span>
+
+    /** Image metadata, valid for the imageMetadataIndex only. */
+<span class="nc" id="L183">    private JPEGMetadata imageMetadata = null;</span>
+<span class="nc" id="L184">    private int imageMetadataIndex = -1;</span>
+
+    /**
+     * Set to true every time we seek in the stream; used to
+     * invalidate the native buffer contents in C.
+     */
+<span class="nc" id="L190">    private boolean haveSeeked = false;</span>
+
+    /**
+     * Tables that have been read from a tables-only image at the
+     * beginning of a stream.
+     */
+<span class="nc" id="L196">    private JPEGQTable [] abbrevQTables = null;</span>
+<span class="nc" id="L197">    private JPEGHuffmanTable[] abbrevDCHuffmanTables = null;</span>
+<span class="nc" id="L198">    private JPEGHuffmanTable[] abbrevACHuffmanTables = null;</span>
+
+<span class="nc" id="L200">    private int minProgressivePass = 0;</span>
+<span class="nc" id="L201">    private int maxProgressivePass = Integer.MAX_VALUE;</span>
+
+    /**
+     * Variables used by progress monitoring.
+     */
+    private static final int UNKNOWN = -1;  // Number of passes
+    private static final int MIN_ESTIMATED_PASSES = 10; // IJG default
+<span class="nc" id="L208">    private int knownPassCount = UNKNOWN;</span>
+<span class="nc" id="L209">    private int pass = 0;</span>
+<span class="nc" id="L210">    private float percentToDate = 0.0F;</span>
+<span class="nc" id="L211">    private float previousPassPercentage = 0.0F;</span>
+<span class="nc" id="L212">    private int progInterval = 0;</span>
+
+    /**
+     * Set to true once stream has been checked for stream metadata
+     */
+<span class="nc" id="L217">    private boolean tablesOnlyChecked = false;</span>
+
+    /** The referent to be registered with the Disposer. */
+<span class="nc" id="L220">    private Object disposerReferent = new Object();</span>
+
+    /** The DisposerRecord that handles the actual disposal of this reader. */
+    private DisposerRecord disposerRecord;
+
+    /** Sets up static C structures. */
+    private static native void initReaderIDs(Class iisClass,
+                                             Class qTableClass,
+                                             Class huffClass);
+
+    public JPEGImageReader(ImageReaderSpi originator) {
+<span class="nc" id="L231">        super(originator);</span>
+<span class="nc" id="L232">        structPointer = initJPEGImageReader();</span>
+<span class="nc" id="L233">        disposerRecord = new JPEGReaderDisposerRecord(structPointer);</span>
+<span class="nc" id="L234">        Disposer.addRecord(disposerReferent, disposerRecord);</span>
+<span class="nc" id="L235">    }</span>
+
+    /** Sets up per-reader C structure and returns a pointer to it. */
+    private native long initJPEGImageReader();
+
+    /**
+     * Called by the native code or other classes to signal a warning.
+     * The code is used to lookup a localized message to be used when
+     * sending warnings to listeners.
+     */
+    protected void warningOccurred(int code) {
+<span class="nc" id="L246">        cbLock.lock();</span>
+        try {
+<span class="nc bnc" id="L248" title="All 4 branches missed.">            if ((code &lt; 0) || (code &gt; MAX_WARNING)){</span>
+<span class="nc" id="L249">                throw new InternalError(&quot;Invalid warning index&quot;);</span>
+            }
+<span class="nc" id="L251">            processWarningOccurred</span>
+<span class="nc" id="L252">                (&quot;com.sun.imageio.plugins.jpeg.JPEGImageReaderResources&quot;,</span>
+<span class="nc" id="L253">                 Integer.toString(code));</span>
+        } finally {
+<span class="nc" id="L255">            cbLock.unlock();</span>
+<span class="nc" id="L256">        }</span>
+<span class="nc" id="L257">    }</span>
+
+    /**
+     * The library has it's own error facility that emits warning messages.
+     * This routine is called by the native code when it has already
+     * formatted a string for output.
+     * XXX  For truly complete localization of all warning messages,
+     * the sun_jpeg_output_message routine in the native code should
+     * send only the codes and parameters to a method here in Java,
+     * which will then format and send the warnings, using localized
+     * strings.  This method will have to deal with all the parameters
+     * and formats (%u with possibly large numbers, %02d, %02x, etc.)
+     * that actually occur in the JPEG library.  For now, this prevents
+     * library warnings from being printed to stderr.
+     */
+    protected void warningWithMessage(String msg) {
+<span class="nc" id="L273">        cbLock.lock();</span>
+        try {
+<span class="nc" id="L275">            processWarningOccurred(msg);</span>
+        } finally {
+<span class="nc" id="L277">            cbLock.unlock();</span>
+<span class="nc" id="L278">        }</span>
+<span class="nc" id="L279">    }</span>
+
+    public void setInput(Object input,
+                         boolean seekForwardOnly,
+                         boolean ignoreMetadata)
+    {
+<span class="nc" id="L285">        setThreadLock();</span>
+        try {
+<span class="nc" id="L287">            cbLock.check();</span>
+
+<span class="nc" id="L289">            super.setInput(input, seekForwardOnly, ignoreMetadata);</span>
+<span class="nc" id="L290">            this.ignoreMetadata = ignoreMetadata;</span>
+<span class="nc" id="L291">            resetInternalState();</span>
+<span class="nc" id="L292">            iis = (ImageInputStream) input; // Always works</span>
+<span class="nc" id="L293">            setSource(structPointer);</span>
+        } finally {
+<span class="nc" id="L295">            clearThreadLock();</span>
+<span class="nc" id="L296">        }</span>
+<span class="nc" id="L297">    }</span>
+
+    /**
+     * This method is called from native code in order to fill
+     * native input buffer.
+     *
+     * We block any attempt to change the reading state during this
+     * method, in order to prevent a corruption of the native decoder
+     * state.
+     *
+     * @return number of bytes read from the stream.
+     */
+    private int readInputData(byte[] buf, int off, int len) throws IOException {
+<span class="nc" id="L310">        cbLock.lock();</span>
+        try {
+<span class="nc" id="L312">            return iis.read(buf, off, len);</span>
+        } finally {
+<span class="nc" id="L314">            cbLock.unlock();</span>
+        }
+    }
+
+    /**
+     * This method is called from the native code in order to
+     * skip requested number of bytes in the input stream.
+     *
+     * @param n
+     * @return
+     * @throws IOException
+     */
+    private long skipInputBytes(long n) throws IOException {
+<span class="nc" id="L327">        cbLock.lock();</span>
+        try {
+<span class="nc" id="L329">            return iis.skipBytes(n);</span>
+        } finally {
+<span class="nc" id="L331">            cbLock.unlock();</span>
+        }
+    }
+
+    private native void setSource(long structPointer);
+
+    private void checkTablesOnly() throws IOException {
+<span class="nc bnc" id="L338" title="All 2 branches missed.">        if (debug) {</span>
+<span class="nc" id="L339">            System.out.println(&quot;Checking for tables-only image&quot;);</span>
+        }
+<span class="nc" id="L341">        long savePos = iis.getStreamPosition();</span>
+<span class="nc bnc" id="L342" title="All 2 branches missed.">        if (debug) {</span>
+<span class="nc" id="L343">            System.out.println(&quot;saved pos is &quot; + savePos);</span>
+<span class="nc" id="L344">            System.out.println(&quot;length is &quot; + iis.length());</span>
+        }
+        // Read the first header
+<span class="nc" id="L347">        boolean tablesOnly = readNativeHeader(true);</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">        if (tablesOnly) {</span>
+<span class="nc bnc" id="L349" title="All 2 branches missed.">            if (debug) {</span>
+<span class="nc" id="L350">                System.out.println(&quot;tables-only image found&quot;);</span>
+<span class="nc" id="L351">                long pos = iis.getStreamPosition();</span>
+<span class="nc" id="L352">                System.out.println(&quot;pos after return from native is &quot; + pos);</span>
+            }
+            // This reads the tables-only image twice, once from C
+            // and once from Java, but only if ignoreMetadata is false
+<span class="nc bnc" id="L356" title="All 2 branches missed.">            if (ignoreMetadata == false) {</span>
+<span class="nc" id="L357">                iis.seek(savePos);</span>
+<span class="nc" id="L358">                haveSeeked = true;</span>
+<span class="nc" id="L359">                streamMetadata = new JPEGMetadata(true, false,</span>
+                                                  iis, this);
+<span class="nc" id="L361">                long pos = iis.getStreamPosition();</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">                if (debug) {</span>
+<span class="nc" id="L363">                    System.out.println</span>
+<span class="nc" id="L364">                        (&quot;pos after constructing stream metadata is &quot; + pos);</span>
+                }
+            }
+            // Now we are at the first image if there are any, so add it
+            // to the list
+<span class="nc bnc" id="L369" title="All 2 branches missed.">            if (hasNextImage()) {</span>
+<span class="nc" id="L370">                imagePositions.add(new Long(iis.getStreamPosition()));</span>
+            }
+        } else { // Not tables only, so add original pos to the list
+<span class="nc" id="L373">            imagePositions.add(new Long(savePos));</span>
+            // And set current image since we've read it now
+<span class="nc" id="L375">            currentImage = 0;</span>
+        }
+<span class="nc bnc" id="L377" title="All 2 branches missed.">        if (seekForwardOnly) {</span>
+<span class="nc" id="L378">            Long pos = (Long) imagePositions.get(imagePositions.size()-1);</span>
+<span class="nc" id="L379">            iis.flushBefore(pos.longValue());</span>
+        }
+<span class="nc" id="L381">        tablesOnlyChecked = true;</span>
+<span class="nc" id="L382">    }</span>
+
+    public int getNumImages(boolean allowSearch) throws IOException {
+<span class="nc" id="L385">        setThreadLock();</span>
+        try { // locked thread
+<span class="nc" id="L387">            cbLock.check();</span>
+
+<span class="nc" id="L389">            return getNumImagesOnThread(allowSearch);</span>
+        } finally {
+<span class="nc" id="L391">            clearThreadLock();</span>
+        }
+    }
+
+    private int getNumImagesOnThread(boolean allowSearch)
+      throws IOException {
+<span class="nc bnc" id="L397" title="All 2 branches missed.">        if (numImages != 0) {</span>
+<span class="nc" id="L398">            return numImages;</span>
+        }
+<span class="nc bnc" id="L400" title="All 2 branches missed.">        if (iis == null) {</span>
+<span class="nc" id="L401">            throw new IllegalStateException(&quot;Input not set&quot;);</span>
+        }
+<span class="nc bnc" id="L403" title="All 2 branches missed.">        if (allowSearch == true) {</span>
+<span class="nc bnc" id="L404" title="All 2 branches missed.">            if (seekForwardOnly) {</span>
+<span class="nc" id="L405">                throw new IllegalStateException(</span>
+                    &quot;seekForwardOnly and allowSearch can't both be true!&quot;);
+            }
+            // Otherwise we have to read the entire stream
+
+<span class="nc bnc" id="L410" title="All 2 branches missed.">            if (!tablesOnlyChecked) {</span>
+<span class="nc" id="L411">                checkTablesOnly();</span>
+            }
+
+<span class="nc" id="L414">            iis.mark();</span>
+
+<span class="nc" id="L416">            gotoImage(0);</span>
+
+<span class="nc" id="L418">            JPEGBuffer buffer = new JPEGBuffer(iis);</span>
+<span class="nc" id="L419">            buffer.loadBuf(0);</span>
+
+<span class="nc" id="L421">            boolean done = false;</span>
+<span class="nc bnc" id="L422" title="All 2 branches missed.">            while (!done) {</span>
+<span class="nc" id="L423">                done = buffer.scanForFF(this);</span>
+<span class="nc bnc" id="L424" title="All 3 branches missed.">                switch (buffer.buf[buffer.bufPtr] &amp; 0xff) {</span>
+                case JPEG.SOI:
+<span class="nc" id="L426">                    numImages++;</span>
+                    // FALL THROUGH to decrement buffer vars
+                    // This first set doesn't have a length
+                case 0: // not a marker, just a data 0xff
+                case JPEG.RST0:
+                case JPEG.RST1:
+                case JPEG.RST2:
+                case JPEG.RST3:
+                case JPEG.RST4:
+                case JPEG.RST5:
+                case JPEG.RST6:
+                case JPEG.RST7:
+                case JPEG.EOI:
+<span class="nc" id="L439">                    buffer.bufAvail--;</span>
+<span class="nc" id="L440">                    buffer.bufPtr++;</span>
+<span class="nc" id="L441">                    break;</span>
+                    // All the others have a length
+                default:
+<span class="nc" id="L444">                    buffer.bufAvail--;</span>
+<span class="nc" id="L445">                    buffer.bufPtr++;</span>
+<span class="nc" id="L446">                    buffer.loadBuf(2);</span>
+<span class="nc" id="L447">                    int length = ((buffer.buf[buffer.bufPtr++] &amp; 0xff) &lt;&lt; 8) |</span>
+                        (buffer.buf[buffer.bufPtr++] &amp; 0xff);
+<span class="nc" id="L449">                    buffer.bufAvail -= 2;</span>
+<span class="nc" id="L450">                    length -= 2; // length includes itself</span>
+<span class="nc" id="L451">                    buffer.skipData(length);</span>
+                }
+            }
+
+
+<span class="nc" id="L456">            iis.reset();</span>
+
+<span class="nc" id="L458">            return numImages;</span>
+        }
+
+<span class="nc" id="L461">        return -1;  // Search is necessary for JPEG</span>
+    }
+
+    /**
+     * Sets the input stream to the start of the requested image.
+     * &lt;pre&gt;
+     * @exception IllegalStateException if the input source has not been
+     * set.
+     * @exception IndexOutOfBoundsException if the supplied index is
+     * out of bounds.
+     * &lt;/pre&gt;
+     */
+    private void gotoImage(int imageIndex) throws IOException {
+<span class="nc bnc" id="L474" title="All 2 branches missed.">        if (iis == null) {</span>
+<span class="nc" id="L475">            throw new IllegalStateException(&quot;Input not set&quot;);</span>
+        }
+<span class="nc bnc" id="L477" title="All 2 branches missed.">        if (imageIndex &lt; minIndex) {</span>
+<span class="nc" id="L478">            throw new IndexOutOfBoundsException();</span>
+        }
+<span class="nc bnc" id="L480" title="All 2 branches missed.">        if (!tablesOnlyChecked) {</span>
+<span class="nc" id="L481">            checkTablesOnly();</span>
+        }
+<span class="nc bnc" id="L483" title="All 2 branches missed.">        if (imageIndex &lt; imagePositions.size()) {</span>
+<span class="nc" id="L484">            iis.seek(((Long)(imagePositions.get(imageIndex))).longValue());</span>
+        } else {
+            // read to start of image, saving positions
+            // First seek to the last position we already have, and skip the
+            // entire image
+<span class="nc" id="L489">            Long pos = (Long) imagePositions.get(imagePositions.size()-1);</span>
+<span class="nc" id="L490">            iis.seek(pos.longValue());</span>
+<span class="nc" id="L491">            skipImage();</span>
+            // Now add all intervening positions, skipping images
+<span class="nc" id="L493">            for (int index = imagePositions.size();</span>
+<span class="nc bnc" id="L494" title="All 2 branches missed.">                 index &lt;= imageIndex;</span>
+<span class="nc" id="L495">                 index++) {</span>
+                // Is there an image?
+<span class="nc bnc" id="L497" title="All 2 branches missed.">                if (!hasNextImage()) {</span>
+<span class="nc" id="L498">                    throw new IndexOutOfBoundsException();</span>
+                }
+<span class="nc" id="L500">                pos = new Long(iis.getStreamPosition());</span>
+<span class="nc" id="L501">                imagePositions.add(pos);</span>
+<span class="nc bnc" id="L502" title="All 2 branches missed.">                if (seekForwardOnly) {</span>
+<span class="nc" id="L503">                    iis.flushBefore(pos.longValue());</span>
+                }
+<span class="nc bnc" id="L505" title="All 2 branches missed.">                if (index &lt; imageIndex) {</span>
+<span class="nc" id="L506">                    skipImage();</span>
+                }  // Otherwise we are where we want to be
+            }
+        }
+
+<span class="nc bnc" id="L511" title="All 2 branches missed.">        if (seekForwardOnly) {</span>
+<span class="nc" id="L512">            minIndex = imageIndex;</span>
+        }
+
+<span class="nc" id="L515">        haveSeeked = true;  // No way is native buffer still valid</span>
+<span class="nc" id="L516">    }</span>
+
+    /**
+     * Skip over a complete image in the stream, leaving the stream
+     * positioned such that the next byte to be read is the first
+     * byte of the next image.  For JPEG, this means that we read
+     * until we encounter an EOI marker or until the end of the stream.
+     * If the stream ends before an EOI marker is encountered, an
+     * IndexOutOfBoundsException is thrown.
+     */
+    private void skipImage() throws IOException {
+<span class="nc bnc" id="L527" title="All 2 branches missed.">        if (debug) {</span>
+<span class="nc" id="L528">            System.out.println(&quot;skipImage called&quot;);</span>
+        }
+<span class="nc" id="L530">        boolean foundFF = false;</span>
+<span class="nc" id="L531">        for (int byteval = iis.read();</span>
+<span class="nc bnc" id="L532" title="All 2 branches missed.">             byteval != -1;</span>
+<span class="nc" id="L533">             byteval = iis.read()) {</span>
+
+<span class="nc bnc" id="L535" title="All 2 branches missed.">            if (foundFF == true) {</span>
+<span class="nc bnc" id="L536" title="All 2 branches missed.">                if (byteval == JPEG.EOI) {</span>
+<span class="nc" id="L537">                    return;</span>
+                }
+            }
+<span class="nc bnc" id="L540" title="All 2 branches missed.">            foundFF = (byteval == 0xff) ? true : false;</span>
+        }
+<span class="nc" id="L542">        throw new IndexOutOfBoundsException();</span>
+    }
+
+    /**
+     * Returns &lt;code&gt;true&lt;/code&gt; if there is an image beyond
+     * the current stream position.  Does not disturb the
+     * stream position.
+     */
+    private boolean hasNextImage() throws IOException {
+<span class="nc bnc" id="L551" title="All 2 branches missed.">        if (debug) {</span>
+<span class="nc" id="L552">            System.out.print(&quot;hasNextImage called; returning &quot;);</span>
+        }
+<span class="nc" id="L554">        iis.mark();</span>
+<span class="nc" id="L555">        boolean foundFF = false;</span>
+<span class="nc" id="L556">        for (int byteval = iis.read();</span>
+<span class="nc bnc" id="L557" title="All 2 branches missed.">             byteval != -1;</span>
+<span class="nc" id="L558">             byteval = iis.read()) {</span>
+
+<span class="nc bnc" id="L560" title="All 2 branches missed.">            if (foundFF == true) {</span>
+<span class="nc bnc" id="L561" title="All 2 branches missed.">                if (byteval == JPEG.SOI) {</span>
+<span class="nc" id="L562">                    iis.reset();</span>
+<span class="nc bnc" id="L563" title="All 2 branches missed.">                    if (debug) {</span>
+<span class="nc" id="L564">                        System.out.println(&quot;true&quot;);</span>
+                    }
+<span class="nc" id="L566">                    return true;</span>
+                }
+            }
+<span class="nc bnc" id="L569" title="All 2 branches missed.">            foundFF = (byteval == 0xff) ? true : false;</span>
+        }
+        // We hit the end of the stream before we hit an SOI, so no image
+<span class="nc" id="L572">        iis.reset();</span>
+<span class="nc bnc" id="L573" title="All 2 branches missed.">        if (debug) {</span>
+<span class="nc" id="L574">            System.out.println(&quot;false&quot;);</span>
+        }
+<span class="nc" id="L576">        return false;</span>
+    }
+
+    /**
+     * Push back the given number of bytes to the input stream.
+     * Called by the native code at the end of each image so
+     * that the next one can be identified from Java.
+     */
+    private void pushBack(int num) throws IOException {
+<span class="nc bnc" id="L585" title="All 2 branches missed.">        if (debug) {</span>
+<span class="nc" id="L586">            System.out.println(&quot;pushing back &quot; + num + &quot; bytes&quot;);</span>
+        }
+<span class="nc" id="L588">        cbLock.lock();</span>
+        try {
+<span class="nc" id="L590">            iis.seek(iis.getStreamPosition()-num);</span>
+            // The buffer is clear after this, so no need to set haveSeeked.
+        } finally {
+<span class="nc" id="L593">            cbLock.unlock();</span>
+<span class="nc" id="L594">        }</span>
+<span class="nc" id="L595">    }</span>
+
+    /**
+     * Reads header information for the given image, if possible.
+     */
+    private void readHeader(int imageIndex, boolean reset)
+        throws IOException {
+<span class="nc" id="L602">        gotoImage(imageIndex);</span>
+<span class="nc" id="L603">        readNativeHeader(reset); // Ignore return</span>
+<span class="nc" id="L604">        currentImage = imageIndex;</span>
+<span class="nc" id="L605">    }</span>
+
+    private boolean readNativeHeader(boolean reset) throws IOException {
+<span class="nc" id="L608">        boolean retval = false;</span>
+<span class="nc" id="L609">        retval = readImageHeader(structPointer, haveSeeked, reset);</span>
+<span class="nc" id="L610">        haveSeeked = false;</span>
+<span class="nc" id="L611">        return retval;</span>
+    }
+
+    /**
+     * Read in the header information starting from the current
+     * stream position, returning &lt;code&gt;true&lt;/code&gt; if the
+     * header was a tables-only image.  After this call, the
+     * native IJG decompression struct will contain the image
+     * information required by most query calls below
+     * (e.g. getWidth, getHeight, etc.), if the header was not
+     * a tables-only image.
+     * If reset is &lt;code&gt;true&lt;/code&gt;, the state of the IJG
+     * object is reset so that it can read a header again.
+     * This happens automatically if the header was a tables-only
+     * image.
+     */
+    private native boolean readImageHeader(long structPointer,
+                                           boolean clearBuffer,
+                                           boolean reset)
+        throws IOException;
+
+    /*
+     * Called by the native code whenever an image header has been
+     * read.  Whether we read metadata or not, we always need this
+     * information, so it is passed back independently of
+     * metadata, which may never be read.
+     */
+    private void setImageData(int width,
+                              int height,
+                              int colorSpaceCode,
+                              int outColorSpaceCode,
+                              int numComponents,
+                              byte [] iccData) {
+<span class="nc" id="L644">        this.width = width;</span>
+<span class="nc" id="L645">        this.height = height;</span>
+<span class="nc" id="L646">        this.colorSpaceCode = colorSpaceCode;</span>
+<span class="nc" id="L647">        this.outColorSpaceCode = outColorSpaceCode;</span>
+<span class="nc" id="L648">        this.numComponents = numComponents;</span>
+
+<span class="nc bnc" id="L650" title="All 2 branches missed.">        if (iccData == null) {</span>
+<span class="nc" id="L651">            iccCS = null;</span>
+<span class="nc" id="L652">            return;</span>
+        }
+
+<span class="nc" id="L655">        ICC_Profile newProfile = null;</span>
+        try {
+<span class="nc" id="L657">            newProfile = ICC_Profile.getInstance(iccData);</span>
+<span class="nc" id="L658">        } catch (IllegalArgumentException e) {</span>
+            /*
+             * Color profile data seems to be invalid.
+             * Ignore this profile.
+             */
+<span class="nc" id="L663">            iccCS = null;</span>
+<span class="nc" id="L664">            warningOccurred(WARNING_IGNORE_INVALID_ICC);</span>
+
+<span class="nc" id="L666">            return;</span>
+<span class="nc" id="L667">        }</span>
+<span class="nc" id="L668">        byte[] newData = newProfile.getData();</span>
+
+<span class="nc" id="L670">        ICC_Profile oldProfile = null;</span>
+<span class="nc bnc" id="L671" title="All 2 branches missed.">        if (iccCS instanceof ICC_ColorSpace) {</span>
+<span class="nc" id="L672">            oldProfile = ((ICC_ColorSpace)iccCS).getProfile();</span>
+        }
+<span class="nc" id="L674">        byte[] oldData = null;</span>
+<span class="nc bnc" id="L675" title="All 2 branches missed.">        if (oldProfile != null) {</span>
+<span class="nc" id="L676">            oldData = oldProfile.getData();</span>
+        }
+
+        /*
+         * At the moment we can't rely on the ColorSpace.equals()
+         * and ICC_Profile.equals() because they do not detect
+         * the case when two profiles are created from same data.
+         *
+         * So, we have to do data comparison in order to avoid
+         * creation of different ColorSpace instances for the same
+         * embedded data.
+         */
+<span class="nc bnc" id="L688" title="All 2 branches missed.">        if (oldData == null ||</span>
+<span class="nc bnc" id="L689" title="All 2 branches missed.">            !java.util.Arrays.equals(oldData, newData))</span>
+        {
+<span class="nc" id="L691">            iccCS = new ICC_ColorSpace(newProfile);</span>
+            // verify new color space
+            try {
+<span class="nc" id="L694">                float[] colors = iccCS.fromRGB(new float[] {1f, 0f, 0f});</span>
+<span class="nc" id="L695">            } catch (CMMException e) {</span>
+                /*
+                 * Embedded profile seems to be corrupted.
+                 * Ignore this profile.
+                 */
+<span class="nc" id="L700">                iccCS = null;</span>
+<span class="nc" id="L701">                cbLock.lock();</span>
+                try {
+<span class="nc" id="L703">                    warningOccurred(WARNING_IGNORE_INVALID_ICC);</span>
+                } finally {
+<span class="nc" id="L705">                    cbLock.unlock();</span>
+<span class="nc" id="L706">                }</span>
+<span class="nc" id="L707">            }</span>
+        }
+<span class="nc" id="L709">    }</span>
+
+    public int getWidth(int imageIndex) throws IOException {
+<span class="nc" id="L712">        setThreadLock();</span>
+        try {
+<span class="nc bnc" id="L714" title="All 2 branches missed.">            if (currentImage != imageIndex) {</span>
+<span class="nc" id="L715">                cbLock.check();</span>
+<span class="nc" id="L716">                readHeader(imageIndex, true);</span>
+            }
+<span class="nc" id="L718">            return width;</span>
+        } finally {
+<span class="nc" id="L720">            clearThreadLock();</span>
+        }
+    }
+
+    public int getHeight(int imageIndex) throws IOException {
+<span class="nc" id="L725">        setThreadLock();</span>
+        try {
+<span class="nc bnc" id="L727" title="All 2 branches missed.">            if (currentImage != imageIndex) {</span>
+<span class="nc" id="L728">                cbLock.check();</span>
+<span class="nc" id="L729">                readHeader(imageIndex, true);</span>
+            }
+<span class="nc" id="L731">            return height;</span>
+        } finally {
+<span class="nc" id="L733">            clearThreadLock();</span>
+        }
+    }
+
+    /////////// Color Conversion and Image Types
+
+    /**
+     * Return an ImageTypeSpecifier corresponding to the given
+     * color space code, or null if the color space is unsupported.
+     */
+    private ImageTypeProducer getImageType(int code) {
+<span class="nc" id="L744">        ImageTypeProducer ret = null;</span>
+
+<span class="nc bnc" id="L746" title="All 4 branches missed.">        if ((code &gt; 0) &amp;&amp; (code &lt; JPEG.NUM_JCS_CODES)) {</span>
+<span class="nc" id="L747">            ret = ImageTypeProducer.getTypeProducer(code);</span>
+        }
+<span class="nc" id="L749">        return ret;</span>
+    }
+
+    public ImageTypeSpecifier getRawImageType(int imageIndex)
+        throws IOException {
+<span class="nc" id="L754">        setThreadLock();</span>
+        try {
+<span class="nc bnc" id="L756" title="All 2 branches missed.">            if (currentImage != imageIndex) {</span>
+<span class="nc" id="L757">                cbLock.check();</span>
+
+<span class="nc" id="L759">                readHeader(imageIndex, true);</span>
+            }
+
+            // Returns null if it can't be represented
+<span class="nc" id="L763">            return getImageType(colorSpaceCode).getType();</span>
+        } finally {
+<span class="nc" id="L765">            clearThreadLock();</span>
+        }
+    }
+
+    public Iterator getImageTypes(int imageIndex)
+        throws IOException {
+<span class="nc" id="L771">        setThreadLock();</span>
+        try {
+<span class="nc" id="L773">            return getImageTypesOnThread(imageIndex);</span>
+        } finally {
+<span class="nc" id="L775">            clearThreadLock();</span>
+        }
+    }
+
+    private Iterator getImageTypesOnThread(int imageIndex)
+        throws IOException {
+<span class="nc bnc" id="L781" title="All 2 branches missed.">        if (currentImage != imageIndex) {</span>
+<span class="nc" id="L782">            cbLock.check();</span>
+<span class="nc" id="L783">            readHeader(imageIndex, true);</span>
+        }
+
+        // We return an iterator containing the default, any
+        // conversions that the library provides, and
+        // all the other default types with the same number
+        // of components, as we can do these as a post-process.
+        // As we convert Rasters rather than images, images
+        // with alpha cannot be converted in a post-process.
+
+        // If this image can't be interpreted, this method
+        // returns an empty Iterator.
+
+        // Get the raw ITS, if there is one.  Note that this
+        // won't always be the same as the default.
+<span class="nc" id="L798">        ImageTypeProducer raw = getImageType(colorSpaceCode);</span>
+
+        // Given the encoded colorspace, build a list of ITS's
+        // representing outputs you could handle starting
+        // with the default.
+
+<span class="nc" id="L804">        ArrayList&lt;ImageTypeProducer&gt; list = new ArrayList&lt;ImageTypeProducer&gt;(1);</span>
+
+<span class="nc bnc" id="L806" title="All 8 branches missed.">        switch (colorSpaceCode) {</span>
+        case JPEG.JCS_GRAYSCALE:
+<span class="nc" id="L808">            list.add(raw);</span>
+<span class="nc" id="L809">            list.add(getImageType(JPEG.JCS_RGB));</span>
+<span class="nc" id="L810">            break;</span>
+        case JPEG.JCS_RGB:
+<span class="nc" id="L812">            list.add(raw);</span>
+<span class="nc" id="L813">            list.add(getImageType(JPEG.JCS_GRAYSCALE));</span>
+<span class="nc" id="L814">            list.add(getImageType(JPEG.JCS_YCC));</span>
+<span class="nc" id="L815">            break;</span>
+        case JPEG.JCS_RGBA:
+<span class="nc" id="L817">            list.add(raw);</span>
+<span class="nc" id="L818">            break;</span>
+        case JPEG.JCS_YCC:
+<span class="nc bnc" id="L820" title="All 2 branches missed.">            if (raw != null) {  // Might be null if PYCC.pf not installed</span>
+<span class="nc" id="L821">                list.add(raw);</span>
+<span class="nc" id="L822">                list.add(getImageType(JPEG.JCS_RGB));</span>
+            }
+            break;
+        case JPEG.JCS_YCCA:
+<span class="nc bnc" id="L826" title="All 2 branches missed.">            if (raw != null) {  // Might be null if PYCC.pf not installed</span>
+<span class="nc" id="L827">                list.add(raw);</span>
+            }
+            break;
+        case JPEG.JCS_YCbCr:
+            // As there is no YCbCr ColorSpace, we can't support
+            // the raw type.
+
+            // due to 4705399, use RGB as default in order to avoid
+            // slowing down of drawing operations with result image.
+<span class="nc" id="L836">            list.add(getImageType(JPEG.JCS_RGB));</span>
+
+<span class="nc bnc" id="L838" title="All 2 branches missed.">            if (iccCS != null) {</span>
+<span class="nc" id="L839">                list.add(new ImageTypeProducer() {</span>
+                    protected ImageTypeSpecifier produce() {
+<span class="nc" id="L841">                        return ImageTypeSpecifier.createInterleaved</span>
+<span class="nc" id="L842">                         (iccCS,</span>
+                          JPEG.bOffsRGB,  // Assume it's for RGB
+                          DataBuffer.TYPE_BYTE,
+                          false,
+                          false);
+                    }
+                });
+
+            }
+
+<span class="nc" id="L852">            list.add(getImageType(JPEG.JCS_GRAYSCALE));</span>
+<span class="nc" id="L853">            list.add(getImageType(JPEG.JCS_YCC));</span>
+<span class="nc" id="L854">            break;</span>
+        case JPEG.JCS_YCbCrA:  // Default is to convert to RGBA
+            // As there is no YCbCr ColorSpace, we can't support
+            // the raw type.
+<span class="nc" id="L858">            list.add(getImageType(JPEG.JCS_RGBA));</span>
+            break;
+        }
+
+<span class="nc" id="L862">        return new ImageTypeIterator(list.iterator());</span>
+    }
+
+    /**
+     * Checks the implied color conversion between the stream and
+     * the target image, altering the IJG output color space if necessary.
+     * If a java color conversion is required, then this sets up
+     * &lt;code&gt;convert&lt;/code&gt;.
+     * If bands are being rearranged at all (either source or destination
+     * bands are specified in the param), then the default color
+     * conversions are assumed to be correct.
+     * Throws an IIOException if there is no conversion available.
+     */
+    private void checkColorConversion(BufferedImage image,
+                                      ImageReadParam param)
+        throws IIOException {
+
+        // If we are rearranging channels at all, the default
+        // conversions remain in place.  If the user wants
+        // raw channels then he should do this while reading
+        // a Raster.
+<span class="nc bnc" id="L883" title="All 2 branches missed.">        if (param != null) {</span>
+<span class="nc bnc" id="L884" title="All 2 branches missed.">            if ((param.getSourceBands() != null) ||</span>
+<span class="nc bnc" id="L885" title="All 2 branches missed.">                (param.getDestinationBands() != null)) {</span>
+                // Accept default conversions out of decoder, silently
+<span class="nc" id="L887">                return;</span>
+            }
+        }
+
+        // XXX - We do not currently support any indexed color models,
+        // though we could, as IJG will quantize for us.
+        // This is a performance and memory-use issue, as
+        // users can read RGB and then convert to indexed in Java.
+
+<span class="nc" id="L896">        ColorModel cm = image.getColorModel();</span>
+
+<span class="nc bnc" id="L898" title="All 2 branches missed.">        if (cm instanceof IndexColorModel) {</span>
+<span class="nc" id="L899">            throw new IIOException(&quot;IndexColorModel not supported&quot;);</span>
+        }
+
+        // Now check the ColorSpace type against outColorSpaceCode
+        // We may want to tweak the default
+<span class="nc" id="L904">        ColorSpace cs = cm.getColorSpace();</span>
+<span class="nc" id="L905">        int csType = cs.getType();</span>
+<span class="nc" id="L906">        convert = null;</span>
+<span class="nc bnc" id="L907" title="All 6 branches missed.">        switch (outColorSpaceCode) {</span>
+        case JPEG.JCS_GRAYSCALE:  // Its gray in the file
+<span class="nc bnc" id="L909" title="All 2 branches missed.">            if  (csType == ColorSpace.TYPE_RGB) { // We want RGB</span>
+                // IJG can do this for us more efficiently
+<span class="nc" id="L911">                setOutColorSpace(structPointer, JPEG.JCS_RGB);</span>
+                // Update java state according to changes
+                // in the native part of decoder.
+<span class="nc" id="L914">                outColorSpaceCode = JPEG.JCS_RGB;</span>
+<span class="nc" id="L915">                numComponents = 3;</span>
+<span class="nc bnc" id="L916" title="All 2 branches missed.">            } else if (csType != ColorSpace.TYPE_GRAY) {</span>
+<span class="nc" id="L917">                throw new IIOException(&quot;Incompatible color conversion&quot;);</span>
+            }
+            break;
+        case JPEG.JCS_RGB:  // IJG wants to go to RGB
+<span class="nc bnc" id="L921" title="All 2 branches missed.">            if (csType ==  ColorSpace.TYPE_GRAY) {  // We want gray</span>
+<span class="nc bnc" id="L922" title="All 2 branches missed.">                if (colorSpaceCode == JPEG.JCS_YCbCr) {</span>
+                    // If the jpeg space is YCbCr, IJG can do it
+<span class="nc" id="L924">                    setOutColorSpace(structPointer, JPEG.JCS_GRAYSCALE);</span>
+                    // Update java state according to changes
+                    // in the native part of decoder.
+<span class="nc" id="L927">                    outColorSpaceCode = JPEG.JCS_GRAYSCALE;</span>
+<span class="nc" id="L928">                    numComponents = 1;</span>
+                }
+<span class="nc bnc" id="L930" title="All 2 branches missed.">            } else if ((iccCS != null) &amp;&amp;</span>
+<span class="nc bnc" id="L931" title="All 4 branches missed.">                       (cm.getNumComponents() == numComponents) &amp;&amp;</span>
+                       (cs != iccCS)) {
+                // We have an ICC profile but it isn't used in the dest
+                // image.  So convert from the profile cs to the target cs
+<span class="nc" id="L935">                convert = new ColorConvertOp(iccCS, cs, null);</span>
+                // Leave IJG conversion in place; we still need it
+<span class="nc bnc" id="L937" title="All 2 branches missed.">            } else if ((iccCS == null) &amp;&amp;</span>
+<span class="nc bnc" id="L938" title="All 2 branches missed.">                       (!cs.isCS_sRGB()) &amp;&amp;</span>
+<span class="nc bnc" id="L939" title="All 2 branches missed.">                       (cm.getNumComponents() == numComponents)) {</span>
+                // Target isn't sRGB, so convert from sRGB to the target
+<span class="nc" id="L941">                convert = new ColorConvertOp(JPEG.JCS.sRGB, cs, null);</span>
+<span class="nc bnc" id="L942" title="All 2 branches missed.">            } else if (csType != ColorSpace.TYPE_RGB) {</span>
+<span class="nc" id="L943">                throw new IIOException(&quot;Incompatible color conversion&quot;);</span>
+            }
+            break;
+        case JPEG.JCS_RGBA:
+            // No conversions available; image must be RGBA
+<span class="nc bnc" id="L948" title="All 2 branches missed.">            if ((csType != ColorSpace.TYPE_RGB) ||</span>
+<span class="nc bnc" id="L949" title="All 2 branches missed.">                (cm.getNumComponents() != numComponents)) {</span>
+<span class="nc" id="L950">                throw new IIOException(&quot;Incompatible color conversion&quot;);</span>
+            }
+            break;
+        case JPEG.JCS_YCC:
+            {
+<span class="nc" id="L955">                ColorSpace YCC = JPEG.JCS.getYCC();</span>
+<span class="nc bnc" id="L956" title="All 2 branches missed.">                if (YCC == null) { // We can't do YCC at all</span>
+<span class="nc" id="L957">                    throw new IIOException(&quot;Incompatible color conversion&quot;);</span>
+                }
+<span class="nc bnc" id="L959" title="All 2 branches missed.">                if ((cs != YCC) &amp;&amp;</span>
+<span class="nc bnc" id="L960" title="All 2 branches missed.">                    (cm.getNumComponents() == numComponents)) {</span>
+<span class="nc" id="L961">                    convert = new ColorConvertOp(YCC, cs, null);</span>
+                }
+            }
+<span class="nc" id="L964">            break;</span>
+        case JPEG.JCS_YCCA:
+            {
+<span class="nc" id="L967">                ColorSpace YCC = JPEG.JCS.getYCC();</span>
+                // No conversions available; image must be YCCA
+<span class="nc bnc" id="L969" title="All 4 branches missed.">                if ((YCC == null) || // We can't do YCC at all</span>
+                    (cs != YCC) ||
+<span class="nc bnc" id="L971" title="All 2 branches missed.">                    (cm.getNumComponents() != numComponents)) {</span>
+<span class="nc" id="L972">                    throw new IIOException(&quot;Incompatible color conversion&quot;);</span>
+                }
+            }
+<span class="nc" id="L975">            break;</span>
+        default:
+            // Anything else we can't handle at all
+<span class="nc" id="L978">            throw new IIOException(&quot;Incompatible color conversion&quot;);</span>
+        }
+<span class="nc" id="L980">    }</span>
+
+    /**
+     * Set the IJG output space to the given value.  The library will
+     * perform the appropriate colorspace conversions.
+     */
+    private native void setOutColorSpace(long structPointer, int id);
+
+    /////// End of Color Conversion &amp; Image Types
+
+    public ImageReadParam getDefaultReadParam() {
+<span class="nc" id="L991">        return new JPEGImageReadParam();</span>
+    }
+
+    public IIOMetadata getStreamMetadata() throws IOException {
+<span class="nc" id="L995">        setThreadLock();</span>
+        try {
+<span class="nc bnc" id="L997" title="All 2 branches missed.">            if (!tablesOnlyChecked) {</span>
+<span class="nc" id="L998">                cbLock.check();</span>
+<span class="nc" id="L999">                checkTablesOnly();</span>
+            }
+<span class="nc" id="L1001">            return streamMetadata;</span>
+        } finally {
+<span class="nc" id="L1003">            clearThreadLock();</span>
+        }
+    }
+
+    public IIOMetadata getImageMetadata(int imageIndex)
+        throws IOException {
+<span class="nc" id="L1009">        setThreadLock();</span>
+        try {
+            // imageMetadataIndex will always be either a valid index or
+            // -1, in which case imageMetadata will not be null.
+            // So we can leave checking imageIndex for gotoImage.
+<span class="nc bnc" id="L1014" title="All 4 branches missed.">            if ((imageMetadataIndex == imageIndex)</span>
+                &amp;&amp; (imageMetadata != null)) {
+<span class="nc" id="L1016">                return imageMetadata;</span>
+            }
+
+<span class="nc" id="L1019">            cbLock.check();</span>
+
+<span class="nc" id="L1021">            gotoImage(imageIndex);</span>
+
+<span class="nc" id="L1023">            imageMetadata = new JPEGMetadata(false, false, iis, this);</span>
+
+<span class="nc" id="L1025">            imageMetadataIndex = imageIndex;</span>
+
+<span class="nc" id="L1027">            return imageMetadata;</span>
+        } finally {
+<span class="nc" id="L1029">            clearThreadLock();</span>
+        }
+    }
+
+    public BufferedImage read(int imageIndex, ImageReadParam param)
+        throws IOException {
+<span class="nc" id="L1035">        setThreadLock();</span>
+        try {
+<span class="nc" id="L1037">            cbLock.check();</span>
+            try {
+<span class="nc" id="L1039">                readInternal(imageIndex, param, false);</span>
+<span class="nc" id="L1040">            } catch (RuntimeException e) {</span>
+<span class="nc" id="L1041">                resetLibraryState(structPointer);</span>
+<span class="nc" id="L1042">                throw e;</span>
+<span class="nc" id="L1043">            } catch (IOException e) {</span>
+<span class="nc" id="L1044">                resetLibraryState(structPointer);</span>
+<span class="nc" id="L1045">                throw e;</span>
+<span class="nc" id="L1046">            }</span>
+
+<span class="nc" id="L1048">            BufferedImage ret = image;</span>
+<span class="nc" id="L1049">            image = null;  // don't keep a reference here</span>
+<span class="nc" id="L1050">            return ret;</span>
+        } finally {
+<span class="nc" id="L1052">            clearThreadLock();</span>
+        }
+    }
+
+    private Raster readInternal(int imageIndex,
+                                ImageReadParam param,
+                                boolean wantRaster) throws IOException {
+<span class="nc" id="L1059">        readHeader(imageIndex, false);</span>
+
+<span class="nc" id="L1061">        WritableRaster imRas = null;</span>
+<span class="nc" id="L1062">        int numImageBands = 0;</span>
+
+<span class="nc bnc" id="L1064" title="All 2 branches missed.">        if (!wantRaster){</span>
+            // Can we read this image?
+<span class="nc" id="L1066">            Iterator imageTypes = getImageTypes(imageIndex);</span>
+<span class="nc bnc" id="L1067" title="All 2 branches missed.">            if (imageTypes.hasNext() == false) {</span>
+<span class="nc" id="L1068">                throw new IIOException(&quot;Unsupported Image Type&quot;);</span>
+            }
+
+<span class="nc" id="L1071">            image = getDestination(param, imageTypes, width, height);</span>
+<span class="nc" id="L1072">            imRas = image.getRaster();</span>
+
+            // The destination may still be incompatible.
+
+<span class="nc" id="L1076">            numImageBands = image.getSampleModel().getNumBands();</span>
+
+            // Check whether we can handle any implied color conversion
+
+            // Throws IIOException if the stream and the image are
+            // incompatible, and sets convert if a java conversion
+            // is necessary
+<span class="nc" id="L1083">            checkColorConversion(image, param);</span>
+
+            // Check the source and destination bands in the param
+<span class="nc" id="L1086">            checkReadParamBandSettings(param, numComponents, numImageBands);</span>
+<span class="nc" id="L1087">        } else {</span>
+            // Set the output color space equal to the input colorspace
+            // This disables all conversions
+<span class="nc" id="L1090">            setOutColorSpace(structPointer, colorSpaceCode);</span>
+<span class="nc" id="L1091">            image = null;</span>
+        }
+
+        // Create an intermediate 1-line Raster that will hold the decoded,
+        // subsampled, clipped, band-selected image data in a single
+        // byte-interleaved buffer.  The above transformations
+        // will occur in C for performance.  Every time this Raster
+        // is filled we will call back to acceptPixels below to copy
+        // this to whatever kind of buffer our image has.
+
+<span class="nc" id="L1101">        int [] srcBands = JPEG.bandOffsets[numComponents-1];</span>
+<span class="nc bnc" id="L1102" title="All 2 branches missed.">        int numRasterBands = (wantRaster ? numComponents : numImageBands);</span>
+<span class="nc" id="L1103">        destinationBands = null;</span>
+
+<span class="nc" id="L1105">        Rectangle srcROI = new Rectangle(0, 0, 0, 0);</span>
+<span class="nc" id="L1106">        destROI = new Rectangle(0, 0, 0, 0);</span>
+<span class="nc" id="L1107">        computeRegions(param, width, height, image, srcROI, destROI);</span>
+
+<span class="nc" id="L1109">        int periodX = 1;</span>
+<span class="nc" id="L1110">        int periodY = 1;</span>
+
+<span class="nc" id="L1112">        minProgressivePass = 0;</span>
+<span class="nc" id="L1113">        maxProgressivePass = Integer.MAX_VALUE;</span>
+
+<span class="nc bnc" id="L1115" title="All 2 branches missed.">        if (param != null) {</span>
+<span class="nc" id="L1116">            periodX = param.getSourceXSubsampling();</span>
+<span class="nc" id="L1117">            periodY = param.getSourceYSubsampling();</span>
+
+<span class="nc" id="L1119">            int[] sBands = param.getSourceBands();</span>
+<span class="nc bnc" id="L1120" title="All 2 branches missed.">            if (sBands != null) {</span>
+<span class="nc" id="L1121">                srcBands = sBands;</span>
+<span class="nc" id="L1122">                numRasterBands = srcBands.length;</span>
+            }
+<span class="nc bnc" id="L1124" title="All 2 branches missed.">            if (!wantRaster) {  // ignore dest bands for Raster</span>
+<span class="nc" id="L1125">                destinationBands = param.getDestinationBands();</span>
+            }
+
+<span class="nc" id="L1128">            minProgressivePass = param.getSourceMinProgressivePass();</span>
+<span class="nc" id="L1129">            maxProgressivePass = param.getSourceMaxProgressivePass();</span>
+
+<span class="nc bnc" id="L1131" title="All 2 branches missed.">            if (param instanceof JPEGImageReadParam) {</span>
+<span class="nc" id="L1132">                JPEGImageReadParam jparam = (JPEGImageReadParam) param;</span>
+<span class="nc bnc" id="L1133" title="All 2 branches missed.">                if (jparam.areTablesSet()) {</span>
+<span class="nc" id="L1134">                    abbrevQTables = jparam.getQTables();</span>
+<span class="nc" id="L1135">                    abbrevDCHuffmanTables = jparam.getDCHuffmanTables();</span>
+<span class="nc" id="L1136">                    abbrevACHuffmanTables = jparam.getACHuffmanTables();</span>
+                }
+            }
+        }
+
+<span class="nc" id="L1141">        int lineSize = destROI.width*numRasterBands;</span>
+
+<span class="nc" id="L1143">        buffer = new DataBufferByte(lineSize);</span>
+
+<span class="nc" id="L1145">        int [] bandOffs = JPEG.bandOffsets[numRasterBands-1];</span>
+
+<span class="nc" id="L1147">        raster = Raster.createInterleavedRaster(buffer,</span>
+                                                destROI.width, 1,
+                                                lineSize,
+                                                numRasterBands,
+                                                bandOffs,
+                                                null);
+
+        // Now that we have the Raster we'll decode to, get a view of the
+        // target Raster that will permit a simple setRect for each scanline
+<span class="nc bnc" id="L1156" title="All 2 branches missed.">        if (wantRaster) {</span>
+<span class="nc" id="L1157">            target =  Raster.createInterleavedRaster(DataBuffer.TYPE_BYTE,</span>
+                                                     destROI.width,
+                                                     destROI.height,
+                                                     lineSize,
+                                                     numRasterBands,
+                                                     bandOffs,
+                                                     null);
+        } else {
+<span class="nc" id="L1165">            target = imRas;</span>
+        }
+<span class="nc" id="L1167">        int [] bandSizes = target.getSampleModel().getSampleSize();</span>
+<span class="nc bnc" id="L1168" title="All 2 branches missed.">        for (int i = 0; i &lt; bandSizes.length; i++) {</span>
+<span class="nc bnc" id="L1169" title="All 4 branches missed.">            if (bandSizes[i] &lt;= 0 || bandSizes[i] &gt; 8) {</span>
+<span class="nc" id="L1170">                throw new IIOException(&quot;Illegal band size: should be 0 &lt; size &lt;= 8&quot;);</span>
+            }
+        }
+
+        /*
+         * If the process is sequential, and we have restart markers,
+         * we could skip to the correct restart marker, if the library
+         * lets us.  That's an optimization to investigate later.
+         */
+
+        // Check for update listeners (don't call back if none)
+<span class="nc bnc" id="L1181" title="All 4 branches missed.">        boolean callbackUpdates = ((updateListeners != null)</span>
+                                   || (progressListeners != null));
+
+        // Set up progression data
+<span class="nc" id="L1185">        initProgressData();</span>
+        // if we have a metadata object, we can count the scans
+        // and set knownPassCount
+<span class="nc bnc" id="L1188" title="All 2 branches missed.">        if (imageIndex == imageMetadataIndex) { // We have metadata</span>
+<span class="nc" id="L1189">            knownPassCount = 0;</span>
+<span class="nc" id="L1190">            for (Iterator iter = imageMetadata.markerSequence.iterator();</span>
+<span class="nc bnc" id="L1191" title="All 2 branches missed.">                 iter.hasNext();) {</span>
+<span class="nc bnc" id="L1192" title="All 2 branches missed.">                if (iter.next() instanceof SOSMarkerSegment) {</span>
+<span class="nc" id="L1193">                    knownPassCount++;</span>
+                }
+            }
+        }
+<span class="nc" id="L1197">        progInterval = Math.max((target.getHeight()-1) / 20, 1);</span>
+<span class="nc bnc" id="L1198" title="All 2 branches missed.">        if (knownPassCount &gt; 0) {</span>
+<span class="nc" id="L1199">            progInterval *= knownPassCount;</span>
+<span class="nc bnc" id="L1200" title="All 2 branches missed.">        } else if (maxProgressivePass != Integer.MAX_VALUE) {</span>
+<span class="nc" id="L1201">            progInterval *= (maxProgressivePass - minProgressivePass + 1);</span>
+        }
+
+<span class="nc bnc" id="L1204" title="All 2 branches missed.">        if (debug) {</span>
+<span class="nc" id="L1205">            System.out.println(&quot;**** Read Data *****&quot;);</span>
+<span class="nc" id="L1206">            System.out.println(&quot;numRasterBands is &quot; + numRasterBands);</span>
+<span class="nc" id="L1207">            System.out.print(&quot;srcBands:&quot;);</span>
+<span class="nc bnc" id="L1208" title="All 2 branches missed.">            for (int i = 0; i&lt;srcBands.length;i++)</span>
+<span class="nc" id="L1209">                System.out.print(&quot; &quot; + srcBands[i]);</span>
+<span class="nc" id="L1210">            System.out.println();</span>
+<span class="nc" id="L1211">            System.out.println(&quot;destination bands is &quot; + destinationBands);</span>
+<span class="nc bnc" id="L1212" title="All 2 branches missed.">            if (destinationBands != null) {</span>
+<span class="nc bnc" id="L1213" title="All 2 branches missed.">                for (int i = 0; i &lt; destinationBands.length; i++) {</span>
+<span class="nc" id="L1214">                    System.out.print(&quot; &quot; + destinationBands[i]);</span>
+                }
+<span class="nc" id="L1216">                System.out.println();</span>
+            }
+<span class="nc" id="L1218">            System.out.println(&quot;sourceROI is &quot; + srcROI);</span>
+<span class="nc" id="L1219">            System.out.println(&quot;destROI is &quot; + destROI);</span>
+<span class="nc" id="L1220">            System.out.println(&quot;periodX is &quot; + periodX);</span>
+<span class="nc" id="L1221">            System.out.println(&quot;periodY is &quot; + periodY);</span>
+<span class="nc" id="L1222">            System.out.println(&quot;minProgressivePass is &quot; + minProgressivePass);</span>
+<span class="nc" id="L1223">            System.out.println(&quot;maxProgressivePass is &quot; + maxProgressivePass);</span>
+<span class="nc" id="L1224">            System.out.println(&quot;callbackUpdates is &quot; + callbackUpdates);</span>
+        }
+
+        // Finally, we are ready to read
+
+<span class="nc" id="L1229">        processImageStarted(currentImage);</span>
+
+<span class="nc" id="L1231">        boolean aborted = false;</span>
+
+        // Note that getData disables acceleration on buffer, but it is
+        // just a 1-line intermediate data transfer buffer that will not
+        // affect the acceleration of the resulting image.
+<span class="nc" id="L1236">        aborted = readImage(structPointer,</span>
+<span class="nc" id="L1237">                            buffer.getData(),</span>
+                            numRasterBands,
+                            srcBands,
+                            bandSizes,
+                            srcROI.x, srcROI.y,
+                            srcROI.width, srcROI.height,
+                            periodX, periodY,
+                            abbrevQTables,
+                            abbrevDCHuffmanTables,
+                            abbrevACHuffmanTables,
+                            minProgressivePass, maxProgressivePass,
+                            callbackUpdates);
+
+<span class="nc bnc" id="L1250" title="All 2 branches missed.">        if (aborted) {</span>
+<span class="nc" id="L1251">            processReadAborted();</span>
+        } else {
+<span class="nc" id="L1253">            processImageComplete();</span>
+        }
+
+<span class="nc" id="L1256">        return target;</span>
+
+    }
+
+    /**
+     * This method is called back from C when the intermediate Raster
+     * is full.  The parameter indicates the scanline in the target
+     * Raster to which the intermediate Raster should be copied.
+     * After the copy, we notify update listeners.
+     */
+    private void acceptPixels(int y, boolean progressive) {
+<span class="nc bnc" id="L1267" title="All 2 branches missed.">        if (convert != null) {</span>
+<span class="nc" id="L1268">            convert.filter(raster, raster);</span>
+        }
+<span class="nc" id="L1270">        target.setRect(destROI.x, destROI.y + y, raster);</span>
+
+<span class="nc" id="L1272">        cbLock.lock();</span>
+        try {
+<span class="nc" id="L1274">            processImageUpdate(image,</span>
+                               destROI.x, destROI.y+y,
+<span class="nc" id="L1276">                               raster.getWidth(), 1,</span>
+                               1, 1,
+                               destinationBands);
+<span class="nc bnc" id="L1279" title="All 4 branches missed.">            if ((y &gt; 0) &amp;&amp; (y%progInterval == 0)) {</span>
+<span class="nc" id="L1280">                int height = target.getHeight()-1;</span>
+<span class="nc" id="L1281">                float percentOfPass = ((float)y)/height;</span>
+<span class="nc bnc" id="L1282" title="All 2 branches missed.">                if (progressive) {</span>
+<span class="nc bnc" id="L1283" title="All 2 branches missed.">                    if (knownPassCount != UNKNOWN) {</span>
+<span class="nc" id="L1284">                        processImageProgress((pass + percentOfPass)*100.0F</span>
+                                             / knownPassCount);
+<span class="nc bnc" id="L1286" title="All 2 branches missed.">                    } else if (maxProgressivePass != Integer.MAX_VALUE) {</span>
+                        // Use the range of allowed progressive passes
+<span class="nc" id="L1288">                        processImageProgress((pass + percentOfPass)*100.0F</span>
+                                             / (maxProgressivePass - minProgressivePass + 1));
+                    } else {
+                        // Assume there are a minimum of MIN_ESTIMATED_PASSES
+                        // and that there is always one more pass
+                        // Compute the percentage as the percentage at the end
+                        // of the previous pass, plus the percentage of this
+                        // pass scaled to be the percentage of the total remaining,
+                        // assuming a minimum of MIN_ESTIMATED_PASSES passes and
+                        // that there is always one more pass.  This is monotonic
+                        // and asymptotic to 1.0, which is what we need.
+<span class="nc" id="L1299">                        int remainingPasses = // including this one</span>
+<span class="nc" id="L1300">                            Math.max(2, MIN_ESTIMATED_PASSES-pass);</span>
+<span class="nc" id="L1301">                        int totalPasses = pass + remainingPasses-1;</span>
+<span class="nc" id="L1302">                        progInterval = Math.max(height/20*totalPasses,</span>
+                                                totalPasses);
+<span class="nc bnc" id="L1304" title="All 2 branches missed.">                        if (y%progInterval == 0) {</span>
+<span class="nc" id="L1305">                            percentToDate = previousPassPercentage +</span>
+                                (1.0F - previousPassPercentage)
+                                * (percentOfPass)/remainingPasses;
+<span class="nc bnc" id="L1308" title="All 2 branches missed.">                            if (debug) {</span>
+<span class="nc" id="L1309">                                System.out.print(&quot;pass= &quot; + pass);</span>
+<span class="nc" id="L1310">                                System.out.print(&quot;, y= &quot; + y);</span>
+<span class="nc" id="L1311">                                System.out.print(&quot;, progInt= &quot; + progInterval);</span>
+<span class="nc" id="L1312">                                System.out.print(&quot;, % of pass: &quot; + percentOfPass);</span>
+<span class="nc" id="L1313">                                System.out.print(&quot;, rem. passes: &quot;</span>
+                                                 + remainingPasses);
+<span class="nc" id="L1315">                                System.out.print(&quot;, prev%: &quot;</span>
+                                                 + previousPassPercentage);
+<span class="nc" id="L1317">                                System.out.print(&quot;, %ToDate: &quot; + percentToDate);</span>
+<span class="nc" id="L1318">                                System.out.print(&quot; &quot;);</span>
+                            }
+<span class="nc" id="L1320">                            processImageProgress(percentToDate*100.0F);</span>
+                        }
+<span class="nc" id="L1322">                    }</span>
+                } else {
+<span class="nc" id="L1324">                    processImageProgress(percentOfPass * 100.0F);</span>
+                }
+            }
+        } finally {
+<span class="nc" id="L1328">            cbLock.unlock();</span>
+<span class="nc" id="L1329">        }</span>
+<span class="nc" id="L1330">    }</span>
+
+    private void initProgressData() {
+<span class="nc" id="L1333">        knownPassCount = UNKNOWN;</span>
+<span class="nc" id="L1334">        pass = 0;</span>
+<span class="nc" id="L1335">        percentToDate = 0.0F;</span>
+<span class="nc" id="L1336">        previousPassPercentage = 0.0F;</span>
+<span class="nc" id="L1337">        progInterval = 0;</span>
+<span class="nc" id="L1338">    }</span>
+
+    private void passStarted (int pass) {
+<span class="nc" id="L1341">        cbLock.lock();</span>
+        try {
+<span class="nc" id="L1343">            this.pass = pass;</span>
+<span class="nc" id="L1344">            previousPassPercentage = percentToDate;</span>
+<span class="nc" id="L1345">            processPassStarted(image,</span>
+                               pass,
+                               minProgressivePass,
+                               maxProgressivePass,
+                               0, 0,
+                               1,1,
+                               destinationBands);
+        } finally {
+<span class="nc" id="L1353">            cbLock.unlock();</span>
+<span class="nc" id="L1354">        }</span>
+<span class="nc" id="L1355">    }</span>
+
+    private void passComplete () {
+<span class="nc" id="L1358">        cbLock.lock();</span>
+        try {
+<span class="nc" id="L1360">            processPassComplete(image);</span>
+        } finally {
+<span class="nc" id="L1362">            cbLock.unlock();</span>
+<span class="nc" id="L1363">        }</span>
+<span class="nc" id="L1364">    }</span>
+
+    void thumbnailStarted(int thumbnailIndex) {
+<span class="nc" id="L1367">        cbLock.lock();</span>
+        try {
+<span class="nc" id="L1369">            processThumbnailStarted(currentImage, thumbnailIndex);</span>
+        } finally {
+<span class="nc" id="L1371">            cbLock.unlock();</span>
+<span class="nc" id="L1372">        }</span>
+<span class="nc" id="L1373">    }</span>
+
+    // Provide access to protected superclass method
+    void thumbnailProgress(float percentageDone) {
+<span class="nc" id="L1377">        cbLock.lock();</span>
+        try {
+<span class="nc" id="L1379">            processThumbnailProgress(percentageDone);</span>
+        } finally {
+<span class="nc" id="L1381">            cbLock.unlock();</span>
+<span class="nc" id="L1382">        }</span>
+<span class="nc" id="L1383">    }</span>
+
+    // Provide access to protected superclass method
+    void thumbnailComplete() {
+<span class="nc" id="L1387">        cbLock.lock();</span>
+        try {
+<span class="nc" id="L1389">            processThumbnailComplete();</span>
+        } finally {
+<span class="nc" id="L1391">            cbLock.unlock();</span>
+<span class="nc" id="L1392">        }</span>
+<span class="nc" id="L1393">    }</span>
+
+    /**
+     * Returns &lt;code&gt;true&lt;/code&gt; if the read was aborted.
+     */
+    private native boolean readImage(long structPointer,
+                                     byte [] buffer,
+                                     int numRasterBands,
+                                     int [] srcBands,
+                                     int [] bandSizes,
+                                     int sourceXOffset, int sourceYOffset,
+                                     int sourceWidth, int sourceHeight,
+                                     int periodX, int periodY,
+                                     JPEGQTable [] abbrevQTables,
+                                     JPEGHuffmanTable [] abbrevDCHuffmanTables,
+                                     JPEGHuffmanTable [] abbrevACHuffmanTables,
+                                     int minProgressivePass,
+                                     int maxProgressivePass,
+                                     boolean wantUpdates);
+
+    public void abort() {
+<span class="nc" id="L1414">        setThreadLock();</span>
+        try {
+            /**
+             * NB: we do not check the call back lock here,
+             * we allow to abort the reader any time.
+             */
+
+<span class="nc" id="L1421">            super.abort();</span>
+<span class="nc" id="L1422">            abortRead(structPointer);</span>
+        } finally {
+<span class="nc" id="L1424">            clearThreadLock();</span>
+<span class="nc" id="L1425">        }</span>
+<span class="nc" id="L1426">    }</span>
+
+    /** Set the C level abort flag. Keep it atomic for thread safety. */
+    private native void abortRead(long structPointer);
+
+    /** Resets library state when an exception occurred during a read. */
+    private native void resetLibraryState(long structPointer);
+
+    public boolean canReadRaster() {
+<span class="nc" id="L1435">        return true;</span>
+    }
+
+    public Raster readRaster(int imageIndex, ImageReadParam param)
+        throws IOException {
+<span class="nc" id="L1440">        setThreadLock();</span>
+<span class="nc" id="L1441">        Raster retval = null;</span>
+        try {
+<span class="nc" id="L1443">            cbLock.check();</span>
+            /*
+             * This could be further optimized by not resetting the dest.
+             * offset and creating a translated raster in readInternal()
+             * (see bug 4994702 for more info).
+             */
+
+            // For Rasters, destination offset is logical, not physical, so
+            // set it to 0 before calling computeRegions, so that the destination
+            // region is not clipped.
+<span class="nc" id="L1453">            Point saveDestOffset = null;</span>
+<span class="nc bnc" id="L1454" title="All 2 branches missed.">            if (param != null) {</span>
+<span class="nc" id="L1455">                saveDestOffset = param.getDestinationOffset();</span>
+<span class="nc" id="L1456">                param.setDestinationOffset(new Point(0, 0));</span>
+            }
+<span class="nc" id="L1458">            retval = readInternal(imageIndex, param, true);</span>
+            // Apply the destination offset, if any, as a logical offset
+<span class="nc bnc" id="L1460" title="All 2 branches missed.">            if (saveDestOffset != null) {</span>
+<span class="nc" id="L1461">                target = target.createWritableTranslatedChild(saveDestOffset.x,</span>
+                                                              saveDestOffset.y);
+            }
+<span class="nc" id="L1464">        } catch (RuntimeException e) {</span>
+<span class="nc" id="L1465">            resetLibraryState(structPointer);</span>
+<span class="nc" id="L1466">            throw e;</span>
+<span class="nc" id="L1467">        } catch (IOException e) {</span>
+<span class="nc" id="L1468">            resetLibraryState(structPointer);</span>
+<span class="nc" id="L1469">            throw e;</span>
+        } finally {
+<span class="nc" id="L1471">            clearThreadLock();</span>
+<span class="nc" id="L1472">        }</span>
+<span class="nc" id="L1473">        return retval;</span>
+    }
+
+    public boolean readerSupportsThumbnails() {
+<span class="nc" id="L1477">        return true;</span>
+    }
+
+    public int getNumThumbnails(int imageIndex) throws IOException {
+<span class="nc" id="L1481">        setThreadLock();</span>
+        try {
+<span class="nc" id="L1483">            cbLock.check();</span>
+
+<span class="nc" id="L1485">            getImageMetadata(imageIndex);  // checks iis state for us</span>
+            // Now check the jfif segments
+<span class="nc" id="L1487">            JFIFMarkerSegment jfif =</span>
+                (JFIFMarkerSegment) imageMetadata.findMarkerSegment
+<span class="nc" id="L1489">                (JFIFMarkerSegment.class, true);</span>
+<span class="nc" id="L1490">            int retval = 0;</span>
+<span class="nc bnc" id="L1491" title="All 2 branches missed.">            if (jfif != null) {</span>
+<span class="nc bnc" id="L1492" title="All 2 branches missed.">                retval = (jfif.thumb == null) ? 0 : 1;</span>
+<span class="nc" id="L1493">                retval += jfif.extSegments.size();</span>
+            }
+<span class="nc" id="L1495">            return retval;</span>
+        } finally {
+<span class="nc" id="L1497">            clearThreadLock();</span>
+        }
+    }
+
+    public int getThumbnailWidth(int imageIndex, int thumbnailIndex)
+        throws IOException {
+<span class="nc" id="L1503">        setThreadLock();</span>
+        try {
+<span class="nc" id="L1505">            cbLock.check();</span>
+
+<span class="nc bnc" id="L1507" title="All 2 branches missed.">            if ((thumbnailIndex &lt; 0)</span>
+<span class="nc bnc" id="L1508" title="All 2 branches missed.">                || (thumbnailIndex &gt;= getNumThumbnails(imageIndex))) {</span>
+<span class="nc" id="L1509">                throw new IndexOutOfBoundsException(&quot;No such thumbnail&quot;);</span>
+            }
+            // Now we know that there is a jfif segment
+<span class="nc" id="L1512">            JFIFMarkerSegment jfif =</span>
+                (JFIFMarkerSegment) imageMetadata.findMarkerSegment
+<span class="nc" id="L1514">                (JFIFMarkerSegment.class, true);</span>
+<span class="nc" id="L1515">            return  jfif.getThumbnailWidth(thumbnailIndex);</span>
+        } finally {
+<span class="nc" id="L1517">            clearThreadLock();</span>
+        }
+    }
+
+    public int getThumbnailHeight(int imageIndex, int thumbnailIndex)
+        throws IOException {
+<span class="nc" id="L1523">        setThreadLock();</span>
+        try {
+<span class="nc" id="L1525">            cbLock.check();</span>
+
+<span class="nc bnc" id="L1527" title="All 2 branches missed.">            if ((thumbnailIndex &lt; 0)</span>
+<span class="nc bnc" id="L1528" title="All 2 branches missed.">                || (thumbnailIndex &gt;= getNumThumbnails(imageIndex))) {</span>
+<span class="nc" id="L1529">                throw new IndexOutOfBoundsException(&quot;No such thumbnail&quot;);</span>
+            }
+            // Now we know that there is a jfif segment
+<span class="nc" id="L1532">            JFIFMarkerSegment jfif =</span>
+                (JFIFMarkerSegment) imageMetadata.findMarkerSegment
+<span class="nc" id="L1534">                (JFIFMarkerSegment.class, true);</span>
+<span class="nc" id="L1535">            return  jfif.getThumbnailHeight(thumbnailIndex);</span>
+        } finally {
+<span class="nc" id="L1537">            clearThreadLock();</span>
+        }
+    }
+
+    public BufferedImage readThumbnail(int imageIndex,
+                                       int thumbnailIndex)
+        throws IOException {
+<span class="nc" id="L1544">        setThreadLock();</span>
+        try {
+<span class="nc" id="L1546">            cbLock.check();</span>
+
+<span class="nc bnc" id="L1548" title="All 2 branches missed.">            if ((thumbnailIndex &lt; 0)</span>
+<span class="nc bnc" id="L1549" title="All 2 branches missed.">                || (thumbnailIndex &gt;= getNumThumbnails(imageIndex))) {</span>
+<span class="nc" id="L1550">                throw new IndexOutOfBoundsException(&quot;No such thumbnail&quot;);</span>
+            }
+            // Now we know that there is a jfif segment and that iis is good
+<span class="nc" id="L1553">            JFIFMarkerSegment jfif =</span>
+                (JFIFMarkerSegment) imageMetadata.findMarkerSegment
+<span class="nc" id="L1555">                (JFIFMarkerSegment.class, true);</span>
+<span class="nc" id="L1556">            return  jfif.getThumbnail(iis, thumbnailIndex, this);</span>
+        } finally {
+<span class="nc" id="L1558">            clearThreadLock();</span>
+        }
+    }
+
+    private void resetInternalState() {
+        // reset C structures
+<span class="nc" id="L1564">        resetReader(structPointer);</span>
+
+        // reset local Java structures
+<span class="nc" id="L1567">        numImages = 0;</span>
+<span class="nc" id="L1568">        imagePositions = new ArrayList();</span>
+<span class="nc" id="L1569">        currentImage = -1;</span>
+<span class="nc" id="L1570">        image = null;</span>
+<span class="nc" id="L1571">        raster = null;</span>
+<span class="nc" id="L1572">        target = null;</span>
+<span class="nc" id="L1573">        buffer = null;</span>
+<span class="nc" id="L1574">        destROI = null;</span>
+<span class="nc" id="L1575">        destinationBands = null;</span>
+<span class="nc" id="L1576">        streamMetadata = null;</span>
+<span class="nc" id="L1577">        imageMetadata = null;</span>
+<span class="nc" id="L1578">        imageMetadataIndex = -1;</span>
+<span class="nc" id="L1579">        haveSeeked = false;</span>
+<span class="nc" id="L1580">        tablesOnlyChecked = false;</span>
+<span class="nc" id="L1581">        iccCS = null;</span>
+<span class="nc" id="L1582">        initProgressData();</span>
+<span class="nc" id="L1583">    }</span>
+
+    public void reset() {
+<span class="nc" id="L1586">        setThreadLock();</span>
+        try {
+<span class="nc" id="L1588">            cbLock.check();</span>
+<span class="nc" id="L1589">            super.reset();</span>
+        } finally {
+<span class="nc" id="L1591">            clearThreadLock();</span>
+<span class="nc" id="L1592">        }</span>
+<span class="nc" id="L1593">    }</span>
+
+    private native void resetReader(long structPointer);
+
+    public void dispose() {
+<span class="nc" id="L1598">        setThreadLock();</span>
+        try {
+<span class="nc" id="L1600">            cbLock.check();</span>
+
+<span class="nc bnc" id="L1602" title="All 2 branches missed.">            if (structPointer != 0) {</span>
+<span class="nc" id="L1603">                disposerRecord.dispose();</span>
+<span class="nc" id="L1604">                structPointer = 0;</span>
+            }
+        } finally {
+<span class="nc" id="L1607">            clearThreadLock();</span>
+<span class="nc" id="L1608">        }</span>
+<span class="nc" id="L1609">    }</span>
+
+    private static native void disposeReader(long structPointer);
+
+    private static class JPEGReaderDisposerRecord implements DisposerRecord {
+        private long pData;
+
+<span class="nc" id="L1616">        public JPEGReaderDisposerRecord(long pData) {</span>
+<span class="nc" id="L1617">            this.pData = pData;</span>
+<span class="nc" id="L1618">        }</span>
+
+        public synchronized void dispose() {
+<span class="nc bnc" id="L1621" title="All 2 branches missed.">            if (pData != 0) {</span>
+<span class="nc" id="L1622">                disposeReader(pData);</span>
+<span class="nc" id="L1623">                pData = 0;</span>
+            }
+<span class="nc" id="L1625">        }</span>
+    }
+
+<span class="nc" id="L1628">    private Thread theThread = null;</span>
+<span class="nc" id="L1629">    private int theLockCount = 0;</span>
+
+    private synchronized void setThreadLock() {
+<span class="nc" id="L1632">        Thread currThread = Thread.currentThread();</span>
+<span class="nc bnc" id="L1633" title="All 2 branches missed.">        if (theThread != null) {</span>
+<span class="nc bnc" id="L1634" title="All 2 branches missed.">            if (theThread != currThread) {</span>
+                // it looks like that this reader instance is used
+                // by multiple threads.
+<span class="nc" id="L1637">                throw new IllegalStateException(&quot;Attempt to use instance of &quot; +</span>
+                                                this + &quot; locked on thread &quot; +
+                                                theThread + &quot; from thread &quot; +
+                                                currThread);
+            } else {
+<span class="nc" id="L1642">                theLockCount ++;</span>
+            }
+        } else {
+<span class="nc" id="L1645">            theThread = currThread;</span>
+<span class="nc" id="L1646">            theLockCount = 1;</span>
+        }
+<span class="nc" id="L1648">    }</span>
+
+    private synchronized void clearThreadLock() {
+<span class="nc" id="L1651">        Thread currThread = Thread.currentThread();</span>
+<span class="nc bnc" id="L1652" title="All 4 branches missed.">        if (theThread == null || theThread != currThread) {</span>
+<span class="nc" id="L1653">            throw new IllegalStateException(&quot;Attempt to clear thread lock &quot; +</span>
+                                            &quot; form wrong thread.&quot; +
+                                            &quot; Locked thread: &quot; + theThread +
+                                            &quot;; current thread: &quot; + currThread);
+        }
+<span class="nc" id="L1658">        theLockCount --;</span>
+<span class="nc bnc" id="L1659" title="All 2 branches missed.">        if (theLockCount == 0) {</span>
+<span class="nc" id="L1660">            theThread = null;</span>
+        }
+<span class="nc" id="L1662">    }</span>
+
+<span class="nc" id="L1664">    private CallBackLock cbLock = new CallBackLock();</span>
+
+    private static class CallBackLock {
+
+        private State lockState;
+
+<span class="nc" id="L1670">        CallBackLock() {</span>
+<span class="nc" id="L1671">            lockState = State.Unlocked;</span>
+<span class="nc" id="L1672">        }</span>
+
+        void check() {
+<span class="nc bnc" id="L1675" title="All 2 branches missed.">            if (lockState != State.Unlocked) {</span>
+<span class="nc" id="L1676">                throw new IllegalStateException(&quot;Access to the reader is not allowed&quot;);</span>
+            }
+<span class="nc" id="L1678">        }</span>
+
+        private void lock() {
+<span class="nc" id="L1681">            lockState = State.Locked;</span>
+<span class="nc" id="L1682">        }</span>
+
+        private void unlock() {
+<span class="nc" id="L1685">            lockState = State.Unlocked;</span>
+<span class="nc" id="L1686">        }</span>
+
+<span class="nc" id="L1688">        private static enum State {</span>
+<span class="nc" id="L1689">            Unlocked,</span>
+<span class="nc" id="L1690">            Locked</span>
+        }
+    }
+}
+
+/**
+ * An internal helper class that wraps producer's iterator
+ * and extracts specifier instances on demand.
+ */
+class ImageTypeIterator implements Iterator&lt;ImageTypeSpecifier&gt; {
+     private Iterator&lt;ImageTypeProducer&gt; producers;
+<span class="nc" id="L1701">     private ImageTypeSpecifier theNext = null;</span>
+
+<span class="nc" id="L1703">     public ImageTypeIterator(Iterator&lt;ImageTypeProducer&gt; producers) {</span>
+<span class="nc" id="L1704">         this.producers = producers;</span>
+<span class="nc" id="L1705">     }</span>
+
+     public boolean hasNext() {
+<span class="nc bnc" id="L1708" title="All 2 branches missed.">         if (theNext != null) {</span>
+<span class="nc" id="L1709">             return true;</span>
+         }
+<span class="nc bnc" id="L1711" title="All 2 branches missed.">         if (!producers.hasNext()) {</span>
+<span class="nc" id="L1712">             return false;</span>
+         }
+         do {
+<span class="nc" id="L1715">             theNext = producers.next().getType();</span>
+<span class="nc bnc" id="L1716" title="All 4 branches missed.">         } while (theNext == null &amp;&amp; producers.hasNext());</span>
+
+<span class="nc bnc" id="L1718" title="All 2 branches missed.">         return (theNext != null);</span>
+     }
+
+     public ImageTypeSpecifier next() {
+<span class="nc bnc" id="L1722" title="All 4 branches missed.">         if (theNext != null || hasNext()) {</span>
+<span class="nc" id="L1723">             ImageTypeSpecifier t = theNext;</span>
+<span class="nc" id="L1724">             theNext = null;</span>
+<span class="nc" id="L1725">             return t;</span>
+         } else {
+<span class="nc" id="L1727">             throw new NoSuchElementException();</span>
+         }
+     }
+
+     public void remove() {
+<span class="nc" id="L1732">         producers.remove();</span>
+<span class="nc" id="L1733">     }</span>
+}
+
+/**
+ * An internal helper class that provides means for deferred creation
+ * of ImageTypeSpecifier instance required to describe available
+ * destination types.
+ *
+ * This implementation only supports standard
+ * jpeg color spaces (defined by corresponding JCS color space code).
+ *
+ * To support other color spaces one can override produce() method to
+ * return custom instance of ImageTypeSpecifier.
+ */
+class ImageTypeProducer {
+
+<span class="nc" id="L1749">    private ImageTypeSpecifier type = null;</span>
+<span class="nc" id="L1750">    boolean failed = false;</span>
+    private int csCode;
+
+<span class="nc" id="L1753">    public ImageTypeProducer(int csCode) {</span>
+<span class="nc" id="L1754">        this.csCode = csCode;</span>
+<span class="nc" id="L1755">    }</span>
+
+<span class="nc" id="L1757">    public ImageTypeProducer() {</span>
+<span class="nc" id="L1758">        csCode = -1; // undefined</span>
+<span class="nc" id="L1759">    }</span>
+
+    public synchronized ImageTypeSpecifier getType() {
+<span class="nc bnc" id="L1762" title="All 4 branches missed.">        if (!failed &amp;&amp; type == null) {</span>
+            try {
+<span class="nc" id="L1764">                type = produce();</span>
+<span class="nc" id="L1765">            } catch (Throwable e) {</span>
+<span class="nc" id="L1766">                failed = true;</span>
+<span class="nc" id="L1767">            }</span>
+        }
+<span class="nc" id="L1769">        return type;</span>
+    }
+
+<span class="nc" id="L1772">    private static final ImageTypeProducer [] defaultTypes =</span>
+            new ImageTypeProducer [JPEG.NUM_JCS_CODES];
+
+    public synchronized static ImageTypeProducer getTypeProducer(int csCode) {
+<span class="nc bnc" id="L1776" title="All 4 branches missed.">        if (csCode &lt; 0 || csCode &gt;= JPEG.NUM_JCS_CODES) {</span>
+<span class="nc" id="L1777">            return null;</span>
+        }
+<span class="nc bnc" id="L1779" title="All 2 branches missed.">        if (defaultTypes[csCode] == null) {</span>
+<span class="nc" id="L1780">            defaultTypes[csCode] = new ImageTypeProducer(csCode);</span>
+        }
+<span class="nc" id="L1782">        return defaultTypes[csCode];</span>
+    }
+
+    protected ImageTypeSpecifier produce() {
+<span class="nc bnc" id="L1786" title="All 6 branches missed.">        switch (csCode) {</span>
+            case JPEG.JCS_GRAYSCALE:
+<span class="nc" id="L1788">                return ImageTypeSpecifier.createFromBufferedImageType</span>
+<span class="nc" id="L1789">                        (BufferedImage.TYPE_BYTE_GRAY);</span>
+            case JPEG.JCS_RGB:
+<span class="nc" id="L1791">                return ImageTypeSpecifier.createInterleaved(JPEG.JCS.sRGB,</span>
+                        JPEG.bOffsRGB,
+                        DataBuffer.TYPE_BYTE,
+                        false,
+                        false);
+            case JPEG.JCS_RGBA:
+<span class="nc" id="L1797">                return ImageTypeSpecifier.createPacked(JPEG.JCS.sRGB,</span>
+                        0xff000000,
+                        0x00ff0000,
+                        0x0000ff00,
+                        0x000000ff,
+                        DataBuffer.TYPE_INT,
+                        false);
+            case JPEG.JCS_YCC:
+<span class="nc bnc" id="L1805" title="All 2 branches missed.">                if (JPEG.JCS.getYCC() != null) {</span>
+<span class="nc" id="L1806">                    return ImageTypeSpecifier.createInterleaved(</span>
+<span class="nc" id="L1807">                            JPEG.JCS.getYCC(),</span>
+                        JPEG.bandOffsets[2],
+                        DataBuffer.TYPE_BYTE,
+                        false,
+                        false);
+                } else {
+<span class="nc" id="L1813">                    return null;</span>
+                }
+            case JPEG.JCS_YCCA:
+<span class="nc bnc" id="L1816" title="All 2 branches missed.">                if (JPEG.JCS.getYCC() != null) {</span>
+<span class="nc" id="L1817">                    return ImageTypeSpecifier.createInterleaved(</span>
+<span class="nc" id="L1818">                            JPEG.JCS.getYCC(),</span>
+                        JPEG.bandOffsets[3],
+                        DataBuffer.TYPE_BYTE,
+                        true,
+                        false);
+                } else {
+<span class="nc" id="L1824">                    return null;</span>
+                }
+            default:
+<span class="nc" id="L1827">                return null;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

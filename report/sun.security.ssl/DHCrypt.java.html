@@ -1,0 +1,248 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>DHCrypt.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.ssl</a> &gt; <span class="el_source">DHCrypt.java</span></div><h1>DHCrypt.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1996, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+
+package sun.security.ssl;
+
+import java.math.BigInteger;
+import java.security.*;
+import java.io.IOException;
+import javax.net.ssl.SSLHandshakeException;
+import javax.crypto.SecretKey;
+import javax.crypto.KeyAgreement;
+import javax.crypto.interfaces.DHPublicKey;
+import javax.crypto.spec.*;
+
+import sun.security.util.KeyUtil;
+
+/**
+ * This class implements the Diffie-Hellman key exchange algorithm.
+ * D-H means combining your private key with your partners public key to
+ * generate a number. The peer does the same with its private key and our
+ * public key. Through the magic of Diffie-Hellman we both come up with the
+ * same number. This number is secret (discounting MITM attacks) and hence
+ * called the shared secret. It has the same length as the modulus, e.g. 512
+ * or 1024 bit. Man-in-the-middle attacks are typically countered by an
+ * independent authentication step using certificates (RSA, DSA, etc.).
+ *
+ * The thing to note is that the shared secret is constant for two partners
+ * with constant private keys. This is often not what we want, which is why
+ * it is generally a good idea to create a new private key for each session.
+ * Generating a private key involves one modular exponentiation assuming
+ * suitable D-H parameters are available.
+ *
+ * General usage of this class (TLS DHE case):
+ *  . if we are server, call DHCrypt(keyLength,random). This generates
+ *    an ephemeral keypair of the request length.
+ *  . if we are client, call DHCrypt(modulus, base, random). This
+ *    generates an ephemeral keypair using the parameters specified by
+ *    the server.
+ *  . send parameters and public value to remote peer
+ *  . receive peers ephemeral public key
+ *  . call getAgreedSecret() to calculate the shared secret
+ *
+ * In TLS the server chooses the parameter values itself, the client must use
+ * those sent to it by the server.
+ *
+ * The use of ephemeral keys as described above also achieves what is called
+ * &quot;forward secrecy&quot;. This means that even if the authentication keys are
+ * broken at a later date, the shared secret remains secure. The session is
+ * compromised only if the authentication keys are already broken at the
+ * time the key exchange takes place and an active MITM attack is used.
+ * This is in contrast to straightforward encrypting RSA key exchanges.
+ *
+ * @author David Brownell
+ */
+final class DHCrypt {
+
+    // group parameters (prime modulus and generator)
+    private BigInteger modulus;                 // P (aka N)
+    private BigInteger base;                    // G (aka alpha)
+
+    // our private key (including private component x)
+    private PrivateKey privateKey;
+
+    // public component of our key, X = (g ^ x) mod p
+    private BigInteger publicValue;             // X (aka y)
+
+    // the times to recove from failure if public key validation
+<span class="nc" id="L91">    private static int MAX_FAILOVER_TIMES = 2;</span>
+
+    /**
+     * Generate a Diffie-Hellman keypair of the specified size.
+     */
+<span class="nc" id="L96">    DHCrypt(int keyLength, SecureRandom random) {</span>
+        try {
+<span class="nc" id="L98">            KeyPairGenerator kpg = JsseJce.getKeyPairGenerator(&quot;DiffieHellman&quot;);</span>
+<span class="nc" id="L99">            kpg.initialize(keyLength, random);</span>
+
+<span class="nc" id="L101">            DHPublicKeySpec spec = generateDHPublicKeySpec(kpg);</span>
+<span class="nc bnc" id="L102" title="All 2 branches missed.">            if (spec == null) {</span>
+<span class="nc" id="L103">                throw new RuntimeException(&quot;Could not generate DH keypair&quot;);</span>
+            }
+
+<span class="nc" id="L106">            publicValue = spec.getY();</span>
+<span class="nc" id="L107">            modulus = spec.getP();</span>
+<span class="nc" id="L108">            base = spec.getG();</span>
+<span class="nc" id="L109">        } catch (GeneralSecurityException e) {</span>
+<span class="nc" id="L110">            throw new RuntimeException(&quot;Could not generate DH keypair&quot;, e);</span>
+<span class="nc" id="L111">        }</span>
+<span class="nc" id="L112">    }</span>
+
+
+    /**
+     * Generate a Diffie-Hellman keypair using the specified parameters.
+     *
+     * @param modulus the Diffie-Hellman modulus P
+     * @param base the Diffie-Hellman base G
+     */
+<span class="nc" id="L121">    DHCrypt(BigInteger modulus, BigInteger base, SecureRandom random) {</span>
+<span class="nc" id="L122">        this.modulus = modulus;</span>
+<span class="nc" id="L123">        this.base = base;</span>
+        try {
+<span class="nc" id="L125">            KeyPairGenerator kpg = JsseJce.getKeyPairGenerator(&quot;DiffieHellman&quot;);</span>
+<span class="nc" id="L126">            DHParameterSpec params = new DHParameterSpec(modulus, base);</span>
+<span class="nc" id="L127">            kpg.initialize(params, random);</span>
+
+<span class="nc" id="L129">            DHPublicKeySpec spec = generateDHPublicKeySpec(kpg);</span>
+<span class="nc bnc" id="L130" title="All 2 branches missed.">            if (spec == null) {</span>
+<span class="nc" id="L131">                throw new RuntimeException(&quot;Could not generate DH keypair&quot;);</span>
+            }
+
+<span class="nc" id="L134">            publicValue = spec.getY();</span>
+<span class="nc" id="L135">        } catch (GeneralSecurityException e) {</span>
+<span class="nc" id="L136">            throw new RuntimeException(&quot;Could not generate DH keypair&quot;, e);</span>
+<span class="nc" id="L137">        }</span>
+<span class="nc" id="L138">    }</span>
+
+
+    static DHPublicKeySpec getDHPublicKeySpec(PublicKey key) {
+<span class="nc bnc" id="L142" title="All 2 branches missed.">        if (key instanceof DHPublicKey) {</span>
+<span class="nc" id="L143">            DHPublicKey dhKey = (DHPublicKey)key;</span>
+<span class="nc" id="L144">            DHParameterSpec params = dhKey.getParams();</span>
+<span class="nc" id="L145">            return new DHPublicKeySpec(dhKey.getY(),</span>
+<span class="nc" id="L146">                                    params.getP(), params.getG());</span>
+        }
+        try {
+<span class="nc" id="L149">            KeyFactory factory = JsseJce.getKeyFactory(&quot;DH&quot;);</span>
+<span class="nc" id="L150">            return factory.getKeySpec(key, DHPublicKeySpec.class);</span>
+<span class="nc" id="L151">        } catch (Exception e) {</span>
+<span class="nc" id="L152">            throw new RuntimeException(e);</span>
+        }
+    }
+
+
+    /** Returns the Diffie-Hellman modulus. */
+    BigInteger getModulus() {
+<span class="nc" id="L159">        return modulus;</span>
+    }
+
+    /** Returns the Diffie-Hellman base (generator).  */
+    BigInteger getBase() {
+<span class="nc" id="L164">        return base;</span>
+    }
+
+    /**
+     * Gets the public key of this end of the key exchange.
+     */
+    BigInteger getPublicKey() {
+<span class="nc" id="L171">        return publicValue;</span>
+    }
+
+    /**
+     * Get the secret data that has been agreed on through Diffie-Hellman
+     * key agreement protocol.  Note that in the two party protocol, if
+     * the peer keys are already known, no other data needs to be sent in
+     * order to agree on a secret.  That is, a secured message may be
+     * sent without any mandatory round-trip overheads.
+     *
+     * &lt;P&gt;It is illegal to call this member function if the private key
+     * has not been set (or generated).
+     *
+     * @param  peerPublicKey the peer's public key.
+     * @param  keyIsValidated whether the {@code peerPublicKey} has beed
+     *         validated
+     * @return the secret, which is an unsigned big-endian integer
+     *         the same size as the Diffie-Hellman modulus.
+     */
+    SecretKey getAgreedSecret(BigInteger peerPublicValue,
+            boolean keyIsValidated) throws IOException {
+        try {
+<span class="nc" id="L193">            KeyFactory kf = JsseJce.getKeyFactory(&quot;DiffieHellman&quot;);</span>
+<span class="nc" id="L194">            DHPublicKeySpec spec =</span>
+                        new DHPublicKeySpec(peerPublicValue, modulus, base);
+<span class="nc" id="L196">            PublicKey publicKey = kf.generatePublic(spec);</span>
+<span class="nc" id="L197">            KeyAgreement ka = JsseJce.getKeyAgreement(&quot;DiffieHellman&quot;);</span>
+
+            // validate the Diffie-Hellman public key
+<span class="nc bnc" id="L200" title="All 2 branches missed.">            if (!keyIsValidated &amp;&amp;</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">                    !KeyUtil.isOracleJCEProvider(ka.getProvider().getName())) {</span>
+                try {
+<span class="nc" id="L203">                    KeyUtil.validate(spec);</span>
+<span class="nc" id="L204">                } catch (InvalidKeyException ike) {</span>
+                    // prefer handshake_failure alert to internal_error alert
+<span class="nc" id="L206">                    throw new SSLHandshakeException(ike.getMessage());</span>
+<span class="nc" id="L207">                }</span>
+            }
+
+<span class="nc" id="L210">            ka.init(privateKey);</span>
+<span class="nc" id="L211">            ka.doPhase(publicKey, true);</span>
+<span class="nc" id="L212">            return ka.generateSecret(&quot;TlsPremasterSecret&quot;);</span>
+<span class="nc" id="L213">        } catch (GeneralSecurityException e) {</span>
+<span class="nc" id="L214">            throw new RuntimeException(&quot;Could not generate secret&quot;, e);</span>
+        }
+    }
+
+    // Generate and validate DHPublicKeySpec
+    private DHPublicKeySpec generateDHPublicKeySpec(KeyPairGenerator kpg)
+            throws GeneralSecurityException {
+
+<span class="nc" id="L222">        boolean doExtraValiadtion =</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">                    (!KeyUtil.isOracleJCEProvider(kpg.getProvider().getName()));</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        for (int i = 0; i &lt;= MAX_FAILOVER_TIMES; i++) {</span>
+<span class="nc" id="L225">            KeyPair kp = kpg.generateKeyPair();</span>
+<span class="nc" id="L226">            privateKey = kp.getPrivate();</span>
+<span class="nc" id="L227">            DHPublicKeySpec spec = getDHPublicKeySpec(kp.getPublic());</span>
+
+            // validate the Diffie-Hellman public key
+<span class="nc bnc" id="L230" title="All 2 branches missed.">            if (doExtraValiadtion) {</span>
+                try {
+<span class="nc" id="L232">                    KeyUtil.validate(spec);</span>
+<span class="nc" id="L233">                } catch (InvalidKeyException ivke) {</span>
+<span class="nc bnc" id="L234" title="All 2 branches missed.">                    if (i == MAX_FAILOVER_TIMES) {</span>
+<span class="nc" id="L235">                        throw ivke;</span>
+                    }
+                    // otherwise, ignore the exception and try the next one
+<span class="nc" id="L238">                    continue;</span>
+<span class="nc" id="L239">                }</span>
+            }
+
+<span class="nc" id="L242">            return spec;</span>
+        }
+
+<span class="nc" id="L245">        return null;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

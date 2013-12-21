@@ -1,0 +1,697 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ArrayPrefixHelpers.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">java.util</a> &gt; <span class="el_source">ArrayPrefixHelpers.java</span></div><h1>ArrayPrefixHelpers.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package java.util;
+
+/*
+ * Written by Doug Lea with assistance from members of JCP JSR-166
+ * Expert Group and released to the public domain, as explained at
+ * http://creativecommons.org/publicdomain/zero/1.0/
+ */
+
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.CountedCompleter;
+import java.util.function.BinaryOperator;
+import java.util.function.IntBinaryOperator;
+import java.util.function.LongBinaryOperator;
+import java.util.function.DoubleBinaryOperator;
+
+/**
+ * ForkJoin tasks to perform Arrays.parallelPrefix operations.
+ *
+ * @author Doug Lea
+ * @since 1.8
+ */
+class ArrayPrefixHelpers {
+<span class="nc" id="L47">    private ArrayPrefixHelpers() {}; // non-instantiable</span>
+
+    /*
+     * Parallel prefix (aka cumulate, scan) task classes
+     * are based loosely on Guy Blelloch's original
+     * algorithm (http://www.cs.cmu.edu/~scandal/alg/scan.html):
+     *  Keep dividing by two to threshold segment size, and then:
+     *   Pass 1: Create tree of partial sums for each segment
+     *   Pass 2: For each segment, cumulate with offset of left sibling
+     *
+     * This version improves performance within FJ framework mainly by
+     * allowing the second pass of ready left-hand sides to proceed
+     * even if some right-hand side first passes are still executing.
+     * It also combines first and second pass for leftmost segment,
+     * and skips the first pass for rightmost segment (whose result is
+     * not needed for second pass).  It similarly manages to avoid
+     * requiring that users supply an identity basis for accumulations
+     * by tracking those segments/subtasks for which the first
+     * existing element is used as base.
+     *
+     * Managing this relies on ORing some bits in the pendingCount for
+     * phases/states: CUMULATE, SUMMED, and FINISHED. CUMULATE is the
+     * main phase bit. When false, segments compute only their sum.
+     * When true, they cumulate array elements. CUMULATE is set at
+     * root at beginning of second pass and then propagated down. But
+     * it may also be set earlier for subtrees with lo==0 (the left
+     * spine of tree). SUMMED is a one bit join count. For leafs, it
+     * is set when summed. For internal nodes, it becomes true when
+     * one child is summed.  When the second child finishes summing,
+     * we then moves up tree to trigger the cumulate phase. FINISHED
+     * is also a one bit join count. For leafs, it is set when
+     * cumulated. For internal nodes, it becomes true when one child
+     * is cumulated.  When the second child finishes cumulating, it
+     * then moves up tree, completing at the root.
+     *
+     * To better exploit locality and reduce overhead, the compute
+     * method loops starting with the current task, moving if possible
+     * to one of its subtasks rather than forking.
+     *
+     * As usual for this sort of utility, there are 4 versions, that
+     * are simple copy/paste/adapt variants of each other.  (The
+     * double and int versions differ from long version soley by
+     * replacing &quot;long&quot; (with case-matching)).
+     */
+
+    // see above
+    static final int CUMULATE = 1;
+    static final int SUMMED   = 2;
+    static final int FINISHED = 4;
+
+    /** The smallest subtask array partition size to use as threshold */
+    static final int MIN_PARTITION = 16;
+
+    static final class CumulateTask&lt;T&gt; extends CountedCompleter&lt;Void&gt; {
+        final T[] array;
+        final BinaryOperator&lt;T&gt; function;
+        CumulateTask&lt;T&gt; left, right;
+        T in, out;
+        final int lo, hi, origin, fence, threshold;
+
+        /** Root task constructor */
+        public CumulateTask(CumulateTask&lt;T&gt; parent,
+                            BinaryOperator&lt;T&gt; function,
+                            T[] array, int lo, int hi) {
+<span class="nc" id="L111">            super(parent);</span>
+<span class="nc" id="L112">            this.function = function; this.array = array;</span>
+<span class="nc" id="L113">            this.lo = this.origin = lo; this.hi = this.fence = hi;</span>
+            int p;
+<span class="nc" id="L115">            this.threshold =</span>
+<span class="nc bnc" id="L116" title="All 2 branches missed.">                    (p = (hi - lo) / (ForkJoinPool.getCommonPoolParallelism() &lt;&lt; 3))</span>
+                    &lt;= MIN_PARTITION ? MIN_PARTITION : p;
+<span class="nc" id="L118">        }</span>
+
+        /** Subtask constructor */
+        CumulateTask(CumulateTask&lt;T&gt; parent, BinaryOperator&lt;T&gt; function,
+                     T[] array, int origin, int fence, int threshold,
+                     int lo, int hi) {
+<span class="nc" id="L124">            super(parent);</span>
+<span class="nc" id="L125">            this.function = function; this.array = array;</span>
+<span class="nc" id="L126">            this.origin = origin; this.fence = fence;</span>
+<span class="nc" id="L127">            this.threshold = threshold;</span>
+<span class="nc" id="L128">            this.lo = lo; this.hi = hi;</span>
+<span class="nc" id="L129">        }</span>
+
+        @SuppressWarnings(&quot;unchecked&quot;)
+        public final void compute() {
+            final BinaryOperator&lt;T&gt; fn;
+            final T[] a;
+<span class="nc bnc" id="L135" title="All 4 branches missed.">            if ((fn = this.function) == null || (a = this.array) == null)</span>
+<span class="nc" id="L136">                throw new NullPointerException();    // hoist checks</span>
+<span class="nc" id="L137">            int th = threshold, org = origin, fnc = fence, l, h;</span>
+<span class="nc" id="L138">            CumulateTask&lt;T&gt; t = this;</span>
+<span class="nc bnc" id="L139" title="All 4 branches missed.">            outer: while ((l = t.lo) &gt;= 0 &amp;&amp; (h = t.hi) &lt;= a.length) {</span>
+<span class="nc bnc" id="L140" title="All 2 branches missed.">                if (h - l &gt; th) {</span>
+<span class="nc" id="L141">                    CumulateTask&lt;T&gt; lt = t.left, rt = t.right, f;</span>
+<span class="nc bnc" id="L142" title="All 2 branches missed.">                    if (lt == null) {                // first pass</span>
+<span class="nc" id="L143">                        int mid = (l + h) &gt;&gt;&gt; 1;</span>
+<span class="nc" id="L144">                        f = rt = t.right =</span>
+                                new CumulateTask&lt;T&gt;(t, fn, a, org, fnc, th, mid, h);
+<span class="nc" id="L146">                        t = lt = t.left  =</span>
+                                new CumulateTask&lt;T&gt;(t, fn, a, org, fnc, th, l, mid);
+<span class="nc" id="L148">                    }</span>
+                    else {                           // possibly refork
+<span class="nc" id="L150">                        T pin = t.in;</span>
+<span class="nc" id="L151">                        lt.in = pin;</span>
+<span class="nc" id="L152">                        f = t = null;</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">                        if (rt != null) {</span>
+<span class="nc" id="L154">                            T lout = lt.out;</span>
+<span class="nc bnc" id="L155" title="All 2 branches missed.">                            rt.in = (l == org ? lout :</span>
+<span class="nc" id="L156">                                     fn.apply(pin, lout));</span>
+                            for (int c;;) {
+<span class="nc bnc" id="L158" title="All 2 branches missed.">                                if (((c = rt.getPendingCount()) &amp; CUMULATE) != 0)</span>
+<span class="nc" id="L159">                                    break;</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">                                if (rt.compareAndSetPendingCount(c, c|CUMULATE)){</span>
+<span class="nc" id="L161">                                    t = rt;</span>
+<span class="nc" id="L162">                                    break;</span>
+                                }
+                            }
+                        }
+                        for (int c;;) {
+<span class="nc bnc" id="L167" title="All 2 branches missed.">                            if (((c = lt.getPendingCount()) &amp; CUMULATE) != 0)</span>
+<span class="nc" id="L168">                                break;</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">                            if (lt.compareAndSetPendingCount(c, c|CUMULATE)) {</span>
+<span class="nc bnc" id="L170" title="All 2 branches missed.">                                if (t != null)</span>
+<span class="nc" id="L171">                                    f = t;</span>
+<span class="nc" id="L172">                                t = lt;</span>
+<span class="nc" id="L173">                                break;</span>
+                            }
+                        }
+<span class="nc bnc" id="L176" title="All 2 branches missed.">                        if (t == null)</span>
+<span class="nc" id="L177">                            break;</span>
+                    }
+<span class="nc bnc" id="L179" title="All 2 branches missed.">                    if (f != null)</span>
+<span class="nc" id="L180">                        f.fork();</span>
+<span class="nc" id="L181">                }</span>
+                else {
+                    int state; // Transition to sum, cumulate, or both
+                    for (int b;;) {
+<span class="nc bnc" id="L185" title="All 2 branches missed.">                        if (((b = t.getPendingCount()) &amp; FINISHED) != 0)</span>
+<span class="nc" id="L186">                            break outer;                      // already done</span>
+<span class="nc bnc" id="L187" title="All 4 branches missed.">                        state = ((b &amp; CUMULATE) != 0? FINISHED :</span>
+                                 (l &gt; org) ? SUMMED : (SUMMED|FINISHED));
+<span class="nc bnc" id="L189" title="All 2 branches missed.">                        if (t.compareAndSetPendingCount(b, b|state))</span>
+<span class="nc" id="L190">                            break;</span>
+                    }
+
+                    T sum;
+<span class="nc bnc" id="L194" title="All 2 branches missed.">                    if (state != SUMMED) {</span>
+                        int first;
+<span class="nc bnc" id="L196" title="All 2 branches missed.">                        if (l == org) {                       // leftmost; no in</span>
+<span class="nc" id="L197">                            sum = a[org];</span>
+<span class="nc" id="L198">                            first = org + 1;</span>
+                        }
+                        else {
+<span class="nc" id="L201">                            sum = t.in;</span>
+<span class="nc" id="L202">                            first = l;</span>
+                        }
+<span class="nc bnc" id="L204" title="All 2 branches missed.">                        for (int i = first; i &lt; h; ++i)       // cumulate</span>
+<span class="nc" id="L205">                            a[i] = sum = fn.apply(sum, a[i]);</span>
+<span class="nc" id="L206">                    }</span>
+<span class="nc bnc" id="L207" title="All 2 branches missed.">                    else if (h &lt; fnc) {                       // skip rightmost</span>
+<span class="nc" id="L208">                        sum = a[l];</span>
+<span class="nc bnc" id="L209" title="All 2 branches missed.">                        for (int i = l + 1; i &lt; h; ++i)       // sum only</span>
+<span class="nc" id="L210">                            sum = fn.apply(sum, a[i]);</span>
+                    }
+                    else
+<span class="nc" id="L213">                        sum = t.in;</span>
+<span class="nc" id="L214">                    t.out = sum;</span>
+                    for (CumulateTask&lt;T&gt; par;;) {             // propagate
+<span class="nc bnc" id="L216" title="All 2 branches missed.">                        if ((par = (CumulateTask&lt;T&gt;)t.getCompleter()) == null) {</span>
+<span class="nc bnc" id="L217" title="All 2 branches missed.">                            if ((state &amp; FINISHED) != 0)      // enable join</span>
+<span class="nc" id="L218">                                t.quietlyComplete();</span>
+                            break outer;
+                        }
+<span class="nc" id="L221">                        int b = par.getPendingCount();</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">                        if ((b &amp; state &amp; FINISHED) != 0)</span>
+<span class="nc" id="L223">                            t = par;                          // both done</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">                        else if ((b &amp; state &amp; SUMMED) != 0) { // both summed</span>
+                            int nextState; CumulateTask&lt;T&gt; lt, rt;
+<span class="nc bnc" id="L226" title="All 4 branches missed.">                            if ((lt = par.left) != null &amp;&amp;</span>
+                                (rt = par.right) != null) {
+<span class="nc" id="L228">                                T lout = lt.out;</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">                                par.out = (rt.hi == fnc ? lout :</span>
+<span class="nc" id="L230">                                           fn.apply(lout, rt.out));</span>
+                            }
+<span class="nc bnc" id="L232" title="All 4 branches missed.">                            int refork = (((b &amp; CUMULATE) == 0 &amp;&amp;</span>
+                                           par.lo == org) ? CUMULATE : 0);
+<span class="nc bnc" id="L234" title="All 2 branches missed.">                            if ((nextState = b|state|refork) == b ||</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">                                par.compareAndSetPendingCount(b, nextState)) {</span>
+<span class="nc" id="L236">                                state = SUMMED;               // drop finished</span>
+<span class="nc" id="L237">                                t = par;</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">                                if (refork != 0)</span>
+<span class="nc" id="L239">                                    par.fork();</span>
+                            }
+<span class="nc" id="L241">                        }</span>
+<span class="nc bnc" id="L242" title="All 2 branches missed.">                        else if (par.compareAndSetPendingCount(b, b|state))</span>
+<span class="nc" id="L243">                            break outer;                      // sib not ready</span>
+<span class="nc" id="L244">                    }</span>
+                }
+            }
+<span class="nc" id="L247">        }</span>
+    }
+
+    static final class LongCumulateTask extends CountedCompleter&lt;Void&gt; {
+        final long[] array;
+        final LongBinaryOperator function;
+        LongCumulateTask left, right;
+        long in, out;
+        final int lo, hi, origin, fence, threshold;
+
+        /** Root task constructor */
+        public LongCumulateTask(LongCumulateTask parent,
+                                LongBinaryOperator function,
+                                long[] array, int lo, int hi) {
+<span class="nc" id="L261">            super(parent);</span>
+<span class="nc" id="L262">            this.function = function; this.array = array;</span>
+<span class="nc" id="L263">            this.lo = this.origin = lo; this.hi = this.fence = hi;</span>
+            int p;
+<span class="nc" id="L265">            this.threshold =</span>
+<span class="nc bnc" id="L266" title="All 2 branches missed.">                    (p = (hi - lo) / (ForkJoinPool.getCommonPoolParallelism() &lt;&lt; 3))</span>
+                    &lt;= MIN_PARTITION ? MIN_PARTITION : p;
+<span class="nc" id="L268">        }</span>
+
+        /** Subtask constructor */
+        LongCumulateTask(LongCumulateTask parent, LongBinaryOperator function,
+                         long[] array, int origin, int fence, int threshold,
+                         int lo, int hi) {
+<span class="nc" id="L274">            super(parent);</span>
+<span class="nc" id="L275">            this.function = function; this.array = array;</span>
+<span class="nc" id="L276">            this.origin = origin; this.fence = fence;</span>
+<span class="nc" id="L277">            this.threshold = threshold;</span>
+<span class="nc" id="L278">            this.lo = lo; this.hi = hi;</span>
+<span class="nc" id="L279">        }</span>
+
+        public final void compute() {
+            final LongBinaryOperator fn;
+            final long[] a;
+<span class="nc bnc" id="L284" title="All 4 branches missed.">            if ((fn = this.function) == null || (a = this.array) == null)</span>
+<span class="nc" id="L285">                throw new NullPointerException();    // hoist checks</span>
+<span class="nc" id="L286">            int th = threshold, org = origin, fnc = fence, l, h;</span>
+<span class="nc" id="L287">            LongCumulateTask t = this;</span>
+<span class="nc bnc" id="L288" title="All 4 branches missed.">            outer: while ((l = t.lo) &gt;= 0 &amp;&amp; (h = t.hi) &lt;= a.length) {</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">                if (h - l &gt; th) {</span>
+<span class="nc" id="L290">                    LongCumulateTask lt = t.left, rt = t.right, f;</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">                    if (lt == null) {                // first pass</span>
+<span class="nc" id="L292">                        int mid = (l + h) &gt;&gt;&gt; 1;</span>
+<span class="nc" id="L293">                        f = rt = t.right =</span>
+                                new LongCumulateTask(t, fn, a, org, fnc, th, mid, h);
+<span class="nc" id="L295">                        t = lt = t.left  =</span>
+                                new LongCumulateTask(t, fn, a, org, fnc, th, l, mid);
+<span class="nc" id="L297">                    }</span>
+                    else {                           // possibly refork
+<span class="nc" id="L299">                        long pin = t.in;</span>
+<span class="nc" id="L300">                        lt.in = pin;</span>
+<span class="nc" id="L301">                        f = t = null;</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">                        if (rt != null) {</span>
+<span class="nc" id="L303">                            long lout = lt.out;</span>
+<span class="nc bnc" id="L304" title="All 2 branches missed.">                            rt.in = (l == org ? lout :</span>
+<span class="nc" id="L305">                                     fn.applyAsLong(pin, lout));</span>
+                            for (int c;;) {
+<span class="nc bnc" id="L307" title="All 2 branches missed.">                                if (((c = rt.getPendingCount()) &amp; CUMULATE) != 0)</span>
+<span class="nc" id="L308">                                    break;</span>
+<span class="nc bnc" id="L309" title="All 2 branches missed.">                                if (rt.compareAndSetPendingCount(c, c|CUMULATE)){</span>
+<span class="nc" id="L310">                                    t = rt;</span>
+<span class="nc" id="L311">                                    break;</span>
+                                }
+                            }
+                        }
+                        for (int c;;) {
+<span class="nc bnc" id="L316" title="All 2 branches missed.">                            if (((c = lt.getPendingCount()) &amp; CUMULATE) != 0)</span>
+<span class="nc" id="L317">                                break;</span>
+<span class="nc bnc" id="L318" title="All 2 branches missed.">                            if (lt.compareAndSetPendingCount(c, c|CUMULATE)) {</span>
+<span class="nc bnc" id="L319" title="All 2 branches missed.">                                if (t != null)</span>
+<span class="nc" id="L320">                                    f = t;</span>
+<span class="nc" id="L321">                                t = lt;</span>
+<span class="nc" id="L322">                                break;</span>
+                            }
+                        }
+<span class="nc bnc" id="L325" title="All 2 branches missed.">                        if (t == null)</span>
+<span class="nc" id="L326">                            break;</span>
+                    }
+<span class="nc bnc" id="L328" title="All 2 branches missed.">                    if (f != null)</span>
+<span class="nc" id="L329">                        f.fork();</span>
+<span class="nc" id="L330">                }</span>
+                else {
+                    int state; // Transition to sum, cumulate, or both
+                    for (int b;;) {
+<span class="nc bnc" id="L334" title="All 2 branches missed.">                        if (((b = t.getPendingCount()) &amp; FINISHED) != 0)</span>
+<span class="nc" id="L335">                            break outer;                      // already done</span>
+<span class="nc bnc" id="L336" title="All 4 branches missed.">                        state = ((b &amp; CUMULATE) != 0? FINISHED :</span>
+                                 (l &gt; org) ? SUMMED : (SUMMED|FINISHED));
+<span class="nc bnc" id="L338" title="All 2 branches missed.">                        if (t.compareAndSetPendingCount(b, b|state))</span>
+<span class="nc" id="L339">                            break;</span>
+                    }
+
+                    long sum;
+<span class="nc bnc" id="L343" title="All 2 branches missed.">                    if (state != SUMMED) {</span>
+                        int first;
+<span class="nc bnc" id="L345" title="All 2 branches missed.">                        if (l == org) {                       // leftmost; no in</span>
+<span class="nc" id="L346">                            sum = a[org];</span>
+<span class="nc" id="L347">                            first = org + 1;</span>
+                        }
+                        else {
+<span class="nc" id="L350">                            sum = t.in;</span>
+<span class="nc" id="L351">                            first = l;</span>
+                        }
+<span class="nc bnc" id="L353" title="All 2 branches missed.">                        for (int i = first; i &lt; h; ++i)       // cumulate</span>
+<span class="nc" id="L354">                            a[i] = sum = fn.applyAsLong(sum, a[i]);</span>
+<span class="nc" id="L355">                    }</span>
+<span class="nc bnc" id="L356" title="All 2 branches missed.">                    else if (h &lt; fnc) {                       // skip rightmost</span>
+<span class="nc" id="L357">                        sum = a[l];</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">                        for (int i = l + 1; i &lt; h; ++i)       // sum only</span>
+<span class="nc" id="L359">                            sum = fn.applyAsLong(sum, a[i]);</span>
+                    }
+                    else
+<span class="nc" id="L362">                        sum = t.in;</span>
+<span class="nc" id="L363">                    t.out = sum;</span>
+                    for (LongCumulateTask par;;) {            // propagate
+<span class="nc bnc" id="L365" title="All 2 branches missed.">                        if ((par = (LongCumulateTask)t.getCompleter()) == null) {</span>
+<span class="nc bnc" id="L366" title="All 2 branches missed.">                            if ((state &amp; FINISHED) != 0)      // enable join</span>
+<span class="nc" id="L367">                                t.quietlyComplete();</span>
+                            break outer;
+                        }
+<span class="nc" id="L370">                        int b = par.getPendingCount();</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">                        if ((b &amp; state &amp; FINISHED) != 0)</span>
+<span class="nc" id="L372">                            t = par;                          // both done</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">                        else if ((b &amp; state &amp; SUMMED) != 0) { // both summed</span>
+                            int nextState; LongCumulateTask lt, rt;
+<span class="nc bnc" id="L375" title="All 4 branches missed.">                            if ((lt = par.left) != null &amp;&amp;</span>
+                                (rt = par.right) != null) {
+<span class="nc" id="L377">                                long lout = lt.out;</span>
+<span class="nc bnc" id="L378" title="All 2 branches missed.">                                par.out = (rt.hi == fnc ? lout :</span>
+<span class="nc" id="L379">                                           fn.applyAsLong(lout, rt.out));</span>
+                            }
+<span class="nc bnc" id="L381" title="All 4 branches missed.">                            int refork = (((b &amp; CUMULATE) == 0 &amp;&amp;</span>
+                                           par.lo == org) ? CUMULATE : 0);
+<span class="nc bnc" id="L383" title="All 2 branches missed.">                            if ((nextState = b|state|refork) == b ||</span>
+<span class="nc bnc" id="L384" title="All 2 branches missed.">                                par.compareAndSetPendingCount(b, nextState)) {</span>
+<span class="nc" id="L385">                                state = SUMMED;               // drop finished</span>
+<span class="nc" id="L386">                                t = par;</span>
+<span class="nc bnc" id="L387" title="All 2 branches missed.">                                if (refork != 0)</span>
+<span class="nc" id="L388">                                    par.fork();</span>
+                            }
+<span class="nc" id="L390">                        }</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">                        else if (par.compareAndSetPendingCount(b, b|state))</span>
+<span class="nc" id="L392">                            break outer;                      // sib not ready</span>
+<span class="nc" id="L393">                    }</span>
+                }
+            }
+<span class="nc" id="L396">        }</span>
+    }
+
+    static final class DoubleCumulateTask extends CountedCompleter&lt;Void&gt; {
+        final double[] array;
+        final DoubleBinaryOperator function;
+        DoubleCumulateTask left, right;
+        double in, out;
+        final int lo, hi, origin, fence, threshold;
+
+        /** Root task constructor */
+        public DoubleCumulateTask(DoubleCumulateTask parent,
+                                  DoubleBinaryOperator function,
+                                  double[] array, int lo, int hi) {
+<span class="nc" id="L410">            super(parent);</span>
+<span class="nc" id="L411">            this.function = function; this.array = array;</span>
+<span class="nc" id="L412">            this.lo = this.origin = lo; this.hi = this.fence = hi;</span>
+            int p;
+<span class="nc" id="L414">            this.threshold =</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">                    (p = (hi - lo) / (ForkJoinPool.getCommonPoolParallelism() &lt;&lt; 3))</span>
+                    &lt;= MIN_PARTITION ? MIN_PARTITION : p;
+<span class="nc" id="L417">        }</span>
+
+        /** Subtask constructor */
+        DoubleCumulateTask(DoubleCumulateTask parent, DoubleBinaryOperator function,
+                           double[] array, int origin, int fence, int threshold,
+                           int lo, int hi) {
+<span class="nc" id="L423">            super(parent);</span>
+<span class="nc" id="L424">            this.function = function; this.array = array;</span>
+<span class="nc" id="L425">            this.origin = origin; this.fence = fence;</span>
+<span class="nc" id="L426">            this.threshold = threshold;</span>
+<span class="nc" id="L427">            this.lo = lo; this.hi = hi;</span>
+<span class="nc" id="L428">        }</span>
+
+        public final void compute() {
+            final DoubleBinaryOperator fn;
+            final double[] a;
+<span class="nc bnc" id="L433" title="All 4 branches missed.">            if ((fn = this.function) == null || (a = this.array) == null)</span>
+<span class="nc" id="L434">                throw new NullPointerException();    // hoist checks</span>
+<span class="nc" id="L435">            int th = threshold, org = origin, fnc = fence, l, h;</span>
+<span class="nc" id="L436">            DoubleCumulateTask t = this;</span>
+<span class="nc bnc" id="L437" title="All 4 branches missed.">            outer: while ((l = t.lo) &gt;= 0 &amp;&amp; (h = t.hi) &lt;= a.length) {</span>
+<span class="nc bnc" id="L438" title="All 2 branches missed.">                if (h - l &gt; th) {</span>
+<span class="nc" id="L439">                    DoubleCumulateTask lt = t.left, rt = t.right, f;</span>
+<span class="nc bnc" id="L440" title="All 2 branches missed.">                    if (lt == null) {                // first pass</span>
+<span class="nc" id="L441">                        int mid = (l + h) &gt;&gt;&gt; 1;</span>
+<span class="nc" id="L442">                        f = rt = t.right =</span>
+                                new DoubleCumulateTask(t, fn, a, org, fnc, th, mid, h);
+<span class="nc" id="L444">                        t = lt = t.left  =</span>
+                                new DoubleCumulateTask(t, fn, a, org, fnc, th, l, mid);
+<span class="nc" id="L446">                    }</span>
+                    else {                           // possibly refork
+<span class="nc" id="L448">                        double pin = t.in;</span>
+<span class="nc" id="L449">                        lt.in = pin;</span>
+<span class="nc" id="L450">                        f = t = null;</span>
+<span class="nc bnc" id="L451" title="All 2 branches missed.">                        if (rt != null) {</span>
+<span class="nc" id="L452">                            double lout = lt.out;</span>
+<span class="nc bnc" id="L453" title="All 2 branches missed.">                            rt.in = (l == org ? lout :</span>
+<span class="nc" id="L454">                                     fn.applyAsDouble(pin, lout));</span>
+                            for (int c;;) {
+<span class="nc bnc" id="L456" title="All 2 branches missed.">                                if (((c = rt.getPendingCount()) &amp; CUMULATE) != 0)</span>
+<span class="nc" id="L457">                                    break;</span>
+<span class="nc bnc" id="L458" title="All 2 branches missed.">                                if (rt.compareAndSetPendingCount(c, c|CUMULATE)){</span>
+<span class="nc" id="L459">                                    t = rt;</span>
+<span class="nc" id="L460">                                    break;</span>
+                                }
+                            }
+                        }
+                        for (int c;;) {
+<span class="nc bnc" id="L465" title="All 2 branches missed.">                            if (((c = lt.getPendingCount()) &amp; CUMULATE) != 0)</span>
+<span class="nc" id="L466">                                break;</span>
+<span class="nc bnc" id="L467" title="All 2 branches missed.">                            if (lt.compareAndSetPendingCount(c, c|CUMULATE)) {</span>
+<span class="nc bnc" id="L468" title="All 2 branches missed.">                                if (t != null)</span>
+<span class="nc" id="L469">                                    f = t;</span>
+<span class="nc" id="L470">                                t = lt;</span>
+<span class="nc" id="L471">                                break;</span>
+                            }
+                        }
+<span class="nc bnc" id="L474" title="All 2 branches missed.">                        if (t == null)</span>
+<span class="nc" id="L475">                            break;</span>
+                    }
+<span class="nc bnc" id="L477" title="All 2 branches missed.">                    if (f != null)</span>
+<span class="nc" id="L478">                        f.fork();</span>
+<span class="nc" id="L479">                }</span>
+                else {
+                    int state; // Transition to sum, cumulate, or both
+                    for (int b;;) {
+<span class="nc bnc" id="L483" title="All 2 branches missed.">                        if (((b = t.getPendingCount()) &amp; FINISHED) != 0)</span>
+<span class="nc" id="L484">                            break outer;                      // already done</span>
+<span class="nc bnc" id="L485" title="All 4 branches missed.">                        state = ((b &amp; CUMULATE) != 0? FINISHED :</span>
+                                 (l &gt; org) ? SUMMED : (SUMMED|FINISHED));
+<span class="nc bnc" id="L487" title="All 2 branches missed.">                        if (t.compareAndSetPendingCount(b, b|state))</span>
+<span class="nc" id="L488">                            break;</span>
+                    }
+
+                    double sum;
+<span class="nc bnc" id="L492" title="All 2 branches missed.">                    if (state != SUMMED) {</span>
+                        int first;
+<span class="nc bnc" id="L494" title="All 2 branches missed.">                        if (l == org) {                       // leftmost; no in</span>
+<span class="nc" id="L495">                            sum = a[org];</span>
+<span class="nc" id="L496">                            first = org + 1;</span>
+                        }
+                        else {
+<span class="nc" id="L499">                            sum = t.in;</span>
+<span class="nc" id="L500">                            first = l;</span>
+                        }
+<span class="nc bnc" id="L502" title="All 2 branches missed.">                        for (int i = first; i &lt; h; ++i)       // cumulate</span>
+<span class="nc" id="L503">                            a[i] = sum = fn.applyAsDouble(sum, a[i]);</span>
+<span class="nc" id="L504">                    }</span>
+<span class="nc bnc" id="L505" title="All 2 branches missed.">                    else if (h &lt; fnc) {                       // skip rightmost</span>
+<span class="nc" id="L506">                        sum = a[l];</span>
+<span class="nc bnc" id="L507" title="All 2 branches missed.">                        for (int i = l + 1; i &lt; h; ++i)       // sum only</span>
+<span class="nc" id="L508">                            sum = fn.applyAsDouble(sum, a[i]);</span>
+                    }
+                    else
+<span class="nc" id="L511">                        sum = t.in;</span>
+<span class="nc" id="L512">                    t.out = sum;</span>
+                    for (DoubleCumulateTask par;;) {            // propagate
+<span class="nc bnc" id="L514" title="All 2 branches missed.">                        if ((par = (DoubleCumulateTask)t.getCompleter()) == null) {</span>
+<span class="nc bnc" id="L515" title="All 2 branches missed.">                            if ((state &amp; FINISHED) != 0)      // enable join</span>
+<span class="nc" id="L516">                                t.quietlyComplete();</span>
+                            break outer;
+                        }
+<span class="nc" id="L519">                        int b = par.getPendingCount();</span>
+<span class="nc bnc" id="L520" title="All 2 branches missed.">                        if ((b &amp; state &amp; FINISHED) != 0)</span>
+<span class="nc" id="L521">                            t = par;                          // both done</span>
+<span class="nc bnc" id="L522" title="All 2 branches missed.">                        else if ((b &amp; state &amp; SUMMED) != 0) { // both summed</span>
+                            int nextState; DoubleCumulateTask lt, rt;
+<span class="nc bnc" id="L524" title="All 4 branches missed.">                            if ((lt = par.left) != null &amp;&amp;</span>
+                                (rt = par.right) != null) {
+<span class="nc" id="L526">                                double lout = lt.out;</span>
+<span class="nc bnc" id="L527" title="All 2 branches missed.">                                par.out = (rt.hi == fnc ? lout :</span>
+<span class="nc" id="L528">                                           fn.applyAsDouble(lout, rt.out));</span>
+                            }
+<span class="nc bnc" id="L530" title="All 4 branches missed.">                            int refork = (((b &amp; CUMULATE) == 0 &amp;&amp;</span>
+                                           par.lo == org) ? CUMULATE : 0);
+<span class="nc bnc" id="L532" title="All 2 branches missed.">                            if ((nextState = b|state|refork) == b ||</span>
+<span class="nc bnc" id="L533" title="All 2 branches missed.">                                par.compareAndSetPendingCount(b, nextState)) {</span>
+<span class="nc" id="L534">                                state = SUMMED;               // drop finished</span>
+<span class="nc" id="L535">                                t = par;</span>
+<span class="nc bnc" id="L536" title="All 2 branches missed.">                                if (refork != 0)</span>
+<span class="nc" id="L537">                                    par.fork();</span>
+                            }
+<span class="nc" id="L539">                        }</span>
+<span class="nc bnc" id="L540" title="All 2 branches missed.">                        else if (par.compareAndSetPendingCount(b, b|state))</span>
+<span class="nc" id="L541">                            break outer;                      // sib not ready</span>
+<span class="nc" id="L542">                    }</span>
+                }
+            }
+<span class="nc" id="L545">        }</span>
+    }
+
+    static final class IntCumulateTask extends CountedCompleter&lt;Void&gt; {
+        final int[] array;
+        final IntBinaryOperator function;
+        IntCumulateTask left, right;
+        int in, out;
+        final int lo, hi, origin, fence, threshold;
+
+        /** Root task constructor */
+        public IntCumulateTask(IntCumulateTask parent,
+                               IntBinaryOperator function,
+                               int[] array, int lo, int hi) {
+<span class="nc" id="L559">            super(parent);</span>
+<span class="nc" id="L560">            this.function = function; this.array = array;</span>
+<span class="nc" id="L561">            this.lo = this.origin = lo; this.hi = this.fence = hi;</span>
+            int p;
+<span class="nc" id="L563">            this.threshold =</span>
+<span class="nc bnc" id="L564" title="All 2 branches missed.">                    (p = (hi - lo) / (ForkJoinPool.getCommonPoolParallelism() &lt;&lt; 3))</span>
+                    &lt;= MIN_PARTITION ? MIN_PARTITION : p;
+<span class="nc" id="L566">        }</span>
+
+        /** Subtask constructor */
+        IntCumulateTask(IntCumulateTask parent, IntBinaryOperator function,
+                        int[] array, int origin, int fence, int threshold,
+                        int lo, int hi) {
+<span class="nc" id="L572">            super(parent);</span>
+<span class="nc" id="L573">            this.function = function; this.array = array;</span>
+<span class="nc" id="L574">            this.origin = origin; this.fence = fence;</span>
+<span class="nc" id="L575">            this.threshold = threshold;</span>
+<span class="nc" id="L576">            this.lo = lo; this.hi = hi;</span>
+<span class="nc" id="L577">        }</span>
+
+        public final void compute() {
+            final IntBinaryOperator fn;
+            final int[] a;
+<span class="nc bnc" id="L582" title="All 4 branches missed.">            if ((fn = this.function) == null || (a = this.array) == null)</span>
+<span class="nc" id="L583">                throw new NullPointerException();    // hoist checks</span>
+<span class="nc" id="L584">            int th = threshold, org = origin, fnc = fence, l, h;</span>
+<span class="nc" id="L585">            IntCumulateTask t = this;</span>
+<span class="nc bnc" id="L586" title="All 4 branches missed.">            outer: while ((l = t.lo) &gt;= 0 &amp;&amp; (h = t.hi) &lt;= a.length) {</span>
+<span class="nc bnc" id="L587" title="All 2 branches missed.">                if (h - l &gt; th) {</span>
+<span class="nc" id="L588">                    IntCumulateTask lt = t.left, rt = t.right, f;</span>
+<span class="nc bnc" id="L589" title="All 2 branches missed.">                    if (lt == null) {                // first pass</span>
+<span class="nc" id="L590">                        int mid = (l + h) &gt;&gt;&gt; 1;</span>
+<span class="nc" id="L591">                        f = rt = t.right =</span>
+                                new IntCumulateTask(t, fn, a, org, fnc, th, mid, h);
+<span class="nc" id="L593">                        t = lt = t.left  =</span>
+                                new IntCumulateTask(t, fn, a, org, fnc, th, l, mid);
+<span class="nc" id="L595">                    }</span>
+                    else {                           // possibly refork
+<span class="nc" id="L597">                        int pin = t.in;</span>
+<span class="nc" id="L598">                        lt.in = pin;</span>
+<span class="nc" id="L599">                        f = t = null;</span>
+<span class="nc bnc" id="L600" title="All 2 branches missed.">                        if (rt != null) {</span>
+<span class="nc" id="L601">                            int lout = lt.out;</span>
+<span class="nc bnc" id="L602" title="All 2 branches missed.">                            rt.in = (l == org ? lout :</span>
+<span class="nc" id="L603">                                     fn.applyAsInt(pin, lout));</span>
+                            for (int c;;) {
+<span class="nc bnc" id="L605" title="All 2 branches missed.">                                if (((c = rt.getPendingCount()) &amp; CUMULATE) != 0)</span>
+<span class="nc" id="L606">                                    break;</span>
+<span class="nc bnc" id="L607" title="All 2 branches missed.">                                if (rt.compareAndSetPendingCount(c, c|CUMULATE)){</span>
+<span class="nc" id="L608">                                    t = rt;</span>
+<span class="nc" id="L609">                                    break;</span>
+                                }
+                            }
+                        }
+                        for (int c;;) {
+<span class="nc bnc" id="L614" title="All 2 branches missed.">                            if (((c = lt.getPendingCount()) &amp; CUMULATE) != 0)</span>
+<span class="nc" id="L615">                                break;</span>
+<span class="nc bnc" id="L616" title="All 2 branches missed.">                            if (lt.compareAndSetPendingCount(c, c|CUMULATE)) {</span>
+<span class="nc bnc" id="L617" title="All 2 branches missed.">                                if (t != null)</span>
+<span class="nc" id="L618">                                    f = t;</span>
+<span class="nc" id="L619">                                t = lt;</span>
+<span class="nc" id="L620">                                break;</span>
+                            }
+                        }
+<span class="nc bnc" id="L623" title="All 2 branches missed.">                        if (t == null)</span>
+<span class="nc" id="L624">                            break;</span>
+                    }
+<span class="nc bnc" id="L626" title="All 2 branches missed.">                    if (f != null)</span>
+<span class="nc" id="L627">                        f.fork();</span>
+<span class="nc" id="L628">                }</span>
+                else {
+                    int state; // Transition to sum, cumulate, or both
+                    for (int b;;) {
+<span class="nc bnc" id="L632" title="All 2 branches missed.">                        if (((b = t.getPendingCount()) &amp; FINISHED) != 0)</span>
+<span class="nc" id="L633">                            break outer;                      // already done</span>
+<span class="nc bnc" id="L634" title="All 4 branches missed.">                        state = ((b &amp; CUMULATE) != 0? FINISHED :</span>
+                                 (l &gt; org) ? SUMMED : (SUMMED|FINISHED));
+<span class="nc bnc" id="L636" title="All 2 branches missed.">                        if (t.compareAndSetPendingCount(b, b|state))</span>
+<span class="nc" id="L637">                            break;</span>
+                    }
+
+                    int sum;
+<span class="nc bnc" id="L641" title="All 2 branches missed.">                    if (state != SUMMED) {</span>
+                        int first;
+<span class="nc bnc" id="L643" title="All 2 branches missed.">                        if (l == org) {                       // leftmost; no in</span>
+<span class="nc" id="L644">                            sum = a[org];</span>
+<span class="nc" id="L645">                            first = org + 1;</span>
+                        }
+                        else {
+<span class="nc" id="L648">                            sum = t.in;</span>
+<span class="nc" id="L649">                            first = l;</span>
+                        }
+<span class="nc bnc" id="L651" title="All 2 branches missed.">                        for (int i = first; i &lt; h; ++i)       // cumulate</span>
+<span class="nc" id="L652">                            a[i] = sum = fn.applyAsInt(sum, a[i]);</span>
+<span class="nc" id="L653">                    }</span>
+<span class="nc bnc" id="L654" title="All 2 branches missed.">                    else if (h &lt; fnc) {                       // skip rightmost</span>
+<span class="nc" id="L655">                        sum = a[l];</span>
+<span class="nc bnc" id="L656" title="All 2 branches missed.">                        for (int i = l + 1; i &lt; h; ++i)       // sum only</span>
+<span class="nc" id="L657">                            sum = fn.applyAsInt(sum, a[i]);</span>
+                    }
+                    else
+<span class="nc" id="L660">                        sum = t.in;</span>
+<span class="nc" id="L661">                    t.out = sum;</span>
+                    for (IntCumulateTask par;;) {            // propagate
+<span class="nc bnc" id="L663" title="All 2 branches missed.">                        if ((par = (IntCumulateTask)t.getCompleter()) == null) {</span>
+<span class="nc bnc" id="L664" title="All 2 branches missed.">                            if ((state &amp; FINISHED) != 0)      // enable join</span>
+<span class="nc" id="L665">                                t.quietlyComplete();</span>
+                            break outer;
+                        }
+<span class="nc" id="L668">                        int b = par.getPendingCount();</span>
+<span class="nc bnc" id="L669" title="All 2 branches missed.">                        if ((b &amp; state &amp; FINISHED) != 0)</span>
+<span class="nc" id="L670">                            t = par;                          // both done</span>
+<span class="nc bnc" id="L671" title="All 2 branches missed.">                        else if ((b &amp; state &amp; SUMMED) != 0) { // both summed</span>
+                            int nextState; IntCumulateTask lt, rt;
+<span class="nc bnc" id="L673" title="All 4 branches missed.">                            if ((lt = par.left) != null &amp;&amp;</span>
+                                (rt = par.right) != null) {
+<span class="nc" id="L675">                                int lout = lt.out;</span>
+<span class="nc bnc" id="L676" title="All 2 branches missed.">                                par.out = (rt.hi == fnc ? lout :</span>
+<span class="nc" id="L677">                                           fn.applyAsInt(lout, rt.out));</span>
+                            }
+<span class="nc bnc" id="L679" title="All 4 branches missed.">                            int refork = (((b &amp; CUMULATE) == 0 &amp;&amp;</span>
+                                           par.lo == org) ? CUMULATE : 0);
+<span class="nc bnc" id="L681" title="All 2 branches missed.">                            if ((nextState = b|state|refork) == b ||</span>
+<span class="nc bnc" id="L682" title="All 2 branches missed.">                                par.compareAndSetPendingCount(b, nextState)) {</span>
+<span class="nc" id="L683">                                state = SUMMED;               // drop finished</span>
+<span class="nc" id="L684">                                t = par;</span>
+<span class="nc bnc" id="L685" title="All 2 branches missed.">                                if (refork != 0)</span>
+<span class="nc" id="L686">                                    par.fork();</span>
+                            }
+<span class="nc" id="L688">                        }</span>
+<span class="nc bnc" id="L689" title="All 2 branches missed.">                        else if (par.compareAndSetPendingCount(b, b|state))</span>
+<span class="nc" id="L690">                            break outer;                      // sib not ready</span>
+<span class="nc" id="L691">                    }</span>
+                }
+            }
+<span class="nc" id="L694">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

@@ -1,0 +1,361 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>OCSP.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.provider.certpath</a> &gt; <span class="el_source">OCSP.java</span></div><h1>OCSP.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2009, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package sun.security.provider.certpath;
+
+import java.io.InputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.URI;
+import java.net.URL;
+import java.net.HttpURLConnection;
+import java.security.cert.CertificateException;
+import java.security.cert.CertPathValidatorException;
+import java.security.cert.CertPathValidatorException.BasicReason;
+import java.security.cert.CRLReason;
+import java.security.cert.Extension;
+import java.security.cert.X509Certificate;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Date;
+import java.util.List;
+import java.util.Map;
+
+import static sun.security.provider.certpath.OCSPResponse.*;
+import sun.security.action.GetIntegerAction;
+import sun.security.util.Debug;
+import sun.security.util.ObjectIdentifier;
+import sun.security.x509.AccessDescription;
+import sun.security.x509.AuthorityInfoAccessExtension;
+import sun.security.x509.GeneralName;
+import sun.security.x509.GeneralNameInterface;
+import sun.security.x509.URIName;
+import sun.security.x509.X509CertImpl;
+
+/**
+ * This is a class that checks the revocation status of a certificate(s) using
+ * OCSP. It is not a PKIXCertPathChecker and therefore can be used outside of
+ * the CertPathValidator framework. It is useful when you want to
+ * just check the revocation status of a certificate, and you don't want to
+ * incur the overhead of validating all of the certificates in the
+ * associated certificate chain.
+ *
+ * @author Sean Mullan
+ */
+public final class OCSP {
+
+<span class="nc" id="L68">    static final ObjectIdentifier NONCE_EXTENSION_OID =</span>
+<span class="nc" id="L69">        ObjectIdentifier.newInternal(new int[]{ 1, 3, 6, 1, 5, 5, 7, 48, 1, 2});</span>
+
+<span class="nc" id="L71">    private static final Debug debug = Debug.getInstance(&quot;certpath&quot;);</span>
+
+    private static final int DEFAULT_CONNECT_TIMEOUT = 15000;
+
+    /**
+     * Integer value indicating the timeout length, in seconds, to be
+     * used for the OCSP check. A timeout of zero is interpreted as
+     * an infinite timeout.
+     */
+<span class="nc" id="L80">    private static final int CONNECT_TIMEOUT = initializeTimeout();</span>
+
+    /**
+     * Initialize the timeout length by getting the OCSP timeout
+     * system property. If the property has not been set, or if its
+     * value is negative, set the timeout length to the default.
+     */
+    private static int initializeTimeout() {
+<span class="nc" id="L88">        Integer tmp = java.security.AccessController.doPrivileged(</span>
+                new GetIntegerAction(&quot;com.sun.security.ocsp.timeout&quot;));
+<span class="nc bnc" id="L90" title="All 4 branches missed.">        if (tmp == null || tmp &lt; 0) {</span>
+<span class="nc" id="L91">            return DEFAULT_CONNECT_TIMEOUT;</span>
+        }
+        // Convert to milliseconds, as the system property will be
+        // specified in seconds
+<span class="nc" id="L95">        return tmp * 1000;</span>
+    }
+
+<span class="nc" id="L98">    private OCSP() {}</span>
+
+    /**
+     * Obtains the revocation status of a certificate using OCSP using the most
+     * common defaults. The OCSP responder URI is retrieved from the
+     * certificate's AIA extension. The OCSP responder certificate is assumed
+     * to be the issuer's certificate (or issued by the issuer CA).
+     *
+     * @param cert the certificate to be checked
+     * @param issuerCert the issuer certificate
+     * @return the RevocationStatus
+     * @throws IOException if there is an exception connecting to or
+     *    communicating with the OCSP responder
+     * @throws CertPathValidatorException if an exception occurs while
+     *    encoding the OCSP Request or validating the OCSP Response
+     */
+    public static RevocationStatus check(X509Certificate cert,
+                                         X509Certificate issuerCert)
+        throws IOException, CertPathValidatorException {
+<span class="nc" id="L117">        CertId certId = null;</span>
+<span class="nc" id="L118">        URI responderURI = null;</span>
+        try {
+<span class="nc" id="L120">            X509CertImpl certImpl = X509CertImpl.toImpl(cert);</span>
+<span class="nc" id="L121">            responderURI = getResponderURI(certImpl);</span>
+<span class="nc bnc" id="L122" title="All 2 branches missed.">            if (responderURI == null) {</span>
+<span class="nc" id="L123">                throw new CertPathValidatorException</span>
+                    (&quot;No OCSP Responder URI in certificate&quot;);
+            }
+<span class="nc" id="L126">            certId = new CertId(issuerCert, certImpl.getSerialNumberObject());</span>
+<span class="nc" id="L127">        } catch (CertificateException | IOException e) {</span>
+<span class="nc" id="L128">            throw new CertPathValidatorException</span>
+                (&quot;Exception while encoding OCSPRequest&quot;, e);
+<span class="nc" id="L130">        }</span>
+<span class="nc" id="L131">        OCSPResponse ocspResponse = check(Collections.singletonList(certId),</span>
+<span class="nc" id="L132">            responderURI, issuerCert, null, Collections.&lt;Extension&gt;emptyList());</span>
+<span class="nc" id="L133">        return (RevocationStatus)ocspResponse.getSingleResponse(certId);</span>
+    }
+
+    /**
+     * Obtains the revocation status of a certificate using OCSP.
+     *
+     * @param cert the certificate to be checked
+     * @param issuerCert the issuer certificate
+     * @param responderURI the URI of the OCSP responder
+     * @param responderCert the OCSP responder's certificate
+     * @param date the time the validity of the OCSP responder's certificate
+     *    should be checked against. If null, the current time is used.
+     * @return the RevocationStatus
+     * @throws IOException if there is an exception connecting to or
+     *    communicating with the OCSP responder
+     * @throws CertPathValidatorException if an exception occurs while
+     *    encoding the OCSP Request or validating the OCSP Response
+     */
+    public static RevocationStatus check(X509Certificate cert,
+                                         X509Certificate issuerCert,
+                                         URI responderURI,
+                                         X509Certificate responderCert,
+                                         Date date)
+        throws IOException, CertPathValidatorException
+    {
+<span class="nc" id="L158">        return check(cert, issuerCert, responderURI, responderCert, date,</span>
+<span class="nc" id="L159">                     Collections.&lt;Extension&gt;emptyList());</span>
+    }
+
+    // Called by com.sun.deploy.security.TrustDecider
+    public static RevocationStatus check(X509Certificate cert,
+                                         X509Certificate issuerCert,
+                                         URI responderURI,
+                                         X509Certificate responderCert,
+                                         Date date, List&lt;Extension&gt; extensions)
+        throws IOException, CertPathValidatorException
+    {
+<span class="nc" id="L170">        CertId certId = null;</span>
+        try {
+<span class="nc" id="L172">            X509CertImpl certImpl = X509CertImpl.toImpl(cert);</span>
+<span class="nc" id="L173">            certId = new CertId(issuerCert, certImpl.getSerialNumberObject());</span>
+<span class="nc" id="L174">        } catch (CertificateException | IOException e) {</span>
+<span class="nc" id="L175">            throw new CertPathValidatorException</span>
+                (&quot;Exception while encoding OCSPRequest&quot;, e);
+<span class="nc" id="L177">        }</span>
+<span class="nc" id="L178">        OCSPResponse ocspResponse = check(Collections.singletonList(certId),</span>
+            responderURI, responderCert, date, extensions);
+<span class="nc" id="L180">        return (RevocationStatus) ocspResponse.getSingleResponse(certId);</span>
+    }
+
+    /**
+     * Checks the revocation status of a list of certificates using OCSP.
+     *
+     * @param certs the CertIds to be checked
+     * @param responderURI the URI of the OCSP responder
+     * @param responderCert the OCSP responder's certificate
+     * @param date the time the validity of the OCSP responder's certificate
+     *    should be checked against. If null, the current time is used.
+     * @return the OCSPResponse
+     * @throws IOException if there is an exception connecting to or
+     *    communicating with the OCSP responder
+     * @throws CertPathValidatorException if an exception occurs while
+     *    encoding the OCSP Request or validating the OCSP Response
+     */
+    static OCSPResponse check(List&lt;CertId&gt; certIds, URI responderURI,
+                              X509Certificate responderCert, Date date,
+                              List&lt;Extension&gt; extensions)
+        throws IOException, CertPathValidatorException
+    {
+<span class="nc" id="L202">        byte[] bytes = null;</span>
+<span class="nc" id="L203">        OCSPRequest request = null;</span>
+        try {
+<span class="nc" id="L205">            request = new OCSPRequest(certIds, extensions);</span>
+<span class="nc" id="L206">            bytes = request.encodeBytes();</span>
+<span class="nc" id="L207">        } catch (IOException ioe) {</span>
+<span class="nc" id="L208">            throw new CertPathValidatorException</span>
+                (&quot;Exception while encoding OCSPRequest&quot;, ioe);
+<span class="nc" id="L210">        }</span>
+
+<span class="nc" id="L212">        InputStream in = null;</span>
+<span class="nc" id="L213">        OutputStream out = null;</span>
+<span class="nc" id="L214">        byte[] response = null;</span>
+        try {
+<span class="nc" id="L216">            URL url = responderURI.toURL();</span>
+<span class="nc bnc" id="L217" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L218">                debug.println(&quot;connecting to OCSP service at: &quot; + url);</span>
+            }
+<span class="nc" id="L220">            HttpURLConnection con = (HttpURLConnection)url.openConnection();</span>
+<span class="nc" id="L221">            con.setConnectTimeout(CONNECT_TIMEOUT);</span>
+<span class="nc" id="L222">            con.setReadTimeout(CONNECT_TIMEOUT);</span>
+<span class="nc" id="L223">            con.setDoOutput(true);</span>
+<span class="nc" id="L224">            con.setDoInput(true);</span>
+<span class="nc" id="L225">            con.setRequestMethod(&quot;POST&quot;);</span>
+<span class="nc" id="L226">            con.setRequestProperty</span>
+<span class="nc" id="L227">                (&quot;Content-type&quot;, &quot;application/ocsp-request&quot;);</span>
+<span class="nc" id="L228">            con.setRequestProperty</span>
+<span class="nc" id="L229">                (&quot;Content-length&quot;, String.valueOf(bytes.length));</span>
+<span class="nc" id="L230">            out = con.getOutputStream();</span>
+<span class="nc" id="L231">            out.write(bytes);</span>
+<span class="nc" id="L232">            out.flush();</span>
+            // Check the response
+<span class="nc bnc" id="L234" title="All 2 branches missed.">            if (debug != null &amp;&amp;</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">                con.getResponseCode() != HttpURLConnection.HTTP_OK) {</span>
+<span class="nc" id="L236">                debug.println(&quot;Received HTTP error: &quot; + con.getResponseCode()</span>
+<span class="nc" id="L237">                    + &quot; - &quot; + con.getResponseMessage());</span>
+            }
+<span class="nc" id="L239">            in = con.getInputStream();</span>
+<span class="nc" id="L240">            int contentLength = con.getContentLength();</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">            if (contentLength == -1) {</span>
+<span class="nc" id="L242">                contentLength = Integer.MAX_VALUE;</span>
+            }
+<span class="nc bnc" id="L244" title="All 2 branches missed.">            response = new byte[contentLength &gt; 2048 ? 2048 : contentLength];</span>
+<span class="nc" id="L245">            int total = 0;</span>
+<span class="nc bnc" id="L246" title="All 2 branches missed.">            while (total &lt; contentLength) {</span>
+<span class="nc" id="L247">                int count = in.read(response, total, response.length - total);</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">                if (count &lt; 0)</span>
+<span class="nc" id="L249">                    break;</span>
+
+<span class="nc" id="L251">                total += count;</span>
+<span class="nc bnc" id="L252" title="All 4 branches missed.">                if (total &gt;= response.length &amp;&amp; total &lt; contentLength) {</span>
+<span class="nc" id="L253">                    response = Arrays.copyOf(response, total * 2);</span>
+                }
+<span class="nc" id="L255">            }</span>
+<span class="nc" id="L256">            response = Arrays.copyOf(response, total);</span>
+<span class="nc" id="L257">        } catch (IOException ioe) {</span>
+<span class="nc" id="L258">            throw new CertPathValidatorException(</span>
+                &quot;Unable to determine revocation status due to network error&quot;,
+                ioe, null, -1, BasicReason.UNDETERMINED_REVOCATION_STATUS);
+        } finally {
+<span class="nc bnc" id="L262" title="All 4 branches missed.">            if (in != null) {</span>
+                try {
+<span class="nc" id="L264">                    in.close();</span>
+<span class="nc" id="L265">                } catch (IOException ioe) {</span>
+<span class="nc" id="L266">                    throw ioe;</span>
+<span class="nc" id="L267">                }</span>
+            }
+<span class="nc bnc" id="L269" title="All 4 branches missed.">            if (out != null) {</span>
+                try {
+<span class="nc" id="L271">                    out.close();</span>
+<span class="nc" id="L272">                } catch (IOException ioe) {</span>
+<span class="nc" id="L273">                    throw ioe;</span>
+<span class="nc" id="L274">                }</span>
+            }
+        }
+
+<span class="nc" id="L278">        OCSPResponse ocspResponse = null;</span>
+        try {
+<span class="nc" id="L280">            ocspResponse = new OCSPResponse(response);</span>
+<span class="nc" id="L281">        } catch (IOException ioe) {</span>
+            // response decoding exception
+<span class="nc" id="L283">            throw new CertPathValidatorException(ioe);</span>
+<span class="nc" id="L284">        }</span>
+
+        // verify the response
+<span class="nc" id="L287">        ocspResponse.verify(certIds, responderCert, date, request.getNonce());</span>
+
+<span class="nc" id="L289">        return ocspResponse;</span>
+    }
+
+    /**
+     * Returns the URI of the OCSP Responder as specified in the
+     * certificate's Authority Information Access extension, or null if
+     * not specified.
+     *
+     * @param cert the certificate
+     * @return the URI of the OCSP Responder, or null if not specified
+     */
+    // Called by com.sun.deploy.security.TrustDecider
+    public static URI getResponderURI(X509Certificate cert) {
+        try {
+<span class="nc" id="L303">            return getResponderURI(X509CertImpl.toImpl(cert));</span>
+<span class="nc" id="L304">        } catch (CertificateException ce) {</span>
+            // treat this case as if the cert had no extension
+<span class="nc" id="L306">            return null;</span>
+        }
+    }
+
+    static URI getResponderURI(X509CertImpl certImpl) {
+
+        // Examine the certificate's AuthorityInfoAccess extension
+<span class="nc" id="L313">        AuthorityInfoAccessExtension aia =</span>
+<span class="nc" id="L314">            certImpl.getAuthorityInfoAccessExtension();</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">        if (aia == null) {</span>
+<span class="nc" id="L316">            return null;</span>
+        }
+
+<span class="nc" id="L319">        List&lt;AccessDescription&gt; descriptions = aia.getAccessDescriptions();</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">        for (AccessDescription description : descriptions) {</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">            if (description.getAccessMethod().equals((Object)</span>
+                AccessDescription.Ad_OCSP_Id)) {
+
+<span class="nc" id="L324">                GeneralName generalName = description.getAccessLocation();</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">                if (generalName.getType() == GeneralNameInterface.NAME_URI) {</span>
+<span class="nc" id="L326">                    URIName uri = (URIName) generalName.getName();</span>
+<span class="nc" id="L327">                    return uri.getURI();</span>
+                }
+            }
+<span class="nc" id="L330">        }</span>
+<span class="nc" id="L331">        return null;</span>
+    }
+
+    /**
+     * The Revocation Status of a certificate.
+     */
+    public static interface RevocationStatus {
+<span class="nc" id="L338">        public enum CertStatus { GOOD, REVOKED, UNKNOWN };</span>
+
+        /**
+         * Returns the revocation status.
+         */
+        CertStatus getCertStatus();
+        /**
+         * Returns the time when the certificate was revoked, or null
+         * if it has not been revoked.
+         */
+        Date getRevocationTime();
+        /**
+         * Returns the reason the certificate was revoked, or null if it
+         * has not been revoked.
+         */
+        CRLReason getRevocationReason();
+
+        /**
+         * Returns a Map of additional extensions.
+         */
+        Map&lt;String, Extension&gt; getSingleExtensions();
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

@@ -1,0 +1,1346 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>EventQueue.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">java.awt</a> &gt; <span class="el_source">EventQueue.java</span></div><h1>EventQueue.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1996, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package java.awt;
+
+import java.awt.event.*;
+
+import java.awt.peer.ComponentPeer;
+
+import java.lang.ref.WeakReference;
+import java.lang.reflect.InvocationTargetException;
+
+import java.security.AccessController;
+import java.security.PrivilegedAction;
+
+import java.util.EmptyStackException;
+
+import sun.awt.*;
+import sun.awt.dnd.SunDropTargetEvent;
+import sun.util.logging.PlatformLogger;
+
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import java.security.AccessControlContext;
+
+import sun.misc.SharedSecrets;
+import sun.misc.JavaSecurityAccess;
+
+/**
+ * &lt;code&gt;EventQueue&lt;/code&gt; is a platform-independent class
+ * that queues events, both from the underlying peer classes
+ * and from trusted application classes.
+ * &lt;p&gt;
+ * It encapsulates asynchronous event dispatch machinery which
+ * extracts events from the queue and dispatches them by calling
+ * {@link #dispatchEvent(AWTEvent) dispatchEvent(AWTEvent)} method
+ * on this &lt;code&gt;EventQueue&lt;/code&gt; with the event to be dispatched
+ * as an argument.  The particular behavior of this machinery is
+ * implementation-dependent.  The only requirements are that events
+ * which were actually enqueued to this queue (note that events
+ * being posted to the &lt;code&gt;EventQueue&lt;/code&gt; can be coalesced)
+ * are dispatched:
+ * &lt;dl&gt;
+ *   &lt;dt&gt; Sequentially.
+ *   &lt;dd&gt; That is, it is not permitted that several events from
+ *        this queue are dispatched simultaneously.
+ *   &lt;dt&gt; In the same order as they are enqueued.
+ *   &lt;dd&gt; That is, if &lt;code&gt;AWTEvent&lt;/code&gt;&amp;nbsp;A is enqueued
+ *        to the &lt;code&gt;EventQueue&lt;/code&gt; before
+ *        &lt;code&gt;AWTEvent&lt;/code&gt;&amp;nbsp;B then event B will not be
+ *        dispatched before event A.
+ * &lt;/dl&gt;
+ * &lt;p&gt;
+ * Some browsers partition applets in different code bases into
+ * separate contexts, and establish walls between these contexts.
+ * In such a scenario, there will be one &lt;code&gt;EventQueue&lt;/code&gt;
+ * per context. Other browsers place all applets into the same
+ * context, implying that there will be only a single, global
+ * &lt;code&gt;EventQueue&lt;/code&gt; for all applets. This behavior is
+ * implementation-dependent.  Consult your browser's documentation
+ * for more information.
+ * &lt;p&gt;
+ * For information on the threading issues of the event dispatch
+ * machinery, see &lt;a href=&quot;doc-files/AWTThreadIssues.html#Autoshutdown&quot;
+ * &gt;AWT Threading Issues&lt;/a&gt;.
+ *
+ * @author Thomas Ball
+ * @author Fred Ecks
+ * @author David Mendenhall
+ *
+ * @since       1.1
+ */
+public class EventQueue {
+<span class="fc" id="L98">    private static final AtomicInteger threadInitNumber = new AtomicInteger(0);</span>
+
+    private static final int LOW_PRIORITY = 0;
+    private static final int NORM_PRIORITY = 1;
+    private static final int HIGH_PRIORITY = 2;
+    private static final int ULTIMATE_PRIORITY = 3;
+
+    private static final int NUM_PRIORITIES = ULTIMATE_PRIORITY + 1;
+
+    /*
+     * We maintain one Queue for each priority that the EventQueue supports.
+     * That is, the EventQueue object is actually implemented as
+     * NUM_PRIORITIES queues and all Events on a particular internal Queue
+     * have identical priority. Events are pulled off the EventQueue starting
+     * with the Queue of highest priority. We progress in decreasing order
+     * across all Queues.
+     */
+<span class="fc" id="L115">    private Queue[] queues = new Queue[NUM_PRIORITIES];</span>
+
+    /*
+     * The next EventQueue on the stack, or null if this EventQueue is
+     * on the top of the stack.  If nextQueue is non-null, requests to post
+     * an event are forwarded to nextQueue.
+     */
+    private EventQueue nextQueue;
+
+    /*
+     * The previous EventQueue on the stack, or null if this is the
+     * &quot;base&quot; EventQueue.
+     */
+    private EventQueue previousQueue;
+
+    /*
+     * A single lock to synchronize the push()/pop() and related operations with
+     * all the EventQueues from the AppContext. Synchronization on any particular
+     * event queue(s) is not enough: we should lock the whole stack.
+     */
+    private final Lock pushPopLock;
+    private final Condition pushPopCond;
+
+    /*
+     * Dummy runnable to wake up EDT from getNextEvent() after
+     push/pop is performed
+     */
+<span class="fc" id="L142">    private final static Runnable dummyRunnable = new Runnable() {</span>
+        public void run() {
+<span class="nc" id="L144">        }</span>
+    };
+
+    private EventDispatchThread dispatchThread;
+
+<span class="fc" id="L149">    private final ThreadGroup threadGroup =</span>
+<span class="fc" id="L150">        Thread.currentThread().getThreadGroup();</span>
+<span class="fc" id="L151">    private final ClassLoader classLoader =</span>
+<span class="fc" id="L152">        Thread.currentThread().getContextClassLoader();</span>
+
+    /*
+     * The time stamp of the last dispatched InputEvent or ActionEvent.
+     */
+<span class="fc" id="L157">    private long mostRecentEventTime = System.currentTimeMillis();</span>
+
+    /*
+     * The time stamp of the last KeyEvent .
+     */
+<span class="fc" id="L162">    private long mostRecentKeyEventTime = System.currentTimeMillis();</span>
+
+    /**
+     * The modifiers field of the current event, if the current event is an
+     * InputEvent or ActionEvent.
+     */
+    private WeakReference&lt;AWTEvent&gt; currentEvent;
+
+    /*
+     * Non-zero if a thread is waiting in getNextEvent(int) for an event of
+     * a particular ID to be posted to the queue.
+     */
+    private volatile int waitForID;
+
+    /*
+     * AppContext corresponding to the queue.
+     */
+    private final AppContext appContext;
+
+<span class="fc" id="L181">    private final String name = &quot;AWT-EventQueue-&quot; + threadInitNumber.getAndIncrement();</span>
+
+    private FwDispatcher fwDispatcher;
+
+<span class="fc" id="L185">    private static final PlatformLogger eventLog = PlatformLogger.getLogger(&quot;java.awt.event.EventQueue&quot;);</span>
+
+    static {
+<span class="fc" id="L188">        AWTAccessor.setEventQueueAccessor(</span>
+<span class="fc" id="L189">            new AWTAccessor.EventQueueAccessor() {</span>
+                public Thread getDispatchThread(EventQueue eventQueue) {
+<span class="nc" id="L191">                    return eventQueue.getDispatchThread();</span>
+                }
+                public boolean isDispatchThreadImpl(EventQueue eventQueue) {
+<span class="nc" id="L194">                    return eventQueue.isDispatchThreadImpl();</span>
+                }
+                public void removeSourceEvents(EventQueue eventQueue,
+                                               Object source,
+                                               boolean removeAllEvents)
+                {
+<span class="nc" id="L200">                    eventQueue.removeSourceEvents(source, removeAllEvents);</span>
+<span class="nc" id="L201">                }</span>
+                public boolean noEvents(EventQueue eventQueue) {
+<span class="nc" id="L203">                    return eventQueue.noEvents();</span>
+                }
+                public void wakeup(EventQueue eventQueue, boolean isShutdown) {
+<span class="nc" id="L206">                    eventQueue.wakeup(isShutdown);</span>
+<span class="nc" id="L207">                }</span>
+                public void invokeAndWait(Object source, Runnable r)
+                    throws InterruptedException, InvocationTargetException
+                {
+<span class="nc" id="L211">                    EventQueue.invokeAndWait(source, r);</span>
+<span class="nc" id="L212">                }</span>
+                public void setFwDispatcher(EventQueue eventQueue,
+                                            FwDispatcher dispatcher) {
+<span class="nc" id="L215">                    eventQueue.setFwDispatcher(dispatcher);</span>
+<span class="nc" id="L216">                }</span>
+            });
+    }
+
+<span class="fc" id="L220">    public EventQueue() {</span>
+<span class="fc bfc" id="L221" title="All 2 branches covered.">        for (int i = 0; i &lt; NUM_PRIORITIES; i++) {</span>
+<span class="fc" id="L222">            queues[i] = new Queue();</span>
+        }
+        /*
+         * NOTE: if you ever have to start the associated event dispatch
+         * thread at this point, be aware of the following problem:
+         * If this EventQueue instance is created in
+         * SunToolkit.createNewAppContext() the started dispatch thread
+         * may call AppContext.getAppContext() before createNewAppContext()
+         * completes thus causing mess in thread group to appcontext mapping.
+         */
+
+<span class="fc" id="L233">        appContext = AppContext.getAppContext();</span>
+<span class="fc" id="L234">        pushPopLock = (Lock)appContext.get(AppContext.EVENT_QUEUE_LOCK_KEY);</span>
+<span class="fc" id="L235">        pushPopCond = (Condition)appContext.get(AppContext.EVENT_QUEUE_COND_KEY);</span>
+<span class="fc" id="L236">    }</span>
+
+    /**
+     * Posts a 1.1-style event to the &lt;code&gt;EventQueue&lt;/code&gt;.
+     * If there is an existing event on the queue with the same ID
+     * and event source, the source &lt;code&gt;Component&lt;/code&gt;'s
+     * &lt;code&gt;coalesceEvents&lt;/code&gt; method will be called.
+     *
+     * @param theEvent an instance of &lt;code&gt;java.awt.AWTEvent&lt;/code&gt;,
+     *          or a subclass of it
+     * @throws NullPointerException if &lt;code&gt;theEvent&lt;/code&gt; is &lt;code&gt;null&lt;/code&gt;
+     */
+    public void postEvent(AWTEvent theEvent) {
+<span class="nc" id="L249">        SunToolkit.flushPendingEvents(appContext);</span>
+<span class="nc" id="L250">        postEventPrivate(theEvent);</span>
+<span class="nc" id="L251">    }</span>
+
+    /**
+     * Posts a 1.1-style event to the &lt;code&gt;EventQueue&lt;/code&gt;.
+     * If there is an existing event on the queue with the same ID
+     * and event source, the source &lt;code&gt;Component&lt;/code&gt;'s
+     * &lt;code&gt;coalesceEvents&lt;/code&gt; method will be called.
+     *
+     * @param theEvent an instance of &lt;code&gt;java.awt.AWTEvent&lt;/code&gt;,
+     *          or a subclass of it
+     */
+    private final void postEventPrivate(AWTEvent theEvent) {
+<span class="nc" id="L263">        theEvent.isPosted = true;</span>
+<span class="nc" id="L264">        pushPopLock.lock();</span>
+        try {
+<span class="nc bnc" id="L266" title="All 2 branches missed.">            if (nextQueue != null) {</span>
+                // Forward the event to the top of EventQueue stack
+<span class="nc" id="L268">                nextQueue.postEventPrivate(theEvent);</span>
+<span class="nc" id="L269">                return;</span>
+            }
+<span class="nc bnc" id="L271" title="All 2 branches missed.">            if (dispatchThread == null) {</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">                if (theEvent.getSource() == AWTAutoShutdown.getInstance()) {</span>
+<span class="nc" id="L273">                    return;</span>
+                } else {
+<span class="nc" id="L275">                    initDispatchThread();</span>
+                }
+            }
+<span class="nc" id="L278">            postEvent(theEvent, getPriority(theEvent));</span>
+        } finally {
+<span class="nc" id="L280">            pushPopLock.unlock();</span>
+<span class="nc" id="L281">        }</span>
+<span class="nc" id="L282">    }</span>
+
+    private static int getPriority(AWTEvent theEvent) {
+<span class="nc bnc" id="L285" title="All 2 branches missed.">        if (theEvent instanceof PeerEvent) {</span>
+<span class="nc" id="L286">            PeerEvent peerEvent = (PeerEvent)theEvent;</span>
+<span class="nc bnc" id="L287" title="All 2 branches missed.">            if ((peerEvent.getFlags() &amp; PeerEvent.ULTIMATE_PRIORITY_EVENT) != 0) {</span>
+<span class="nc" id="L288">                return ULTIMATE_PRIORITY;</span>
+            }
+<span class="nc bnc" id="L290" title="All 2 branches missed.">            if ((peerEvent.getFlags() &amp; PeerEvent.PRIORITY_EVENT) != 0) {</span>
+<span class="nc" id="L291">                return HIGH_PRIORITY;</span>
+            }
+<span class="nc bnc" id="L293" title="All 2 branches missed.">            if ((peerEvent.getFlags() &amp; PeerEvent.LOW_PRIORITY_EVENT) != 0) {</span>
+<span class="nc" id="L294">                return LOW_PRIORITY;</span>
+            }
+        }
+<span class="nc" id="L297">        int id = theEvent.getID();</span>
+<span class="nc bnc" id="L298" title="All 4 branches missed.">        if ((id &gt;= PaintEvent.PAINT_FIRST) &amp;&amp; (id &lt;= PaintEvent.PAINT_LAST)) {</span>
+<span class="nc" id="L299">            return LOW_PRIORITY;</span>
+        }
+<span class="nc" id="L301">        return NORM_PRIORITY;</span>
+    }
+
+    /**
+     * Posts the event to the internal Queue of specified priority,
+     * coalescing as appropriate.
+     *
+     * @param theEvent an instance of &lt;code&gt;java.awt.AWTEvent&lt;/code&gt;,
+     *          or a subclass of it
+     * @param priority  the desired priority of the event
+     */
+    private void postEvent(AWTEvent theEvent, int priority) {
+<span class="nc bnc" id="L313" title="All 2 branches missed.">        if (coalesceEvent(theEvent, priority)) {</span>
+<span class="nc" id="L314">            return;</span>
+        }
+
+<span class="nc" id="L317">        EventQueueItem newItem = new EventQueueItem(theEvent);</span>
+
+<span class="nc" id="L319">        cacheEQItem(newItem);</span>
+
+<span class="nc bnc" id="L321" title="All 2 branches missed.">        boolean notifyID = (theEvent.getID() == this.waitForID);</span>
+
+<span class="nc bnc" id="L323" title="All 2 branches missed.">        if (queues[priority].head == null) {</span>
+<span class="nc" id="L324">            boolean shouldNotify = noEvents();</span>
+<span class="nc" id="L325">            queues[priority].head = queues[priority].tail = newItem;</span>
+
+<span class="nc bnc" id="L327" title="All 2 branches missed.">            if (shouldNotify) {</span>
+<span class="nc bnc" id="L328" title="All 2 branches missed.">                if (theEvent.getSource() != AWTAutoShutdown.getInstance()) {</span>
+<span class="nc" id="L329">                    AWTAutoShutdown.getInstance().notifyThreadBusy(dispatchThread);</span>
+                }
+<span class="nc" id="L331">                pushPopCond.signalAll();</span>
+<span class="nc bnc" id="L332" title="All 2 branches missed.">            } else if (notifyID) {</span>
+<span class="nc" id="L333">                pushPopCond.signalAll();</span>
+            }
+<span class="nc" id="L335">        } else {</span>
+            // The event was not coalesced or has non-Component source.
+            // Insert it at the end of the appropriate Queue.
+<span class="nc" id="L338">            queues[priority].tail.next = newItem;</span>
+<span class="nc" id="L339">            queues[priority].tail = newItem;</span>
+<span class="nc bnc" id="L340" title="All 2 branches missed.">            if (notifyID) {</span>
+<span class="nc" id="L341">                pushPopCond.signalAll();</span>
+            }
+        }
+<span class="nc" id="L344">    }</span>
+
+    private boolean coalescePaintEvent(PaintEvent e) {
+<span class="nc" id="L347">        ComponentPeer sourcePeer = ((Component)e.getSource()).peer;</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">        if (sourcePeer != null) {</span>
+<span class="nc" id="L349">            sourcePeer.coalescePaintEvent(e);</span>
+        }
+<span class="nc" id="L351">        EventQueueItem[] cache = ((Component)e.getSource()).eventCache;</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">        if (cache == null) {</span>
+<span class="nc" id="L353">            return false;</span>
+        }
+<span class="nc" id="L355">        int index = eventToCacheIndex(e);</span>
+
+<span class="nc bnc" id="L357" title="All 4 branches missed.">        if (index != -1 &amp;&amp; cache[index] != null) {</span>
+<span class="nc" id="L358">            PaintEvent merged = mergePaintEvents(e, (PaintEvent)cache[index].event);</span>
+<span class="nc bnc" id="L359" title="All 2 branches missed.">            if (merged != null) {</span>
+<span class="nc" id="L360">                cache[index].event = merged;</span>
+<span class="nc" id="L361">                return true;</span>
+            }
+        }
+<span class="nc" id="L364">        return false;</span>
+    }
+
+    private PaintEvent mergePaintEvents(PaintEvent a, PaintEvent b) {
+<span class="nc" id="L368">        Rectangle aRect = a.getUpdateRect();</span>
+<span class="nc" id="L369">        Rectangle bRect = b.getUpdateRect();</span>
+<span class="nc bnc" id="L370" title="All 2 branches missed.">        if (bRect.contains(aRect)) {</span>
+<span class="nc" id="L371">            return b;</span>
+        }
+<span class="nc bnc" id="L373" title="All 2 branches missed.">        if (aRect.contains(bRect)) {</span>
+<span class="nc" id="L374">            return a;</span>
+        }
+<span class="nc" id="L376">        return null;</span>
+    }
+
+    private boolean coalesceMouseEvent(MouseEvent e) {
+<span class="nc" id="L380">        EventQueueItem[] cache = ((Component)e.getSource()).eventCache;</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">        if (cache == null) {</span>
+<span class="nc" id="L382">            return false;</span>
+        }
+<span class="nc" id="L384">        int index = eventToCacheIndex(e);</span>
+<span class="nc bnc" id="L385" title="All 4 branches missed.">        if (index != -1 &amp;&amp; cache[index] != null) {</span>
+<span class="nc" id="L386">            cache[index].event = e;</span>
+<span class="nc" id="L387">            return true;</span>
+        }
+<span class="nc" id="L389">        return false;</span>
+    }
+
+    private boolean coalescePeerEvent(PeerEvent e) {
+<span class="nc" id="L393">        EventQueueItem[] cache = ((Component)e.getSource()).eventCache;</span>
+<span class="nc bnc" id="L394" title="All 2 branches missed.">        if (cache == null) {</span>
+<span class="nc" id="L395">            return false;</span>
+        }
+<span class="nc" id="L397">        int index = eventToCacheIndex(e);</span>
+<span class="nc bnc" id="L398" title="All 4 branches missed.">        if (index != -1 &amp;&amp; cache[index] != null) {</span>
+<span class="nc" id="L399">            e = e.coalesceEvents((PeerEvent)cache[index].event);</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">            if (e != null) {</span>
+<span class="nc" id="L401">                cache[index].event = e;</span>
+<span class="nc" id="L402">                return true;</span>
+            } else {
+<span class="nc" id="L404">                cache[index] = null;</span>
+            }
+        }
+<span class="nc" id="L407">        return false;</span>
+    }
+
+    /*
+     * Should avoid of calling this method by any means
+     * as it's working time is dependant on EQ length.
+     * In the wors case this method alone can slow down the entire application
+     * 10 times by stalling the Event processing.
+     * Only here by backward compatibility reasons.
+     */
+    private boolean coalesceOtherEvent(AWTEvent e, int priority) {
+<span class="nc" id="L418">        int id = e.getID();</span>
+<span class="nc" id="L419">        Component source = (Component)e.getSource();</span>
+<span class="nc" id="L420">        for (EventQueueItem entry = queues[priority].head;</span>
+<span class="nc bnc" id="L421" title="All 2 branches missed.">            entry != null; entry = entry.next)</span>
+        {
+            // Give Component.coalesceEvents a chance
+<span class="nc bnc" id="L424" title="All 4 branches missed.">            if (entry.event.getSource() == source &amp;&amp; entry.event.getID() == id) {</span>
+<span class="nc" id="L425">                AWTEvent coalescedEvent = source.coalesceEvents(</span>
+                    entry.event, e);
+<span class="nc bnc" id="L427" title="All 2 branches missed.">                if (coalescedEvent != null) {</span>
+<span class="nc" id="L428">                    entry.event = coalescedEvent;</span>
+<span class="nc" id="L429">                    return true;</span>
+                }
+            }
+        }
+<span class="nc" id="L433">        return false;</span>
+    }
+
+    private boolean coalesceEvent(AWTEvent e, int priority) {
+<span class="nc bnc" id="L437" title="All 2 branches missed.">        if (!(e.getSource() instanceof Component)) {</span>
+<span class="nc" id="L438">            return false;</span>
+        }
+<span class="nc bnc" id="L440" title="All 2 branches missed.">        if (e instanceof PeerEvent) {</span>
+<span class="nc" id="L441">            return coalescePeerEvent((PeerEvent)e);</span>
+        }
+        // The worst case
+<span class="nc bnc" id="L444" title="All 2 branches missed.">        if (((Component)e.getSource()).isCoalescingEnabled()</span>
+<span class="nc bnc" id="L445" title="All 2 branches missed.">            &amp;&amp; coalesceOtherEvent(e, priority))</span>
+        {
+<span class="nc" id="L447">            return true;</span>
+        }
+<span class="nc bnc" id="L449" title="All 2 branches missed.">        if (e instanceof PaintEvent) {</span>
+<span class="nc" id="L450">            return coalescePaintEvent((PaintEvent)e);</span>
+        }
+<span class="nc bnc" id="L452" title="All 2 branches missed.">        if (e instanceof MouseEvent) {</span>
+<span class="nc" id="L453">            return coalesceMouseEvent((MouseEvent)e);</span>
+        }
+<span class="nc" id="L455">        return false;</span>
+    }
+
+    private void cacheEQItem(EventQueueItem entry) {
+<span class="nc" id="L459">        int index = eventToCacheIndex(entry.event);</span>
+<span class="nc bnc" id="L460" title="All 4 branches missed.">        if (index != -1 &amp;&amp; entry.event.getSource() instanceof Component) {</span>
+<span class="nc" id="L461">            Component source = (Component)entry.event.getSource();</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">            if (source.eventCache == null) {</span>
+<span class="nc" id="L463">                source.eventCache = new EventQueueItem[CACHE_LENGTH];</span>
+            }
+<span class="nc" id="L465">            source.eventCache[index] = entry;</span>
+        }
+<span class="nc" id="L467">    }</span>
+
+    private void uncacheEQItem(EventQueueItem entry) {
+<span class="nc" id="L470">        int index = eventToCacheIndex(entry.event);</span>
+<span class="nc bnc" id="L471" title="All 4 branches missed.">        if (index != -1 &amp;&amp; entry.event.getSource() instanceof Component) {</span>
+<span class="nc" id="L472">            Component source = (Component)entry.event.getSource();</span>
+<span class="nc bnc" id="L473" title="All 2 branches missed.">            if (source.eventCache == null) {</span>
+<span class="nc" id="L474">                return;</span>
+            }
+<span class="nc" id="L476">            source.eventCache[index] = null;</span>
+        }
+<span class="nc" id="L478">    }</span>
+
+    private static final int PAINT = 0;
+    private static final int UPDATE = 1;
+    private static final int MOVE = 2;
+    private static final int DRAG = 3;
+    private static final int PEER = 4;
+    private static final int CACHE_LENGTH = 5;
+
+    private static int eventToCacheIndex(AWTEvent e) {
+<span class="nc bnc" id="L488" title="All 5 branches missed.">        switch(e.getID()) {</span>
+        case PaintEvent.PAINT:
+<span class="nc" id="L490">            return PAINT;</span>
+        case PaintEvent.UPDATE:
+<span class="nc" id="L492">            return UPDATE;</span>
+        case MouseEvent.MOUSE_MOVED:
+<span class="nc" id="L494">            return MOVE;</span>
+        case MouseEvent.MOUSE_DRAGGED:
+            // Return -1 for SunDropTargetEvent since they are usually synchronous
+            // and we don't want to skip them by coalescing with MouseEvent or other drag events
+<span class="nc bnc" id="L498" title="All 2 branches missed.">            return e instanceof SunDropTargetEvent ? -1 : DRAG;</span>
+        default:
+<span class="nc bnc" id="L500" title="All 2 branches missed.">            return e instanceof PeerEvent ? PEER : -1;</span>
+        }
+    }
+
+    /**
+     * Returns whether an event is pending on any of the separate
+     * Queues.
+     * @return whether an event is pending on any of the separate Queues
+     */
+    private boolean noEvents() {
+<span class="nc bnc" id="L510" title="All 2 branches missed.">        for (int i = 0; i &lt; NUM_PRIORITIES; i++) {</span>
+<span class="nc bnc" id="L511" title="All 2 branches missed.">            if (queues[i].head != null) {</span>
+<span class="nc" id="L512">                return false;</span>
+            }
+        }
+
+<span class="nc" id="L516">        return true;</span>
+    }
+
+    /**
+     * Removes an event from the &lt;code&gt;EventQueue&lt;/code&gt; and
+     * returns it.  This method will block until an event has
+     * been posted by another thread.
+     * @return the next &lt;code&gt;AWTEvent&lt;/code&gt;
+     * @exception InterruptedException
+     *            if any thread has interrupted this thread
+     */
+    public AWTEvent getNextEvent() throws InterruptedException {
+        do {
+            /*
+             * SunToolkit.flushPendingEvents must be called outside
+             * of the synchronized block to avoid deadlock when
+             * event queues are nested with push()/pop().
+             */
+<span class="nc" id="L534">            SunToolkit.flushPendingEvents(appContext);</span>
+<span class="nc" id="L535">            pushPopLock.lock();</span>
+            try {
+<span class="nc" id="L537">                AWTEvent event = getNextEventPrivate();</span>
+<span class="nc bnc" id="L538" title="All 2 branches missed.">                if (event != null) {</span>
+<span class="nc" id="L539">                    return event;</span>
+                }
+<span class="nc" id="L541">                AWTAutoShutdown.getInstance().notifyThreadFree(dispatchThread);</span>
+<span class="nc" id="L542">                pushPopCond.await();</span>
+            } finally {
+<span class="nc" id="L544">                pushPopLock.unlock();</span>
+<span class="nc" id="L545">            }</span>
+<span class="nc" id="L546">        } while(true);</span>
+    }
+
+    /*
+     * Must be called under the lock. Doesn't call flushPendingEvents()
+     */
+    AWTEvent getNextEventPrivate() throws InterruptedException {
+<span class="nc bnc" id="L553" title="All 2 branches missed.">        for (int i = NUM_PRIORITIES - 1; i &gt;= 0; i--) {</span>
+<span class="nc bnc" id="L554" title="All 2 branches missed.">            if (queues[i].head != null) {</span>
+<span class="nc" id="L555">                EventQueueItem entry = queues[i].head;</span>
+<span class="nc" id="L556">                queues[i].head = entry.next;</span>
+<span class="nc bnc" id="L557" title="All 2 branches missed.">                if (entry.next == null) {</span>
+<span class="nc" id="L558">                    queues[i].tail = null;</span>
+                }
+<span class="nc" id="L560">                uncacheEQItem(entry);</span>
+<span class="nc" id="L561">                return entry.event;</span>
+            }
+        }
+<span class="nc" id="L564">        return null;</span>
+    }
+
+    AWTEvent getNextEvent(int id) throws InterruptedException {
+        do {
+            /*
+             * SunToolkit.flushPendingEvents must be called outside
+             * of the synchronized block to avoid deadlock when
+             * event queues are nested with push()/pop().
+             */
+<span class="nc" id="L574">            SunToolkit.flushPendingEvents(appContext);</span>
+<span class="nc" id="L575">            pushPopLock.lock();</span>
+            try {
+<span class="nc bnc" id="L577" title="All 2 branches missed.">                for (int i = 0; i &lt; NUM_PRIORITIES; i++) {</span>
+<span class="nc" id="L578">                    for (EventQueueItem entry = queues[i].head, prev = null;</span>
+<span class="nc bnc" id="L579" title="All 2 branches missed.">                         entry != null; prev = entry, entry = entry.next)</span>
+                    {
+<span class="nc bnc" id="L581" title="All 2 branches missed.">                        if (entry.event.getID() == id) {</span>
+<span class="nc bnc" id="L582" title="All 2 branches missed.">                            if (prev == null) {</span>
+<span class="nc" id="L583">                                queues[i].head = entry.next;</span>
+                            } else {
+<span class="nc" id="L585">                                prev.next = entry.next;</span>
+                            }
+<span class="nc bnc" id="L587" title="All 2 branches missed.">                            if (queues[i].tail == entry) {</span>
+<span class="nc" id="L588">                                queues[i].tail = prev;</span>
+                            }
+<span class="nc" id="L590">                            uncacheEQItem(entry);</span>
+<span class="nc" id="L591">                            return entry.event;</span>
+                        }
+                    }
+                }
+<span class="nc" id="L595">                waitForID = id;</span>
+<span class="nc" id="L596">                pushPopCond.await();</span>
+<span class="nc" id="L597">                waitForID = 0;</span>
+            } finally {
+<span class="nc" id="L599">                pushPopLock.unlock();</span>
+<span class="nc" id="L600">            }</span>
+<span class="nc" id="L601">        } while(true);</span>
+    }
+
+    /**
+     * Returns the first event on the &lt;code&gt;EventQueue&lt;/code&gt;
+     * without removing it.
+     * @return the first event
+     */
+    public AWTEvent peekEvent() {
+<span class="nc" id="L610">        pushPopLock.lock();</span>
+        try {
+<span class="nc bnc" id="L612" title="All 2 branches missed.">            for (int i = NUM_PRIORITIES - 1; i &gt;= 0; i--) {</span>
+<span class="nc bnc" id="L613" title="All 2 branches missed.">                if (queues[i].head != null) {</span>
+<span class="nc" id="L614">                    return queues[i].head.event;</span>
+                }
+            }
+        } finally {
+<span class="nc" id="L618">            pushPopLock.unlock();</span>
+<span class="nc" id="L619">        }</span>
+
+<span class="nc" id="L621">        return null;</span>
+    }
+
+    /**
+     * Returns the first event with the specified id, if any.
+     * @param id the id of the type of event desired
+     * @return the first event of the specified id or &lt;code&gt;null&lt;/code&gt;
+     *    if there is no such event
+     */
+    public AWTEvent peekEvent(int id) {
+<span class="nc" id="L631">        pushPopLock.lock();</span>
+        try {
+<span class="nc bnc" id="L633" title="All 2 branches missed.">            for (int i = NUM_PRIORITIES - 1; i &gt;= 0; i--) {</span>
+<span class="nc" id="L634">                EventQueueItem q = queues[i].head;</span>
+<span class="nc bnc" id="L635" title="All 2 branches missed.">                for (; q != null; q = q.next) {</span>
+<span class="nc bnc" id="L636" title="All 2 branches missed.">                    if (q.event.getID() == id) {</span>
+<span class="nc" id="L637">                        return q.event;</span>
+                    }
+                }
+            }
+        } finally {
+<span class="nc" id="L642">            pushPopLock.unlock();</span>
+<span class="nc" id="L643">        }</span>
+
+<span class="nc" id="L645">        return null;</span>
+    }
+
+<span class="fc" id="L648">    private static final JavaSecurityAccess javaSecurityAccess =</span>
+<span class="fc" id="L649">        SharedSecrets.getJavaSecurityAccess();</span>
+
+    /**
+     * Dispatches an event. The manner in which the event is
+     * dispatched depends upon the type of the event and the
+     * type of the event's source object:
+     * &lt;p&gt;
+     * &lt;table border=1 summary=&quot;Event types, source types, and dispatch methods&quot;&gt;
+     * &lt;tr&gt;
+     *     &lt;th&gt;Event Type&lt;/th&gt;
+     *     &lt;th&gt;Source Type&lt;/th&gt;
+     *     &lt;th&gt;Dispatched To&lt;/th&gt;
+     * &lt;/tr&gt;
+     * &lt;tr&gt;
+     *     &lt;td&gt;ActiveEvent&lt;/td&gt;
+     *     &lt;td&gt;Any&lt;/td&gt;
+     *     &lt;td&gt;event.dispatch()&lt;/td&gt;
+     * &lt;/tr&gt;
+     * &lt;tr&gt;
+     *     &lt;td&gt;Other&lt;/td&gt;
+     *     &lt;td&gt;Component&lt;/td&gt;
+     *     &lt;td&gt;source.dispatchEvent(AWTEvent)&lt;/td&gt;
+     * &lt;/tr&gt;
+     * &lt;tr&gt;
+     *     &lt;td&gt;Other&lt;/td&gt;
+     *     &lt;td&gt;MenuComponent&lt;/td&gt;
+     *     &lt;td&gt;source.dispatchEvent(AWTEvent)&lt;/td&gt;
+     * &lt;/tr&gt;
+     * &lt;tr&gt;
+     *     &lt;td&gt;Other&lt;/td&gt;
+     *     &lt;td&gt;Other&lt;/td&gt;
+     *     &lt;td&gt;No action (ignored)&lt;/td&gt;
+     * &lt;/tr&gt;
+     * &lt;/table&gt;
+     * &lt;p&gt;
+     * @param event an instance of &lt;code&gt;java.awt.AWTEvent&lt;/code&gt;,
+     *          or a subclass of it
+     * @throws NullPointerException if &lt;code&gt;event&lt;/code&gt; is &lt;code&gt;null&lt;/code&gt;
+     * @since           1.2
+     */
+    protected void dispatchEvent(final AWTEvent event) {
+<span class="nc" id="L690">        final Object src = event.getSource();</span>
+<span class="nc" id="L691">        final PrivilegedAction&lt;Void&gt; action = new PrivilegedAction&lt;Void&gt;() {</span>
+            public Void run() {
+                // In case fwDispatcher is installed and we're already on the
+                // dispatch thread (e.g. performing DefaultKeyboardFocusManager.sendMessage),
+                // dispatch the event straight away.
+<span class="nc bnc" id="L696" title="All 4 branches missed.">                if (fwDispatcher == null || isDispatchThreadImpl()) {</span>
+<span class="nc" id="L697">                    dispatchEventImpl(event, src);</span>
+                } else {
+<span class="nc" id="L699">                    fwDispatcher.scheduleDispatch(new Runnable() {</span>
+                        @Override
+                        public void run() {
+<span class="nc" id="L702">                            dispatchEventImpl(event, src);</span>
+<span class="nc" id="L703">                        }</span>
+                    });
+                }
+<span class="nc" id="L706">                return null;</span>
+            }
+        };
+
+<span class="nc" id="L710">        final AccessControlContext stack = AccessController.getContext();</span>
+<span class="nc" id="L711">        final AccessControlContext srcAcc = getAccessControlContextFrom(src);</span>
+<span class="nc" id="L712">        final AccessControlContext eventAcc = event.getAccessControlContext();</span>
+<span class="nc bnc" id="L713" title="All 2 branches missed.">        if (srcAcc == null) {</span>
+<span class="nc" id="L714">            javaSecurityAccess.doIntersectionPrivilege(action, stack, eventAcc);</span>
+        } else {
+<span class="nc" id="L716">            javaSecurityAccess.doIntersectionPrivilege(</span>
+<span class="nc" id="L717">                new PrivilegedAction&lt;Void&gt;() {</span>
+                    public Void run() {
+<span class="nc" id="L719">                        javaSecurityAccess.doIntersectionPrivilege(action, eventAcc);</span>
+<span class="nc" id="L720">                        return null;</span>
+                    }
+                }, stack, srcAcc);
+        }
+<span class="nc" id="L724">    }</span>
+
+    private static AccessControlContext getAccessControlContextFrom(Object src) {
+<span class="nc bnc" id="L727" title="All 2 branches missed.">        return src instanceof Component ?</span>
+<span class="nc bnc" id="L728" title="All 2 branches missed.">            ((Component)src).getAccessControlContext() :</span>
+            src instanceof MenuComponent ?
+<span class="nc bnc" id="L730" title="All 2 branches missed.">                ((MenuComponent)src).getAccessControlContext() :</span>
+                src instanceof TrayIcon ?
+<span class="nc" id="L732">                    ((TrayIcon)src).getAccessControlContext() :</span>
+                    null;
+    }
+
+    /**
+     * Called from dispatchEvent() under a correct AccessControlContext
+     */
+    private void dispatchEventImpl(final AWTEvent event, final Object src) {
+<span class="nc" id="L740">        event.isPosted = true;</span>
+<span class="nc bnc" id="L741" title="All 2 branches missed.">        if (event instanceof ActiveEvent) {</span>
+            // This could become the sole method of dispatching in time.
+<span class="nc" id="L743">            setCurrentEventAndMostRecentTimeImpl(event);</span>
+<span class="nc" id="L744">            ((ActiveEvent)event).dispatch();</span>
+<span class="nc bnc" id="L745" title="All 2 branches missed.">        } else if (src instanceof Component) {</span>
+<span class="nc" id="L746">            ((Component)src).dispatchEvent(event);</span>
+<span class="nc" id="L747">            event.dispatched();</span>
+<span class="nc bnc" id="L748" title="All 2 branches missed.">        } else if (src instanceof MenuComponent) {</span>
+<span class="nc" id="L749">            ((MenuComponent)src).dispatchEvent(event);</span>
+<span class="nc bnc" id="L750" title="All 2 branches missed.">        } else if (src instanceof TrayIcon) {</span>
+<span class="nc" id="L751">            ((TrayIcon)src).dispatchEvent(event);</span>
+<span class="nc bnc" id="L752" title="All 2 branches missed.">        } else if (src instanceof AWTAutoShutdown) {</span>
+<span class="nc bnc" id="L753" title="All 2 branches missed.">            if (noEvents()) {</span>
+<span class="nc" id="L754">                dispatchThread.stopDispatching();</span>
+            }
+        } else {
+<span class="nc bnc" id="L757" title="All 2 branches missed.">            if (eventLog.isLoggable(PlatformLogger.Level.FINE)) {</span>
+<span class="nc" id="L758">                eventLog.fine(&quot;Unable to dispatch event: &quot; + event);</span>
+            }
+        }
+<span class="nc" id="L761">    }</span>
+
+    /**
+     * Returns the timestamp of the most recent event that had a timestamp, and
+     * that was dispatched from the &lt;code&gt;EventQueue&lt;/code&gt; associated with the
+     * calling thread. If an event with a timestamp is currently being
+     * dispatched, its timestamp will be returned. If no events have yet
+     * been dispatched, the EventQueue's initialization time will be
+     * returned instead.In the current version of
+     * the JDK, only &lt;code&gt;InputEvent&lt;/code&gt;s,
+     * &lt;code&gt;ActionEvent&lt;/code&gt;s, and &lt;code&gt;InvocationEvent&lt;/code&gt;s have
+     * timestamps; however, future versions of the JDK may add timestamps to
+     * additional event types. Note that this method should only be invoked
+     * from an application's {@link #isDispatchThread event dispatching thread}.
+     * If this method is
+     * invoked from another thread, the current system time (as reported by
+     * &lt;code&gt;System.currentTimeMillis()&lt;/code&gt;) will be returned instead.
+     *
+     * @return the timestamp of the last &lt;code&gt;InputEvent&lt;/code&gt;,
+     *         &lt;code&gt;ActionEvent&lt;/code&gt;, or &lt;code&gt;InvocationEvent&lt;/code&gt; to be
+     *         dispatched, or &lt;code&gt;System.currentTimeMillis()&lt;/code&gt; if this
+     *         method is invoked on a thread other than an event dispatching
+     *         thread
+     * @see java.awt.event.InputEvent#getWhen
+     * @see java.awt.event.ActionEvent#getWhen
+     * @see java.awt.event.InvocationEvent#getWhen
+     * @see #isDispatchThread
+     *
+     * @since 1.4
+     */
+    public static long getMostRecentEventTime() {
+<span class="nc" id="L792">        return Toolkit.getEventQueue().getMostRecentEventTimeImpl();</span>
+    }
+    private long getMostRecentEventTimeImpl() {
+<span class="nc" id="L795">        pushPopLock.lock();</span>
+        try {
+<span class="nc bnc" id="L797" title="All 2 branches missed.">            return (Thread.currentThread() == dispatchThread)</span>
+                ? mostRecentEventTime
+<span class="nc" id="L799">                : System.currentTimeMillis();</span>
+        } finally {
+<span class="nc" id="L801">            pushPopLock.unlock();</span>
+        }
+    }
+
+    /**
+     * @return most recent event time on all threads.
+     */
+    long getMostRecentEventTimeEx() {
+<span class="nc" id="L809">        pushPopLock.lock();</span>
+        try {
+<span class="nc" id="L811">            return mostRecentEventTime;</span>
+        } finally {
+<span class="nc" id="L813">            pushPopLock.unlock();</span>
+        }
+    }
+
+    /**
+     * Returns the the event currently being dispatched by the
+     * &lt;code&gt;EventQueue&lt;/code&gt; associated with the calling thread. This is
+     * useful if a method needs access to the event, but was not designed to
+     * receive a reference to it as an argument. Note that this method should
+     * only be invoked from an application's event dispatching thread. If this
+     * method is invoked from another thread, null will be returned.
+     *
+     * @return the event currently being dispatched, or null if this method is
+     *         invoked on a thread other than an event dispatching thread
+     * @since 1.4
+     */
+    public static AWTEvent getCurrentEvent() {
+<span class="nc" id="L830">        return Toolkit.getEventQueue().getCurrentEventImpl();</span>
+    }
+    private AWTEvent getCurrentEventImpl() {
+<span class="nc" id="L833">        pushPopLock.lock();</span>
+        try {
+<span class="nc bnc" id="L835" title="All 2 branches missed.">                return (Thread.currentThread() == dispatchThread)</span>
+<span class="nc" id="L836">                ? currentEvent.get()</span>
+                : null;
+        } finally {
+<span class="nc" id="L839">            pushPopLock.unlock();</span>
+        }
+    }
+
+    /**
+     * Replaces the existing &lt;code&gt;EventQueue&lt;/code&gt; with the specified one.
+     * Any pending events are transferred to the new &lt;code&gt;EventQueue&lt;/code&gt;
+     * for processing by it.
+     *
+     * @param newEventQueue an &lt;code&gt;EventQueue&lt;/code&gt;
+     *          (or subclass thereof) instance to be use
+     * @see      java.awt.EventQueue#pop
+     * @throws NullPointerException if &lt;code&gt;newEventQueue&lt;/code&gt; is &lt;code&gt;null&lt;/code&gt;
+     * @since           1.2
+     */
+    public void push(EventQueue newEventQueue) {
+<span class="nc bnc" id="L855" title="All 2 branches missed.">        if (eventLog.isLoggable(PlatformLogger.Level.FINE)) {</span>
+<span class="nc" id="L856">            eventLog.fine(&quot;EventQueue.push(&quot; + newEventQueue + &quot;)&quot;);</span>
+        }
+
+<span class="nc" id="L859">        pushPopLock.lock();</span>
+        try {
+<span class="nc" id="L861">            EventQueue topQueue = this;</span>
+<span class="nc bnc" id="L862" title="All 2 branches missed.">            while (topQueue.nextQueue != null) {</span>
+<span class="nc" id="L863">                topQueue = topQueue.nextQueue;</span>
+            }
+<span class="nc bnc" id="L865" title="All 2 branches missed.">            if (topQueue.fwDispatcher != null) {</span>
+<span class="nc" id="L866">                throw new RuntimeException(&quot;push() to queue with fwDispatcher&quot;);</span>
+            }
+<span class="nc bnc" id="L868" title="All 2 branches missed.">            if ((topQueue.dispatchThread != null) &amp;&amp;</span>
+<span class="nc bnc" id="L869" title="All 2 branches missed.">                (topQueue.dispatchThread.getEventQueue() == this))</span>
+            {
+<span class="nc" id="L871">                newEventQueue.dispatchThread = topQueue.dispatchThread;</span>
+<span class="nc" id="L872">                topQueue.dispatchThread.setEventQueue(newEventQueue);</span>
+            }
+
+            // Transfer all events forward to new EventQueue.
+<span class="nc bnc" id="L876" title="All 2 branches missed.">            while (topQueue.peekEvent() != null) {</span>
+                try {
+                    // Use getNextEventPrivate() as it doesn't call flushPendingEvents()
+<span class="nc" id="L879">                    newEventQueue.postEventPrivate(topQueue.getNextEventPrivate());</span>
+<span class="nc" id="L880">                } catch (InterruptedException ie) {</span>
+<span class="nc bnc" id="L881" title="All 2 branches missed.">                    if (eventLog.isLoggable(PlatformLogger.Level.FINE)) {</span>
+<span class="nc" id="L882">                        eventLog.fine(&quot;Interrupted push&quot;, ie);</span>
+                    }
+<span class="nc" id="L884">                }</span>
+            }
+
+            // Wake up EDT waiting in getNextEvent(), so it can
+            // pick up a new EventQueue. Post the waking event before
+            // topQueue.nextQueue is assigned, otherwise the event would
+            // go newEventQueue
+<span class="nc" id="L891">            topQueue.postEventPrivate(new InvocationEvent(topQueue, dummyRunnable));</span>
+
+<span class="nc" id="L893">            newEventQueue.previousQueue = topQueue;</span>
+<span class="nc" id="L894">            topQueue.nextQueue = newEventQueue;</span>
+
+<span class="nc bnc" id="L896" title="All 2 branches missed.">            if (appContext.get(AppContext.EVENT_QUEUE_KEY) == topQueue) {</span>
+<span class="nc" id="L897">                appContext.put(AppContext.EVENT_QUEUE_KEY, newEventQueue);</span>
+            }
+
+<span class="nc" id="L900">            pushPopCond.signalAll();</span>
+        } finally {
+<span class="nc" id="L902">            pushPopLock.unlock();</span>
+<span class="nc" id="L903">        }</span>
+<span class="nc" id="L904">    }</span>
+
+    /**
+     * Stops dispatching events using this &lt;code&gt;EventQueue&lt;/code&gt;.
+     * Any pending events are transferred to the previous
+     * &lt;code&gt;EventQueue&lt;/code&gt; for processing.
+     * &lt;p&gt;
+     * Warning: To avoid deadlock, do not declare this method
+     * synchronized in a subclass.
+     *
+     * @exception EmptyStackException if no previous push was made
+     *  on this &lt;code&gt;EventQueue&lt;/code&gt;
+     * @see      java.awt.EventQueue#push
+     * @since           1.2
+     */
+    protected void pop() throws EmptyStackException {
+<span class="nc bnc" id="L920" title="All 2 branches missed.">        if (eventLog.isLoggable(PlatformLogger.Level.FINE)) {</span>
+<span class="nc" id="L921">            eventLog.fine(&quot;EventQueue.pop(&quot; + this + &quot;)&quot;);</span>
+        }
+
+<span class="nc" id="L924">        pushPopLock.lock();</span>
+        try {
+<span class="nc" id="L926">            EventQueue topQueue = this;</span>
+<span class="nc bnc" id="L927" title="All 2 branches missed.">            while (topQueue.nextQueue != null) {</span>
+<span class="nc" id="L928">                topQueue = topQueue.nextQueue;</span>
+            }
+<span class="nc" id="L930">            EventQueue prevQueue = topQueue.previousQueue;</span>
+<span class="nc bnc" id="L931" title="All 2 branches missed.">            if (prevQueue == null) {</span>
+<span class="nc" id="L932">                throw new EmptyStackException();</span>
+            }
+
+<span class="nc" id="L935">            topQueue.previousQueue = null;</span>
+<span class="nc" id="L936">            prevQueue.nextQueue = null;</span>
+
+            // Transfer all events back to previous EventQueue.
+<span class="nc bnc" id="L939" title="All 2 branches missed.">            while (topQueue.peekEvent() != null) {</span>
+                try {
+<span class="nc" id="L941">                    prevQueue.postEventPrivate(topQueue.getNextEventPrivate());</span>
+<span class="nc" id="L942">                } catch (InterruptedException ie) {</span>
+<span class="nc bnc" id="L943" title="All 2 branches missed.">                    if (eventLog.isLoggable(PlatformLogger.Level.FINE)) {</span>
+<span class="nc" id="L944">                        eventLog.fine(&quot;Interrupted pop&quot;, ie);</span>
+                    }
+<span class="nc" id="L946">                }</span>
+            }
+
+<span class="nc bnc" id="L949" title="All 2 branches missed.">            if ((topQueue.dispatchThread != null) &amp;&amp;</span>
+<span class="nc bnc" id="L950" title="All 2 branches missed.">                (topQueue.dispatchThread.getEventQueue() == this))</span>
+            {
+<span class="nc" id="L952">                prevQueue.dispatchThread = topQueue.dispatchThread;</span>
+<span class="nc" id="L953">                topQueue.dispatchThread.setEventQueue(prevQueue);</span>
+            }
+
+<span class="nc bnc" id="L956" title="All 2 branches missed.">            if (appContext.get(AppContext.EVENT_QUEUE_KEY) == this) {</span>
+<span class="nc" id="L957">                appContext.put(AppContext.EVENT_QUEUE_KEY, prevQueue);</span>
+            }
+
+            // Wake up EDT waiting in getNextEvent(), so it can
+            // pick up a new EventQueue
+<span class="nc" id="L962">            topQueue.postEventPrivate(new InvocationEvent(topQueue, dummyRunnable));</span>
+
+<span class="nc" id="L964">            pushPopCond.signalAll();</span>
+        } finally {
+<span class="nc" id="L966">            pushPopLock.unlock();</span>
+<span class="nc" id="L967">        }</span>
+<span class="nc" id="L968">    }</span>
+
+    /**
+     * Creates a new {@code secondary loop} associated with this
+     * event queue. Use the {@link SecondaryLoop#enter} and
+     * {@link SecondaryLoop#exit} methods to start and stop the
+     * event loop and dispatch the events from this queue.
+     *
+     * @return secondaryLoop A new secondary loop object, which can
+     *                       be used to launch a new nested event
+     *                       loop and dispatch events from this queue
+     *
+     * @see SecondaryLoop#enter
+     * @see SecondaryLoop#exit
+     *
+     * @since 1.7
+     */
+    public SecondaryLoop createSecondaryLoop() {
+<span class="nc" id="L986">        return createSecondaryLoop(null, null, 0);</span>
+    }
+
+    SecondaryLoop createSecondaryLoop(Conditional cond, EventFilter filter, long interval) {
+<span class="nc" id="L990">        pushPopLock.lock();</span>
+        try {
+<span class="nc bnc" id="L992" title="All 2 branches missed.">            if (nextQueue != null) {</span>
+                // Forward the request to the top of EventQueue stack
+<span class="nc" id="L994">                return nextQueue.createSecondaryLoop(cond, filter, interval);</span>
+            }
+<span class="nc bnc" id="L996" title="All 2 branches missed.">            if (fwDispatcher != null) {</span>
+<span class="nc" id="L997">                return fwDispatcher.createSecondaryLoop();</span>
+            }
+<span class="nc bnc" id="L999" title="All 2 branches missed.">            if (dispatchThread == null) {</span>
+<span class="nc" id="L1000">                initDispatchThread();</span>
+            }
+<span class="nc" id="L1002">            return new WaitDispatchSupport(dispatchThread, cond, filter, interval);</span>
+        } finally {
+<span class="nc" id="L1004">            pushPopLock.unlock();</span>
+        }
+    }
+
+    /**
+     * Returns true if the calling thread is
+     * {@link Toolkit#getSystemEventQueue the current AWT EventQueue}'s
+     * dispatch thread. Use this method to ensure that a particular
+     * task is being executed (or not being) there.
+     * &lt;p&gt;
+     * Note: use the {@link #invokeLater} or {@link #invokeAndWait}
+     * methods to execute a task in
+     * {@link Toolkit#getSystemEventQueue the current AWT EventQueue}'s
+     * dispatch thread.
+     * &lt;p&gt;
+     *
+     * @return true if running in
+     * {@link Toolkit#getSystemEventQueue the current AWT EventQueue}'s
+     * dispatch thread
+     * @see             #invokeLater
+     * @see             #invokeAndWait
+     * @see             Toolkit#getSystemEventQueue
+     * @since           1.2
+     */
+    public static boolean isDispatchThread() {
+<span class="nc" id="L1029">        EventQueue eq = Toolkit.getEventQueue();</span>
+<span class="nc" id="L1030">        return eq.isDispatchThreadImpl();</span>
+    }
+
+    final boolean isDispatchThreadImpl() {
+<span class="nc" id="L1034">        EventQueue eq = this;</span>
+<span class="nc" id="L1035">        pushPopLock.lock();</span>
+        try {
+<span class="nc" id="L1037">            EventQueue next = eq.nextQueue;</span>
+<span class="nc bnc" id="L1038" title="All 2 branches missed.">            while (next != null) {</span>
+<span class="nc" id="L1039">                eq = next;</span>
+<span class="nc" id="L1040">                next = eq.nextQueue;</span>
+            }
+<span class="nc bnc" id="L1042" title="All 2 branches missed.">            if (eq.fwDispatcher != null) {</span>
+<span class="nc" id="L1043">                return eq.fwDispatcher.isDispatchThread();</span>
+            }
+<span class="nc bnc" id="L1045" title="All 2 branches missed.">            return (Thread.currentThread() == eq.dispatchThread);</span>
+        } finally {
+<span class="nc" id="L1047">            pushPopLock.unlock();</span>
+        }
+    }
+
+    final void initDispatchThread() {
+<span class="nc" id="L1052">        pushPopLock.lock();</span>
+        try {
+<span class="nc bnc" id="L1054" title="All 6 branches missed.">            if (dispatchThread == null &amp;&amp; !threadGroup.isDestroyed() &amp;&amp; !appContext.isDisposed()) {</span>
+<span class="nc" id="L1055">                dispatchThread = AccessController.doPrivileged(</span>
+<span class="nc" id="L1056">                    new PrivilegedAction&lt;EventDispatchThread&gt;() {</span>
+                        public EventDispatchThread run() {
+<span class="nc" id="L1058">                            EventDispatchThread t =</span>
+<span class="nc" id="L1059">                                new EventDispatchThread(threadGroup,</span>
+<span class="nc" id="L1060">                                                        name,</span>
+                                                        EventQueue.this);
+<span class="nc" id="L1062">                            t.setContextClassLoader(classLoader);</span>
+<span class="nc" id="L1063">                            t.setPriority(Thread.NORM_PRIORITY + 1);</span>
+<span class="nc" id="L1064">                            t.setDaemon(false);</span>
+<span class="nc" id="L1065">                            return t;</span>
+                        }
+                    }
+                );
+<span class="nc" id="L1069">                AWTAutoShutdown.getInstance().notifyThreadBusy(dispatchThread);</span>
+<span class="nc" id="L1070">                dispatchThread.start();</span>
+            }
+        } finally {
+<span class="nc" id="L1073">            pushPopLock.unlock();</span>
+<span class="nc" id="L1074">        }</span>
+<span class="nc" id="L1075">    }</span>
+
+    final void detachDispatchThread(EventDispatchThread edt) {
+        /*
+         * Minimize discard possibility for non-posted events
+         */
+<span class="nc" id="L1081">        SunToolkit.flushPendingEvents(appContext);</span>
+        /*
+         * This synchronized block is to secure that the event dispatch
+         * thread won't die in the middle of posting a new event to the
+         * associated event queue. It is important because we notify
+         * that the event dispatch thread is busy after posting a new event
+         * to its queue, so the EventQueue.dispatchThread reference must
+         * be valid at that point.
+         */
+<span class="nc" id="L1090">        pushPopLock.lock();</span>
+        try {
+<span class="nc bnc" id="L1092" title="All 2 branches missed.">            if (edt == dispatchThread) {</span>
+<span class="nc" id="L1093">                dispatchThread = null;</span>
+            }
+<span class="nc" id="L1095">            AWTAutoShutdown.getInstance().notifyThreadFree(edt);</span>
+        } finally {
+<span class="nc" id="L1097">            pushPopLock.unlock();</span>
+<span class="nc" id="L1098">        }</span>
+<span class="nc" id="L1099">    }</span>
+
+    /*
+     * Gets the &lt;code&gt;EventDispatchThread&lt;/code&gt; for this
+     * &lt;code&gt;EventQueue&lt;/code&gt;.
+     * @return the event dispatch thread associated with this event queue
+     *         or &lt;code&gt;null&lt;/code&gt; if this event queue doesn't have a
+     *         working thread associated with it
+     * @see    java.awt.EventQueue#initDispatchThread
+     * @see    java.awt.EventQueue#detachDispatchThread
+     */
+    final EventDispatchThread getDispatchThread() {
+<span class="nc" id="L1111">        pushPopLock.lock();</span>
+        try {
+<span class="nc" id="L1113">            return dispatchThread;</span>
+        } finally {
+<span class="nc" id="L1115">            pushPopLock.unlock();</span>
+        }
+    }
+
+    /*
+     * Removes any pending events for the specified source object.
+     * If removeAllEvents parameter is &lt;code&gt;true&lt;/code&gt; then all
+     * events for the specified source object are removed, if it
+     * is &lt;code&gt;false&lt;/code&gt; then &lt;code&gt;SequencedEvent&lt;/code&gt;, &lt;code&gt;SentEvent&lt;/code&gt;,
+     * &lt;code&gt;FocusEvent&lt;/code&gt;, &lt;code&gt;WindowEvent&lt;/code&gt;, &lt;code&gt;KeyEvent&lt;/code&gt;,
+     * and &lt;code&gt;InputMethodEvent&lt;/code&gt; are kept in the queue, but all other
+     * events are removed.
+     *
+     * This method is normally called by the source's
+     * &lt;code&gt;removeNotify&lt;/code&gt; method.
+     */
+    final void removeSourceEvents(Object source, boolean removeAllEvents) {
+<span class="nc" id="L1132">        SunToolkit.flushPendingEvents(appContext);</span>
+<span class="nc" id="L1133">        pushPopLock.lock();</span>
+        try {
+<span class="nc bnc" id="L1135" title="All 2 branches missed.">            for (int i = 0; i &lt; NUM_PRIORITIES; i++) {</span>
+<span class="nc" id="L1136">                EventQueueItem entry = queues[i].head;</span>
+<span class="nc" id="L1137">                EventQueueItem prev = null;</span>
+<span class="nc bnc" id="L1138" title="All 2 branches missed.">                while (entry != null) {</span>
+<span class="nc bnc" id="L1139" title="All 16 branches missed.">                    if ((entry.event.getSource() == source)</span>
+                        &amp;&amp; (removeAllEvents
+                            || ! (entry.event instanceof SequencedEvent
+                                  || entry.event instanceof SentEvent
+                                  || entry.event instanceof FocusEvent
+                                  || entry.event instanceof WindowEvent
+                                  || entry.event instanceof KeyEvent
+                                  || entry.event instanceof InputMethodEvent)))
+                    {
+<span class="nc bnc" id="L1148" title="All 2 branches missed.">                        if (entry.event instanceof SequencedEvent) {</span>
+<span class="nc" id="L1149">                            ((SequencedEvent)entry.event).dispose();</span>
+                        }
+<span class="nc bnc" id="L1151" title="All 2 branches missed.">                        if (entry.event instanceof SentEvent) {</span>
+<span class="nc" id="L1152">                            ((SentEvent)entry.event).dispose();</span>
+                        }
+<span class="nc bnc" id="L1154" title="All 2 branches missed.">                        if (entry.event instanceof InvocationEvent) {</span>
+<span class="nc" id="L1155">                            AWTAccessor.getInvocationEventAccessor()</span>
+<span class="nc" id="L1156">                                    .dispose((InvocationEvent)entry.event);</span>
+                        }
+<span class="nc bnc" id="L1158" title="All 2 branches missed.">                        if (prev == null) {</span>
+<span class="nc" id="L1159">                            queues[i].head = entry.next;</span>
+                        } else {
+<span class="nc" id="L1161">                            prev.next = entry.next;</span>
+                        }
+<span class="nc" id="L1163">                        uncacheEQItem(entry);</span>
+                    } else {
+<span class="nc" id="L1165">                        prev = entry;</span>
+                    }
+<span class="nc" id="L1167">                    entry = entry.next;</span>
+                }
+<span class="nc" id="L1169">                queues[i].tail = prev;</span>
+            }
+        } finally {
+<span class="nc" id="L1172">            pushPopLock.unlock();</span>
+<span class="nc" id="L1173">        }</span>
+<span class="nc" id="L1174">    }</span>
+
+    synchronized long getMostRecentKeyEventTime() {
+<span class="nc" id="L1177">        pushPopLock.lock();</span>
+        try {
+<span class="nc" id="L1179">            return mostRecentKeyEventTime;</span>
+        } finally {
+<span class="nc" id="L1181">            pushPopLock.unlock();</span>
+        }
+    }
+
+    static void setCurrentEventAndMostRecentTime(AWTEvent e) {
+<span class="nc" id="L1186">        Toolkit.getEventQueue().setCurrentEventAndMostRecentTimeImpl(e);</span>
+<span class="nc" id="L1187">    }</span>
+    private void setCurrentEventAndMostRecentTimeImpl(AWTEvent e) {
+<span class="nc" id="L1189">        pushPopLock.lock();</span>
+        try {
+<span class="nc bnc" id="L1191" title="All 2 branches missed.">            if (Thread.currentThread() != dispatchThread) {</span>
+<span class="nc" id="L1192">                return;</span>
+            }
+
+<span class="nc" id="L1195">            currentEvent = new WeakReference&lt;&gt;(e);</span>
+
+            // This series of 'instanceof' checks should be replaced with a
+            // polymorphic type (for example, an interface which declares a
+            // getWhen() method). However, this would require us to make such
+            // a type public, or to place it in sun.awt. Both of these approaches
+            // have been frowned upon. So for now, we hack.
+            //
+            // In tiger, we will probably give timestamps to all events, so this
+            // will no longer be an issue.
+<span class="nc" id="L1205">            long mostRecentEventTime2 = Long.MIN_VALUE;</span>
+<span class="nc bnc" id="L1206" title="All 2 branches missed.">            if (e instanceof InputEvent) {</span>
+<span class="nc" id="L1207">                InputEvent ie = (InputEvent)e;</span>
+<span class="nc" id="L1208">                mostRecentEventTime2 = ie.getWhen();</span>
+<span class="nc bnc" id="L1209" title="All 2 branches missed.">                if (e instanceof KeyEvent) {</span>
+<span class="nc" id="L1210">                    mostRecentKeyEventTime = ie.getWhen();</span>
+                }
+<span class="nc bnc" id="L1212" title="All 2 branches missed.">            } else if (e instanceof InputMethodEvent) {</span>
+<span class="nc" id="L1213">                InputMethodEvent ime = (InputMethodEvent)e;</span>
+<span class="nc" id="L1214">                mostRecentEventTime2 = ime.getWhen();</span>
+<span class="nc bnc" id="L1215" title="All 2 branches missed.">            } else if (e instanceof ActionEvent) {</span>
+<span class="nc" id="L1216">                ActionEvent ae = (ActionEvent)e;</span>
+<span class="nc" id="L1217">                mostRecentEventTime2 = ae.getWhen();</span>
+<span class="nc bnc" id="L1218" title="All 2 branches missed.">            } else if (e instanceof InvocationEvent) {</span>
+<span class="nc" id="L1219">                InvocationEvent ie = (InvocationEvent)e;</span>
+<span class="nc" id="L1220">                mostRecentEventTime2 = ie.getWhen();</span>
+            }
+<span class="nc" id="L1222">            mostRecentEventTime = Math.max(mostRecentEventTime, mostRecentEventTime2);</span>
+        } finally {
+<span class="nc" id="L1224">            pushPopLock.unlock();</span>
+<span class="nc" id="L1225">        }</span>
+<span class="nc" id="L1226">    }</span>
+
+    /**
+     * Causes &lt;code&gt;runnable&lt;/code&gt; to have its &lt;code&gt;run&lt;/code&gt;
+     * method called in the {@link #isDispatchThread dispatch thread} of
+     * {@link Toolkit#getSystemEventQueue the system EventQueue}.
+     * This will happen after all pending events are processed.
+     *
+     * @param runnable  the &lt;code&gt;Runnable&lt;/code&gt; whose &lt;code&gt;run&lt;/code&gt;
+     *                  method should be executed
+     *                  asynchronously in the
+     *                  {@link #isDispatchThread event dispatch thread}
+     *                  of {@link Toolkit#getSystemEventQueue the system EventQueue}
+     * @see             #invokeAndWait
+     * @see             Toolkit#getSystemEventQueue
+     * @see             #isDispatchThread
+     * @since           1.2
+     */
+    public static void invokeLater(Runnable runnable) {
+<span class="nc" id="L1245">        Toolkit.getEventQueue().postEvent(</span>
+<span class="nc" id="L1246">            new InvocationEvent(Toolkit.getDefaultToolkit(), runnable));</span>
+<span class="nc" id="L1247">    }</span>
+
+    /**
+     * Causes &lt;code&gt;runnable&lt;/code&gt; to have its &lt;code&gt;run&lt;/code&gt;
+     * method called in the {@link #isDispatchThread dispatch thread} of
+     * {@link Toolkit#getSystemEventQueue the system EventQueue}.
+     * This will happen after all pending events are processed.
+     * The call blocks until this has happened.  This method
+     * will throw an Error if called from the
+     * {@link #isDispatchThread event dispatcher thread}.
+     *
+     * @param runnable  the &lt;code&gt;Runnable&lt;/code&gt; whose &lt;code&gt;run&lt;/code&gt;
+     *                  method should be executed
+     *                  synchronously in the
+     *                  {@link #isDispatchThread event dispatch thread}
+     *                  of {@link Toolkit#getSystemEventQueue the system EventQueue}
+     * @exception       InterruptedException  if any thread has
+     *                  interrupted this thread
+     * @exception       InvocationTargetException  if an throwable is thrown
+     *                  when running &lt;code&gt;runnable&lt;/code&gt;
+     * @see             #invokeLater
+     * @see             Toolkit#getSystemEventQueue
+     * @see             #isDispatchThread
+     * @since           1.2
+     */
+    public static void invokeAndWait(Runnable runnable)
+        throws InterruptedException, InvocationTargetException
+    {
+<span class="nc" id="L1275">        invokeAndWait(Toolkit.getDefaultToolkit(), runnable);</span>
+<span class="nc" id="L1276">    }</span>
+
+    static void invokeAndWait(Object source, Runnable runnable)
+        throws InterruptedException, InvocationTargetException
+    {
+<span class="nc bnc" id="L1281" title="All 2 branches missed.">        if (EventQueue.isDispatchThread()) {</span>
+<span class="nc" id="L1282">            throw new Error(&quot;Cannot call invokeAndWait from the event dispatcher thread&quot;);</span>
+        }
+
+<span class="nc" id="L1285">        class AWTInvocationLock {}</span>
+<span class="nc" id="L1286">        Object lock = new AWTInvocationLock();</span>
+
+<span class="nc" id="L1288">        InvocationEvent event =</span>
+            new InvocationEvent(source, runnable, lock, true);
+
+<span class="nc" id="L1291">        synchronized (lock) {</span>
+<span class="nc" id="L1292">            Toolkit.getEventQueue().postEvent(event);</span>
+<span class="nc bnc" id="L1293" title="All 2 branches missed.">            while (!event.isDispatched()) {</span>
+<span class="nc" id="L1294">                lock.wait();</span>
+            }
+<span class="nc" id="L1296">        }</span>
+
+<span class="nc" id="L1298">        Throwable eventThrowable = event.getThrowable();</span>
+<span class="nc bnc" id="L1299" title="All 2 branches missed.">        if (eventThrowable != null) {</span>
+<span class="nc" id="L1300">            throw new InvocationTargetException(eventThrowable);</span>
+        }
+<span class="nc" id="L1302">    }</span>
+
+    /*
+     * Called from PostEventQueue.postEvent to notify that a new event
+     * appeared. First it proceeds to the EventQueue on the top of the
+     * stack, then notifies the associated dispatch thread if it exists
+     * or starts a new one otherwise.
+     */
+    private void wakeup(boolean isShutdown) {
+<span class="nc" id="L1311">        pushPopLock.lock();</span>
+        try {
+<span class="nc bnc" id="L1313" title="All 2 branches missed.">            if (nextQueue != null) {</span>
+                // Forward call to the top of EventQueue stack.
+<span class="nc" id="L1315">                nextQueue.wakeup(isShutdown);</span>
+<span class="nc bnc" id="L1316" title="All 2 branches missed.">            } else if (dispatchThread != null) {</span>
+<span class="nc" id="L1317">                pushPopCond.signalAll();</span>
+<span class="nc bnc" id="L1318" title="All 2 branches missed.">            } else if (!isShutdown) {</span>
+<span class="nc" id="L1319">                initDispatchThread();</span>
+            }
+        } finally {
+<span class="nc" id="L1322">            pushPopLock.unlock();</span>
+<span class="nc" id="L1323">        }</span>
+<span class="nc" id="L1324">    }</span>
+
+    // The method is used by AWTAccessor for javafx/AWT single threaded mode.
+    private void setFwDispatcher(FwDispatcher dispatcher) {
+<span class="nc bnc" id="L1328" title="All 2 branches missed.">        if (nextQueue != null) {</span>
+<span class="nc" id="L1329">            nextQueue.setFwDispatcher(dispatcher);</span>
+        } else {
+<span class="nc" id="L1331">            fwDispatcher = dispatcher;</span>
+        }
+<span class="nc" id="L1333">    }</span>
+}
+
+/**
+ * The Queue object holds pointers to the beginning and end of one internal
+ * queue. An EventQueue object is composed of multiple internal Queues, one
+ * for each priority supported by the EventQueue. All Events on a particular
+ * internal Queue have identical priority.
+ */
+<span class="fc" id="L1342">class Queue {</span>
+    EventQueueItem head;
+    EventQueueItem tail;
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

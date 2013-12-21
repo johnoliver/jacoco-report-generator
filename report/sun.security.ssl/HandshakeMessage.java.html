@@ -1,0 +1,2045 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>HandshakeMessage.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.ssl</a> &gt; <span class="el_source">HandshakeMessage.java</span></div><h1>HandshakeMessage.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1996, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.security.ssl;
+
+import java.io.*;
+import java.math.BigInteger;
+import java.security.*;
+import java.security.interfaces.*;
+import java.security.spec.*;
+import java.security.cert.*;
+import java.security.cert.Certificate;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+import java.lang.reflect.*;
+
+import javax.security.auth.x500.X500Principal;
+
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.DHPublicKeySpec;
+
+import javax.net.ssl.*;
+
+import sun.security.internal.spec.TlsPrfParameterSpec;
+import sun.security.ssl.CipherSuite.*;
+import static sun.security.ssl.CipherSuite.PRF.*;
+import sun.security.util.KeyUtil;
+
+/**
+ * Many data structures are involved in the handshake messages.  These
+ * classes are used as structures, with public data members.  They are
+ * not visible outside the SSL package.
+ *
+ * Handshake messages all have a common header format, and they are all
+ * encoded in a &quot;handshake data&quot; SSL record substream.  The base class
+ * here (HandshakeMessage) provides a common framework and records the
+ * SSL record type of the particular handshake message.
+ *
+ * This file contains subclasses for all the basic handshake messages.
+ * All handshake messages know how to encode and decode themselves on
+ * SSL streams; this facilitates using the same code on SSL client and
+ * server sides, although they don't send and receive the same messages.
+ *
+ * Messages also know how to print themselves, which is quite handy
+ * for debugging.  They always identify their type, and can optionally
+ * dump all of their content.
+ *
+ * @author David Brownell
+ */
+public abstract class HandshakeMessage {
+
+<span class="nc" id="L76">    HandshakeMessage() { }</span>
+
+    // enum HandshakeType:
+    static final byte   ht_hello_request = 0;
+    static final byte   ht_client_hello = 1;
+    static final byte   ht_server_hello = 2;
+
+    static final byte   ht_certificate = 11;
+    static final byte   ht_server_key_exchange = 12;
+    static final byte   ht_certificate_request = 13;
+    static final byte   ht_server_hello_done = 14;
+    static final byte   ht_certificate_verify = 15;
+    static final byte   ht_client_key_exchange = 16;
+
+    static final byte   ht_finished = 20;
+
+    /* Class and subclass dynamic debugging support */
+<span class="nc" id="L93">    public static final Debug debug = Debug.getInstance(&quot;ssl&quot;);</span>
+
+    /**
+     * Utility method to convert a BigInteger to a byte array in unsigned
+     * format as needed in the handshake messages. BigInteger uses
+     * 2's complement format, i.e. it prepends an extra zero if the MSB
+     * is set. We remove that.
+     */
+    static byte[] toByteArray(BigInteger bi) {
+<span class="nc" id="L102">        byte[] b = bi.toByteArray();</span>
+<span class="nc bnc" id="L103" title="All 4 branches missed.">        if ((b.length &gt; 1) &amp;&amp; (b[0] == 0)) {</span>
+<span class="nc" id="L104">            int n = b.length - 1;</span>
+<span class="nc" id="L105">            byte[] newarray = new byte[n];</span>
+<span class="nc" id="L106">            System.arraycopy(b, 1, newarray, 0, n);</span>
+<span class="nc" id="L107">            b = newarray;</span>
+        }
+<span class="nc" id="L109">        return b;</span>
+    }
+
+    /*
+     * SSL 3.0 MAC padding constants.
+     * Also used by CertificateVerify and Finished during the handshake.
+     */
+<span class="nc" id="L116">    static final byte[] MD5_pad1 = genPad(0x36, 48);</span>
+<span class="nc" id="L117">    static final byte[] MD5_pad2 = genPad(0x5c, 48);</span>
+
+<span class="nc" id="L119">    static final byte[] SHA_pad1 = genPad(0x36, 40);</span>
+<span class="nc" id="L120">    static final byte[] SHA_pad2 = genPad(0x5c, 40);</span>
+
+    private static byte[] genPad(int b, int count) {
+<span class="nc" id="L123">        byte[] padding = new byte[count];</span>
+<span class="nc" id="L124">        Arrays.fill(padding, (byte)b);</span>
+<span class="nc" id="L125">        return padding;</span>
+    }
+
+    /*
+     * Write a handshake message on the (handshake) output stream.
+     * This is just a four byte header followed by the data.
+     *
+     * NOTE that huge messages -- notably, ones with huge cert
+     * chains -- are handled correctly.
+     */
+    final void write(HandshakeOutStream s) throws IOException {
+<span class="nc" id="L136">        int len = messageLength();</span>
+<span class="nc bnc" id="L137" title="All 2 branches missed.">        if (len &gt;= Record.OVERFLOW_OF_INT24) {</span>
+<span class="nc" id="L138">            throw new SSLException(&quot;Handshake message too big&quot;</span>
+<span class="nc" id="L139">                + &quot;, type = &quot; + messageType() + &quot;, len = &quot; + len);</span>
+        }
+<span class="nc" id="L141">        s.write(messageType());</span>
+<span class="nc" id="L142">        s.putInt24(len);</span>
+<span class="nc" id="L143">        send(s);</span>
+<span class="nc" id="L144">    }</span>
+
+    /*
+     * Subclasses implement these methods so those kinds of
+     * messages can be emitted.  Base class delegates to subclass.
+     */
+    abstract int  messageType();
+    abstract int  messageLength();
+    abstract void send(HandshakeOutStream s) throws IOException;
+
+    /*
+     * Write a descriptive message on the output stream; for debugging.
+     */
+    abstract void print(PrintStream p) throws IOException;
+
+//
+// NOTE:  the rest of these classes are nested within this one, and are
+// imported by other classes in this package.  There are a few other
+// handshake message classes, not neatly nested here because of current
+// licensing requirement for native (RSA) methods.  They belong here,
+// but those native methods complicate things a lot!
+//
+
+
+/*
+ * HelloRequest ... SERVER --&gt; CLIENT
+ *
+ * Server can ask the client to initiate a new handshake, e.g. to change
+ * session parameters after a connection has been (re)established.
+ */
+static final class HelloRequest extends HandshakeMessage {
+    @Override
+<span class="nc" id="L176">    int messageType() { return ht_hello_request; }</span>
+
+<span class="nc" id="L178">    HelloRequest() { }</span>
+
+    HelloRequest(HandshakeInStream in) throws IOException
+<span class="nc" id="L181">    {</span>
+        // nothing in this message
+<span class="nc" id="L183">    }</span>
+
+    @Override
+<span class="nc" id="L186">    int messageLength() { return 0; }</span>
+
+    @Override
+    void send(HandshakeOutStream out) throws IOException
+    {
+        // nothing in this messaage
+<span class="nc" id="L192">    }</span>
+
+    @Override
+    void print(PrintStream out) throws IOException
+    {
+<span class="nc" id="L197">        out.println(&quot;*** HelloRequest (empty)&quot;);</span>
+<span class="nc" id="L198">    }</span>
+
+}
+
+
+/*
+ * ClientHello ... CLIENT --&gt; SERVER
+ *
+ * Client initiates handshake by telling server what it wants, and what it
+ * can support (prioritized by what's first in the ciphe suite list).
+ *
+ * By RFC2246:7.4.1.2 it's explicitly anticipated that this message
+ * will have more data added at the end ... e.g. what CAs the client trusts.
+ * Until we know how to parse it, we will just read what we know
+ * about, and let our caller handle the jumps over unknown data.
+ */
+static final class ClientHello extends HandshakeMessage {
+
+    ProtocolVersion     protocolVersion;
+    RandomCookie        clnt_random;
+    SessionId           sessionId;
+    private CipherSuiteList    cipherSuites;
+    byte[]              compression_methods;
+
+<span class="nc" id="L222">    HelloExtensions extensions = new HelloExtensions();</span>
+
+<span class="nc" id="L224">    private final static byte[]  NULL_COMPRESSION = new byte[] {0};</span>
+
+    ClientHello(SecureRandom generator, ProtocolVersion protocolVersion,
+<span class="nc" id="L227">            SessionId sessionId, CipherSuiteList cipherSuites) {</span>
+
+<span class="nc" id="L229">        this.protocolVersion = protocolVersion;</span>
+<span class="nc" id="L230">        this.sessionId = sessionId;</span>
+<span class="nc" id="L231">        this.cipherSuites = cipherSuites;</span>
+
+<span class="nc bnc" id="L233" title="All 2 branches missed.">        if (cipherSuites.containsEC()) {</span>
+<span class="nc" id="L234">            extensions.add(SupportedEllipticCurvesExtension.DEFAULT);</span>
+<span class="nc" id="L235">            extensions.add(SupportedEllipticPointFormatsExtension.DEFAULT);</span>
+        }
+
+<span class="nc" id="L238">        clnt_random = new RandomCookie(generator);</span>
+<span class="nc" id="L239">        compression_methods = NULL_COMPRESSION;</span>
+<span class="nc" id="L240">    }</span>
+
+<span class="nc" id="L242">    ClientHello(HandshakeInStream s, int messageLength) throws IOException {</span>
+<span class="nc" id="L243">        protocolVersion = ProtocolVersion.valueOf(s.getInt8(), s.getInt8());</span>
+<span class="nc" id="L244">        clnt_random = new RandomCookie(s);</span>
+<span class="nc" id="L245">        sessionId = new SessionId(s.getBytes8());</span>
+<span class="nc" id="L246">        cipherSuites = new CipherSuiteList(s);</span>
+<span class="nc" id="L247">        compression_methods = s.getBytes8();</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">        if (messageLength() != messageLength) {</span>
+<span class="nc" id="L249">            extensions = new HelloExtensions(s);</span>
+        }
+<span class="nc" id="L251">    }</span>
+
+    CipherSuiteList getCipherSuites() {
+<span class="nc" id="L254">        return cipherSuites;</span>
+    }
+
+    // add renegotiation_info extension
+    void addRenegotiationInfoExtension(byte[] clientVerifyData) {
+<span class="nc" id="L259">        HelloExtension renegotiationInfo = new RenegotiationInfoExtension(</span>
+                    clientVerifyData, new byte[0]);
+<span class="nc" id="L261">        extensions.add(renegotiationInfo);</span>
+<span class="nc" id="L262">    }</span>
+
+    // add server_name extension
+    void addSNIExtension(List&lt;SNIServerName&gt; serverNames) {
+        try {
+<span class="nc" id="L267">            extensions.add(new ServerNameExtension(serverNames));</span>
+<span class="nc" id="L268">        } catch (IOException ioe) {</span>
+            // ignore the exception and return
+<span class="nc" id="L270">        }</span>
+<span class="nc" id="L271">    }</span>
+
+    // add signature_algorithm extension
+    void addSignatureAlgorithmsExtension(
+            Collection&lt;SignatureAndHashAlgorithm&gt; algorithms) {
+<span class="nc" id="L276">        HelloExtension signatureAlgorithm =</span>
+                new SignatureAlgorithmsExtension(algorithms);
+<span class="nc" id="L278">        extensions.add(signatureAlgorithm);</span>
+<span class="nc" id="L279">    }</span>
+
+    @Override
+<span class="nc" id="L282">    int messageType() { return ht_client_hello; }</span>
+
+    @Override
+    int messageLength() {
+        /*
+         * Add fixed size parts of each field...
+         * version + random + session + cipher + compress
+         */
+<span class="nc" id="L290">        return (2 + 32 + 1 + 2 + 1</span>
+<span class="nc" id="L291">            + sessionId.length()                /* ... + variable parts */</span>
+<span class="nc" id="L292">            + (cipherSuites.size() * 2)</span>
+            + compression_methods.length)
+<span class="nc" id="L294">            + extensions.length();</span>
+    }
+
+    @Override
+    void send(HandshakeOutStream s) throws IOException {
+<span class="nc" id="L299">        s.putInt8(protocolVersion.major);</span>
+<span class="nc" id="L300">        s.putInt8(protocolVersion.minor);</span>
+<span class="nc" id="L301">        clnt_random.send(s);</span>
+<span class="nc" id="L302">        s.putBytes8(sessionId.getId());</span>
+<span class="nc" id="L303">        cipherSuites.send(s);</span>
+<span class="nc" id="L304">        s.putBytes8(compression_methods);</span>
+<span class="nc" id="L305">        extensions.send(s);</span>
+<span class="nc" id="L306">    }</span>
+
+    @Override
+    void print(PrintStream s) throws IOException {
+<span class="nc" id="L310">        s.println(&quot;*** ClientHello, &quot; + protocolVersion);</span>
+
+<span class="nc bnc" id="L312" title="All 4 branches missed.">        if (debug != null &amp;&amp; Debug.isOn(&quot;verbose&quot;)) {</span>
+<span class="nc" id="L313">            s.print(&quot;RandomCookie:  &quot;);</span>
+<span class="nc" id="L314">            clnt_random.print(s);</span>
+
+<span class="nc" id="L316">            s.print(&quot;Session ID:  &quot;);</span>
+<span class="nc" id="L317">            s.println(sessionId);</span>
+
+<span class="nc" id="L319">            s.println(&quot;Cipher Suites: &quot; + cipherSuites);</span>
+
+<span class="nc" id="L321">            Debug.println(s, &quot;Compression Methods&quot;, compression_methods);</span>
+<span class="nc" id="L322">            extensions.print(s);</span>
+<span class="nc" id="L323">            s.println(&quot;***&quot;);</span>
+        }
+<span class="nc" id="L325">    }</span>
+}
+
+/*
+ * ServerHello ... SERVER --&gt; CLIENT
+ *
+ * Server chooses protocol options from among those it supports and the
+ * client supports.  Then it sends the basic session descriptive parameters
+ * back to the client.
+ */
+static final
+class ServerHello extends HandshakeMessage
+{
+    @Override
+<span class="nc" id="L339">    int messageType() { return ht_server_hello; }</span>
+
+    ProtocolVersion     protocolVersion;
+    RandomCookie        svr_random;
+    SessionId           sessionId;
+    CipherSuite         cipherSuite;
+    byte                compression_method;
+<span class="nc" id="L346">    HelloExtensions extensions = new HelloExtensions();</span>
+
+<span class="nc" id="L348">    ServerHello() {</span>
+        // empty
+<span class="nc" id="L350">    }</span>
+
+    ServerHello(HandshakeInStream input, int messageLength)
+<span class="nc" id="L353">            throws IOException {</span>
+<span class="nc" id="L354">        protocolVersion = ProtocolVersion.valueOf(input.getInt8(),</span>
+<span class="nc" id="L355">                                                  input.getInt8());</span>
+<span class="nc" id="L356">        svr_random = new RandomCookie(input);</span>
+<span class="nc" id="L357">        sessionId = new SessionId(input.getBytes8());</span>
+<span class="nc" id="L358">        cipherSuite = CipherSuite.valueOf(input.getInt8(), input.getInt8());</span>
+<span class="nc" id="L359">        compression_method = (byte)input.getInt8();</span>
+<span class="nc bnc" id="L360" title="All 2 branches missed.">        if (messageLength() != messageLength) {</span>
+<span class="nc" id="L361">            extensions = new HelloExtensions(input);</span>
+        }
+<span class="nc" id="L363">    }</span>
+
+    @Override
+    int messageLength()
+    {
+        // almost fixed size, except session ID and extensions:
+        //      major + minor = 2
+        //      random = 32
+        //      session ID len field = 1
+        //      cipher suite + compression = 3
+        //      extensions: if present, 2 + length of extensions
+<span class="nc" id="L374">        return 38 + sessionId.length() + extensions.length();</span>
+    }
+
+    @Override
+    void send(HandshakeOutStream s) throws IOException
+    {
+<span class="nc" id="L380">        s.putInt8(protocolVersion.major);</span>
+<span class="nc" id="L381">        s.putInt8(protocolVersion.minor);</span>
+<span class="nc" id="L382">        svr_random.send(s);</span>
+<span class="nc" id="L383">        s.putBytes8(sessionId.getId());</span>
+<span class="nc" id="L384">        s.putInt8(cipherSuite.id &gt;&gt; 8);</span>
+<span class="nc" id="L385">        s.putInt8(cipherSuite.id &amp; 0xff);</span>
+<span class="nc" id="L386">        s.putInt8(compression_method);</span>
+<span class="nc" id="L387">        extensions.send(s);</span>
+<span class="nc" id="L388">    }</span>
+
+    @Override
+    void print(PrintStream s) throws IOException
+    {
+<span class="nc" id="L393">        s.println(&quot;*** ServerHello, &quot; + protocolVersion);</span>
+
+<span class="nc bnc" id="L395" title="All 4 branches missed.">        if (debug != null &amp;&amp; Debug.isOn(&quot;verbose&quot;)) {</span>
+<span class="nc" id="L396">            s.print(&quot;RandomCookie:  &quot;);</span>
+<span class="nc" id="L397">            svr_random.print(s);</span>
+
+<span class="nc" id="L399">            s.print(&quot;Session ID:  &quot;);</span>
+<span class="nc" id="L400">            s.println(sessionId);</span>
+
+<span class="nc" id="L402">            s.println(&quot;Cipher Suite: &quot; + cipherSuite);</span>
+<span class="nc" id="L403">            s.println(&quot;Compression Method: &quot; + compression_method);</span>
+<span class="nc" id="L404">            extensions.print(s);</span>
+<span class="nc" id="L405">            s.println(&quot;***&quot;);</span>
+        }
+<span class="nc" id="L407">    }</span>
+}
+
+
+/*
+ * CertificateMsg ... send by both CLIENT and SERVER
+ *
+ * Each end of a connection may need to pass its certificate chain to
+ * the other end.  Such chains are intended to validate an identity with
+ * reference to some certifying authority.  Examples include companies
+ * like Verisign, or financial institutions.  There's some control over
+ * the certifying authorities which are sent.
+ *
+ * NOTE: that these messages might be huge, taking many handshake records.
+ * Up to 2^48 bytes of certificate may be sent, in records of at most 2^14
+ * bytes each ... up to 2^32 records sent on the output stream.
+ */
+static final
+class CertificateMsg extends HandshakeMessage
+{
+    @Override
+<span class="nc" id="L428">    int messageType() { return ht_certificate; }</span>
+
+    private X509Certificate[] chain;
+
+    private List&lt;byte[]&gt; encodedChain;
+
+    private int messageLength;
+
+<span class="nc" id="L436">    CertificateMsg(X509Certificate[] certs) {</span>
+<span class="nc" id="L437">        chain = certs;</span>
+<span class="nc" id="L438">    }</span>
+
+<span class="nc" id="L440">    CertificateMsg(HandshakeInStream input) throws IOException {</span>
+<span class="nc" id="L441">        int chainLen = input.getInt24();</span>
+<span class="nc" id="L442">        List&lt;Certificate&gt; v = new ArrayList&lt;&gt;(4);</span>
+
+<span class="nc" id="L444">        CertificateFactory cf = null;</span>
+<span class="nc bnc" id="L445" title="All 2 branches missed.">        while (chainLen &gt; 0) {</span>
+<span class="nc" id="L446">            byte[] cert = input.getBytes24();</span>
+<span class="nc" id="L447">            chainLen -= (3 + cert.length);</span>
+            try {
+<span class="nc bnc" id="L449" title="All 2 branches missed.">                if (cf == null) {</span>
+<span class="nc" id="L450">                    cf = CertificateFactory.getInstance(&quot;X.509&quot;);</span>
+                }
+<span class="nc" id="L452">                v.add(cf.generateCertificate(new ByteArrayInputStream(cert)));</span>
+<span class="nc" id="L453">            } catch (CertificateException e) {</span>
+<span class="nc" id="L454">                throw (SSLProtocolException)new SSLProtocolException(</span>
+<span class="nc" id="L455">                    e.getMessage()).initCause(e);</span>
+<span class="nc" id="L456">            }</span>
+<span class="nc" id="L457">        }</span>
+
+<span class="nc" id="L459">        chain = v.toArray(new X509Certificate[v.size()]);</span>
+<span class="nc" id="L460">    }</span>
+
+    @Override
+    int messageLength() {
+<span class="nc bnc" id="L464" title="All 2 branches missed.">        if (encodedChain == null) {</span>
+<span class="nc" id="L465">            messageLength = 3;</span>
+<span class="nc" id="L466">            encodedChain = new ArrayList&lt;byte[]&gt;(chain.length);</span>
+            try {
+<span class="nc bnc" id="L468" title="All 2 branches missed.">                for (X509Certificate cert : chain) {</span>
+<span class="nc" id="L469">                    byte[] b = cert.getEncoded();</span>
+<span class="nc" id="L470">                    encodedChain.add(b);</span>
+<span class="nc" id="L471">                    messageLength += b.length + 3;</span>
+                }
+<span class="nc" id="L473">            } catch (CertificateEncodingException e) {</span>
+<span class="nc" id="L474">                encodedChain = null;</span>
+<span class="nc" id="L475">                throw new RuntimeException(&quot;Could not encode certificates&quot;, e);</span>
+<span class="nc" id="L476">            }</span>
+        }
+<span class="nc" id="L478">        return messageLength;</span>
+    }
+
+    @Override
+    void send(HandshakeOutStream s) throws IOException {
+<span class="nc" id="L483">        s.putInt24(messageLength() - 3);</span>
+<span class="nc bnc" id="L484" title="All 2 branches missed.">        for (byte[] b : encodedChain) {</span>
+<span class="nc" id="L485">            s.putBytes24(b);</span>
+<span class="nc" id="L486">        }</span>
+<span class="nc" id="L487">    }</span>
+
+    @Override
+    void print(PrintStream s) throws IOException {
+<span class="nc" id="L491">        s.println(&quot;*** Certificate chain&quot;);</span>
+
+<span class="nc bnc" id="L493" title="All 4 branches missed.">        if (debug != null &amp;&amp; Debug.isOn(&quot;verbose&quot;)) {</span>
+<span class="nc bnc" id="L494" title="All 2 branches missed.">            for (int i = 0; i &lt; chain.length; i++)</span>
+<span class="nc" id="L495">                s.println(&quot;chain [&quot; + i + &quot;] = &quot; + chain[i]);</span>
+<span class="nc" id="L496">            s.println(&quot;***&quot;);</span>
+        }
+<span class="nc" id="L498">    }</span>
+
+    X509Certificate[] getCertificateChain() {
+<span class="nc" id="L501">        return chain.clone();</span>
+    }
+}
+
+/*
+ * ServerKeyExchange ... SERVER --&gt; CLIENT
+ *
+ * The cipher suite selected, when combined with the certificate exchanged,
+ * implies one of several different kinds of key exchange.  Most current
+ * cipher suites require the server to send more than its certificate.
+ *
+ * The primary exceptions are when a server sends an encryption-capable
+ * RSA public key in its cert, to be used with RSA (or RSA_export) key
+ * exchange; and when a server sends its Diffie-Hellman cert.  Those kinds
+ * of key exchange do not require a ServerKeyExchange message.
+ *
+ * Key exchange can be viewed as having three modes, which are explicit
+ * for the Diffie-Hellman flavors and poorly specified for RSA ones:
+ *
+ *      - &quot;Ephemeral&quot; keys.  Here, a &quot;temporary&quot; key is allocated by the
+ *        server, and signed.  Diffie-Hellman keys signed using RSA or
+ *        DSS are ephemeral (DHE flavor).  RSA keys get used to do the same
+ *        thing, to cut the key size down to 512 bits (export restrictions)
+ *        or for signing-only RSA certificates.
+ *
+ *      - Anonymity.  Here no server certificate is sent, only the public
+ *        key of the server.  This case is subject to man-in-the-middle
+ *        attacks.  This can be done with Diffie-Hellman keys (DH_anon) or
+ *        with RSA keys, but is only used in SSLv3 for DH_anon.
+ *
+ *      - &quot;Normal&quot; case.  Here a server certificate is sent, and the public
+ *        key there is used directly in exchanging the premaster secret.
+ *        For example, Diffie-Hellman &quot;DH&quot; flavor, and any RSA flavor with
+ *        only 512 bit keys.
+ *
+ * If a server certificate is sent, there is no anonymity.  However,
+ * when a certificate is sent, ephemeral keys may still be used to
+ * exchange the premaster secret.  That's how RSA_EXPORT often works,
+ * as well as how the DHE_* flavors work.
+ */
+<span class="nc" id="L541">static abstract class ServerKeyExchange extends HandshakeMessage</span>
+{
+    @Override
+<span class="nc" id="L544">    int messageType() { return ht_server_key_exchange; }</span>
+}
+
+
+/*
+ * Using RSA for Key Exchange:  exchange a session key that's not as big
+ * as the signing-only key.  Used for export applications, since exported
+ * RSA encryption keys can't be bigger than 512 bytes.
+ *
+ * This is never used when keys are 512 bits or smaller, and isn't used
+ * on &quot;US Domestic&quot; ciphers in any case.
+ */
+static final
+class RSA_ServerKeyExchange extends ServerKeyExchange
+{
+    private byte rsa_modulus[];     // 1 to 2^16 - 1 bytes
+    private byte rsa_exponent[];    // 1 to 2^16 - 1 bytes
+
+    private Signature signature;
+    private byte[] signatureBytes;
+
+    /*
+     * Hash the nonces and the ephemeral RSA public key.
+     */
+    private void updateSignature(byte clntNonce[], byte svrNonce[])
+            throws SignatureException {
+        int tmp;
+
+<span class="nc" id="L572">        signature.update(clntNonce);</span>
+<span class="nc" id="L573">        signature.update(svrNonce);</span>
+
+<span class="nc" id="L575">        tmp = rsa_modulus.length;</span>
+<span class="nc" id="L576">        signature.update((byte)(tmp &gt;&gt; 8));</span>
+<span class="nc" id="L577">        signature.update((byte)(tmp &amp; 0x0ff));</span>
+<span class="nc" id="L578">        signature.update(rsa_modulus);</span>
+
+<span class="nc" id="L580">        tmp = rsa_exponent.length;</span>
+<span class="nc" id="L581">        signature.update((byte)(tmp &gt;&gt; 8));</span>
+<span class="nc" id="L582">        signature.update((byte)(tmp &amp; 0x0ff));</span>
+<span class="nc" id="L583">        signature.update(rsa_exponent);</span>
+<span class="nc" id="L584">    }</span>
+
+
+    /*
+     * Construct an RSA server key exchange message, using data
+     * known _only_ to the server.
+     *
+     * The client knows the public key corresponding to this private
+     * key, from the Certificate message sent previously.  To comply
+     * with US export regulations we use short RSA keys ... either
+     * long term ones in the server's X509 cert, or else ephemeral
+     * ones sent using this message.
+     */
+    RSA_ServerKeyExchange(PublicKey ephemeralKey, PrivateKey privateKey,
+            RandomCookie clntNonce, RandomCookie svrNonce, SecureRandom sr)
+<span class="nc" id="L599">            throws GeneralSecurityException {</span>
+<span class="nc" id="L600">        RSAPublicKeySpec rsaKey = JsseJce.getRSAPublicKeySpec(ephemeralKey);</span>
+<span class="nc" id="L601">        rsa_modulus = toByteArray(rsaKey.getModulus());</span>
+<span class="nc" id="L602">        rsa_exponent = toByteArray(rsaKey.getPublicExponent());</span>
+<span class="nc" id="L603">        signature = RSASignature.getInstance();</span>
+<span class="nc" id="L604">        signature.initSign(privateKey, sr);</span>
+<span class="nc" id="L605">        updateSignature(clntNonce.random_bytes, svrNonce.random_bytes);</span>
+<span class="nc" id="L606">        signatureBytes = signature.sign();</span>
+<span class="nc" id="L607">    }</span>
+
+
+    /*
+     * Parse an RSA server key exchange message, using data known
+     * to the client (and, in some situations, eavesdroppers).
+     */
+    RSA_ServerKeyExchange(HandshakeInStream input)
+<span class="nc" id="L615">            throws IOException, NoSuchAlgorithmException {</span>
+<span class="nc" id="L616">        signature = RSASignature.getInstance();</span>
+<span class="nc" id="L617">        rsa_modulus = input.getBytes16();</span>
+<span class="nc" id="L618">        rsa_exponent = input.getBytes16();</span>
+<span class="nc" id="L619">        signatureBytes = input.getBytes16();</span>
+<span class="nc" id="L620">    }</span>
+
+    /*
+     * Get the ephemeral RSA public key that will be used in this
+     * SSL connection.
+     */
+    PublicKey getPublicKey() {
+        try {
+<span class="nc" id="L628">            KeyFactory kfac = JsseJce.getKeyFactory(&quot;RSA&quot;);</span>
+            // modulus and exponent are always positive
+<span class="nc" id="L630">            RSAPublicKeySpec kspec = new RSAPublicKeySpec(</span>
+                new BigInteger(1, rsa_modulus),
+                new BigInteger(1, rsa_exponent));
+<span class="nc" id="L633">            return kfac.generatePublic(kspec);</span>
+<span class="nc" id="L634">        } catch (Exception e) {</span>
+<span class="nc" id="L635">            throw new RuntimeException(e);</span>
+        }
+    }
+
+    /*
+     * Verify the signed temporary key using the hashes computed
+     * from it and the two nonces.  This is called by clients
+     * with &quot;exportable&quot; RSA flavors.
+     */
+    boolean verify(PublicKey certifiedKey, RandomCookie clntNonce,
+            RandomCookie svrNonce) throws GeneralSecurityException {
+<span class="nc" id="L646">        signature.initVerify(certifiedKey);</span>
+<span class="nc" id="L647">        updateSignature(clntNonce.random_bytes, svrNonce.random_bytes);</span>
+<span class="nc" id="L648">        return signature.verify(signatureBytes);</span>
+    }
+
+    @Override
+    int messageLength() {
+<span class="nc" id="L653">        return 6 + rsa_modulus.length + rsa_exponent.length</span>
+               + signatureBytes.length;
+    }
+
+    @Override
+    void send(HandshakeOutStream s) throws IOException {
+<span class="nc" id="L659">        s.putBytes16(rsa_modulus);</span>
+<span class="nc" id="L660">        s.putBytes16(rsa_exponent);</span>
+<span class="nc" id="L661">        s.putBytes16(signatureBytes);</span>
+<span class="nc" id="L662">    }</span>
+
+    @Override
+    void print(PrintStream s) throws IOException {
+<span class="nc" id="L666">        s.println(&quot;*** RSA ServerKeyExchange&quot;);</span>
+
+<span class="nc bnc" id="L668" title="All 4 branches missed.">        if (debug != null &amp;&amp; Debug.isOn(&quot;verbose&quot;)) {</span>
+<span class="nc" id="L669">            Debug.println(s, &quot;RSA Modulus&quot;, rsa_modulus);</span>
+<span class="nc" id="L670">            Debug.println(s, &quot;RSA Public Exponent&quot;, rsa_exponent);</span>
+        }
+<span class="nc" id="L672">    }</span>
+}
+
+
+/*
+ * Using Diffie-Hellman algorithm for key exchange.  All we really need to
+ * do is securely get Diffie-Hellman keys (using the same P, G parameters)
+ * to our peer, then we automatically have a shared secret without need
+ * to exchange any more data.  (D-H only solutions, such as SKIP, could
+ * eliminate key exchange negotiations and get faster connection setup.
+ * But they still need a signature algorithm like DSS/DSA to support the
+ * trusted distribution of keys without relying on unscalable physical
+ * key distribution systems.)
+ *
+ * This class supports several DH-based key exchange algorithms, though
+ * perhaps eventually each deserves its own class.  Notably, this has
+ * basic support for DH_anon and its DHE_DSS and DHE_RSA signed variants.
+ */
+static final
+class DH_ServerKeyExchange extends ServerKeyExchange
+{
+    // Fix message encoding, see 4348279
+<span class="nc" id="L694">    private final static boolean dhKeyExchangeFix =</span>
+<span class="nc" id="L695">        Debug.getBooleanProperty(&quot;com.sun.net.ssl.dhKeyExchangeFix&quot;, true);</span>
+
+    private byte                dh_p [];        // 1 to 2^16 - 1 bytes
+    private byte                dh_g [];        // 1 to 2^16 - 1 bytes
+    private byte                dh_Ys [];       // 1 to 2^16 - 1 bytes
+
+    private byte                signature [];
+
+    // protocol version being established using this ServerKeyExchange message
+    ProtocolVersion protocolVersion;
+
+    // the preferable signature algorithm used by this ServerKeyExchange message
+    private SignatureAndHashAlgorithm preferableSignatureAlgorithm;
+
+    /*
+     * Construct from initialized DH key object, for DH_anon
+     * key exchange.
+     */
+<span class="nc" id="L713">    DH_ServerKeyExchange(DHCrypt obj, ProtocolVersion protocolVersion) {</span>
+<span class="nc" id="L714">        this.protocolVersion = protocolVersion;</span>
+<span class="nc" id="L715">        this.preferableSignatureAlgorithm = null;</span>
+
+        // The DH key has been validated in the constructor of DHCrypt.
+<span class="nc" id="L718">        setValues(obj);</span>
+<span class="nc" id="L719">        signature = null;</span>
+<span class="nc" id="L720">    }</span>
+
+    /*
+     * Construct from initialized DH key object and the key associated
+     * with the cert chain which was sent ... for DHE_DSS and DHE_RSA
+     * key exchange.  (Constructor called by server.)
+     */
+    DH_ServerKeyExchange(DHCrypt obj, PrivateKey key, byte clntNonce[],
+            byte svrNonce[], SecureRandom sr,
+            SignatureAndHashAlgorithm signAlgorithm,
+<span class="nc" id="L730">            ProtocolVersion protocolVersion) throws GeneralSecurityException {</span>
+
+<span class="nc" id="L732">        this.protocolVersion = protocolVersion;</span>
+
+        // The DH key has been validated in the constructor of DHCrypt.
+<span class="nc" id="L735">        setValues(obj);</span>
+
+        Signature sig;
+<span class="nc bnc" id="L738" title="All 2 branches missed.">        if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L739">            this.preferableSignatureAlgorithm = signAlgorithm;</span>
+<span class="nc" id="L740">            sig = JsseJce.getSignature(signAlgorithm.getAlgorithmName());</span>
+        } else {
+<span class="nc" id="L742">            this.preferableSignatureAlgorithm = null;</span>
+<span class="nc bnc" id="L743" title="All 2 branches missed.">            if (key.getAlgorithm().equals(&quot;DSA&quot;)) {</span>
+<span class="nc" id="L744">                sig = JsseJce.getSignature(JsseJce.SIGNATURE_DSA);</span>
+            } else {
+<span class="nc" id="L746">                sig = RSASignature.getInstance();</span>
+            }
+        }
+
+<span class="nc" id="L750">        sig.initSign(key, sr);</span>
+<span class="nc" id="L751">        updateSignature(sig, clntNonce, svrNonce);</span>
+<span class="nc" id="L752">        signature = sig.sign();</span>
+<span class="nc" id="L753">    }</span>
+
+    /*
+     * Construct a DH_ServerKeyExchange message from an input
+     * stream, as if sent from server to client for use with
+     * DH_anon key exchange
+     */
+    DH_ServerKeyExchange(HandshakeInStream input,
+            ProtocolVersion protocolVersion)
+<span class="nc" id="L762">            throws IOException, GeneralSecurityException {</span>
+
+<span class="nc" id="L764">        this.protocolVersion = protocolVersion;</span>
+<span class="nc" id="L765">        this.preferableSignatureAlgorithm = null;</span>
+
+<span class="nc" id="L767">        dh_p = input.getBytes16();</span>
+<span class="nc" id="L768">        dh_g = input.getBytes16();</span>
+<span class="nc" id="L769">        dh_Ys = input.getBytes16();</span>
+<span class="nc" id="L770">        KeyUtil.validate(new DHPublicKeySpec(new BigInteger(1, dh_Ys),</span>
+                                             new BigInteger(1, dh_p),
+                                             new BigInteger(1, dh_g)));
+
+<span class="nc" id="L774">        signature = null;</span>
+<span class="nc" id="L775">    }</span>
+
+    /*
+     * Construct a DH_ServerKeyExchange message from an input stream
+     * and a certificate, as if sent from server to client for use with
+     * DHE_DSS or DHE_RSA key exchange.  (Called by client.)
+     */
+    DH_ServerKeyExchange(HandshakeInStream input, PublicKey publicKey,
+            byte clntNonce[], byte svrNonce[], int messageSize,
+            Collection&lt;SignatureAndHashAlgorithm&gt; localSupportedSignAlgs,
+            ProtocolVersion protocolVersion)
+<span class="nc" id="L786">            throws IOException, GeneralSecurityException {</span>
+
+<span class="nc" id="L788">        this.protocolVersion = protocolVersion;</span>
+
+        // read params: ServerDHParams
+<span class="nc" id="L791">        dh_p = input.getBytes16();</span>
+<span class="nc" id="L792">        dh_g = input.getBytes16();</span>
+<span class="nc" id="L793">        dh_Ys = input.getBytes16();</span>
+<span class="nc" id="L794">        KeyUtil.validate(new DHPublicKeySpec(new BigInteger(1, dh_Ys),</span>
+                                             new BigInteger(1, dh_p),
+                                             new BigInteger(1, dh_g)));
+
+        // read the signature and hash algorithm
+<span class="nc bnc" id="L799" title="All 2 branches missed.">        if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L800">            int hash = input.getInt8();         // hash algorithm</span>
+<span class="nc" id="L801">            int signature = input.getInt8();    // signature algorithm</span>
+
+<span class="nc" id="L803">            preferableSignatureAlgorithm =</span>
+<span class="nc" id="L804">                SignatureAndHashAlgorithm.valueOf(hash, signature, 0);</span>
+
+            // Is it a local supported signature algorithm?
+<span class="nc bnc" id="L807" title="All 2 branches missed.">            if (!localSupportedSignAlgs.contains(</span>
+                    preferableSignatureAlgorithm)) {
+<span class="nc" id="L809">                throw new SSLHandshakeException(</span>
+                        &quot;Unsupported SignatureAndHashAlgorithm in &quot; +
+                        &quot;ServerKeyExchange message&quot;);
+            }
+<span class="nc" id="L813">        } else {</span>
+<span class="nc" id="L814">            this.preferableSignatureAlgorithm = null;</span>
+        }
+
+        // read the signature
+        byte signature[];
+<span class="nc bnc" id="L819" title="All 2 branches missed.">        if (dhKeyExchangeFix) {</span>
+<span class="nc" id="L820">            signature = input.getBytes16();</span>
+        } else {
+<span class="nc" id="L822">            messageSize -= (dh_p.length + 2);</span>
+<span class="nc" id="L823">            messageSize -= (dh_g.length + 2);</span>
+<span class="nc" id="L824">            messageSize -= (dh_Ys.length + 2);</span>
+
+<span class="nc" id="L826">            signature = new byte[messageSize];</span>
+<span class="nc" id="L827">            input.read(signature);</span>
+        }
+
+        Signature sig;
+<span class="nc" id="L831">        String algorithm = publicKey.getAlgorithm();</span>
+<span class="nc bnc" id="L832" title="All 2 branches missed.">        if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L833">            sig = JsseJce.getSignature(</span>
+<span class="nc" id="L834">                        preferableSignatureAlgorithm.getAlgorithmName());</span>
+        } else {
+<span class="nc bnc" id="L836" title="All 10 branches missed.">                switch (algorithm) {</span>
+                    case &quot;DSA&quot;:
+<span class="nc" id="L838">                        sig = JsseJce.getSignature(JsseJce.SIGNATURE_DSA);</span>
+<span class="nc" id="L839">                        break;</span>
+                    case &quot;RSA&quot;:
+<span class="nc" id="L841">                        sig = RSASignature.getInstance();</span>
+<span class="nc" id="L842">                        break;</span>
+                    default:
+<span class="nc" id="L844">                        throw new SSLKeyException(&quot;neither an RSA or a DSA key&quot;);</span>
+                }
+        }
+
+<span class="nc" id="L848">        sig.initVerify(publicKey);</span>
+<span class="nc" id="L849">        updateSignature(sig, clntNonce, svrNonce);</span>
+
+<span class="nc bnc" id="L851" title="All 2 branches missed.">        if (sig.verify(signature) == false ) {</span>
+<span class="nc" id="L852">            throw new SSLKeyException(&quot;Server D-H key verification failed&quot;);</span>
+        }
+<span class="nc" id="L854">    }</span>
+
+    /* Return the Diffie-Hellman modulus */
+    BigInteger getModulus() {
+<span class="nc" id="L858">        return new BigInteger(1, dh_p);</span>
+    }
+
+    /* Return the Diffie-Hellman base/generator */
+    BigInteger getBase() {
+<span class="nc" id="L863">        return new BigInteger(1, dh_g);</span>
+    }
+
+    /* Return the server's Diffie-Hellman public key */
+    BigInteger getServerPublicKey() {
+<span class="nc" id="L868">        return new BigInteger(1, dh_Ys);</span>
+    }
+
+    /*
+     * Update sig with nonces and Diffie-Hellman public key.
+     */
+    private void updateSignature(Signature sig, byte clntNonce[],
+            byte svrNonce[]) throws SignatureException {
+        int tmp;
+
+<span class="nc" id="L878">        sig.update(clntNonce);</span>
+<span class="nc" id="L879">        sig.update(svrNonce);</span>
+
+<span class="nc" id="L881">        tmp = dh_p.length;</span>
+<span class="nc" id="L882">        sig.update((byte)(tmp &gt;&gt; 8));</span>
+<span class="nc" id="L883">        sig.update((byte)(tmp &amp; 0x0ff));</span>
+<span class="nc" id="L884">        sig.update(dh_p);</span>
+
+<span class="nc" id="L886">        tmp = dh_g.length;</span>
+<span class="nc" id="L887">        sig.update((byte)(tmp &gt;&gt; 8));</span>
+<span class="nc" id="L888">        sig.update((byte)(tmp &amp; 0x0ff));</span>
+<span class="nc" id="L889">        sig.update(dh_g);</span>
+
+<span class="nc" id="L891">        tmp = dh_Ys.length;</span>
+<span class="nc" id="L892">        sig.update((byte)(tmp &gt;&gt; 8));</span>
+<span class="nc" id="L893">        sig.update((byte)(tmp &amp; 0x0ff));</span>
+<span class="nc" id="L894">        sig.update(dh_Ys);</span>
+<span class="nc" id="L895">    }</span>
+
+    private void setValues(DHCrypt obj) {
+<span class="nc" id="L898">        dh_p = toByteArray(obj.getModulus());</span>
+<span class="nc" id="L899">        dh_g = toByteArray(obj.getBase());</span>
+<span class="nc" id="L900">        dh_Ys = toByteArray(obj.getPublicKey());</span>
+<span class="nc" id="L901">    }</span>
+
+    @Override
+    int messageLength() {
+<span class="nc" id="L905">        int temp = 6;   // overhead for p, g, y(s) values.</span>
+
+<span class="nc" id="L907">        temp += dh_p.length;</span>
+<span class="nc" id="L908">        temp += dh_g.length;</span>
+<span class="nc" id="L909">        temp += dh_Ys.length;</span>
+
+<span class="nc bnc" id="L911" title="All 2 branches missed.">        if (signature != null) {</span>
+<span class="nc bnc" id="L912" title="All 2 branches missed.">            if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L913">                temp += SignatureAndHashAlgorithm.sizeInRecord();</span>
+            }
+
+<span class="nc" id="L916">            temp += signature.length;</span>
+<span class="nc bnc" id="L917" title="All 2 branches missed.">            if (dhKeyExchangeFix) {</span>
+<span class="nc" id="L918">                temp += 2;</span>
+            }
+        }
+
+<span class="nc" id="L922">        return temp;</span>
+    }
+
+    @Override
+    void send(HandshakeOutStream s) throws IOException {
+<span class="nc" id="L927">        s.putBytes16(dh_p);</span>
+<span class="nc" id="L928">        s.putBytes16(dh_g);</span>
+<span class="nc" id="L929">        s.putBytes16(dh_Ys);</span>
+
+<span class="nc bnc" id="L931" title="All 2 branches missed.">        if (signature != null) {</span>
+<span class="nc bnc" id="L932" title="All 2 branches missed.">            if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L933">                s.putInt8(preferableSignatureAlgorithm.getHashValue());</span>
+<span class="nc" id="L934">                s.putInt8(preferableSignatureAlgorithm.getSignatureValue());</span>
+            }
+
+<span class="nc bnc" id="L937" title="All 2 branches missed.">            if (dhKeyExchangeFix) {</span>
+<span class="nc" id="L938">                s.putBytes16(signature);</span>
+            } else {
+<span class="nc" id="L940">                s.write(signature);</span>
+            }
+        }
+<span class="nc" id="L943">    }</span>
+
+    @Override
+    void print(PrintStream s) throws IOException {
+<span class="nc" id="L947">        s.println(&quot;*** Diffie-Hellman ServerKeyExchange&quot;);</span>
+
+<span class="nc bnc" id="L949" title="All 4 branches missed.">        if (debug != null &amp;&amp; Debug.isOn(&quot;verbose&quot;)) {</span>
+<span class="nc" id="L950">            Debug.println(s, &quot;DH Modulus&quot;, dh_p);</span>
+<span class="nc" id="L951">            Debug.println(s, &quot;DH Base&quot;, dh_g);</span>
+<span class="nc" id="L952">            Debug.println(s, &quot;Server DH Public Key&quot;, dh_Ys);</span>
+
+<span class="nc bnc" id="L954" title="All 2 branches missed.">            if (signature == null) {</span>
+<span class="nc" id="L955">                s.println(&quot;Anonymous&quot;);</span>
+            } else {
+<span class="nc bnc" id="L957" title="All 2 branches missed.">                if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L958">                    s.println(&quot;Signature Algorithm &quot; +</span>
+<span class="nc" id="L959">                        preferableSignatureAlgorithm.getAlgorithmName());</span>
+                }
+
+<span class="nc" id="L962">                s.println(&quot;Signed with a DSA or RSA public key&quot;);</span>
+            }
+        }
+<span class="nc" id="L965">    }</span>
+}
+
+/*
+ * ECDH server key exchange message. Sent by the server for ECDHE and ECDH_anon
+ * ciphersuites to communicate its ephemeral public key (including the
+ * EC domain parameters).
+ *
+ * We support named curves only, no explicitly encoded curves.
+ */
+static final
+class ECDH_ServerKeyExchange extends ServerKeyExchange {
+
+    // constants for ECCurveType
+    private final static int CURVE_EXPLICIT_PRIME = 1;
+    private final static int CURVE_EXPLICIT_CHAR2 = 2;
+    private final static int CURVE_NAMED_CURVE    = 3;
+
+    // id of the curve we are using
+    private int curveId;
+    // encoded public point
+    private byte[] pointBytes;
+
+    // signature bytes (or null if anonymous)
+    private byte[] signatureBytes;
+
+    // public key object encapsulated in this message
+    private ECPublicKey publicKey;
+
+    // protocol version being established using this ServerKeyExchange message
+    ProtocolVersion protocolVersion;
+
+    // the preferable signature algorithm used by this ServerKeyExchange message
+    private SignatureAndHashAlgorithm preferableSignatureAlgorithm;
+
+    ECDH_ServerKeyExchange(ECDHCrypt obj, PrivateKey privateKey,
+            byte[] clntNonce, byte[] svrNonce, SecureRandom sr,
+            SignatureAndHashAlgorithm signAlgorithm,
+<span class="nc" id="L1003">            ProtocolVersion protocolVersion) throws GeneralSecurityException {</span>
+
+<span class="nc" id="L1005">        this.protocolVersion = protocolVersion;</span>
+
+<span class="nc" id="L1007">        publicKey = (ECPublicKey)obj.getPublicKey();</span>
+<span class="nc" id="L1008">        ECParameterSpec params = publicKey.getParams();</span>
+<span class="nc" id="L1009">        ECPoint point = publicKey.getW();</span>
+<span class="nc" id="L1010">        pointBytes = JsseJce.encodePoint(point, params.getCurve());</span>
+<span class="nc" id="L1011">        curveId = SupportedEllipticCurvesExtension.getCurveIndex(params);</span>
+
+<span class="nc bnc" id="L1013" title="All 2 branches missed.">        if (privateKey == null) {</span>
+            // ECDH_anon
+<span class="nc" id="L1015">            return;</span>
+        }
+
+        Signature sig;
+<span class="nc bnc" id="L1019" title="All 2 branches missed.">        if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L1020">            this.preferableSignatureAlgorithm = signAlgorithm;</span>
+<span class="nc" id="L1021">            sig = JsseJce.getSignature(signAlgorithm.getAlgorithmName());</span>
+        } else {
+<span class="nc" id="L1023">            sig = getSignature(privateKey.getAlgorithm());</span>
+        }
+<span class="nc" id="L1025">        sig.initSign(privateKey);  // where is the SecureRandom?</span>
+
+<span class="nc" id="L1027">        updateSignature(sig, clntNonce, svrNonce);</span>
+<span class="nc" id="L1028">        signatureBytes = sig.sign();</span>
+<span class="nc" id="L1029">    }</span>
+
+    /*
+     * Parse an ECDH server key exchange message.
+     */
+    ECDH_ServerKeyExchange(HandshakeInStream input, PublicKey signingKey,
+            byte[] clntNonce, byte[] svrNonce,
+            Collection&lt;SignatureAndHashAlgorithm&gt; localSupportedSignAlgs,
+            ProtocolVersion protocolVersion)
+<span class="nc" id="L1038">            throws IOException, GeneralSecurityException {</span>
+
+<span class="nc" id="L1040">        this.protocolVersion = protocolVersion;</span>
+
+        // read params: ServerECDHParams
+<span class="nc" id="L1043">        int curveType = input.getInt8();</span>
+        ECParameterSpec parameters;
+        // These parsing errors should never occur as we negotiated
+        // the supported curves during the exchange of the Hello messages.
+<span class="nc bnc" id="L1047" title="All 2 branches missed.">        if (curveType == CURVE_NAMED_CURVE) {</span>
+<span class="nc" id="L1048">            curveId = input.getInt16();</span>
+<span class="nc bnc" id="L1049" title="All 2 branches missed.">            if (SupportedEllipticCurvesExtension.isSupported(curveId)</span>
+                    == false) {
+<span class="nc" id="L1051">                throw new SSLHandshakeException(</span>
+                    &quot;Unsupported curveId: &quot; + curveId);
+            }
+<span class="nc" id="L1054">            String curveOid =</span>
+<span class="nc" id="L1055">                SupportedEllipticCurvesExtension.getCurveOid(curveId);</span>
+<span class="nc bnc" id="L1056" title="All 2 branches missed.">            if (curveOid == null) {</span>
+<span class="nc" id="L1057">                throw new SSLHandshakeException(</span>
+                    &quot;Unknown named curve: &quot; + curveId);
+            }
+<span class="nc" id="L1060">            parameters = JsseJce.getECParameterSpec(curveOid);</span>
+<span class="nc bnc" id="L1061" title="All 2 branches missed.">            if (parameters == null) {</span>
+<span class="nc" id="L1062">                throw new SSLHandshakeException(</span>
+                    &quot;Unsupported curve: &quot; + curveOid);
+            }
+<span class="nc" id="L1065">        } else {</span>
+<span class="nc" id="L1066">            throw new SSLHandshakeException(</span>
+                &quot;Unsupported ECCurveType: &quot; + curveType);
+        }
+<span class="nc" id="L1069">        pointBytes = input.getBytes8();</span>
+
+<span class="nc" id="L1071">        ECPoint point = JsseJce.decodePoint(pointBytes, parameters.getCurve());</span>
+<span class="nc" id="L1072">        KeyFactory factory = JsseJce.getKeyFactory(&quot;EC&quot;);</span>
+<span class="nc" id="L1073">        publicKey = (ECPublicKey)factory.generatePublic(</span>
+            new ECPublicKeySpec(point, parameters));
+
+<span class="nc bnc" id="L1076" title="All 2 branches missed.">        if (signingKey == null) {</span>
+            // ECDH_anon
+<span class="nc" id="L1078">            return;</span>
+        }
+
+        // read the signature and hash algorithm
+<span class="nc bnc" id="L1082" title="All 2 branches missed.">        if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L1083">            int hash = input.getInt8();         // hash algorithm</span>
+<span class="nc" id="L1084">            int signature = input.getInt8();    // signature algorithm</span>
+
+<span class="nc" id="L1086">            preferableSignatureAlgorithm =</span>
+<span class="nc" id="L1087">                SignatureAndHashAlgorithm.valueOf(hash, signature, 0);</span>
+
+            // Is it a local supported signature algorithm?
+<span class="nc bnc" id="L1090" title="All 2 branches missed.">            if (!localSupportedSignAlgs.contains(</span>
+                    preferableSignatureAlgorithm)) {
+<span class="nc" id="L1092">                throw new SSLHandshakeException(</span>
+                        &quot;Unsupported SignatureAndHashAlgorithm in &quot; +
+                        &quot;ServerKeyExchange message&quot;);
+            }
+        }
+
+        // read the signature
+<span class="nc" id="L1099">        signatureBytes = input.getBytes16();</span>
+
+        // verify the signature
+        Signature sig;
+<span class="nc bnc" id="L1103" title="All 2 branches missed.">        if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L1104">            sig = JsseJce.getSignature(</span>
+<span class="nc" id="L1105">                        preferableSignatureAlgorithm.getAlgorithmName());</span>
+        } else {
+<span class="nc" id="L1107">            sig = getSignature(signingKey.getAlgorithm());</span>
+        }
+<span class="nc" id="L1109">        sig.initVerify(signingKey);</span>
+
+<span class="nc" id="L1111">        updateSignature(sig, clntNonce, svrNonce);</span>
+
+<span class="nc bnc" id="L1113" title="All 2 branches missed.">        if (sig.verify(signatureBytes) == false ) {</span>
+<span class="nc" id="L1114">            throw new SSLKeyException(</span>
+                &quot;Invalid signature on ECDH server key exchange message&quot;);
+        }
+<span class="nc" id="L1117">    }</span>
+
+    /*
+     * Get the ephemeral EC public key encapsulated in this message.
+     */
+    ECPublicKey getPublicKey() {
+<span class="nc" id="L1123">        return publicKey;</span>
+    }
+
+    private static Signature getSignature(String keyAlgorithm)
+            throws NoSuchAlgorithmException {
+<span class="nc bnc" id="L1128" title="All 10 branches missed.">            switch (keyAlgorithm) {</span>
+                case &quot;EC&quot;:
+<span class="nc" id="L1130">                    return JsseJce.getSignature(JsseJce.SIGNATURE_ECDSA);</span>
+                case &quot;RSA&quot;:
+<span class="nc" id="L1132">                    return RSASignature.getInstance();</span>
+                default:
+<span class="nc" id="L1134">                    throw new NoSuchAlgorithmException(&quot;neither an RSA or a EC key&quot;);</span>
+            }
+    }
+
+    private void updateSignature(Signature sig, byte clntNonce[],
+            byte svrNonce[]) throws SignatureException {
+<span class="nc" id="L1140">        sig.update(clntNonce);</span>
+<span class="nc" id="L1141">        sig.update(svrNonce);</span>
+
+<span class="nc" id="L1143">        sig.update((byte)CURVE_NAMED_CURVE);</span>
+<span class="nc" id="L1144">        sig.update((byte)(curveId &gt;&gt; 8));</span>
+<span class="nc" id="L1145">        sig.update((byte)curveId);</span>
+<span class="nc" id="L1146">        sig.update((byte)pointBytes.length);</span>
+<span class="nc" id="L1147">        sig.update(pointBytes);</span>
+<span class="nc" id="L1148">    }</span>
+
+    @Override
+    int messageLength() {
+<span class="nc" id="L1152">        int sigLen = 0;</span>
+<span class="nc bnc" id="L1153" title="All 2 branches missed.">        if (signatureBytes != null) {</span>
+<span class="nc" id="L1154">            sigLen = 2 + signatureBytes.length;</span>
+<span class="nc bnc" id="L1155" title="All 2 branches missed.">            if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L1156">                sigLen += SignatureAndHashAlgorithm.sizeInRecord();</span>
+            }
+        }
+
+<span class="nc" id="L1160">        return 4 + pointBytes.length + sigLen;</span>
+    }
+
+    @Override
+    void send(HandshakeOutStream s) throws IOException {
+<span class="nc" id="L1165">        s.putInt8(CURVE_NAMED_CURVE);</span>
+<span class="nc" id="L1166">        s.putInt16(curveId);</span>
+<span class="nc" id="L1167">        s.putBytes8(pointBytes);</span>
+
+<span class="nc bnc" id="L1169" title="All 2 branches missed.">        if (signatureBytes != null) {</span>
+<span class="nc bnc" id="L1170" title="All 2 branches missed.">            if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L1171">                s.putInt8(preferableSignatureAlgorithm.getHashValue());</span>
+<span class="nc" id="L1172">                s.putInt8(preferableSignatureAlgorithm.getSignatureValue());</span>
+            }
+
+<span class="nc" id="L1175">            s.putBytes16(signatureBytes);</span>
+        }
+<span class="nc" id="L1177">    }</span>
+
+    @Override
+    void print(PrintStream s) throws IOException {
+<span class="nc" id="L1181">        s.println(&quot;*** ECDH ServerKeyExchange&quot;);</span>
+
+<span class="nc bnc" id="L1183" title="All 4 branches missed.">        if (debug != null &amp;&amp; Debug.isOn(&quot;verbose&quot;)) {</span>
+<span class="nc bnc" id="L1184" title="All 2 branches missed.">            if (signatureBytes == null) {</span>
+<span class="nc" id="L1185">                s.println(&quot;Anonymous&quot;);</span>
+            } else {
+<span class="nc bnc" id="L1187" title="All 2 branches missed.">                if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L1188">                    s.println(&quot;Signature Algorithm &quot; +</span>
+<span class="nc" id="L1189">                            preferableSignatureAlgorithm.getAlgorithmName());</span>
+                }
+            }
+
+<span class="nc" id="L1193">            s.println(&quot;Server key: &quot; + publicKey);</span>
+        }
+<span class="nc" id="L1195">    }</span>
+}
+
+static final class DistinguishedName {
+
+    /*
+     * DER encoded distinguished name.
+     * TLS requires that its not longer than 65535 bytes.
+     */
+    byte name[];
+
+<span class="nc" id="L1206">    DistinguishedName(HandshakeInStream input) throws IOException {</span>
+<span class="nc" id="L1207">        name = input.getBytes16();</span>
+<span class="nc" id="L1208">    }</span>
+
+<span class="nc" id="L1210">    DistinguishedName(X500Principal dn) {</span>
+<span class="nc" id="L1211">        name = dn.getEncoded();</span>
+<span class="nc" id="L1212">    }</span>
+
+    X500Principal getX500Principal() throws IOException {
+        try {
+<span class="nc" id="L1216">            return new X500Principal(name);</span>
+<span class="nc" id="L1217">        } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L1218">            throw (SSLProtocolException)new SSLProtocolException(</span>
+<span class="nc" id="L1219">                e.getMessage()).initCause(e);</span>
+        }
+    }
+
+    int length() {
+<span class="nc" id="L1224">        return 2 + name.length;</span>
+    }
+
+    void send(HandshakeOutStream output) throws IOException {
+<span class="nc" id="L1228">        output.putBytes16(name);</span>
+<span class="nc" id="L1229">    }</span>
+
+    void print(PrintStream output) throws IOException {
+<span class="nc" id="L1232">        X500Principal principal = new X500Principal(name);</span>
+<span class="nc" id="L1233">        output.println(&quot;&lt;&quot; + principal.toString() + &quot;&gt;&quot;);</span>
+<span class="nc" id="L1234">    }</span>
+}
+
+/*
+ * CertificateRequest ... SERVER --&gt; CLIENT
+ *
+ * Authenticated servers may ask clients to authenticate themselves
+ * in turn, using this message.
+ *
+ * Prior to TLS 1.2, the structure of the message is defined as:
+ *     struct {
+ *         ClientCertificateType certificate_types&lt;1..2^8-1&gt;;
+ *         DistinguishedName certificate_authorities&lt;0..2^16-1&gt;;
+ *     } CertificateRequest;
+ *
+ * In TLS 1.2, the structure is changed to:
+ *     struct {
+ *         ClientCertificateType certificate_types&lt;1..2^8-1&gt;;
+ *         SignatureAndHashAlgorithm
+ *           supported_signature_algorithms&lt;2^16-1&gt;;
+ *         DistinguishedName certificate_authorities&lt;0..2^16-1&gt;;
+ *     } CertificateRequest;
+ *
+ */
+static final
+class CertificateRequest extends HandshakeMessage
+{
+    // enum ClientCertificateType
+    static final int   cct_rsa_sign = 1;
+    static final int   cct_dss_sign = 2;
+    static final int   cct_rsa_fixed_dh = 3;
+    static final int   cct_dss_fixed_dh = 4;
+
+    // The existance of these two values is a bug in the SSL specification.
+    // They are never used in the protocol.
+    static final int   cct_rsa_ephemeral_dh = 5;
+    static final int   cct_dss_ephemeral_dh = 6;
+
+    // From RFC 4492 (ECC)
+    static final int    cct_ecdsa_sign       = 64;
+    static final int    cct_rsa_fixed_ecdh   = 65;
+    static final int    cct_ecdsa_fixed_ecdh = 66;
+
+<span class="nc" id="L1277">    private final static byte[] TYPES_NO_ECC = { cct_rsa_sign, cct_dss_sign };</span>
+<span class="nc" id="L1278">    private final static byte[] TYPES_ECC =</span>
+        { cct_rsa_sign, cct_dss_sign, cct_ecdsa_sign };
+
+    byte                types [];               // 1 to 255 types
+    DistinguishedName   authorities [];         // 3 to 2^16 - 1
+        // ... &quot;3&quot; because that's the smallest DER-encoded X500 DN
+
+    // protocol version being established using this CertificateRequest message
+    ProtocolVersion protocolVersion;
+
+    // supported_signature_algorithms for TLS 1.2 or later
+    private Collection&lt;SignatureAndHashAlgorithm&gt; algorithms;
+
+    // length of supported_signature_algorithms
+    private int algorithmsLen;
+
+    CertificateRequest(X509Certificate ca[], KeyExchange keyExchange,
+            Collection&lt;SignatureAndHashAlgorithm&gt; signAlgs,
+<span class="nc" id="L1296">            ProtocolVersion protocolVersion) throws IOException {</span>
+
+<span class="nc" id="L1298">        this.protocolVersion = protocolVersion;</span>
+
+        // always use X500Principal
+<span class="nc" id="L1301">        authorities = new DistinguishedName[ca.length];</span>
+<span class="nc bnc" id="L1302" title="All 2 branches missed.">        for (int i = 0; i &lt; ca.length; i++) {</span>
+<span class="nc" id="L1303">            X500Principal x500Principal = ca[i].getSubjectX500Principal();</span>
+<span class="nc" id="L1304">            authorities[i] = new DistinguishedName(x500Principal);</span>
+        }
+        // we support RSA, DSS, and ECDSA client authentication and they
+        // can be used with all ciphersuites. If this changes, the code
+        // needs to be adapted to take keyExchange into account.
+        // We only request ECDSA client auth if we have ECC crypto available.
+<span class="nc bnc" id="L1310" title="All 2 branches missed.">        this.types = JsseJce.isEcAvailable() ? TYPES_ECC : TYPES_NO_ECC;</span>
+
+        // Use supported_signature_algorithms for TLS 1.2 or later.
+<span class="nc bnc" id="L1313" title="All 2 branches missed.">        if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc bnc" id="L1314" title="All 4 branches missed.">            if (signAlgs == null || signAlgs.isEmpty()) {</span>
+<span class="nc" id="L1315">                throw new SSLProtocolException(</span>
+                        &quot;No supported signature algorithms&quot;);
+            }
+
+<span class="nc" id="L1319">            algorithms = new ArrayList&lt;SignatureAndHashAlgorithm&gt;(signAlgs);</span>
+<span class="nc" id="L1320">            algorithmsLen =</span>
+<span class="nc" id="L1321">                SignatureAndHashAlgorithm.sizeInRecord() * algorithms.size();</span>
+        } else {
+<span class="nc" id="L1323">            algorithms = new ArrayList&lt;SignatureAndHashAlgorithm&gt;();</span>
+<span class="nc" id="L1324">            algorithmsLen = 0;</span>
+        }
+<span class="nc" id="L1326">    }</span>
+
+    CertificateRequest(HandshakeInStream input,
+<span class="nc" id="L1329">            ProtocolVersion protocolVersion) throws IOException {</span>
+
+<span class="nc" id="L1331">        this.protocolVersion = protocolVersion;</span>
+
+        // Read the certificate_types.
+<span class="nc" id="L1334">        types = input.getBytes8();</span>
+
+        // Read the supported_signature_algorithms for TLS 1.2 or later.
+<span class="nc bnc" id="L1337" title="All 2 branches missed.">        if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L1338">            algorithmsLen = input.getInt16();</span>
+<span class="nc bnc" id="L1339" title="All 2 branches missed.">            if (algorithmsLen &lt; 2) {</span>
+<span class="nc" id="L1340">                throw new SSLProtocolException(</span>
+                        &quot;Invalid supported_signature_algorithms field&quot;);
+            }
+
+<span class="nc" id="L1344">            algorithms = new ArrayList&lt;SignatureAndHashAlgorithm&gt;();</span>
+<span class="nc" id="L1345">            int remains = algorithmsLen;</span>
+<span class="nc" id="L1346">            int sequence = 0;</span>
+<span class="nc bnc" id="L1347" title="All 2 branches missed.">            while (remains &gt; 1) {    // needs at least two bytes</span>
+<span class="nc" id="L1348">                int hash = input.getInt8();         // hash algorithm</span>
+<span class="nc" id="L1349">                int signature = input.getInt8();    // signature algorithm</span>
+
+<span class="nc" id="L1351">                SignatureAndHashAlgorithm algorithm =</span>
+<span class="nc" id="L1352">                    SignatureAndHashAlgorithm.valueOf(hash, signature,</span>
+                                                                ++sequence);
+<span class="nc" id="L1354">                algorithms.add(algorithm);</span>
+<span class="nc" id="L1355">                remains -= 2;  // one byte for hash, one byte for signature</span>
+<span class="nc" id="L1356">            }</span>
+
+<span class="nc bnc" id="L1358" title="All 2 branches missed.">            if (remains != 0) {</span>
+<span class="nc" id="L1359">                throw new SSLProtocolException(</span>
+                        &quot;Invalid supported_signature_algorithms field&quot;);
+            }
+<span class="nc" id="L1362">        } else {</span>
+<span class="nc" id="L1363">            algorithms = new ArrayList&lt;SignatureAndHashAlgorithm&gt;();</span>
+<span class="nc" id="L1364">            algorithmsLen = 0;</span>
+        }
+
+        // read the certificate_authorities
+<span class="nc" id="L1368">        int len = input.getInt16();</span>
+<span class="nc" id="L1369">        ArrayList&lt;DistinguishedName&gt; v = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1370" title="All 2 branches missed.">        while (len &gt;= 3) {</span>
+<span class="nc" id="L1371">            DistinguishedName dn = new DistinguishedName(input);</span>
+<span class="nc" id="L1372">            v.add(dn);</span>
+<span class="nc" id="L1373">            len -= dn.length();</span>
+<span class="nc" id="L1374">        }</span>
+
+<span class="nc bnc" id="L1376" title="All 2 branches missed.">        if (len != 0) {</span>
+<span class="nc" id="L1377">            throw new SSLProtocolException(&quot;Bad CertificateRequest DN length&quot;);</span>
+        }
+
+<span class="nc" id="L1380">        authorities = v.toArray(new DistinguishedName[v.size()]);</span>
+<span class="nc" id="L1381">    }</span>
+
+    X500Principal[] getAuthorities() throws IOException {
+<span class="nc" id="L1384">        X500Principal[] ret = new X500Principal[authorities.length];</span>
+<span class="nc bnc" id="L1385" title="All 2 branches missed.">        for (int i = 0; i &lt; authorities.length; i++) {</span>
+<span class="nc" id="L1386">            ret[i] = authorities[i].getX500Principal();</span>
+        }
+<span class="nc" id="L1388">        return ret;</span>
+    }
+
+    Collection&lt;SignatureAndHashAlgorithm&gt; getSignAlgorithms() {
+<span class="nc" id="L1392">        return algorithms;</span>
+    }
+
+    @Override
+    int messageType() {
+<span class="nc" id="L1397">        return ht_certificate_request;</span>
+    }
+
+    @Override
+    int messageLength() {
+<span class="nc" id="L1402">        int len = 1 + types.length + 2;</span>
+
+<span class="nc bnc" id="L1404" title="All 2 branches missed.">        if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L1405">            len += algorithmsLen + 2;</span>
+        }
+
+<span class="nc bnc" id="L1408" title="All 2 branches missed.">        for (int i = 0; i &lt; authorities.length; i++) {</span>
+<span class="nc" id="L1409">            len += authorities[i].length();</span>
+        }
+
+<span class="nc" id="L1412">        return len;</span>
+    }
+
+    @Override
+    void send(HandshakeOutStream output) throws IOException {
+        // put certificate_types
+<span class="nc" id="L1418">        output.putBytes8(types);</span>
+
+        // put supported_signature_algorithms
+<span class="nc bnc" id="L1421" title="All 2 branches missed.">        if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L1422">            output.putInt16(algorithmsLen);</span>
+<span class="nc bnc" id="L1423" title="All 2 branches missed.">            for (SignatureAndHashAlgorithm algorithm : algorithms) {</span>
+<span class="nc" id="L1424">                output.putInt8(algorithm.getHashValue());      // hash</span>
+<span class="nc" id="L1425">                output.putInt8(algorithm.getSignatureValue()); // signature</span>
+<span class="nc" id="L1426">            }</span>
+        }
+
+        // put certificate_authorities
+<span class="nc" id="L1430">        int len = 0;</span>
+<span class="nc bnc" id="L1431" title="All 2 branches missed.">        for (int i = 0; i &lt; authorities.length; i++) {</span>
+<span class="nc" id="L1432">            len += authorities[i].length();</span>
+        }
+
+<span class="nc" id="L1435">        output.putInt16(len);</span>
+<span class="nc bnc" id="L1436" title="All 2 branches missed.">        for (int i = 0; i &lt; authorities.length; i++) {</span>
+<span class="nc" id="L1437">            authorities[i].send(output);</span>
+        }
+<span class="nc" id="L1439">    }</span>
+
+    @Override
+    void print(PrintStream s) throws IOException {
+<span class="nc" id="L1443">        s.println(&quot;*** CertificateRequest&quot;);</span>
+
+<span class="nc bnc" id="L1445" title="All 4 branches missed.">        if (debug != null &amp;&amp; Debug.isOn(&quot;verbose&quot;)) {</span>
+<span class="nc" id="L1446">            s.print(&quot;Cert Types: &quot;);</span>
+<span class="nc bnc" id="L1447" title="All 2 branches missed.">            for (int i = 0; i &lt; types.length; i++) {</span>
+<span class="nc bnc" id="L1448" title="All 10 branches missed.">                switch (types[i]) {</span>
+                  case cct_rsa_sign:
+<span class="nc" id="L1450">                    s.print(&quot;RSA&quot;); break;</span>
+                  case cct_dss_sign:
+<span class="nc" id="L1452">                    s.print(&quot;DSS&quot;); break;</span>
+                  case cct_rsa_fixed_dh:
+<span class="nc" id="L1454">                    s.print(&quot;Fixed DH (RSA sig)&quot;); break;</span>
+                  case cct_dss_fixed_dh:
+<span class="nc" id="L1456">                    s.print(&quot;Fixed DH (DSS sig)&quot;); break;</span>
+                  case cct_rsa_ephemeral_dh:
+<span class="nc" id="L1458">                    s.print(&quot;Ephemeral DH (RSA sig)&quot;); break;</span>
+                  case cct_dss_ephemeral_dh:
+<span class="nc" id="L1460">                    s.print(&quot;Ephemeral DH (DSS sig)&quot;); break;</span>
+                  case cct_ecdsa_sign:
+<span class="nc" id="L1462">                    s.print(&quot;ECDSA&quot;); break;</span>
+                  case cct_rsa_fixed_ecdh:
+<span class="nc" id="L1464">                    s.print(&quot;Fixed ECDH (RSA sig)&quot;); break;</span>
+                  case cct_ecdsa_fixed_ecdh:
+<span class="nc" id="L1466">                    s.print(&quot;Fixed ECDH (ECDSA sig)&quot;); break;</span>
+                  default:
+<span class="nc" id="L1468">                    s.print(&quot;Type-&quot; + (types[i] &amp; 0xff)); break;</span>
+                }
+<span class="nc bnc" id="L1470" title="All 2 branches missed.">                if (i != types.length - 1) {</span>
+<span class="nc" id="L1471">                    s.print(&quot;, &quot;);</span>
+                }
+            }
+<span class="nc" id="L1474">            s.println();</span>
+
+<span class="nc bnc" id="L1476" title="All 2 branches missed.">            if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L1477">                StringBuffer buffer = new StringBuffer();</span>
+<span class="nc" id="L1478">                boolean opened = false;</span>
+<span class="nc bnc" id="L1479" title="All 2 branches missed.">                for (SignatureAndHashAlgorithm signAlg : algorithms) {</span>
+<span class="nc bnc" id="L1480" title="All 2 branches missed.">                    if (opened) {</span>
+<span class="nc" id="L1481">                        buffer.append(&quot;, &quot; + signAlg.getAlgorithmName());</span>
+                    } else {
+<span class="nc" id="L1483">                        buffer.append(signAlg.getAlgorithmName());</span>
+<span class="nc" id="L1484">                        opened = true;</span>
+                    }
+<span class="nc" id="L1486">                }</span>
+<span class="nc" id="L1487">                s.println(&quot;Supported Signature Algorithms: &quot; + buffer);</span>
+            }
+
+<span class="nc" id="L1490">            s.println(&quot;Cert Authorities:&quot;);</span>
+<span class="nc bnc" id="L1491" title="All 2 branches missed.">            if (authorities.length == 0) {</span>
+<span class="nc" id="L1492">                s.println(&quot;&lt;Empty&gt;&quot;);</span>
+            } else {
+<span class="nc bnc" id="L1494" title="All 2 branches missed.">                for (int i = 0; i &lt; authorities.length; i++) {</span>
+<span class="nc" id="L1495">                    authorities[i].print(s);</span>
+                }
+            }
+        }
+<span class="nc" id="L1499">    }</span>
+}
+
+
+/*
+ * ServerHelloDone ... SERVER --&gt; CLIENT
+ *
+ * When server's done sending its messages in response to the client's
+ * &quot;hello&quot; (e.g. its own hello, certificate, key exchange message, perhaps
+ * client certificate request) it sends this message to flag that it's
+ * done that part of the handshake.
+ */
+static final
+class ServerHelloDone extends HandshakeMessage
+{
+    @Override
+<span class="nc" id="L1515">    int messageType() { return ht_server_hello_done; }</span>
+
+<span class="nc" id="L1517">    ServerHelloDone() { }</span>
+
+    ServerHelloDone(HandshakeInStream input)
+<span class="nc" id="L1520">    {</span>
+        // nothing to do
+<span class="nc" id="L1522">    }</span>
+
+    @Override
+    int messageLength()
+    {
+<span class="nc" id="L1527">        return 0;</span>
+    }
+
+    @Override
+    void send(HandshakeOutStream s) throws IOException
+    {
+        // nothing to send
+<span class="nc" id="L1534">    }</span>
+
+    @Override
+    void print(PrintStream s) throws IOException
+    {
+<span class="nc" id="L1539">        s.println(&quot;*** ServerHelloDone&quot;);</span>
+<span class="nc" id="L1540">    }</span>
+}
+
+
+/*
+ * CertificateVerify ... CLIENT --&gt; SERVER
+ *
+ * Sent after client sends signature-capable certificates (e.g. not
+ * Diffie-Hellman) to verify.
+ */
+static final class CertificateVerify extends HandshakeMessage {
+
+    // the signature bytes
+    private byte[] signature;
+
+    // protocol version being established using this ServerKeyExchange message
+    ProtocolVersion protocolVersion;
+
+    // the preferable signature algorithm used by this CertificateVerify message
+<span class="nc" id="L1559">    private SignatureAndHashAlgorithm preferableSignatureAlgorithm = null;</span>
+
+    /*
+     * Create an RSA or DSA signed certificate verify message.
+     */
+    CertificateVerify(ProtocolVersion protocolVersion,
+            HandshakeHash handshakeHash, PrivateKey privateKey,
+            SecretKey masterSecret, SecureRandom sr,
+            SignatureAndHashAlgorithm signAlgorithm)
+<span class="nc" id="L1568">            throws GeneralSecurityException {</span>
+
+<span class="nc" id="L1570">        this.protocolVersion = protocolVersion;</span>
+
+<span class="nc" id="L1572">        String algorithm = privateKey.getAlgorithm();</span>
+<span class="nc" id="L1573">        Signature sig = null;</span>
+<span class="nc bnc" id="L1574" title="All 2 branches missed.">        if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L1575">            this.preferableSignatureAlgorithm = signAlgorithm;</span>
+<span class="nc" id="L1576">            sig = JsseJce.getSignature(signAlgorithm.getAlgorithmName());</span>
+        } else {
+<span class="nc" id="L1578">            sig = getSignature(protocolVersion, algorithm);</span>
+        }
+<span class="nc" id="L1580">        sig.initSign(privateKey, sr);</span>
+<span class="nc" id="L1581">        updateSignature(sig, protocolVersion, handshakeHash, algorithm,</span>
+                        masterSecret);
+<span class="nc" id="L1583">        signature = sig.sign();</span>
+<span class="nc" id="L1584">    }</span>
+
+    //
+    // Unmarshal the signed data from the input stream.
+    //
+    CertificateVerify(HandshakeInStream input,
+            Collection&lt;SignatureAndHashAlgorithm&gt; localSupportedSignAlgs,
+<span class="nc" id="L1591">            ProtocolVersion protocolVersion) throws IOException  {</span>
+
+<span class="nc" id="L1593">        this.protocolVersion = protocolVersion;</span>
+
+        // read the signature and hash algorithm
+<span class="nc bnc" id="L1596" title="All 2 branches missed.">        if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L1597">            int hashAlg = input.getInt8();         // hash algorithm</span>
+<span class="nc" id="L1598">            int signAlg = input.getInt8();         // signature algorithm</span>
+
+<span class="nc" id="L1600">            preferableSignatureAlgorithm =</span>
+<span class="nc" id="L1601">                SignatureAndHashAlgorithm.valueOf(hashAlg, signAlg, 0);</span>
+
+            // Is it a local supported signature algorithm?
+<span class="nc bnc" id="L1604" title="All 2 branches missed.">            if (!localSupportedSignAlgs.contains(</span>
+                    preferableSignatureAlgorithm)) {
+<span class="nc" id="L1606">                throw new SSLHandshakeException(</span>
+                        &quot;Unsupported SignatureAndHashAlgorithm in &quot; +
+                        &quot;ServerKeyExchange message&quot;);
+            }
+        }
+
+        // read the signature
+<span class="nc" id="L1613">        signature = input.getBytes16();</span>
+<span class="nc" id="L1614">    }</span>
+
+    /*
+     * Get the preferable signature algorithm used by this message
+     */
+    SignatureAndHashAlgorithm getPreferableSignatureAlgorithm() {
+<span class="nc" id="L1620">        return preferableSignatureAlgorithm;</span>
+    }
+
+    /*
+     * Verify a certificate verify message. Return the result of verification,
+     * if there is a problem throw a GeneralSecurityException.
+     */
+    boolean verify(ProtocolVersion protocolVersion,
+            HandshakeHash handshakeHash, PublicKey publicKey,
+            SecretKey masterSecret) throws GeneralSecurityException {
+<span class="nc" id="L1630">        String algorithm = publicKey.getAlgorithm();</span>
+<span class="nc" id="L1631">        Signature sig = null;</span>
+<span class="nc bnc" id="L1632" title="All 2 branches missed.">        if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L1633">            sig = JsseJce.getSignature(</span>
+<span class="nc" id="L1634">                        preferableSignatureAlgorithm.getAlgorithmName());</span>
+        } else {
+<span class="nc" id="L1636">            sig = getSignature(protocolVersion, algorithm);</span>
+        }
+<span class="nc" id="L1638">        sig.initVerify(publicKey);</span>
+<span class="nc" id="L1639">        updateSignature(sig, protocolVersion, handshakeHash, algorithm,</span>
+                        masterSecret);
+<span class="nc" id="L1641">        return sig.verify(signature);</span>
+    }
+
+    /*
+     * Get the Signature object appropriate for verification using the
+     * given signature algorithm and protocol version.
+     */
+    private static Signature getSignature(ProtocolVersion protocolVersion,
+            String algorithm) throws GeneralSecurityException {
+<span class="nc bnc" id="L1650" title="All 14 branches missed.">            switch (algorithm) {</span>
+                case &quot;RSA&quot;:
+<span class="nc" id="L1652">                    return RSASignature.getInternalInstance();</span>
+                case &quot;DSA&quot;:
+<span class="nc" id="L1654">                    return JsseJce.getSignature(JsseJce.SIGNATURE_RAWDSA);</span>
+                case &quot;EC&quot;:
+<span class="nc" id="L1656">                    return JsseJce.getSignature(JsseJce.SIGNATURE_RAWECDSA);</span>
+                default:
+<span class="nc" id="L1658">                    throw new SignatureException(&quot;Unrecognized algorithm: &quot;</span>
+                        + algorithm);
+            }
+    }
+
+    /*
+     * Update the Signature with the data appropriate for the given
+     * signature algorithm and protocol version so that the object is
+     * ready for signing or verifying.
+     */
+    private static void updateSignature(Signature sig,
+            ProtocolVersion protocolVersion,
+            HandshakeHash handshakeHash, String algorithm, SecretKey masterKey)
+            throws SignatureException {
+
+<span class="nc bnc" id="L1673" title="All 2 branches missed.">        if (algorithm.equals(&quot;RSA&quot;)) {</span>
+<span class="nc bnc" id="L1674" title="All 2 branches missed.">            if (protocolVersion.v &lt; ProtocolVersion.TLS12.v) { // TLS1.1-</span>
+<span class="nc" id="L1675">                MessageDigest md5Clone = handshakeHash.getMD5Clone();</span>
+<span class="nc" id="L1676">                MessageDigest shaClone = handshakeHash.getSHAClone();</span>
+
+<span class="nc bnc" id="L1678" title="All 2 branches missed.">                if (protocolVersion.v &lt; ProtocolVersion.TLS10.v) { // SSLv3</span>
+<span class="nc" id="L1679">                    updateDigest(md5Clone, MD5_pad1, MD5_pad2, masterKey);</span>
+<span class="nc" id="L1680">                    updateDigest(shaClone, SHA_pad1, SHA_pad2, masterKey);</span>
+                }
+
+                // The signature must be an instance of RSASignature, need
+                // to use these hashes directly.
+<span class="nc" id="L1685">                RSASignature.setHashes(sig, md5Clone, shaClone);</span>
+<span class="nc" id="L1686">            } else {  // TLS1.2+</span>
+<span class="nc" id="L1687">                sig.update(handshakeHash.getAllHandshakeMessages());</span>
+            }
+        } else { // DSA, ECDSA
+<span class="nc bnc" id="L1690" title="All 2 branches missed.">            if (protocolVersion.v &lt; ProtocolVersion.TLS12.v) { // TLS1.1-</span>
+<span class="nc" id="L1691">                MessageDigest shaClone = handshakeHash.getSHAClone();</span>
+
+<span class="nc bnc" id="L1693" title="All 2 branches missed.">                if (protocolVersion.v &lt; ProtocolVersion.TLS10.v) { // SSLv3</span>
+<span class="nc" id="L1694">                    updateDigest(shaClone, SHA_pad1, SHA_pad2, masterKey);</span>
+                }
+
+<span class="nc" id="L1697">                sig.update(shaClone.digest());</span>
+<span class="nc" id="L1698">            } else {  // TLS1.2+</span>
+<span class="nc" id="L1699">                sig.update(handshakeHash.getAllHandshakeMessages());</span>
+            }
+        }
+<span class="nc" id="L1702">    }</span>
+
+    /*
+     * Update the MessageDigest for SSLv3 certificate verify or finished
+     * message calculation. The digest must already have been updated with
+     * all preceding handshake messages.
+     * Used by the Finished class as well.
+     */
+    private static void updateDigest(MessageDigest md,
+            byte[] pad1, byte[] pad2,
+            SecretKey masterSecret) {
+        // Digest the key bytes if available.
+        // Otherwise (sensitive key), try digesting the key directly.
+        // That is currently only implemented in SunPKCS11 using a private
+        // reflection API, so we avoid that if possible.
+<span class="nc bnc" id="L1717" title="All 2 branches missed.">        byte[] keyBytes = &quot;RAW&quot;.equals(masterSecret.getFormat())</span>
+<span class="nc" id="L1718">                        ? masterSecret.getEncoded() : null;</span>
+<span class="nc bnc" id="L1719" title="All 2 branches missed.">        if (keyBytes != null) {</span>
+<span class="nc" id="L1720">            md.update(keyBytes);</span>
+        } else {
+<span class="nc" id="L1722">            digestKey(md, masterSecret);</span>
+        }
+<span class="nc" id="L1724">        md.update(pad1);</span>
+<span class="nc" id="L1725">        byte[] temp = md.digest();</span>
+
+<span class="nc bnc" id="L1727" title="All 2 branches missed.">        if (keyBytes != null) {</span>
+<span class="nc" id="L1728">            md.update(keyBytes);</span>
+        } else {
+<span class="nc" id="L1730">            digestKey(md, masterSecret);</span>
+        }
+<span class="nc" id="L1732">        md.update(pad2);</span>
+<span class="nc" id="L1733">        md.update(temp);</span>
+<span class="nc" id="L1734">    }</span>
+
+    private final static Class&lt;?&gt; delegate;
+    private final static Field spiField;
+
+    static {
+        try {
+<span class="nc" id="L1741">            delegate = Class.forName(&quot;java.security.MessageDigest$Delegate&quot;);</span>
+<span class="nc" id="L1742">            spiField = delegate.getDeclaredField(&quot;digestSpi&quot;);</span>
+<span class="nc" id="L1743">        } catch (Exception e) {</span>
+<span class="nc" id="L1744">            throw new RuntimeException(&quot;Reflection failed&quot;, e);</span>
+<span class="nc" id="L1745">        }</span>
+<span class="nc" id="L1746">        makeAccessible(spiField);</span>
+    }
+
+    private static void makeAccessible(final AccessibleObject o) {
+<span class="nc" id="L1750">        AccessController.doPrivileged(new PrivilegedAction&lt;Object&gt;() {</span>
+            @Override
+            public Object run() {
+<span class="nc" id="L1753">                o.setAccessible(true);</span>
+<span class="nc" id="L1754">                return null;</span>
+            }
+        });
+<span class="nc" id="L1757">    }</span>
+
+    // ConcurrentHashMap does not allow null values, use this marker object
+<span class="nc" id="L1760">    private final static Object NULL_OBJECT = new Object();</span>
+
+    // cache Method objects per Spi class
+    // Note that this will prevent the Spi classes from being GC'd. We assume
+    // that is not a problem.
+<span class="nc" id="L1765">    private final static Map&lt;Class&lt;?&gt;,Object&gt; methodCache =</span>
+                                        new ConcurrentHashMap&lt;&gt;();
+
+    private static void digestKey(MessageDigest md, SecretKey key) {
+        try {
+            // Verify that md is implemented via MessageDigestSpi, not
+            // via JDK 1.1 style MessageDigest subclassing.
+<span class="nc bnc" id="L1772" title="All 2 branches missed.">            if (md.getClass() != delegate) {</span>
+<span class="nc" id="L1773">                throw new Exception(&quot;Digest is not a MessageDigestSpi&quot;);</span>
+            }
+<span class="nc" id="L1775">            MessageDigestSpi spi = (MessageDigestSpi)spiField.get(md);</span>
+<span class="nc" id="L1776">            Class&lt;?&gt; clazz = spi.getClass();</span>
+<span class="nc" id="L1777">            Object r = methodCache.get(clazz);</span>
+<span class="nc bnc" id="L1778" title="All 2 branches missed.">            if (r == null) {</span>
+                try {
+<span class="nc" id="L1780">                    r = clazz.getDeclaredMethod(&quot;implUpdate&quot;, SecretKey.class);</span>
+<span class="nc" id="L1781">                    makeAccessible((Method)r);</span>
+<span class="nc" id="L1782">                } catch (NoSuchMethodException e) {</span>
+<span class="nc" id="L1783">                    r = NULL_OBJECT;</span>
+<span class="nc" id="L1784">                }</span>
+<span class="nc" id="L1785">                methodCache.put(clazz, r);</span>
+            }
+<span class="nc bnc" id="L1787" title="All 2 branches missed.">            if (r == NULL_OBJECT) {</span>
+<span class="nc" id="L1788">                throw new Exception(</span>
+                    &quot;Digest does not support implUpdate(SecretKey)&quot;);
+            }
+<span class="nc" id="L1791">            Method update = (Method)r;</span>
+<span class="nc" id="L1792">            update.invoke(spi, key);</span>
+<span class="nc" id="L1793">        } catch (Exception e) {</span>
+<span class="nc" id="L1794">            throw new RuntimeException(</span>
+                &quot;Could not obtain encoded key and &quot;
+                + &quot;MessageDigest cannot digest key&quot;, e);
+<span class="nc" id="L1797">        }</span>
+<span class="nc" id="L1798">    }</span>
+
+    @Override
+    int messageType() {
+<span class="nc" id="L1802">        return ht_certificate_verify;</span>
+    }
+
+    @Override
+    int messageLength() {
+<span class="nc" id="L1807">        int temp = 2;</span>
+
+<span class="nc bnc" id="L1809" title="All 2 branches missed.">        if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L1810">            temp += SignatureAndHashAlgorithm.sizeInRecord();</span>
+        }
+
+<span class="nc" id="L1813">        return temp + signature.length;</span>
+    }
+
+    @Override
+    void send(HandshakeOutStream s) throws IOException {
+<span class="nc bnc" id="L1818" title="All 2 branches missed.">        if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L1819">            s.putInt8(preferableSignatureAlgorithm.getHashValue());</span>
+<span class="nc" id="L1820">            s.putInt8(preferableSignatureAlgorithm.getSignatureValue());</span>
+        }
+
+<span class="nc" id="L1823">        s.putBytes16(signature);</span>
+<span class="nc" id="L1824">    }</span>
+
+    @Override
+    void print(PrintStream s) throws IOException {
+<span class="nc" id="L1828">        s.println(&quot;*** CertificateVerify&quot;);</span>
+
+<span class="nc bnc" id="L1830" title="All 4 branches missed.">        if (debug != null &amp;&amp; Debug.isOn(&quot;verbose&quot;)) {</span>
+<span class="nc bnc" id="L1831" title="All 2 branches missed.">            if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L1832">                s.println(&quot;Signature Algorithm &quot; +</span>
+<span class="nc" id="L1833">                        preferableSignatureAlgorithm.getAlgorithmName());</span>
+            }
+        }
+<span class="nc" id="L1836">    }</span>
+}
+
+
+/*
+ * FINISHED ... sent by both CLIENT and SERVER
+ *
+ * This is the FINISHED message as defined in the SSL and TLS protocols.
+ * Both protocols define this handshake message slightly differently.
+ * This class supports both formats.
+ *
+ * When handshaking is finished, each side sends a &quot;change_cipher_spec&quot;
+ * record, then immediately sends a &quot;finished&quot; handshake message prepared
+ * according to the newly adopted cipher spec.
+ *
+ * NOTE that until this is sent, no application data may be passed, unless
+ * some non-default cipher suite has already been set up on this connection
+ * connection (e.g. a previous handshake arranged one).
+ */
+static final class Finished extends HandshakeMessage {
+
+    // constant for a Finished message sent by the client
+    final static int CLIENT = 1;
+
+    // constant for a Finished message sent by the server
+    final static int SERVER = 2;
+
+    // enum Sender:  &quot;CLNT&quot; and &quot;SRVR&quot;
+<span class="nc" id="L1864">    private static final byte[] SSL_CLIENT = { 0x43, 0x4C, 0x4E, 0x54 };</span>
+<span class="nc" id="L1865">    private static final byte[] SSL_SERVER = { 0x53, 0x52, 0x56, 0x52 };</span>
+
+    /*
+     * Contents of the finished message (&quot;checksum&quot;). For TLS, it
+     * is 12 bytes long, for SSLv3 36 bytes.
+     */
+    private byte[] verifyData;
+
+    /*
+     * Current cipher suite we are negotiating.  TLS 1.2 has
+     * ciphersuite-defined PRF algorithms.
+     */
+    private ProtocolVersion protocolVersion;
+    private CipherSuite cipherSuite;
+
+    /*
+     * Create a finished message to send to the remote peer.
+     */
+    Finished(ProtocolVersion protocolVersion, HandshakeHash handshakeHash,
+<span class="nc" id="L1884">            int sender, SecretKey master, CipherSuite cipherSuite) {</span>
+<span class="nc" id="L1885">        this.protocolVersion = protocolVersion;</span>
+<span class="nc" id="L1886">        this.cipherSuite = cipherSuite;</span>
+<span class="nc" id="L1887">        verifyData = getFinished(handshakeHash, sender, master);</span>
+<span class="nc" id="L1888">    }</span>
+
+    /*
+     * Constructor that reads FINISHED message from stream.
+     */
+    Finished(ProtocolVersion protocolVersion, HandshakeInStream input,
+<span class="nc" id="L1894">            CipherSuite cipherSuite) throws IOException {</span>
+<span class="nc" id="L1895">        this.protocolVersion = protocolVersion;</span>
+<span class="nc" id="L1896">        this.cipherSuite = cipherSuite;</span>
+<span class="nc bnc" id="L1897" title="All 2 branches missed.">        int msgLen = (protocolVersion.v &gt;= ProtocolVersion.TLS10.v) ? 12 : 36;</span>
+<span class="nc" id="L1898">        verifyData = new byte[msgLen];</span>
+<span class="nc" id="L1899">        input.read(verifyData);</span>
+<span class="nc" id="L1900">    }</span>
+
+    /*
+     * Verify that the hashes here are what would have been produced
+     * according to a given set of inputs.  This is used to ensure that
+     * both client and server are fully in sync, and that the handshake
+     * computations have been successful.
+     */
+    boolean verify(HandshakeHash handshakeHash, int sender, SecretKey master) {
+<span class="nc" id="L1909">        byte[] myFinished = getFinished(handshakeHash, sender, master);</span>
+<span class="nc" id="L1910">        return Arrays.equals(myFinished, verifyData);</span>
+    }
+
+    /*
+     * Perform the actual finished message calculation.
+     */
+    private byte[] getFinished(HandshakeHash handshakeHash,
+            int sender, SecretKey masterKey) {
+        byte[] sslLabel;
+        String tlsLabel;
+<span class="nc bnc" id="L1920" title="All 2 branches missed.">        if (sender == CLIENT) {</span>
+<span class="nc" id="L1921">            sslLabel = SSL_CLIENT;</span>
+<span class="nc" id="L1922">            tlsLabel = &quot;client finished&quot;;</span>
+<span class="nc bnc" id="L1923" title="All 2 branches missed.">        } else if (sender == SERVER) {</span>
+<span class="nc" id="L1924">            sslLabel = SSL_SERVER;</span>
+<span class="nc" id="L1925">            tlsLabel = &quot;server finished&quot;;</span>
+        } else {
+<span class="nc" id="L1927">            throw new RuntimeException(&quot;Invalid sender: &quot; + sender);</span>
+        }
+
+<span class="nc bnc" id="L1930" title="All 2 branches missed.">        if (protocolVersion.v &gt;= ProtocolVersion.TLS10.v) {</span>
+            // TLS 1.0+
+            try {
+                byte [] seed;
+                String prfAlg;
+                PRF prf;
+
+                // Get the KeyGenerator alg and calculate the seed.
+<span class="nc bnc" id="L1938" title="All 2 branches missed.">                if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+                    // TLS 1.2
+<span class="nc" id="L1940">                    seed = handshakeHash.getFinishedHash();</span>
+
+<span class="nc" id="L1942">                    prfAlg = &quot;SunTls12Prf&quot;;</span>
+<span class="nc" id="L1943">                    prf = cipherSuite.prfAlg;</span>
+                } else {
+                    // TLS 1.0/1.1
+<span class="nc" id="L1946">                    MessageDigest md5Clone = handshakeHash.getMD5Clone();</span>
+<span class="nc" id="L1947">                    MessageDigest shaClone = handshakeHash.getSHAClone();</span>
+<span class="nc" id="L1948">                    seed = new byte[36];</span>
+<span class="nc" id="L1949">                    md5Clone.digest(seed, 0, 16);</span>
+<span class="nc" id="L1950">                    shaClone.digest(seed, 16, 20);</span>
+
+<span class="nc" id="L1952">                    prfAlg = &quot;SunTlsPrf&quot;;</span>
+<span class="nc" id="L1953">                    prf = P_NONE;</span>
+                }
+
+<span class="nc" id="L1956">                String prfHashAlg = prf.getPRFHashAlg();</span>
+<span class="nc" id="L1957">                int prfHashLength = prf.getPRFHashLength();</span>
+<span class="nc" id="L1958">                int prfBlockSize = prf.getPRFBlockSize();</span>
+
+                /*
+                 * RFC 5246/7.4.9 says that finished messages can
+                 * be ciphersuite-specific in both length/PRF hash
+                 * algorithm.  If we ever run across a different
+                 * length, this call will need to be updated.
+                 */
+<span class="nc" id="L1966">                TlsPrfParameterSpec spec = new TlsPrfParameterSpec(</span>
+                    masterKey, tlsLabel, seed, 12,
+                    prfHashAlg, prfHashLength, prfBlockSize);
+
+<span class="nc" id="L1970">                KeyGenerator kg = JsseJce.getKeyGenerator(prfAlg);</span>
+<span class="nc" id="L1971">                kg.init(spec);</span>
+<span class="nc" id="L1972">                SecretKey prfKey = kg.generateKey();</span>
+<span class="nc bnc" id="L1973" title="All 2 branches missed.">                if (&quot;RAW&quot;.equals(prfKey.getFormat()) == false) {</span>
+<span class="nc" id="L1974">                    throw new ProviderException(</span>
+                        &quot;Invalid PRF output, format must be RAW&quot;);
+                }
+<span class="nc" id="L1977">                byte[] finished = prfKey.getEncoded();</span>
+<span class="nc" id="L1978">                return finished;</span>
+<span class="nc" id="L1979">            } catch (GeneralSecurityException e) {</span>
+<span class="nc" id="L1980">                throw new RuntimeException(&quot;PRF failed&quot;, e);</span>
+            }
+        } else {
+            // SSLv3
+<span class="nc" id="L1984">            MessageDigest md5Clone = handshakeHash.getMD5Clone();</span>
+<span class="nc" id="L1985">            MessageDigest shaClone = handshakeHash.getSHAClone();</span>
+<span class="nc" id="L1986">            updateDigest(md5Clone, sslLabel, MD5_pad1, MD5_pad2, masterKey);</span>
+<span class="nc" id="L1987">            updateDigest(shaClone, sslLabel, SHA_pad1, SHA_pad2, masterKey);</span>
+<span class="nc" id="L1988">            byte[] finished = new byte[36];</span>
+            try {
+<span class="nc" id="L1990">                md5Clone.digest(finished, 0, 16);</span>
+<span class="nc" id="L1991">                shaClone.digest(finished, 16, 20);</span>
+<span class="nc" id="L1992">            } catch (DigestException e) {</span>
+                // cannot occur
+<span class="nc" id="L1994">                throw new RuntimeException(&quot;Digest failed&quot;, e);</span>
+<span class="nc" id="L1995">            }</span>
+<span class="nc" id="L1996">            return finished;</span>
+        }
+    }
+
+    /*
+     * Update the MessageDigest for SSLv3 finished message calculation.
+     * The digest must already have been updated with all preceding handshake
+     * messages. This operation is almost identical to the certificate verify
+     * hash, reuse that code.
+     */
+    private static void updateDigest(MessageDigest md, byte[] sender,
+            byte[] pad1, byte[] pad2, SecretKey masterSecret) {
+<span class="nc" id="L2008">        md.update(sender);</span>
+<span class="nc" id="L2009">        CertificateVerify.updateDigest(md, pad1, pad2, masterSecret);</span>
+<span class="nc" id="L2010">    }</span>
+
+    // get the verify_data of the finished message
+    byte[] getVerifyData() {
+<span class="nc" id="L2014">        return verifyData;</span>
+    }
+
+    @Override
+<span class="nc" id="L2018">    int messageType() { return ht_finished; }</span>
+
+    @Override
+    int messageLength() {
+<span class="nc" id="L2022">        return verifyData.length;</span>
+    }
+
+    @Override
+    void send(HandshakeOutStream out) throws IOException {
+<span class="nc" id="L2027">        out.write(verifyData);</span>
+<span class="nc" id="L2028">    }</span>
+
+    @Override
+    void print(PrintStream s) throws IOException {
+<span class="nc" id="L2032">        s.println(&quot;*** Finished&quot;);</span>
+<span class="nc bnc" id="L2033" title="All 4 branches missed.">        if (debug != null &amp;&amp; Debug.isOn(&quot;verbose&quot;)) {</span>
+<span class="nc" id="L2034">            Debug.println(s, &quot;verify_data&quot;, verifyData);</span>
+<span class="nc" id="L2035">            s.println(&quot;***&quot;);</span>
+        }
+<span class="nc" id="L2037">    }</span>
+}
+
+//
+// END of nested classes
+//
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

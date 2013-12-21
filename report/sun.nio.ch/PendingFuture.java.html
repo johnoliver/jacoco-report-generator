@@ -1,0 +1,255 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>PendingFuture.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.nio.ch</a> &gt; <span class="el_source">PendingFuture.java</span></div><h1>PendingFuture.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2008, 2009, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.nio.ch;
+
+import java.nio.channels.*;
+import java.util.concurrent.*;
+import java.io.IOException;
+
+/**
+ * A Future for a pending I/O operation. A PendingFuture allows for the
+ * attachment of an additional arbitrary context object and a timer task.
+ */
+
+final class PendingFuture&lt;V,A&gt; implements Future&lt;V&gt; {
+<span class="fc" id="L38">    private static final CancellationException CANCELLED =</span>
+        new CancellationException();
+
+    private final AsynchronousChannel channel;
+    private final CompletionHandler&lt;V,? super A&gt; handler;
+    private final A attachment;
+
+    // true if result (or exception) is available
+    private volatile boolean haveResult;
+    private volatile V result;
+    private volatile Throwable exc;
+
+    // latch for waiting (created lazily if needed)
+    private CountDownLatch latch;
+
+    // optional timer task that is cancelled when result becomes available
+    private Future&lt;?&gt; timeoutTask;
+
+    // optional context object
+    private volatile Object context;
+
+    PendingFuture(AsynchronousChannel channel,
+                  CompletionHandler&lt;V,? super A&gt; handler,
+                  A attachment,
+                  Object context)
+<span class="fc" id="L63">    {</span>
+<span class="fc" id="L64">        this.channel = channel;</span>
+<span class="fc" id="L65">        this.handler = handler;</span>
+<span class="fc" id="L66">        this.attachment = attachment;</span>
+<span class="fc" id="L67">        this.context = context;</span>
+<span class="fc" id="L68">    }</span>
+
+    PendingFuture(AsynchronousChannel channel,
+                  CompletionHandler&lt;V,? super A&gt; handler,
+                  A attachment)
+<span class="fc" id="L73">    {</span>
+<span class="fc" id="L74">        this.channel = channel;</span>
+<span class="fc" id="L75">        this.handler = handler;</span>
+<span class="fc" id="L76">        this.attachment = attachment;</span>
+<span class="fc" id="L77">    }</span>
+
+    PendingFuture(AsynchronousChannel channel) {
+<span class="fc" id="L80">        this(channel, null, null);</span>
+<span class="fc" id="L81">    }</span>
+
+    PendingFuture(AsynchronousChannel channel, Object context) {
+<span class="fc" id="L84">        this(channel, null, null, context);</span>
+<span class="fc" id="L85">    }</span>
+
+    AsynchronousChannel channel() {
+<span class="fc" id="L88">        return channel;</span>
+    }
+
+    CompletionHandler&lt;V,? super A&gt; handler() {
+<span class="nc" id="L92">        return handler;</span>
+    }
+
+    A attachment() {
+<span class="nc" id="L96">        return attachment;</span>
+    }
+
+    void setContext(Object context) {
+<span class="nc" id="L100">        this.context = context;</span>
+<span class="nc" id="L101">    }</span>
+
+    Object getContext() {
+<span class="nc" id="L104">        return context;</span>
+    }
+
+    void setTimeoutTask(Future&lt;?&gt; task) {
+<span class="nc" id="L108">        synchronized (this) {</span>
+<span class="nc bnc" id="L109" title="All 2 branches missed.">            if (haveResult) {</span>
+<span class="nc" id="L110">                task.cancel(false);</span>
+            } else {
+<span class="nc" id="L112">                this.timeoutTask = task;</span>
+            }
+<span class="nc" id="L114">        }</span>
+<span class="nc" id="L115">    }</span>
+
+    // creates latch if required; return true if caller needs to wait
+    private boolean prepareForWait() {
+<span class="fc" id="L119">        synchronized (this) {</span>
+<span class="fc bfc" id="L120" title="All 2 branches covered.">            if (haveResult) {</span>
+<span class="fc" id="L121">                return false;</span>
+            } else {
+<span class="fc bfc" id="L123" title="All 2 branches covered.">                if (latch == null)</span>
+<span class="fc" id="L124">                    latch = new CountDownLatch(1);</span>
+<span class="fc" id="L125">                return true;</span>
+            }
+<span class="nc" id="L127">        }</span>
+    }
+
+    /**
+     * Sets the result, or a no-op if the result or exception is already set.
+     */
+    void setResult(V res) {
+<span class="fc" id="L134">        synchronized (this) {</span>
+<span class="fc bfc" id="L135" title="All 2 branches covered.">            if (haveResult)</span>
+<span class="fc" id="L136">                return;</span>
+<span class="fc" id="L137">            result = res;</span>
+<span class="fc" id="L138">            haveResult = true;</span>
+<span class="pc bpc" id="L139" title="1 of 2 branches missed.">            if (timeoutTask != null)</span>
+<span class="nc" id="L140">                timeoutTask.cancel(false);</span>
+<span class="fc bfc" id="L141" title="All 2 branches covered.">            if (latch != null)</span>
+<span class="fc" id="L142">                latch.countDown();</span>
+<span class="pc" id="L143">        }</span>
+<span class="fc" id="L144">    }</span>
+
+    /**
+     * Sets the result, or a no-op if the result or exception is already set.
+     */
+    void setFailure(Throwable x) {
+<span class="pc bpc" id="L150" title="3 of 4 branches missed.">        if (!(x instanceof IOException) &amp;&amp; !(x instanceof SecurityException))</span>
+<span class="nc" id="L151">            x = new IOException(x);</span>
+<span class="fc" id="L152">        synchronized (this) {</span>
+<span class="fc bfc" id="L153" title="All 2 branches covered.">            if (haveResult)</span>
+<span class="fc" id="L154">                return;</span>
+<span class="fc" id="L155">            exc = x;</span>
+<span class="fc" id="L156">            haveResult = true;</span>
+<span class="pc bpc" id="L157" title="1 of 2 branches missed.">            if (timeoutTask != null)</span>
+<span class="nc" id="L158">                timeoutTask.cancel(false);</span>
+<span class="fc bfc" id="L159" title="All 2 branches covered.">            if (latch != null)</span>
+<span class="fc" id="L160">                latch.countDown();</span>
+<span class="pc" id="L161">        }</span>
+<span class="fc" id="L162">    }</span>
+
+    /**
+     * Sets the result
+     */
+    void setResult(V res, Throwable x) {
+<span class="fc bfc" id="L168" title="All 2 branches covered.">        if (x == null) {</span>
+<span class="fc" id="L169">            setResult(res);</span>
+        } else {
+<span class="fc" id="L171">            setFailure(x);</span>
+        }
+<span class="fc" id="L173">    }</span>
+
+    @Override
+    public V get() throws ExecutionException, InterruptedException {
+<span class="fc bfc" id="L177" title="All 2 branches covered.">        if (!haveResult) {</span>
+<span class="fc" id="L178">            boolean needToWait = prepareForWait();</span>
+<span class="fc bfc" id="L179" title="All 2 branches covered.">            if (needToWait)</span>
+<span class="fc" id="L180">                latch.await();</span>
+        }
+<span class="fc bfc" id="L182" title="All 2 branches covered.">        if (exc != null) {</span>
+<span class="fc bfc" id="L183" title="All 2 branches covered.">            if (exc == CANCELLED)</span>
+<span class="fc" id="L184">                throw new CancellationException();</span>
+<span class="fc" id="L185">            throw new ExecutionException(exc);</span>
+        }
+<span class="fc" id="L187">        return result;</span>
+    }
+
+    @Override
+    public V get(long timeout, TimeUnit unit)
+        throws ExecutionException, InterruptedException, TimeoutException
+    {
+<span class="fc bfc" id="L194" title="All 2 branches covered.">        if (!haveResult) {</span>
+<span class="fc" id="L195">            boolean needToWait = prepareForWait();</span>
+<span class="pc bpc" id="L196" title="1 of 2 branches missed.">            if (needToWait)</span>
+<span class="pc bpc" id="L197" title="1 of 2 branches missed.">                if (!latch.await(timeout, unit)) throw new TimeoutException();</span>
+        }
+<span class="pc bpc" id="L199" title="1 of 2 branches missed.">        if (exc != null) {</span>
+<span class="pc bpc" id="L200" title="1 of 2 branches missed.">            if (exc == CANCELLED)</span>
+<span class="fc" id="L201">                throw new CancellationException();</span>
+<span class="nc" id="L202">            throw new ExecutionException(exc);</span>
+        }
+<span class="nc" id="L204">        return result;</span>
+    }
+
+    Throwable exception() {
+<span class="nc bnc" id="L208" title="All 2 branches missed.">        return (exc != CANCELLED) ? exc : null;</span>
+    }
+
+    V value() {
+<span class="nc" id="L212">        return result;</span>
+    }
+
+    @Override
+    public boolean isCancelled() {
+<span class="pc bpc" id="L217" title="1 of 2 branches missed.">        return (exc == CANCELLED);</span>
+    }
+
+    @Override
+    public boolean isDone() {
+<span class="fc" id="L222">        return haveResult;</span>
+    }
+
+    @Override
+    public boolean cancel(boolean mayInterruptIfRunning) {
+<span class="fc" id="L227">        synchronized (this) {</span>
+<span class="pc bpc" id="L228" title="1 of 2 branches missed.">            if (haveResult)</span>
+<span class="nc" id="L229">                return false;    // already completed</span>
+
+            // notify channel
+<span class="pc bpc" id="L232" title="1 of 2 branches missed.">            if (channel() instanceof Cancellable)</span>
+<span class="nc" id="L233">                ((Cancellable)channel()).onCancel(this);</span>
+
+            // set result and cancel timer
+<span class="fc" id="L236">            exc = CANCELLED;</span>
+<span class="fc" id="L237">            haveResult = true;</span>
+<span class="pc bpc" id="L238" title="1 of 2 branches missed.">            if (timeoutTask != null)</span>
+<span class="nc" id="L239">                timeoutTask.cancel(false);</span>
+<span class="pc" id="L240">        }</span>
+
+        // close channel if forceful cancel
+<span class="fc bfc" id="L243" title="All 2 branches covered.">        if (mayInterruptIfRunning) {</span>
+            try {
+<span class="fc" id="L245">                channel().close();</span>
+<span class="pc" id="L246">            } catch (IOException ignore) { }</span>
+        }
+
+        // release waiters
+<span class="pc bpc" id="L250" title="1 of 2 branches missed.">        if (latch != null)</span>
+<span class="nc" id="L251">            latch.countDown();</span>
+<span class="fc" id="L252">        return true;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

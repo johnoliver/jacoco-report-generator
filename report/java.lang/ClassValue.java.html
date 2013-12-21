@@ -1,0 +1,761 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ClassValue.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">java.lang</a> &gt; <span class="el_source">ClassValue.java</span></div><h1>ClassValue.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2010, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package java.lang;
+
+import java.lang.ClassValue.ClassValueMap;
+import java.util.WeakHashMap;
+import java.lang.ref.WeakReference;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static java.lang.ClassValue.ClassValueMap.probeHomeLocation;
+import static java.lang.ClassValue.ClassValueMap.probeBackupLocations;
+
+/**
+ * Lazily associate a computed value with (potentially) every type.
+ * For example, if a dynamic language needs to construct a message dispatch
+ * table for each class encountered at a message send call site,
+ * it can use a {@code ClassValue} to cache information needed to
+ * perform the message send quickly, for each class encountered.
+ * @author John Rose, JSR 292 EG
+ * @since 1.7
+ */
+public abstract class ClassValue&lt;T&gt; {
+    /**
+     * Sole constructor.  (For invocation by subclass constructors, typically
+     * implicit.)
+     */
+<span class="fc" id="L50">    protected ClassValue() {</span>
+<span class="fc" id="L51">    }</span>
+
+    /**
+     * Computes the given class's derived value for this {@code ClassValue}.
+     * &lt;p&gt;
+     * This method will be invoked within the first thread that accesses
+     * the value with the {@link #get get} method.
+     * &lt;p&gt;
+     * Normally, this method is invoked at most once per class,
+     * but it may be invoked again if there has been a call to
+     * {@link #remove remove}.
+     * &lt;p&gt;
+     * If this method throws an exception, the corresponding call to {@code get}
+     * will terminate abnormally with that exception, and no class value will be recorded.
+     *
+     * @param type the type whose class value must be computed
+     * @return the newly computed value associated with this {@code ClassValue}, for the given class or interface
+     * @see #get
+     * @see #remove
+     */
+    protected abstract T computeValue(Class&lt;?&gt; type);
+
+    /**
+     * Returns the value for the given class.
+     * If no value has yet been computed, it is obtained by
+     * an invocation of the {@link #computeValue computeValue} method.
+     * &lt;p&gt;
+     * The actual installation of the value on the class
+     * is performed atomically.
+     * At that point, if several racing threads have
+     * computed values, one is chosen, and returned to
+     * all the racing threads.
+     * &lt;p&gt;
+     * The {@code type} parameter is typically a class, but it may be any type,
+     * such as an interface, a primitive type (like {@code int.class}), or {@code void.class}.
+     * &lt;p&gt;
+     * In the absence of {@code remove} calls, a class value has a simple
+     * state diagram:  uninitialized and initialized.
+     * When {@code remove} calls are made,
+     * the rules for value observation are more complex.
+     * See the documentation for {@link #remove remove} for more information.
+     *
+     * @param type the type whose class value must be computed or retrieved
+     * @return the current value associated with this {@code ClassValue}, for the given class or interface
+     * @throws NullPointerException if the argument is null
+     * @see #remove
+     * @see #computeValue
+     */
+    public T get(Class&lt;?&gt; type) {
+        // non-racing this.hashCodeForCache : final int
+        Entry&lt;?&gt;[] cache;
+<span class="fc" id="L102">        Entry&lt;T&gt; e = probeHomeLocation(cache = getCacheCarefully(type), this);</span>
+        // racing e : current value &lt;=&gt; stale value from current cache or from stale cache
+        // invariant:  e is null or an Entry with readable Entry.version and Entry.value
+<span class="fc bfc" id="L105" title="All 2 branches covered.">        if (match(e))</span>
+            // invariant:  No false positive matches.  False negatives are OK if rare.
+            // The key fact that makes this work: if this.version == e.version,
+            // then this thread has a right to observe (final) e.value.
+<span class="fc" id="L109">            return e.value();</span>
+        // The fast path can fail for any of these reasons:
+        // 1. no entry has been computed yet
+        // 2. hash code collision (before or after reduction mod cache.length)
+        // 3. an entry has been removed (either on this type or another)
+        // 4. the GC has somehow managed to delete e.version and clear the reference
+<span class="fc" id="L115">        return getFromBackup(cache, type);</span>
+    }
+
+    /**
+     * Removes the associated value for the given class.
+     * If this value is subsequently {@linkplain #get read} for the same class,
+     * its value will be reinitialized by invoking its {@link #computeValue computeValue} method.
+     * This may result in an additional invocation of the
+     * {@code computeValue} method for the given class.
+     * &lt;p&gt;
+     * In order to explain the interaction between {@code get} and {@code remove} calls,
+     * we must model the state transitions of a class value to take into account
+     * the alternation between uninitialized and initialized states.
+     * To do this, number these states sequentially from zero, and note that
+     * uninitialized (or removed) states are numbered with even numbers,
+     * while initialized (or re-initialized) states have odd numbers.
+     * &lt;p&gt;
+     * When a thread {@code T} removes a class value in state {@code 2N},
+     * nothing happens, since the class value is already uninitialized.
+     * Otherwise, the state is advanced atomically to {@code 2N+1}.
+     * &lt;p&gt;
+     * When a thread {@code T} queries a class value in state {@code 2N},
+     * the thread first attempts to initialize the class value to state {@code 2N+1}
+     * by invoking {@code computeValue} and installing the resulting value.
+     * &lt;p&gt;
+     * When {@code T} attempts to install the newly computed value,
+     * if the state is still at {@code 2N}, the class value will be initialized
+     * with the computed value, advancing it to state {@code 2N+1}.
+     * &lt;p&gt;
+     * Otherwise, whether the new state is even or odd,
+     * {@code T} will discard the newly computed value
+     * and retry the {@code get} operation.
+     * &lt;p&gt;
+     * Discarding and retrying is an important proviso,
+     * since otherwise {@code T} could potentially install
+     * a disastrously stale value.  For example:
+     * &lt;ul&gt;
+     * &lt;li&gt;{@code T} calls {@code CV.get(C)} and sees state {@code 2N}
+     * &lt;li&gt;{@code T} quickly computes a time-dependent value {@code V0} and gets ready to install it
+     * &lt;li&gt;{@code T} is hit by an unlucky paging or scheduling event, and goes to sleep for a long time
+     * &lt;li&gt;...meanwhile, {@code T2} also calls {@code CV.get(C)} and sees state {@code 2N}
+     * &lt;li&gt;{@code T2} quickly computes a similar time-dependent value {@code V1} and installs it on {@code CV.get(C)}
+     * &lt;li&gt;{@code T2} (or a third thread) then calls {@code CV.remove(C)}, undoing {@code T2}'s work
+     * &lt;li&gt; the previous actions of {@code T2} are repeated several times
+     * &lt;li&gt; also, the relevant computed values change over time: {@code V1}, {@code V2}, ...
+     * &lt;li&gt;...meanwhile, {@code T} wakes up and attempts to install {@code V0}; &lt;em&gt;this must fail&lt;/em&gt;
+     * &lt;/ul&gt;
+     * We can assume in the above scenario that {@code CV.computeValue} uses locks to properly
+     * observe the time-dependent states as it computes {@code V1}, etc.
+     * This does not remove the threat of a stale value, since there is a window of time
+     * between the return of {@code computeValue} in {@code T} and the installation
+     * of the the new value.  No user synchronization is possible during this time.
+     *
+     * @param type the type whose class value must be removed
+     * @throws NullPointerException if the argument is null
+     */
+    public void remove(Class&lt;?&gt; type) {
+<span class="nc" id="L172">        ClassValueMap map = getMap(type);</span>
+<span class="nc" id="L173">        map.removeEntry(this);</span>
+<span class="nc" id="L174">    }</span>
+
+    // Possible functionality for JSR 292 MR 1
+    /*public*/ void put(Class&lt;?&gt; type, T value) {
+<span class="nc" id="L178">        ClassValueMap map = getMap(type);</span>
+<span class="nc" id="L179">        map.changeEntry(this, value);</span>
+<span class="nc" id="L180">    }</span>
+
+    /// --------
+    /// Implementation...
+    /// --------
+
+    /** Return the cache, if it exists, else a dummy empty cache. */
+    private static Entry&lt;?&gt;[] getCacheCarefully(Class&lt;?&gt; type) {
+        // racing type.classValueMap{.cacheArray} : null =&gt; new Entry[X] &lt;=&gt; new Entry[Y]
+<span class="fc" id="L189">        ClassValueMap map = type.classValueMap;</span>
+<span class="fc bfc" id="L190" title="All 2 branches covered.">        if (map == null)  return EMPTY_CACHE;</span>
+<span class="fc" id="L191">        Entry&lt;?&gt;[] cache = map.getCache();</span>
+<span class="fc" id="L192">        return cache;</span>
+        // invariant:  returned value is safe to dereference and check for an Entry
+    }
+
+    /** Initial, one-element, empty cache used by all Class instances.  Must never be filled. */
+<span class="fc" id="L197">    private static final Entry&lt;?&gt;[] EMPTY_CACHE = { null };</span>
+
+    /**
+     * Slow tail of ClassValue.get to retry at nearby locations in the cache,
+     * or take a slow lock and check the hash table.
+     * Called only if the first probe was empty or a collision.
+     * This is a separate method, so compilers can process it independently.
+     */
+    private T getFromBackup(Entry&lt;?&gt;[] cache, Class&lt;?&gt; type) {
+<span class="fc" id="L206">        Entry&lt;T&gt; e = probeBackupLocations(cache, this);</span>
+<span class="pc bpc" id="L207" title="1 of 2 branches missed.">        if (e != null)</span>
+<span class="nc" id="L208">            return e.value();</span>
+<span class="fc" id="L209">        return getFromHashMap(type);</span>
+    }
+
+    // Hack to suppress warnings on the (T) cast, which is a no-op.
+    @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L214">    Entry&lt;T&gt; castEntry(Entry&lt;?&gt; e) { return (Entry&lt;T&gt;) e; }</span>
+
+    /** Called when the fast path of get fails, and cache reprobe also fails.
+     */
+    private T getFromHashMap(Class&lt;?&gt; type) {
+        // The fail-safe recovery is to fall back to the underlying classValueMap.
+<span class="fc" id="L220">        ClassValueMap map = getMap(type);</span>
+        for (;;) {
+<span class="fc" id="L222">            Entry&lt;T&gt; e = map.startEntry(this);</span>
+<span class="pc bpc" id="L223" title="1 of 2 branches missed.">            if (!e.isPromise())</span>
+<span class="nc" id="L224">                return e.value();</span>
+            try {
+                // Try to make a real entry for the promised version.
+<span class="fc" id="L227">                e = makeEntry(e.version(), computeValue(type));</span>
+            } finally {
+                // Whether computeValue throws or returns normally,
+                // be sure to remove the empty entry.
+<span class="pc" id="L231">                e = map.finishEntry(this, e);</span>
+<span class="fc" id="L232">            }</span>
+<span class="pc bpc" id="L233" title="1 of 2 branches missed.">            if (e != null)</span>
+<span class="fc" id="L234">                return e.value();</span>
+            // else try again, in case a racing thread called remove (so e == null)
+<span class="nc" id="L236">        }</span>
+    }
+
+    /** Check that e is non-null, matches this ClassValue, and is live. */
+    boolean match(Entry&lt;?&gt; e) {
+        // racing e.version : null (blank) =&gt; unique Version token =&gt; null (GC-ed version)
+        // non-racing this.version : v1 =&gt; v2 =&gt; ... (updates are read faithfully from volatile)
+<span class="pc bpc" id="L243" title="1 of 4 branches missed.">        return (e != null &amp;&amp; e.get() == this.version);</span>
+        // invariant:  No false positives on version match.  Null is OK for false negative.
+        // invariant:  If version matches, then e.value is readable (final set in Entry.&lt;init&gt;)
+    }
+
+    /** Internal hash code for accessing Class.classValueMap.cacheArray. */
+<span class="fc" id="L249">    final int hashCodeForCache = nextHashCode.getAndAdd(HASH_INCREMENT) &amp; HASH_MASK;</span>
+
+    /** Value stream for hashCodeForCache.  See similar structure in ThreadLocal. */
+<span class="fc" id="L252">    private static final AtomicInteger nextHashCode = new AtomicInteger();</span>
+
+    /** Good for power-of-two tables.  See similar structure in ThreadLocal. */
+    private static final int HASH_INCREMENT = 0x61c88647;
+
+    /** Mask a hash code to be positive but not too large, to prevent wraparound. */
+    static final int HASH_MASK = (-1 &gt;&gt;&gt; 2);
+
+    /**
+     * Private key for retrieval of this object from ClassValueMap.
+     */
+<span class="fc" id="L263">    static class Identity {</span>
+    }
+    /**
+     * This ClassValue's identity, expressed as an opaque object.
+     * The main object {@code ClassValue.this} is incorrect since
+     * subclasses may override {@code ClassValue.equals}, which
+     * could confuse keys in the ClassValueMap.
+     */
+<span class="fc" id="L271">    final Identity identity = new Identity();</span>
+
+    /**
+     * Current version for retrieving this class value from the cache.
+     * Any number of computeValue calls can be cached in association with one version.
+     * But the version changes when a remove (on any type) is executed.
+     * A version change invalidates all cache entries for the affected ClassValue,
+     * by marking them as stale.  Stale cache entries do not force another call
+     * to computeValue, but they do require a synchronized visit to a backing map.
+     * &lt;p&gt;
+     * All user-visible state changes on the ClassValue take place under
+     * a lock inside the synchronized methods of ClassValueMap.
+     * Readers (of ClassValue.get) are notified of such state changes
+     * when this.version is bumped to a new token.
+     * This variable must be volatile so that an unsynchronized reader
+     * will receive the notification without delay.
+     * &lt;p&gt;
+     * If version were not volatile, one thread T1 could persistently hold onto
+     * a stale value this.value == V1, while while another thread T2 advances
+     * (under a lock) to this.value == V2.  This will typically be harmless,
+     * but if T1 and T2 interact causally via some other channel, such that
+     * T1's further actions are constrained (in the JMM) to happen after
+     * the V2 event, then T1's observation of V1 will be an error.
+     * &lt;p&gt;
+     * The practical effect of making this.version be volatile is that it cannot
+     * be hoisted out of a loop (by an optimizing JIT) or otherwise cached.
+     * Some machines may also require a barrier instruction to execute
+     * before this.version.
+     */
+<span class="fc" id="L300">    private volatile Version&lt;T&gt; version = new Version&lt;&gt;(this);</span>
+<span class="fc" id="L301">    Version&lt;T&gt; version() { return version; }</span>
+<span class="nc" id="L302">    void bumpVersion() { version = new Version&lt;&gt;(this); }</span>
+    static class Version&lt;T&gt; {
+        private final ClassValue&lt;T&gt; classValue;
+<span class="fc" id="L305">        private final Entry&lt;T&gt; promise = new Entry&lt;&gt;(this);</span>
+<span class="fc" id="L306">        Version(ClassValue&lt;T&gt; classValue) { this.classValue = classValue; }</span>
+<span class="nc" id="L307">        ClassValue&lt;T&gt; classValue() { return classValue; }</span>
+<span class="fc" id="L308">        Entry&lt;T&gt; promise() { return promise; }</span>
+<span class="nc bnc" id="L309" title="All 2 branches missed.">        boolean isLive() { return classValue.version() == this; }</span>
+    }
+
+    /** One binding of a value to a class via a ClassValue.
+     *  States are:&lt;ul&gt;
+     *  &lt;li&gt; promise if value == Entry.this
+     *  &lt;li&gt; else dead if version == null
+     *  &lt;li&gt; else stale if version != classValue.version
+     *  &lt;li&gt; else live &lt;/ul&gt;
+     *  Promises are never put into the cache; they only live in the
+     *  backing map while a computeValue call is in flight.
+     *  Once an entry goes stale, it can be reset at any time
+     *  into the dead state.
+     */
+<span class="fc bfc" id="L323" title="All 2 branches covered.">    static class Entry&lt;T&gt; extends WeakReference&lt;Version&lt;T&gt;&gt; {</span>
+        final Object value;  // usually of type T, but sometimes (Entry)this
+        Entry(Version&lt;T&gt; version, T value) {
+<span class="fc" id="L326">            super(version);</span>
+<span class="fc" id="L327">            this.value = value;  // for a regular entry, value is of type T</span>
+<span class="fc" id="L328">        }</span>
+<span class="pc bpc" id="L329" title="1 of 4 branches missed.">        private void assertNotPromise() { assert(!isPromise()); }</span>
+        /** For creating a promise. */
+        Entry(Version&lt;T&gt; version) {
+<span class="fc" id="L332">            super(version);</span>
+<span class="fc" id="L333">            this.value = this;  // for a promise, value is not of type T, but Entry!</span>
+<span class="fc" id="L334">        }</span>
+        /** Fetch the value.  This entry must not be a promise. */
+        @SuppressWarnings(&quot;unchecked&quot;)  // if !isPromise, type is T
+<span class="fc" id="L337">        T value() { assertNotPromise(); return (T) value; }</span>
+<span class="fc bfc" id="L338" title="All 2 branches covered.">        boolean isPromise() { return value == this; }</span>
+<span class="fc" id="L339">        Version&lt;T&gt; version() { return get(); }</span>
+        ClassValue&lt;T&gt; classValueOrNull() {
+<span class="nc" id="L341">            Version&lt;T&gt; v = version();</span>
+<span class="nc bnc" id="L342" title="All 2 branches missed.">            return (v == null) ? null : v.classValue();</span>
+        }
+        boolean isLive() {
+<span class="nc" id="L345">            Version&lt;T&gt; v = version();</span>
+<span class="nc bnc" id="L346" title="All 2 branches missed.">            if (v == null)  return false;</span>
+<span class="nc bnc" id="L347" title="All 2 branches missed.">            if (v.isLive())  return true;</span>
+<span class="nc" id="L348">            clear();</span>
+<span class="nc" id="L349">            return false;</span>
+        }
+        Entry&lt;T&gt; refreshVersion(Version&lt;T&gt; v2) {
+<span class="nc" id="L352">            assertNotPromise();</span>
+            @SuppressWarnings(&quot;unchecked&quot;)  // if !isPromise, type is T
+<span class="nc" id="L354">            Entry&lt;T&gt; e2 = new Entry&lt;&gt;(v2, (T) value);</span>
+<span class="nc" id="L355">            clear();</span>
+            // value = null -- caller must drop
+<span class="nc" id="L357">            return e2;</span>
+        }
+<span class="fc" id="L359">        static final Entry&lt;?&gt; DEAD_ENTRY = new Entry&lt;&gt;(null, null);</span>
+    }
+
+    /** Return the backing map associated with this type. */
+    private static ClassValueMap getMap(Class&lt;?&gt; type) {
+        // racing type.classValueMap : null (blank) =&gt; unique ClassValueMap
+        // if a null is observed, a map is created (lazily, synchronously, uniquely)
+        // all further access to that map is synchronized
+<span class="fc" id="L367">        ClassValueMap map = type.classValueMap;</span>
+<span class="fc bfc" id="L368" title="All 2 branches covered.">        if (map != null)  return map;</span>
+<span class="fc" id="L369">        return initializeMap(type);</span>
+    }
+
+<span class="fc" id="L372">    private static final Object CRITICAL_SECTION = new Object();</span>
+    private static ClassValueMap initializeMap(Class&lt;?&gt; type) {
+        ClassValueMap map;
+<span class="fc" id="L375">        synchronized (CRITICAL_SECTION) {  // private object to avoid deadlocks</span>
+            // happens about once per type
+<span class="pc bpc" id="L377" title="1 of 2 branches missed.">            if ((map = type.classValueMap) == null)</span>
+<span class="fc" id="L378">                type.classValueMap = map = new ClassValueMap(type);</span>
+<span class="pc" id="L379">        }</span>
+<span class="fc" id="L380">            return map;</span>
+        }
+
+    static &lt;T&gt; Entry&lt;T&gt; makeEntry(Version&lt;T&gt; explicitVersion, T value) {
+        // Note that explicitVersion might be different from this.version.
+<span class="fc" id="L385">        return new Entry&lt;&gt;(explicitVersion, value);</span>
+
+        // As soon as the Entry is put into the cache, the value will be
+        // reachable via a data race (as defined by the Java Memory Model).
+        // This race is benign, assuming the value object itself can be
+        // read safely by multiple threads.  This is up to the user.
+        //
+        // The entry and version fields themselves can be safely read via
+        // a race because they are either final or have controlled states.
+        // If the pointer from the entry to the version is still null,
+        // or if the version goes immediately dead and is nulled out,
+        // the reader will take the slow path and retry under a lock.
+    }
+
+    // The following class could also be top level and non-public:
+
+    /** A backing map for all ClassValues, relative a single given type.
+     *  Gives a fully serialized &quot;true state&quot; for each pair (ClassValue cv, Class type).
+     *  Also manages an unserialized fast-path cache.
+     */
+<span class="fc bfc" id="L405" title="All 2 branches covered.">    static class ClassValueMap extends WeakHashMap&lt;ClassValue.Identity, Entry&lt;?&gt;&gt; {</span>
+        private final Class&lt;?&gt; type;
+        private Entry&lt;?&gt;[] cacheArray;
+        private int cacheLoad, cacheLoadLimit;
+
+        /** Number of entries initially allocated to each type when first used with any ClassValue.
+         *  It would be pointless to make this much smaller than the Class and ClassValueMap objects themselves.
+         *  Must be a power of 2.
+         */
+        private static final int INITIAL_ENTRIES = 32;
+
+        /** Build a backing map for ClassValues, relative the given type.
+         *  Also, create an empty cache array and install it on the class.
+         */
+<span class="fc" id="L419">        ClassValueMap(Class&lt;?&gt; type) {</span>
+<span class="fc" id="L420">            this.type = type;</span>
+<span class="fc" id="L421">            sizeCache(INITIAL_ENTRIES);</span>
+<span class="fc" id="L422">        }</span>
+
+<span class="fc" id="L424">        Entry&lt;?&gt;[] getCache() { return cacheArray; }</span>
+
+        /** Initiate a query.  Store a promise (placeholder) if there is no value yet. */
+        synchronized
+        &lt;T&gt; Entry&lt;T&gt; startEntry(ClassValue&lt;T&gt; classValue) {
+            @SuppressWarnings(&quot;unchecked&quot;)  // one map has entries for all value types &lt;T&gt;
+<span class="fc" id="L430">            Entry&lt;T&gt; e = (Entry&lt;T&gt;) get(classValue.identity);</span>
+<span class="fc" id="L431">            Version&lt;T&gt; v = classValue.version();</span>
+<span class="pc bpc" id="L432" title="1 of 2 branches missed.">            if (e == null) {</span>
+<span class="fc" id="L433">                e = v.promise();</span>
+                // The presence of a promise means that a value is pending for v.
+                // Eventually, finishEntry will overwrite the promise.
+<span class="fc" id="L436">                put(classValue.identity, e);</span>
+                // Note that the promise is never entered into the cache!
+<span class="fc" id="L438">                return e;</span>
+<span class="nc bnc" id="L439" title="All 2 branches missed.">            } else if (e.isPromise()) {</span>
+                // Somebody else has asked the same question.
+                // Let the races begin!
+<span class="nc bnc" id="L442" title="All 2 branches missed.">                if (e.version() != v) {</span>
+<span class="nc" id="L443">                    e = v.promise();</span>
+<span class="nc" id="L444">                    put(classValue.identity, e);</span>
+                }
+<span class="nc" id="L446">                return e;</span>
+            } else {
+                // there is already a completed entry here; report it
+<span class="nc bnc" id="L449" title="All 2 branches missed.">                if (e.version() != v) {</span>
+                    // There is a stale but valid entry here; make it fresh again.
+                    // Once an entry is in the hash table, we don't care what its version is.
+<span class="nc" id="L452">                    e = e.refreshVersion(v);</span>
+<span class="nc" id="L453">                    put(classValue.identity, e);</span>
+                }
+                // Add to the cache, to enable the fast path, next time.
+<span class="nc" id="L456">                checkCacheLoad();</span>
+<span class="nc" id="L457">                addToCache(classValue, e);</span>
+<span class="nc" id="L458">                return e;</span>
+            }
+        }
+
+        /** Finish a query.  Overwrite a matching placeholder.  Drop stale incoming values. */
+        synchronized
+        &lt;T&gt; Entry&lt;T&gt; finishEntry(ClassValue&lt;T&gt; classValue, Entry&lt;T&gt; e) {
+            @SuppressWarnings(&quot;unchecked&quot;)  // one map has entries for all value types &lt;T&gt;
+<span class="fc" id="L466">            Entry&lt;T&gt; e0 = (Entry&lt;T&gt;) get(classValue.identity);</span>
+<span class="pc bpc" id="L467" title="1 of 2 branches missed.">            if (e == e0) {</span>
+                // We can get here during exception processing, unwinding from computeValue.
+<span class="nc bnc" id="L469" title="All 4 branches missed.">                assert(e.isPromise());</span>
+<span class="nc" id="L470">                remove(classValue.identity);</span>
+<span class="nc" id="L471">                return null;</span>
+<span class="pc bpc" id="L472" title="3 of 6 branches missed.">            } else if (e0 != null &amp;&amp; e0.isPromise() &amp;&amp; e0.version() == e.version()) {</span>
+                // If e0 matches the intended entry, there has not been a remove call
+                // between the previous startEntry and now.  So now overwrite e0.
+<span class="fc" id="L475">                Version&lt;T&gt; v = classValue.version();</span>
+<span class="pc bpc" id="L476" title="1 of 2 branches missed.">                if (e.version() != v)</span>
+<span class="nc" id="L477">                    e = e.refreshVersion(v);</span>
+<span class="fc" id="L478">                put(classValue.identity, e);</span>
+                // Add to the cache, to enable the fast path, next time.
+<span class="fc" id="L480">                checkCacheLoad();</span>
+<span class="fc" id="L481">                addToCache(classValue, e);</span>
+<span class="fc" id="L482">                return e;</span>
+            } else {
+                // Some sort of mismatch; caller must try again.
+<span class="nc" id="L485">                return null;</span>
+            }
+        }
+
+        /** Remove an entry. */
+        synchronized
+        void removeEntry(ClassValue&lt;?&gt; classValue) {
+<span class="nc" id="L492">            Entry&lt;?&gt; e = remove(classValue.identity);</span>
+<span class="nc bnc" id="L493" title="All 2 branches missed.">            if (e == null) {</span>
+                // Uninitialized, and no pending calls to computeValue.  No change.
+<span class="nc bnc" id="L495" title="All 2 branches missed.">            } else if (e.isPromise()) {</span>
+                // State is uninitialized, with a pending call to finishEntry.
+                // Since remove is a no-op in such a state, keep the promise
+                // by putting it back into the map.
+<span class="nc" id="L499">                put(classValue.identity, e);</span>
+            } else {
+                // In an initialized state.  Bump forward, and de-initialize.
+<span class="nc" id="L502">                classValue.bumpVersion();</span>
+                // Make all cache elements for this guy go stale.
+<span class="nc" id="L504">                removeStaleEntries(classValue);</span>
+            }
+<span class="nc" id="L506">        }</span>
+
+        /** Change the value for an entry. */
+        synchronized
+        &lt;T&gt; void changeEntry(ClassValue&lt;T&gt; classValue, T value) {
+            @SuppressWarnings(&quot;unchecked&quot;)  // one map has entries for all value types &lt;T&gt;
+<span class="nc" id="L512">            Entry&lt;T&gt; e0 = (Entry&lt;T&gt;) get(classValue.identity);</span>
+<span class="nc" id="L513">            Version&lt;T&gt; version = classValue.version();</span>
+<span class="nc bnc" id="L514" title="All 2 branches missed.">            if (e0 != null) {</span>
+<span class="nc bnc" id="L515" title="All 4 branches missed.">                if (e0.version() == version &amp;&amp; e0.value() == value)</span>
+                    // no value change =&gt; no version change needed
+<span class="nc" id="L517">                    return;</span>
+<span class="nc" id="L518">                classValue.bumpVersion();</span>
+<span class="nc" id="L519">                removeStaleEntries(classValue);</span>
+            }
+<span class="nc" id="L521">            Entry&lt;T&gt; e = makeEntry(version, value);</span>
+<span class="nc" id="L522">            put(classValue.identity, e);</span>
+            // Add to the cache, to enable the fast path, next time.
+<span class="nc" id="L524">            checkCacheLoad();</span>
+<span class="nc" id="L525">            addToCache(classValue, e);</span>
+<span class="nc" id="L526">        }</span>
+
+        /// --------
+        /// Cache management.
+        /// --------
+
+        // Statics do not need synchronization.
+
+        /** Load the cache entry at the given (hashed) location. */
+        static Entry&lt;?&gt; loadFromCache(Entry&lt;?&gt;[] cache, int i) {
+            // non-racing cache.length : constant
+            // racing cache[i &amp; (mask)] : null &lt;=&gt; Entry
+<span class="fc" id="L538">            return cache[i &amp; (cache.length-1)];</span>
+            // invariant:  returned value is null or well-constructed (ready to match)
+        }
+
+        /** Look in the cache, at the home location for the given ClassValue. */
+        static &lt;T&gt; Entry&lt;T&gt; probeHomeLocation(Entry&lt;?&gt;[] cache, ClassValue&lt;T&gt; classValue) {
+<span class="fc" id="L544">            return classValue.castEntry(loadFromCache(cache, classValue.hashCodeForCache));</span>
+        }
+
+        /** Given that first probe was a collision, retry at nearby locations. */
+        static &lt;T&gt; Entry&lt;T&gt; probeBackupLocations(Entry&lt;?&gt;[] cache, ClassValue&lt;T&gt; classValue) {
+            if (PROBE_LIMIT &lt;= 0)  return null;
+            // Probe the cache carefully, in a range of slots.
+<span class="fc" id="L551">            int mask = (cache.length-1);</span>
+<span class="fc" id="L552">            int home = (classValue.hashCodeForCache &amp; mask);</span>
+<span class="fc" id="L553">            Entry&lt;?&gt; e2 = cache[home];  // victim, if we find the real guy</span>
+<span class="pc bpc" id="L554" title="1 of 2 branches missed.">            if (e2 == null) {</span>
+<span class="fc" id="L555">                return null;   // if nobody is at home, no need to search nearby</span>
+            }
+            // assume !classValue.match(e2), but do not assert, because of races
+<span class="nc" id="L558">            int pos2 = -1;</span>
+<span class="nc bnc" id="L559" title="All 2 branches missed.">            for (int i = home + 1; i &lt; home + PROBE_LIMIT; i++) {</span>
+<span class="nc" id="L560">                Entry&lt;?&gt; e = cache[i &amp; mask];</span>
+<span class="nc bnc" id="L561" title="All 2 branches missed.">                if (e == null) {</span>
+<span class="nc" id="L562">                    break;   // only search within non-null runs</span>
+                }
+<span class="nc bnc" id="L564" title="All 2 branches missed.">                if (classValue.match(e)) {</span>
+                    // relocate colliding entry e2 (from cache[home]) to first empty slot
+<span class="nc" id="L566">                    cache[home] = e;</span>
+<span class="nc bnc" id="L567" title="All 2 branches missed.">                    if (pos2 &gt;= 0) {</span>
+<span class="nc" id="L568">                        cache[i &amp; mask] = Entry.DEAD_ENTRY;</span>
+                    } else {
+<span class="nc" id="L570">                        pos2 = i;</span>
+                    }
+<span class="nc bnc" id="L572" title="All 2 branches missed.">                    cache[pos2 &amp; mask] = ((entryDislocation(cache, pos2, e2) &lt; PROBE_LIMIT)</span>
+                                          ? e2                  // put e2 here if it fits
+                                          : Entry.DEAD_ENTRY);
+<span class="nc" id="L575">                    return classValue.castEntry(e);</span>
+                }
+                // Remember first empty slot, if any:
+<span class="nc bnc" id="L578" title="All 4 branches missed.">                if (!e.isLive() &amp;&amp; pos2 &lt; 0)  pos2 = i;</span>
+            }
+<span class="nc" id="L580">            return null;</span>
+        }
+
+        /** How far out of place is e? */
+        private static int entryDislocation(Entry&lt;?&gt;[] cache, int pos, Entry&lt;?&gt; e) {
+<span class="nc" id="L585">            ClassValue&lt;?&gt; cv = e.classValueOrNull();</span>
+<span class="nc bnc" id="L586" title="All 2 branches missed.">            if (cv == null)  return 0;  // entry is not live!</span>
+<span class="nc" id="L587">            int mask = (cache.length-1);</span>
+<span class="nc" id="L588">            return (pos - cv.hashCodeForCache) &amp; mask;</span>
+        }
+
+        /// --------
+        /// Below this line all functions are private, and assume synchronized access.
+        /// --------
+
+        private void sizeCache(int length) {
+<span class="pc bpc" id="L596" title="1 of 4 branches missed.">            assert((length &amp; (length-1)) == 0);  // must be power of 2</span>
+<span class="fc" id="L597">            cacheLoad = 0;</span>
+<span class="fc" id="L598">            cacheLoadLimit = (int) ((double) length * CACHE_LOAD_LIMIT / 100);</span>
+<span class="fc" id="L599">            cacheArray = new Entry&lt;?&gt;[length];</span>
+<span class="fc" id="L600">        }</span>
+
+        /** Make sure the cache load stays below its limit, if possible. */
+        private void checkCacheLoad() {
+<span class="pc bpc" id="L604" title="1 of 2 branches missed.">            if (cacheLoad &gt;= cacheLoadLimit) {</span>
+<span class="nc" id="L605">                reduceCacheLoad();</span>
+            }
+<span class="fc" id="L607">        }</span>
+        private void reduceCacheLoad() {
+<span class="nc" id="L609">            removeStaleEntries();</span>
+<span class="nc bnc" id="L610" title="All 2 branches missed.">            if (cacheLoad &lt; cacheLoadLimit)</span>
+<span class="nc" id="L611">                return;  // win</span>
+<span class="nc" id="L612">            Entry&lt;?&gt;[] oldCache = getCache();</span>
+<span class="nc bnc" id="L613" title="All 2 branches missed.">            if (oldCache.length &gt; HASH_MASK)</span>
+<span class="nc" id="L614">                return;  // lose</span>
+<span class="nc" id="L615">            sizeCache(oldCache.length * 2);</span>
+<span class="nc bnc" id="L616" title="All 2 branches missed.">            for (Entry&lt;?&gt; e : oldCache) {</span>
+<span class="nc bnc" id="L617" title="All 4 branches missed.">                if (e != null &amp;&amp; e.isLive()) {</span>
+<span class="nc" id="L618">                    addToCache(e);</span>
+                }
+            }
+<span class="nc" id="L621">        }</span>
+
+        /** Remove stale entries in the given range.
+         *  Should be executed under a Map lock.
+         */
+        private void removeStaleEntries(Entry&lt;?&gt;[] cache, int begin, int count) {
+            if (PROBE_LIMIT &lt;= 0)  return;
+<span class="nc" id="L628">            int mask = (cache.length-1);</span>
+<span class="nc" id="L629">            int removed = 0;</span>
+<span class="nc bnc" id="L630" title="All 2 branches missed.">            for (int i = begin; i &lt; begin + count; i++) {</span>
+<span class="nc" id="L631">                Entry&lt;?&gt; e = cache[i &amp; mask];</span>
+<span class="nc bnc" id="L632" title="All 4 branches missed.">                if (e == null || e.isLive())</span>
+<span class="nc" id="L633">                    continue;  // skip null and live entries</span>
+<span class="nc" id="L634">                Entry&lt;?&gt; replacement = null;</span>
+                if (PROBE_LIMIT &gt; 1) {
+                    // avoid breaking up a non-null run
+<span class="nc" id="L637">                    replacement = findReplacement(cache, i);</span>
+                }
+<span class="nc" id="L639">                cache[i &amp; mask] = replacement;</span>
+<span class="nc bnc" id="L640" title="All 2 branches missed.">                if (replacement == null)  removed += 1;</span>
+            }
+<span class="nc" id="L642">            cacheLoad = Math.max(0, cacheLoad - removed);</span>
+<span class="nc" id="L643">        }</span>
+
+        /** Clearing a cache slot risks disconnecting following entries
+         *  from the head of a non-null run, which would allow them
+         *  to be found via reprobes.  Find an entry after cache[begin]
+         *  to plug into the hole, or return null if none is needed.
+         */
+        private Entry&lt;?&gt; findReplacement(Entry&lt;?&gt;[] cache, int home1) {
+<span class="nc" id="L651">            Entry&lt;?&gt; replacement = null;</span>
+<span class="nc" id="L652">            int haveReplacement = -1, replacementPos = 0;</span>
+<span class="nc" id="L653">            int mask = (cache.length-1);</span>
+<span class="nc bnc" id="L654" title="All 2 branches missed.">            for (int i2 = home1 + 1; i2 &lt; home1 + PROBE_LIMIT; i2++) {</span>
+<span class="nc" id="L655">                Entry&lt;?&gt; e2 = cache[i2 &amp; mask];</span>
+<span class="nc bnc" id="L656" title="All 2 branches missed.">                if (e2 == null)  break;  // End of non-null run.</span>
+<span class="nc bnc" id="L657" title="All 2 branches missed.">                if (!e2.isLive())  continue;  // Doomed anyway.</span>
+<span class="nc" id="L658">                int dis2 = entryDislocation(cache, i2, e2);</span>
+<span class="nc bnc" id="L659" title="All 2 branches missed.">                if (dis2 == 0)  continue;  // e2 already optimally placed</span>
+<span class="nc" id="L660">                int home2 = i2 - dis2;</span>
+<span class="nc bnc" id="L661" title="All 2 branches missed.">                if (home2 &lt;= home1) {</span>
+                    // e2 can replace entry at cache[home1]
+<span class="nc bnc" id="L663" title="All 2 branches missed.">                    if (home2 == home1) {</span>
+                        // Put e2 exactly where he belongs.
+<span class="nc" id="L665">                        haveReplacement = 1;</span>
+<span class="nc" id="L666">                        replacementPos = i2;</span>
+<span class="nc" id="L667">                        replacement = e2;</span>
+<span class="nc bnc" id="L668" title="All 2 branches missed.">                    } else if (haveReplacement &lt;= 0) {</span>
+<span class="nc" id="L669">                        haveReplacement = 0;</span>
+<span class="nc" id="L670">                        replacementPos = i2;</span>
+<span class="nc" id="L671">                        replacement = e2;</span>
+                    }
+                    // And keep going, so we can favor larger dislocations.
+                }
+            }
+<span class="nc bnc" id="L676" title="All 2 branches missed.">            if (haveReplacement &gt;= 0) {</span>
+<span class="nc bnc" id="L677" title="All 2 branches missed.">                if (cache[(replacementPos+1) &amp; mask] != null) {</span>
+                    // Be conservative, to avoid breaking up a non-null run.
+<span class="nc" id="L679">                    cache[replacementPos &amp; mask] = (Entry&lt;?&gt;) Entry.DEAD_ENTRY;</span>
+                } else {
+<span class="nc" id="L681">                    cache[replacementPos &amp; mask] = null;</span>
+<span class="nc" id="L682">                    cacheLoad -= 1;</span>
+                }
+            }
+<span class="nc" id="L685">            return replacement;</span>
+        }
+
+        /** Remove stale entries in the range near classValue. */
+        private void removeStaleEntries(ClassValue&lt;?&gt; classValue) {
+<span class="nc" id="L690">            removeStaleEntries(getCache(), classValue.hashCodeForCache, PROBE_LIMIT);</span>
+<span class="nc" id="L691">        }</span>
+
+        /** Remove all stale entries, everywhere. */
+        private void removeStaleEntries() {
+<span class="nc" id="L695">            Entry&lt;?&gt;[] cache = getCache();</span>
+<span class="nc" id="L696">            removeStaleEntries(cache, 0, cache.length + PROBE_LIMIT - 1);</span>
+<span class="nc" id="L697">        }</span>
+
+        /** Add the given entry to the cache, in its home location, unless it is out of date. */
+        private &lt;T&gt; void addToCache(Entry&lt;T&gt; e) {
+<span class="nc" id="L701">            ClassValue&lt;T&gt; classValue = e.classValueOrNull();</span>
+<span class="nc bnc" id="L702" title="All 2 branches missed.">            if (classValue != null)</span>
+<span class="nc" id="L703">                addToCache(classValue, e);</span>
+<span class="nc" id="L704">        }</span>
+
+        /** Add the given entry to the cache, in its home location. */
+        private &lt;T&gt; void addToCache(ClassValue&lt;T&gt; classValue, Entry&lt;T&gt; e) {
+            if (PROBE_LIMIT &lt;= 0)  return;  // do not fill cache
+            // Add e to the cache.
+<span class="fc" id="L710">            Entry&lt;?&gt;[] cache = getCache();</span>
+<span class="fc" id="L711">            int mask = (cache.length-1);</span>
+<span class="fc" id="L712">            int home = classValue.hashCodeForCache &amp; mask;</span>
+<span class="fc" id="L713">            Entry&lt;?&gt; e2 = placeInCache(cache, home, e, false);</span>
+<span class="pc bpc" id="L714" title="1 of 2 branches missed.">            if (e2 == null)  return;  // done</span>
+            if (PROBE_LIMIT &gt; 1) {
+                // try to move e2 somewhere else in his probe range
+<span class="nc" id="L717">                int dis2 = entryDislocation(cache, home, e2);</span>
+<span class="nc" id="L718">                int home2 = home - dis2;</span>
+<span class="nc bnc" id="L719" title="All 2 branches missed.">                for (int i2 = home2; i2 &lt; home2 + PROBE_LIMIT; i2++) {</span>
+<span class="nc bnc" id="L720" title="All 2 branches missed.">                    if (placeInCache(cache, i2 &amp; mask, e2, true) == null) {</span>
+<span class="nc" id="L721">                        return;</span>
+                    }
+                }
+            }
+            // Note:  At this point, e2 is just dropped from the cache.
+<span class="nc" id="L726">        }</span>
+
+        /** Store the given entry.  Update cacheLoad, and return any live victim.
+         *  'Gently' means return self rather than dislocating a live victim.
+         */
+        private Entry&lt;?&gt; placeInCache(Entry&lt;?&gt;[] cache, int pos, Entry&lt;?&gt; e, boolean gently) {
+<span class="fc" id="L732">            Entry&lt;?&gt; e2 = overwrittenEntry(cache[pos]);</span>
+<span class="pc bpc" id="L733" title="3 of 4 branches missed.">            if (gently &amp;&amp; e2 != null) {</span>
+                // do not overwrite a live entry
+<span class="nc" id="L735">                return e;</span>
+            } else {
+<span class="fc" id="L737">                cache[pos] = e;</span>
+<span class="fc" id="L738">                return e2;</span>
+            }
+        }
+
+        /** Note an entry that is about to be overwritten.
+         *  If it is not live, quietly replace it by null.
+         *  If it is an actual null, increment cacheLoad,
+         *  because the caller is going to store something
+         *  in its place.
+         */
+        private &lt;T&gt; Entry&lt;T&gt; overwrittenEntry(Entry&lt;T&gt; e2) {
+<span class="pc bpc" id="L749" title="1 of 2 branches missed.">            if (e2 == null)  cacheLoad += 1;</span>
+<span class="nc bnc" id="L750" title="All 2 branches missed.">            else if (e2.isLive())  return e2;</span>
+<span class="fc" id="L751">            return null;</span>
+        }
+
+        /** Percent loading of cache before resize. */
+        private static final int CACHE_LOAD_LIMIT = 67;  // 0..100
+        /** Maximum number of probes to attempt. */
+        private static final int PROBE_LIMIT      =  6;       // 1..
+        // N.B.  Set PROBE_LIMIT=0 to disable all fast paths.
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

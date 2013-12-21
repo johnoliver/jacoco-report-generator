@@ -1,0 +1,234 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>UCDecoder.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.misc</a> &gt; <span class="el_source">UCDecoder.java</span></div><h1>UCDecoder.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1995, 2000, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package sun.misc;
+
+import java.io.OutputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.PushbackInputStream;
+import java.io.PrintStream;
+import java.io.IOException;
+
+/**
+ * This class implements a robust character decoder. The decoder will
+ * converted encoded text into binary data.
+ *
+ * The basic encoding unit is a 3 character atom. It encodes two bytes
+ * of data. Bytes are encoded into a 64 character set, the characters
+ * were chosen specifically because they appear in all codesets.
+ * We don't care what their numerical equivalent is because
+ * we use a character array to map them. This is like UUencoding
+ * with the dependency on ASCII removed.
+ *
+ * The three chars that make up an atom are encoded as follows:
+ * &lt;pre&gt;
+ *      00xxxyyy 00axxxxx 00byyyyy
+ *      00 = leading zeros, all values are 0 - 63
+ *      xxxyyy - Top 3 bits of X, Top 3 bits of Y
+ *      axxxxx - a = X parity bit, xxxxx lower 5 bits of X
+ *      byyyyy - b = Y parity bit, yyyyy lower 5 bits of Y
+ * &lt;/pre&gt;
+ *
+ * The atoms are arranged into lines suitable for inclusion into an
+ * email message or text file. The number of bytes that are encoded
+ * per line is 48 which keeps the total line length  under 80 chars)
+ *
+ * Each line has the form(
+ * &lt;pre&gt;
+ *  *(LLSS)(DDDD)(DDDD)(DDDD)...(CRC)
+ *  Where each (xxx) represents a three character atom.
+ *  (LLSS) - 8 bit length (high byte), and sequence number
+ *           modulo 256;
+ *  (DDDD) - Data byte atoms, if length is odd, last data
+ *           atom has (DD00) (high byte data, low byte 0)
+ *  (CRC)  - 16 bit CRC for the line, includes length,
+ *           sequence, and all data bytes. If there is a
+ *           zero pad byte (odd length) it is _NOT_
+ *           included in the CRC.
+ * &lt;/pre&gt;
+ *
+ * If an error is encountered during decoding this class throws a
+ * CEFormatException. The specific detail messages are:
+ *
+ * &lt;pre&gt;
+ *    &quot;UCDecoder: High byte parity error.&quot;
+ *    &quot;UCDecoder: Low byte parity error.&quot;
+ *    &quot;UCDecoder: Out of sequence line.&quot;
+ *    &quot;UCDecoder: CRC check failed.&quot;
+ * &lt;/pre&gt;
+ *
+ * @author      Chuck McManis
+ * @see         CharacterEncoder
+ * @see         UCEncoder
+ */
+<span class="nc" id="L85">public class UCDecoder extends CharacterDecoder {</span>
+
+    /** This class encodes two bytes per atom. */
+    protected int bytesPerAtom() {
+<span class="nc" id="L89">        return (2);</span>
+    }
+
+    /** this class encodes 48 bytes per line */
+    protected int bytesPerLine() {
+<span class="nc" id="L94">        return (48);</span>
+    }
+
+    /* this is the UCE mapping of 0-63 to characters .. */
+<span class="nc" id="L98">    private final static byte map_array[] = {</span>
+        //     0         1         2         3         4         5         6         7
+        (byte)'0',(byte)'1',(byte)'2',(byte)'3',(byte)'4',(byte)'5',(byte)'6',(byte)'7', // 0
+        (byte)'8',(byte)'9',(byte)'A',(byte)'B',(byte)'C',(byte)'D',(byte)'E',(byte)'F', // 1
+        (byte)'G',(byte)'H',(byte)'I',(byte)'J',(byte)'K',(byte)'L',(byte)'M',(byte)'N', // 2
+        (byte)'O',(byte)'P',(byte)'Q',(byte)'R',(byte)'S',(byte)'T',(byte)'U',(byte)'V', // 3
+        (byte)'W',(byte)'X',(byte)'Y',(byte)'Z',(byte)'a',(byte)'b',(byte)'c',(byte)'d', // 4
+        (byte)'e',(byte)'f',(byte)'g',(byte)'h',(byte)'i',(byte)'j',(byte)'k',(byte)'l', // 5
+        (byte)'m',(byte)'n',(byte)'o',(byte)'p',(byte)'q',(byte)'r',(byte)'s',(byte)'t', // 6
+        (byte)'u',(byte)'v',(byte)'w',(byte)'x',(byte)'y',(byte)'z',(byte)'(',(byte)')'  // 7
+    };
+
+    private int sequence;
+<span class="nc" id="L111">    private byte tmp[] = new byte[2];</span>
+<span class="nc" id="L112">    private CRC16 crc = new CRC16();</span>
+
+    /**
+     * Decode one atom - reads the characters from the input stream, decodes
+     * them, and checks for valid parity.
+     */
+    protected void decodeAtom(PushbackInputStream inStream, OutputStream outStream, int l) throws IOException {
+        int i, p1, p2, np1, np2;
+<span class="nc" id="L120">        byte a = -1, b = -1, c = -1;</span>
+        byte high_byte, low_byte;
+<span class="nc" id="L122">        byte tmp[] = new byte[3];</span>
+
+<span class="nc" id="L124">        i = inStream.read(tmp);</span>
+<span class="nc bnc" id="L125" title="All 2 branches missed.">        if (i != 3) {</span>
+<span class="nc" id="L126">                throw new CEStreamExhausted();</span>
+        }
+<span class="nc bnc" id="L128" title="All 8 branches missed.">        for (i = 0; (i &lt; 64) &amp;&amp; ((a == -1) || (b == -1) || (c == -1)); i++) {</span>
+<span class="nc bnc" id="L129" title="All 2 branches missed.">            if (tmp[0] == map_array[i]) {</span>
+<span class="nc" id="L130">                a = (byte) i;</span>
+            }
+<span class="nc bnc" id="L132" title="All 2 branches missed.">            if (tmp[1] == map_array[i]) {</span>
+<span class="nc" id="L133">                b = (byte) i;</span>
+            }
+<span class="nc bnc" id="L135" title="All 2 branches missed.">            if (tmp[2] == map_array[i]) {</span>
+<span class="nc" id="L136">                c = (byte) i;</span>
+            }
+        }
+<span class="nc" id="L139">        high_byte = (byte) (((a &amp; 0x38) &lt;&lt; 2) + (b &amp; 0x1f));</span>
+<span class="nc" id="L140">        low_byte = (byte) (((a &amp; 0x7) &lt;&lt; 5) + (c &amp; 0x1f));</span>
+<span class="nc" id="L141">        p1 = 0;</span>
+<span class="nc" id="L142">        p2 = 0;</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">        for (i = 1; i &lt; 256; i = i * 2) {</span>
+<span class="nc bnc" id="L144" title="All 2 branches missed.">            if ((high_byte &amp; i) != 0)</span>
+<span class="nc" id="L145">                p1++;</span>
+<span class="nc bnc" id="L146" title="All 2 branches missed.">            if ((low_byte &amp; i) != 0)</span>
+<span class="nc" id="L147">                p2++;</span>
+        }
+<span class="nc" id="L149">        np1 = (b &amp; 32) / 32;</span>
+<span class="nc" id="L150">        np2 = (c &amp; 32) / 32;</span>
+<span class="nc bnc" id="L151" title="All 2 branches missed.">        if ((p1 &amp; 1) != np1) {</span>
+<span class="nc" id="L152">            throw new CEFormatException(&quot;UCDecoder: High byte parity error.&quot;);</span>
+        }
+<span class="nc bnc" id="L154" title="All 2 branches missed.">        if ((p2 &amp; 1) != np2) {</span>
+<span class="nc" id="L155">            throw new CEFormatException(&quot;UCDecoder: Low byte parity error.&quot;);</span>
+        }
+<span class="nc" id="L157">        outStream.write(high_byte);</span>
+<span class="nc" id="L158">        crc.update(high_byte);</span>
+<span class="nc bnc" id="L159" title="All 2 branches missed.">        if (l == 2) {</span>
+<span class="nc" id="L160">            outStream.write(low_byte);</span>
+<span class="nc" id="L161">            crc.update(low_byte);</span>
+        }
+<span class="nc" id="L163">    }</span>
+
+<span class="nc" id="L165">    private ByteArrayOutputStream lineAndSeq = new ByteArrayOutputStream(2);</span>
+
+    /**
+     * decodeBufferPrefix initializes the sequence number to zero.
+     */
+    protected void decodeBufferPrefix(PushbackInputStream inStream, OutputStream outStream) {
+<span class="nc" id="L171">        sequence = 0;</span>
+<span class="nc" id="L172">    }</span>
+
+    /**
+     * decodeLinePrefix reads the sequence number and the number of
+     * encoded bytes from the line. If the sequence number is not the
+     * previous sequence number + 1 then an exception is thrown.
+     * UCE lines are line terminator immune, they all start with *
+     * so the other thing this method does is scan for the next line
+     * by looking for the * character.
+     *
+     * @exception CEFormatException out of sequence lines detected.
+     */
+    protected int decodeLinePrefix(PushbackInputStream inStream, OutputStream outStream)  throws IOException {
+        int     i;
+        int     nLen, nSeq;
+        byte    xtmp[];
+        int     c;
+
+<span class="nc" id="L190">        crc.value = 0;</span>
+        while (true) {
+<span class="nc" id="L192">            c = inStream.read(tmp, 0, 1);</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">            if (c == -1) {</span>
+<span class="nc" id="L194">                throw new CEStreamExhausted();</span>
+            }
+<span class="nc bnc" id="L196" title="All 2 branches missed.">            if (tmp[0] == '*') {</span>
+<span class="nc" id="L197">                break;</span>
+            }
+        }
+<span class="nc" id="L200">        lineAndSeq.reset();</span>
+<span class="nc" id="L201">        decodeAtom(inStream, lineAndSeq, 2);</span>
+<span class="nc" id="L202">        xtmp = lineAndSeq.toByteArray();</span>
+<span class="nc" id="L203">        nLen = xtmp[0] &amp; 0xff;</span>
+<span class="nc" id="L204">        nSeq = xtmp[1] &amp; 0xff;</span>
+<span class="nc bnc" id="L205" title="All 2 branches missed.">        if (nSeq != sequence) {</span>
+<span class="nc" id="L206">            throw new CEFormatException(&quot;UCDecoder: Out of sequence line.&quot;);</span>
+        }
+<span class="nc" id="L208">        sequence = (sequence + 1) &amp; 0xff;</span>
+<span class="nc" id="L209">        return (nLen);</span>
+    }
+
+
+    /**
+     * this method reads the CRC that is at the end of every line and
+     * verifies that it matches the computed CRC.
+     *
+     * @exception CEFormatException if CRC check fails.
+     */
+    protected void decodeLineSuffix(PushbackInputStream inStream, OutputStream outStream) throws IOException {
+        int i;
+<span class="nc" id="L221">        int lineCRC = crc.value;</span>
+        int readCRC;
+        byte tmp[];
+
+<span class="nc" id="L225">        lineAndSeq.reset();</span>
+<span class="nc" id="L226">        decodeAtom(inStream, lineAndSeq, 2);</span>
+<span class="nc" id="L227">        tmp = lineAndSeq.toByteArray();</span>
+<span class="nc" id="L228">        readCRC = ((tmp[0] &lt;&lt; 8) &amp; 0xFF00) + (tmp[1] &amp; 0xff);</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">        if (readCRC != lineCRC) {</span>
+<span class="nc" id="L230">            throw new CEFormatException(&quot;UCDecoder: CRC check failed.&quot;);</span>
+        }
+<span class="nc" id="L232">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

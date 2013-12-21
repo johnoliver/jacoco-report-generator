@@ -1,0 +1,857 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>InputRecord.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.ssl</a> &gt; <span class="el_source">InputRecord.java</span></div><h1>InputRecord.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1996, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+
+package sun.security.ssl;
+
+import java.io.*;
+import java.nio.*;
+
+import javax.crypto.BadPaddingException;
+
+import javax.net.ssl.*;
+
+import sun.misc.HexDumpEncoder;
+
+
+/**
+ * SSL 3.0 records, as pulled off a TCP stream.  Input records are
+ * basically buffers tied to a particular input stream ... a layer
+ * above this must map these records into the model of a continuous
+ * stream of data.
+ *
+ * Since this returns SSL 3.0 records, it's the layer that needs to
+ * map SSL 2.0 style handshake records into SSL 3.0 ones for those
+ * &quot;old&quot; clients that interop with both V2 and V3 servers.  Not as
+ * pretty as might be desired.
+ *
+ * NOTE:  During handshaking, each message must be hashed to support
+ * verification that the handshake process wasn't compromised.
+ *
+ * @author David Brownell
+ */
+class InputRecord extends ByteArrayInputStream implements Record {
+
+    private HandshakeHash       handshakeHash;
+    private int                 lastHashed;
+<span class="nc" id="L59">    boolean                     formatVerified = true;  // SSLv2 ruled out?</span>
+    private boolean             isClosed;
+    private boolean             appDataValid;
+
+    // The ClientHello version to accept. If set to ProtocolVersion.SSL20Hello
+    // and the first message we read is a ClientHello in V2 format, we convert
+    // it to V3. Otherwise we throw an exception when encountering a V2 hello.
+    private ProtocolVersion     helloVersion;
+
+    /* Class and subclass dynamic debugging support */
+<span class="nc" id="L69">    static final Debug debug = Debug.getInstance(&quot;ssl&quot;);</span>
+
+    /* The existing record length */
+    private int exlen;
+
+    /* V2 handshake message */
+    private byte v2Buf[];
+
+    /*
+     * Construct the record to hold the maximum sized input record.
+     * Data will be filled in separately.
+     *
+     * The structure of the byte buffer looks like:
+     *
+     *     |--------+---------+---------------------------------|
+     *     | header |   IV    | content, MAC/TAG, padding, etc. |
+     *     | headerPlusIVSize |
+     *
+     * header: the header of an SSL records
+     * IV:     the optional IV/nonce field, it is only required for block
+     *         (TLS 1.1 or later) and AEAD cipher suites.
+     *
+     */
+    InputRecord() {
+<span class="nc" id="L93">        super(new byte[maxRecordSize]);</span>
+<span class="nc" id="L94">        setHelloVersion(ProtocolVersion.DEFAULT_HELLO);</span>
+<span class="nc" id="L95">        pos = headerSize;</span>
+<span class="nc" id="L96">        count = headerSize;</span>
+<span class="nc" id="L97">        lastHashed = count;</span>
+<span class="nc" id="L98">        exlen = 0;</span>
+<span class="nc" id="L99">        v2Buf = null;</span>
+<span class="nc" id="L100">    }</span>
+
+    void setHelloVersion(ProtocolVersion helloVersion) {
+<span class="nc" id="L103">        this.helloVersion = helloVersion;</span>
+<span class="nc" id="L104">    }</span>
+
+    ProtocolVersion getHelloVersion() {
+<span class="nc" id="L107">        return helloVersion;</span>
+    }
+
+    /*
+     * Enable format checks if initial handshaking hasn't completed
+     */
+    void enableFormatChecks() {
+<span class="nc" id="L114">        formatVerified = false;</span>
+<span class="nc" id="L115">    }</span>
+
+    // return whether the data in this record is valid, decrypted data
+    boolean isAppDataValid() {
+<span class="nc" id="L119">        return appDataValid;</span>
+    }
+
+    void setAppDataValid(boolean value) {
+<span class="nc" id="L123">        appDataValid = value;</span>
+<span class="nc" id="L124">    }</span>
+
+    /*
+     * Return the content type of the record.
+     */
+    byte contentType() {
+<span class="nc" id="L130">        return buf[0];</span>
+    }
+
+    /*
+     * For handshaking, we need to be able to hash every byte above the
+     * record marking layer.  This is where we're guaranteed to see those
+     * bytes, so this is where we can hash them ... especially in the
+     * case of hashing the initial V2 message!
+     */
+    void setHandshakeHash(HandshakeHash handshakeHash) {
+<span class="nc" id="L140">        this.handshakeHash = handshakeHash;</span>
+<span class="nc" id="L141">    }</span>
+
+    HandshakeHash getHandshakeHash() {
+<span class="nc" id="L144">        return handshakeHash;</span>
+    }
+
+    void decrypt(Authenticator authenticator,
+            CipherBox box) throws BadPaddingException {
+<span class="nc" id="L149">        BadPaddingException reservedBPE = null;</span>
+<span class="nc bnc" id="L150" title="All 2 branches missed.">        int tagLen =</span>
+<span class="nc" id="L151">            (authenticator instanceof MAC) ? ((MAC)authenticator).MAClen() : 0;</span>
+<span class="nc" id="L152">        int cipheredLength = count - headerSize;</span>
+
+<span class="nc bnc" id="L154" title="All 2 branches missed.">        if (!box.isNullCipher()) {</span>
+            try {
+                // apply explicit nonce for AEAD/CBC cipher suites if needed
+<span class="nc" id="L157">                int nonceSize = box.applyExplicitNonce(authenticator,</span>
+<span class="nc" id="L158">                        contentType(), buf, headerSize, cipheredLength);</span>
+<span class="nc" id="L159">                pos = headerSize + nonceSize;</span>
+<span class="nc" id="L160">                lastHashed = pos;   // don't digest the explicit nonce</span>
+
+                // decrypt the content
+<span class="nc" id="L163">                int offset = headerSize;</span>
+<span class="nc bnc" id="L164" title="All 2 branches missed.">                if (box.isAEADMode()) {</span>
+                    // DON'T encrypt the nonce_explicit for AEAD mode
+<span class="nc" id="L166">                    offset += nonceSize;</span>
+                }   // The explicit IV for CBC mode can be decrypted.
+
+                // Note that the CipherBox.decrypt() does not change
+                // the capacity of the buffer.
+<span class="nc" id="L171">                count = offset +</span>
+<span class="nc" id="L172">                    box.decrypt(buf, offset, count - offset, tagLen);</span>
+
+                // Note that we don't remove the nonce from the buffer.
+<span class="nc" id="L175">            } catch (BadPaddingException bpe) {</span>
+                // RFC 2246 states that decryption_failed should be used
+                // for this purpose. However, that allows certain attacks,
+                // so we just send bad record MAC. We also need to make
+                // sure to always check the MAC to avoid a timing attack
+                // for the same issue. See paper by Vaudenay et al and the
+                // update in RFC 4346/5246.
+                //
+                // Failover to message authentication code checking.
+<span class="nc" id="L184">                reservedBPE = bpe;</span>
+<span class="nc" id="L185">            }</span>
+        }
+
+        // Requires message authentication code for null, stream and block
+        // cipher suites.
+<span class="nc bnc" id="L190" title="All 4 branches missed.">        if (authenticator instanceof MAC &amp;&amp; tagLen != 0) {</span>
+<span class="nc" id="L191">            MAC signer = (MAC)authenticator;</span>
+<span class="nc" id="L192">            int macOffset = count - tagLen;</span>
+<span class="nc" id="L193">            int contentLen = macOffset - pos;</span>
+
+            // Note that although it is not necessary, we run the same MAC
+            // computation and comparison on the payload for both stream
+            // cipher and CBC block cipher.
+<span class="nc bnc" id="L198" title="All 2 branches missed.">            if (contentLen &lt; 0) {</span>
+                // negative data length, something is wrong
+<span class="nc bnc" id="L200" title="All 2 branches missed.">                if (reservedBPE == null) {</span>
+<span class="nc" id="L201">                    reservedBPE = new BadPaddingException(&quot;bad record&quot;);</span>
+                }
+
+                // set offset of the dummy MAC
+<span class="nc" id="L205">                macOffset = headerSize + cipheredLength - tagLen;</span>
+<span class="nc" id="L206">                contentLen = macOffset - headerSize;</span>
+            }
+
+<span class="nc" id="L209">            count -= tagLen;  // Set the count before any MAC checking</span>
+                              // exception occurs, so that the following
+                              // process can read the actual decrypted
+                              // content (minus the MAC) in the fragment
+                              // if necessary.
+
+            // Run MAC computation and comparison on the payload.
+<span class="nc bnc" id="L216" title="All 2 branches missed.">            if (checkMacTags(contentType(),</span>
+                    buf, pos, contentLen, signer, false)) {
+<span class="nc bnc" id="L218" title="All 2 branches missed.">                if (reservedBPE == null) {</span>
+<span class="nc" id="L219">                    reservedBPE = new BadPaddingException(&quot;bad record MAC&quot;);</span>
+                }
+            }
+
+            // Run MAC computation and comparison on the remainder.
+            //
+            // It is only necessary for CBC block cipher.  It is used to get a
+            // constant time of MAC computation and comparison on each record.
+<span class="nc bnc" id="L227" title="All 2 branches missed.">            if (box.isCBCMode()) {</span>
+<span class="nc" id="L228">                int remainingLen = calculateRemainingLen(</span>
+                                        signer, cipheredLength, contentLen);
+
+                // NOTE: remainingLen may be bigger (less than 1 block of the
+                // hash algorithm of the MAC) than the cipheredLength. However,
+                // We won't need to worry about it because we always use a
+                // maximum buffer for every record.  We need a change here if
+                // we use small buffer size in the future.
+<span class="nc bnc" id="L236" title="All 2 branches missed.">                if (remainingLen &gt; buf.length) {</span>
+                    // unlikely to happen, just a placehold
+<span class="nc" id="L238">                    throw new RuntimeException(</span>
+                        &quot;Internal buffer capacity error&quot;);
+                }
+
+                // Won't need to worry about the result on the remainder. And
+                // then we won't need to worry about what's actual data to
+                // check MAC tag on.  We start the check from the header of the
+                // buffer so that we don't need to construct a new byte buffer.
+<span class="nc" id="L246">                checkMacTags(contentType(), buf, 0, remainingLen, signer, true);</span>
+            }
+        }
+
+        // Is it a failover?
+<span class="nc bnc" id="L251" title="All 2 branches missed.">        if (reservedBPE != null) {</span>
+<span class="nc" id="L252">            throw reservedBPE;</span>
+        }
+<span class="nc" id="L254">    }</span>
+
+    /*
+     * Run MAC computation and comparison
+     *
+     * Please DON'T change the content of the byte buffer parameter!
+     */
+    static boolean checkMacTags(byte contentType, byte[] buffer,
+            int offset, int contentLen, MAC signer, boolean isSimulated) {
+
+<span class="nc" id="L264">        int tagLen = signer.MAClen();</span>
+<span class="nc" id="L265">        byte[] hash = signer.compute(</span>
+                contentType, buffer, offset, contentLen, isSimulated);
+<span class="nc bnc" id="L267" title="All 4 branches missed.">        if (hash == null || tagLen != hash.length) {</span>
+            // Something is wrong with MAC implementation.
+<span class="nc" id="L269">            throw new RuntimeException(&quot;Internal MAC error&quot;);</span>
+        }
+
+<span class="nc" id="L272">        int[] results = compareMacTags(buffer, offset + contentLen, hash);</span>
+<span class="nc bnc" id="L273" title="All 2 branches missed.">        return (results[0] != 0);</span>
+    }
+
+    /*
+     * A constant-time comparison of the MAC tags.
+     *
+     * Please DON'T change the content of the byte buffer parameter!
+     */
+    private static int[] compareMacTags(
+            byte[] buffer, int offset, byte[] tag) {
+
+        // An array of hits is used to prevent Hotspot optimization for
+        // the purpose of a constant-time check.
+<span class="nc" id="L286">        int[] results = {0, 0};    // {missed #, matched #}</span>
+
+        // The caller ensures there are enough bytes available in the buffer.
+        // So we won't need to check the length of the buffer.
+<span class="nc bnc" id="L290" title="All 2 branches missed.">        for (int i = 0; i &lt; tag.length; i++) {</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">            if (buffer[offset + i] != tag[i]) {</span>
+<span class="nc" id="L292">                results[0]++;       // mismatched bytes</span>
+            } else {
+<span class="nc" id="L294">                results[1]++;       // matched bytes</span>
+            }
+        }
+
+<span class="nc" id="L298">        return results;</span>
+    }
+
+    /*
+     * Calculate the length of a dummy buffer to run MAC computation
+     * and comparison on the remainder.
+     *
+     * The caller MUST ensure that the fullLen is not less than usedLen.
+     */
+    static int calculateRemainingLen(
+            MAC signer, int fullLen, int usedLen) {
+
+<span class="nc" id="L310">        int blockLen = signer.hashBlockLen();</span>
+<span class="nc" id="L311">        int minimalPaddingLen = signer.minimalPaddingLen();</span>
+
+        // (blockLen - minimalPaddingLen) is the maximum message size of
+        // the last block of hash function operation. See FIPS 180-4, or
+        // MD5 specification.
+<span class="nc" id="L316">        fullLen += 13 - (blockLen - minimalPaddingLen);</span>
+<span class="nc" id="L317">        usedLen += 13 - (blockLen - minimalPaddingLen);</span>
+
+        // Note: fullLen is always not less than usedLen, and blockLen
+        // is always bigger than minimalPaddingLen, so we don't worry
+        // about negative values. 0x01 is added to the result to ensure
+        // that the return value is positive.  The extra one byte does
+        // not impact the overall MAC compression function evaluations.
+<span class="nc" id="L324">        return 0x01 + (int)(Math.ceil(fullLen/(1.0d * blockLen)) -</span>
+<span class="nc" id="L325">                Math.ceil(usedLen/(1.0d * blockLen))) * signer.hashBlockLen();</span>
+    }
+
+    /*
+     * Well ... hello_request messages are _never_ hashed since we can't
+     * know when they'd appear in the sequence.
+     */
+    void ignore(int bytes) {
+<span class="nc bnc" id="L333" title="All 2 branches missed.">        if (bytes &gt; 0) {</span>
+<span class="nc" id="L334">            pos += bytes;</span>
+<span class="nc" id="L335">            lastHashed = pos;</span>
+        }
+<span class="nc" id="L337">    }</span>
+
+    /*
+     * We hash the (plaintext) we've processed, but only on demand.
+     *
+     * There is one place where we want to access the hash in the middle
+     * of a record:  client cert message gets hashed, and part of the
+     * same record is the client cert verify message which uses that hash.
+     * So we track how much we've read and hashed.
+     */
+    void doHashes() {
+<span class="nc" id="L348">        int len = pos - lastHashed;</span>
+
+<span class="nc bnc" id="L350" title="All 2 branches missed.">        if (len &gt; 0) {</span>
+<span class="nc" id="L351">            hashInternal(buf, lastHashed, len);</span>
+<span class="nc" id="L352">            lastHashed = pos;</span>
+        }
+<span class="nc" id="L354">    }</span>
+
+    /*
+     * Need a helper function so we can hash the V2 hello correctly
+     */
+    private void hashInternal(byte databuf [], int offset, int len) {
+<span class="nc bnc" id="L360" title="All 4 branches missed.">        if (debug != null &amp;&amp; Debug.isOn(&quot;data&quot;)) {</span>
+            try {
+<span class="nc" id="L362">                HexDumpEncoder hd = new HexDumpEncoder();</span>
+
+<span class="nc" id="L364">                System.out.println(&quot;[read] MD5 and SHA1 hashes:  len = &quot;</span>
+                    + len);
+<span class="nc" id="L366">                hd.encodeBuffer(new ByteArrayInputStream(databuf, offset, len),</span>
+                    System.out);
+<span class="nc" id="L368">            } catch (IOException e) { }</span>
+        }
+<span class="nc" id="L370">        handshakeHash.update(databuf, offset, len);</span>
+<span class="nc" id="L371">    }</span>
+
+
+    /*
+     * Handshake messages may cross record boundaries.  We &quot;queue&quot;
+     * these in big buffers if we need to cope with this problem.
+     * This is not anticipated to be a common case; if this turns
+     * out to be wrong, this can readily be sped up.
+     */
+    void queueHandshake(InputRecord r) throws IOException {
+        int len;
+
+        /*
+         * Hash any data that's read but unhashed.
+         */
+<span class="nc" id="L386">        doHashes();</span>
+
+        /*
+         * Move any unread data to the front of the buffer,
+         * flagging it all as unhashed.
+         */
+<span class="nc bnc" id="L392" title="All 2 branches missed.">        if (pos &gt; headerSize) {</span>
+<span class="nc" id="L393">            len = count - pos;</span>
+<span class="nc bnc" id="L394" title="All 2 branches missed.">            if (len != 0) {</span>
+<span class="nc" id="L395">                System.arraycopy(buf, pos, buf, headerSize, len);</span>
+            }
+<span class="nc" id="L397">            pos = headerSize;</span>
+<span class="nc" id="L398">            lastHashed = pos;</span>
+<span class="nc" id="L399">            count = headerSize + len;</span>
+        }
+
+        /*
+         * Grow &quot;buf&quot; if needed
+         */
+<span class="nc" id="L405">        len = r.available() + count;</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">        if (buf.length &lt; len) {</span>
+            byte        newbuf [];
+
+<span class="nc" id="L409">            newbuf = new byte [len];</span>
+<span class="nc" id="L410">            System.arraycopy(buf, 0, newbuf, 0, count);</span>
+<span class="nc" id="L411">            buf = newbuf;</span>
+        }
+
+        /*
+         * Append the new buffer to this one.
+         */
+<span class="nc" id="L417">        System.arraycopy(r.buf, r.pos, buf, count, len - count);</span>
+<span class="nc" id="L418">        count = len;</span>
+
+        /*
+         * Adjust lastHashed; important for now with clients which
+         * send SSL V2 client hellos.  This will go away eventually,
+         * by buffer code cleanup.
+         */
+<span class="nc" id="L425">        len = r.lastHashed - r.pos;</span>
+<span class="nc bnc" id="L426" title="All 2 branches missed.">        if (pos == headerSize) {</span>
+<span class="nc" id="L427">            lastHashed += len;</span>
+        } else {
+<span class="nc" id="L429">            throw new SSLProtocolException(&quot;?? confused buffer hashing ??&quot;);</span>
+        }
+        // we've read the record, advance the pointers
+<span class="nc" id="L432">        r.pos = r.count;</span>
+<span class="nc" id="L433">    }</span>
+
+
+    /**
+     * Prevent any more data from being read into this record,
+     * and flag the record as holding no data.
+     */
+    @Override
+    public void close() {
+<span class="nc" id="L442">        appDataValid = false;</span>
+<span class="nc" id="L443">        isClosed = true;</span>
+<span class="nc" id="L444">        mark = 0;</span>
+<span class="nc" id="L445">        pos = 0;</span>
+<span class="nc" id="L446">        count = 0;</span>
+<span class="nc" id="L447">    }</span>
+
+
+    /*
+     * We may need to send this SSL v2 &quot;No Cipher&quot; message back, if we
+     * are faced with an SSLv2 &quot;hello&quot; that's not saying &quot;I talk v3&quot;.
+     * It's the only one documented in the V2 spec as a fatal error.
+     */
+<span class="nc" id="L455">    private static final byte[] v2NoCipher = {</span>
+        (byte)0x80, (byte)0x03, // unpadded 3 byte record
+        (byte)0x00,             // ... error message
+        (byte)0x00, (byte)0x01  // ... NO_CIPHER error
+    };
+
+    private int readFully(InputStream s, byte b[], int off, int len)
+            throws IOException {
+<span class="nc" id="L463">        int n = 0;</span>
+<span class="nc bnc" id="L464" title="All 2 branches missed.">        while (n &lt; len) {</span>
+<span class="nc" id="L465">            int readLen = s.read(b, off + n, len - n);</span>
+<span class="nc bnc" id="L466" title="All 2 branches missed.">            if (readLen &lt; 0) {</span>
+<span class="nc" id="L467">                return readLen;</span>
+            }
+
+<span class="nc bnc" id="L470" title="All 4 branches missed.">            if (debug != null &amp;&amp; Debug.isOn(&quot;packet&quot;)) {</span>
+                try {
+<span class="nc" id="L472">                    HexDumpEncoder hd = new HexDumpEncoder();</span>
+<span class="nc" id="L473">                    ByteBuffer bb = ByteBuffer.wrap(b, off + n, readLen);</span>
+
+<span class="nc" id="L475">                    System.out.println(&quot;[Raw read]: length = &quot; +</span>
+<span class="nc" id="L476">                        bb.remaining());</span>
+<span class="nc" id="L477">                    hd.encodeBuffer(bb, System.out);</span>
+<span class="nc" id="L478">                } catch (IOException e) { }</span>
+            }
+
+<span class="nc" id="L481">            n += readLen;</span>
+<span class="nc" id="L482">            exlen += readLen;</span>
+<span class="nc" id="L483">        }</span>
+
+<span class="nc" id="L485">        return n;</span>
+    }
+
+    /*
+     * Read the SSL V3 record ... first time around, check to see if it
+     * really IS a V3 record.  Handle SSL V2 clients which can talk V3.0,
+     * as well as real V3 record format; otherwise report an error.
+     */
+    void read(InputStream s, OutputStream o) throws IOException {
+<span class="nc bnc" id="L494" title="All 2 branches missed.">        if (isClosed) {</span>
+<span class="nc" id="L495">            return;</span>
+        }
+
+        /*
+         * For SSL it really _is_ an error if the other end went away
+         * so ungracefully as to not shut down cleanly.
+         */
+<span class="nc bnc" id="L502" title="All 2 branches missed.">        if(exlen &lt; headerSize) {</span>
+<span class="nc" id="L503">            int really = readFully(s, buf, exlen, headerSize - exlen);</span>
+<span class="nc bnc" id="L504" title="All 2 branches missed.">            if (really &lt; 0) {</span>
+<span class="nc" id="L505">                throw new EOFException(&quot;SSL peer shut down incorrectly&quot;);</span>
+            }
+
+<span class="nc" id="L508">            pos = headerSize;</span>
+<span class="nc" id="L509">            count = headerSize;</span>
+<span class="nc" id="L510">            lastHashed = pos;</span>
+        }
+
+        /*
+         * The first record might use some other record marking convention,
+         * typically SSL v2 header.  (PCT could also be detected here.)
+         * This case is currently common -- Navigator 3.0 usually works
+         * this way, as do IE 3.0 and other products.
+         */
+<span class="nc bnc" id="L519" title="All 2 branches missed.">        if (!formatVerified) {</span>
+<span class="nc" id="L520">            formatVerified = true;</span>
+            /*
+             * The first record must either be a handshake record or an
+             * alert message. If it's not, it is either invalid or an
+             * SSLv2 message.
+             */
+<span class="nc bnc" id="L526" title="All 4 branches missed.">            if (buf[0] != ct_handshake &amp;&amp; buf[0] != ct_alert) {</span>
+<span class="nc" id="L527">                handleUnknownRecord(s, o);</span>
+            } else {
+<span class="nc" id="L529">                readV3Record(s, o);</span>
+            }
+        } else { // formatVerified == true
+<span class="nc" id="L532">            readV3Record(s, o);</span>
+        }
+<span class="nc" id="L534">    }</span>
+
+    /**
+     * Read a SSL/TLS record. Throw an IOException if the format is invalid.
+     */
+    private void readV3Record(InputStream s, OutputStream o)
+            throws IOException {
+<span class="nc" id="L541">        ProtocolVersion recordVersion = ProtocolVersion.valueOf(buf[1], buf[2]);</span>
+        // Check if too old (currently not possible)
+        // or if the major version does not match.
+        // The actual version negotiation is in the handshaker classes
+<span class="nc bnc" id="L545" title="All 4 branches missed.">        if ((recordVersion.v &lt; ProtocolVersion.MIN.v)</span>
+                || (recordVersion.major &gt; ProtocolVersion.MAX.major)) {
+<span class="nc" id="L547">            throw new SSLException(</span>
+                &quot;Unsupported record version &quot; + recordVersion);
+        }
+
+        /*
+         * Get and check length, then the data.
+         */
+<span class="nc" id="L554">        int contentLen = ((buf[3] &amp; 0x0ff) &lt;&lt; 8) + (buf[4] &amp; 0xff);</span>
+
+        /*
+         * Check for upper bound.
+         */
+<span class="nc bnc" id="L559" title="All 4 branches missed.">        if (contentLen &lt; 0 || contentLen &gt; maxLargeRecordSize - headerSize) {</span>
+<span class="nc" id="L560">            throw new SSLProtocolException(&quot;Bad InputRecord size&quot;</span>
+                + &quot;, count = &quot; + contentLen
+                + &quot;, buf.length = &quot; + buf.length);
+        }
+
+        /*
+         * Grow &quot;buf&quot; if needed. Since buf is maxRecordSize by default,
+         * this only occurs when we receive records which violate the
+         * SSL specification. This is a workaround for a Microsoft SSL bug.
+         */
+<span class="nc bnc" id="L570" title="All 2 branches missed.">        if (contentLen &gt; buf.length - headerSize) {</span>
+<span class="nc" id="L571">            byte[] newbuf = new byte[contentLen + headerSize];</span>
+<span class="nc" id="L572">            System.arraycopy(buf, 0, newbuf, 0, headerSize);</span>
+<span class="nc" id="L573">            buf = newbuf;</span>
+        }
+
+<span class="nc bnc" id="L576" title="All 2 branches missed.">        if (exlen &lt; contentLen + headerSize) {</span>
+<span class="nc" id="L577">            int really = readFully(</span>
+                s, buf, exlen, contentLen + headerSize - exlen);
+<span class="nc bnc" id="L579" title="All 2 branches missed.">            if (really &lt; 0) {</span>
+<span class="nc" id="L580">                throw new SSLException(&quot;SSL peer shut down incorrectly&quot;);</span>
+            }
+        }
+
+        // now we've got a complete record.
+<span class="nc" id="L585">        count = contentLen + headerSize;</span>
+<span class="nc" id="L586">        exlen = 0;</span>
+
+<span class="nc bnc" id="L588" title="All 4 branches missed.">        if (debug != null &amp;&amp; Debug.isOn(&quot;record&quot;)) {</span>
+<span class="nc bnc" id="L589" title="All 4 branches missed.">            if (count &lt; 0 || count &gt; (maxRecordSize - headerSize)) {</span>
+<span class="nc" id="L590">                System.out.println(Thread.currentThread().getName()</span>
+                    + &quot;, Bad InputRecord size&quot; + &quot;, count = &quot; + count);
+            }
+<span class="nc" id="L593">            System.out.println(Thread.currentThread().getName()</span>
+                + &quot;, READ: &quot; + recordVersion + &quot; &quot;
+<span class="nc" id="L595">                + contentName(contentType()) + &quot;, length = &quot; + available());</span>
+        }
+        /*
+         * then caller decrypts, verifies, and uncompresses
+         */
+<span class="nc" id="L600">    }</span>
+
+    /**
+     * Deal with unknown records. Called if the first data we read on this
+     * connection does not look like an SSL/TLS record. It could a SSLv2
+     * message, or just garbage.
+     */
+    private void handleUnknownRecord(InputStream s, OutputStream o)
+            throws IOException {
+        /*
+         * No?  Oh well; does it look like a V2 &quot;ClientHello&quot;?
+         * That'd be an unpadded handshake message; we don't
+         * bother checking length just now.
+         */
+<span class="nc bnc" id="L614" title="All 4 branches missed.">        if (((buf[0] &amp; 0x080) != 0) &amp;&amp; buf[2] == 1) {</span>
+            /*
+             * if the user has disabled SSLv2Hello (using
+             * setEnabledProtocol) then throw an
+             * exception
+             */
+<span class="nc bnc" id="L620" title="All 2 branches missed.">            if (helloVersion != ProtocolVersion.SSL20Hello) {</span>
+<span class="nc" id="L621">                throw new SSLHandshakeException(&quot;SSLv2Hello is disabled&quot;);</span>
+            }
+
+<span class="nc" id="L624">            ProtocolVersion recordVersion =</span>
+<span class="nc" id="L625">                                ProtocolVersion.valueOf(buf[3], buf[4]);</span>
+
+<span class="nc bnc" id="L627" title="All 2 branches missed.">            if (recordVersion == ProtocolVersion.SSL20Hello) {</span>
+                /*
+                 * Looks like a V2 client hello, but not one saying
+                 * &quot;let's talk SSLv3&quot;.  So we send an SSLv2 error
+                 * message, one that's treated as fatal by clients.
+                 * (Otherwise we'll hang.)
+                 */
+                try {
+<span class="nc" id="L635">                    writeBuffer(o, v2NoCipher, 0, v2NoCipher.length);</span>
+<span class="nc" id="L636">                } catch (Exception e) {</span>
+                    /* NOTHING */
+<span class="nc" id="L638">                }</span>
+<span class="nc" id="L639">                throw new SSLException(&quot;Unsupported SSL v2.0 ClientHello&quot;);</span>
+            }
+
+            /*
+             * If we can map this into a V3 ClientHello, read and
+             * hash the rest of the V2 handshake, turn it into a
+             * V3 ClientHello message, and pass it up.
+             */
+<span class="nc" id="L647">            int len = ((buf[0] &amp; 0x7f) &lt;&lt; 8) +</span>
+                (buf[1] &amp; 0xff) - 3;
+<span class="nc bnc" id="L649" title="All 2 branches missed.">            if (v2Buf == null) {</span>
+<span class="nc" id="L650">                v2Buf = new byte[len];</span>
+            }
+<span class="nc bnc" id="L652" title="All 2 branches missed.">            if (exlen &lt; len + headerSize) {</span>
+<span class="nc" id="L653">                int really = readFully(</span>
+                        s, v2Buf, exlen - headerSize, len + headerSize - exlen);
+<span class="nc bnc" id="L655" title="All 2 branches missed.">                if (really &lt; 0) {</span>
+<span class="nc" id="L656">                    throw new EOFException(&quot;SSL peer shut down incorrectly&quot;);</span>
+                }
+            }
+
+            // now we've got a complete record.
+<span class="nc" id="L661">            exlen = 0;</span>
+
+<span class="nc" id="L663">            hashInternal(buf, 2, 3);</span>
+<span class="nc" id="L664">            hashInternal(v2Buf, 0, len);</span>
+<span class="nc" id="L665">            V2toV3ClientHello(v2Buf);</span>
+<span class="nc" id="L666">            v2Buf = null;</span>
+<span class="nc" id="L667">            lastHashed = count;</span>
+
+<span class="nc bnc" id="L669" title="All 4 branches missed.">            if (debug != null &amp;&amp; Debug.isOn(&quot;record&quot;))  {</span>
+<span class="nc" id="L670">                System.out.println(</span>
+<span class="nc" id="L671">                    Thread.currentThread().getName()</span>
+                    + &quot;, READ:  SSL v2, contentType = &quot;
+<span class="nc" id="L673">                    + contentName(contentType())</span>
+<span class="nc" id="L674">                    + &quot;, translated length = &quot; + available());</span>
+            }
+<span class="nc" id="L676">            return;</span>
+
+        } else {
+            /*
+             * Does it look like a V2 &quot;ServerHello&quot;?
+             */
+<span class="nc bnc" id="L682" title="All 4 branches missed.">            if (((buf [0] &amp; 0x080) != 0) &amp;&amp; buf [2] == 4) {</span>
+<span class="nc" id="L683">                throw new SSLException(</span>
+                    &quot;SSL V2.0 servers are not supported.&quot;);
+            }
+
+            /*
+             * If this is a V2 NoCipher message then this means
+             * the other server doesn't support V3. Otherwise, we just
+             * don't understand what it's saying.
+             */
+<span class="nc bnc" id="L692" title="All 2 branches missed.">            for (int i = 0; i &lt; v2NoCipher.length; i++) {</span>
+<span class="nc bnc" id="L693" title="All 2 branches missed.">                if (buf[i] != v2NoCipher[i]) {</span>
+<span class="nc" id="L694">                    throw new SSLException(</span>
+                        &quot;Unrecognized SSL message, plaintext connection?&quot;);
+                }
+            }
+
+<span class="nc" id="L699">            throw new SSLException(&quot;SSL V2.0 servers are not supported.&quot;);</span>
+        }
+    }
+
+    /*
+     * Actually do the write here.  For SSLEngine's HS data,
+     * we'll override this method and let it take the appropriate
+     * action.
+     */
+    void writeBuffer(OutputStream s, byte [] buf, int off, int len)
+            throws IOException {
+<span class="nc" id="L710">        s.write(buf, 0, len);</span>
+<span class="nc" id="L711">        s.flush();</span>
+<span class="nc" id="L712">    }</span>
+
+    /*
+     * Support &quot;old&quot; clients which are capable of SSL V3.0 protocol ... for
+     * example, Navigator 3.0 clients.  The V2 message is in the header and
+     * the bytes passed as parameter.  This routine translates the V2 message
+     * into an equivalent V3 one.
+     */
+    private void V2toV3ClientHello(byte v2Msg []) throws SSLException
+    {
+        int i;
+
+        /*
+         * Build the first part of the V3 record header from the V2 one
+         * that's now buffered up.  (Lengths are fixed up later).
+         */
+<span class="nc" id="L728">        buf [0] = ct_handshake;</span>
+<span class="nc" id="L729">        buf [1] = buf [3];      // V3.x</span>
+<span class="nc" id="L730">        buf[2] = buf[4];</span>
+        // header [3..4] for handshake message length
+        // count = 5;
+
+        /*
+         * Store the generic V3 handshake header:  4 bytes
+         */
+<span class="nc" id="L737">        buf [5] = 1;    // HandshakeMessage.ht_client_hello</span>
+        // buf [6..8] for length of ClientHello (int24)
+        // count += 4;
+
+        /*
+         * ClientHello header starts with SSL version
+         */
+<span class="nc" id="L744">        buf [9] = buf [1];</span>
+<span class="nc" id="L745">        buf [10] = buf [2];</span>
+        // count += 2;
+<span class="nc" id="L747">        count = 11;</span>
+
+        /*
+         * Start parsing the V2 message ...
+         */
+        int      cipherSpecLen, sessionIdLen, nonceLen;
+
+<span class="nc" id="L754">        cipherSpecLen = ((v2Msg [0] &amp; 0xff) &lt;&lt; 8) + (v2Msg [1] &amp; 0xff);</span>
+<span class="nc" id="L755">        sessionIdLen  = ((v2Msg [2] &amp; 0xff) &lt;&lt; 8) + (v2Msg [3] &amp; 0xff);</span>
+<span class="nc" id="L756">        nonceLen   = ((v2Msg [4] &amp; 0xff) &lt;&lt; 8) + (v2Msg [5] &amp; 0xff);</span>
+
+        /*
+         * Copy Random value/nonce ... if less than the 32 bytes of
+         * a V3 &quot;Random&quot;, right justify and zero pad to the left.  Else
+         * just take the last 32 bytes.
+         */
+<span class="nc" id="L763">        int      offset = 6 + cipherSpecLen + sessionIdLen;</span>
+
+<span class="nc bnc" id="L765" title="All 2 branches missed.">        if (nonceLen &lt; 32) {</span>
+<span class="nc bnc" id="L766" title="All 2 branches missed.">            for (i = 0; i &lt; (32 - nonceLen); i++)</span>
+<span class="nc" id="L767">                buf [count++] = 0;</span>
+<span class="nc" id="L768">            System.arraycopy(v2Msg, offset, buf, count, nonceLen);</span>
+<span class="nc" id="L769">            count += nonceLen;</span>
+        } else {
+<span class="nc" id="L771">            System.arraycopy(v2Msg, offset + (nonceLen - 32),</span>
+                    buf, count, 32);
+<span class="nc" id="L773">            count += 32;</span>
+        }
+
+        /*
+         * Copy Session ID (only one byte length!)
+         */
+<span class="nc" id="L779">        offset -= sessionIdLen;</span>
+<span class="nc" id="L780">        buf [count++] = (byte) sessionIdLen;</span>
+
+<span class="nc" id="L782">        System.arraycopy(v2Msg, offset, buf, count, sessionIdLen);</span>
+<span class="nc" id="L783">        count += sessionIdLen;</span>
+
+        /*
+         * Copy and translate cipher suites ... V2 specs with first byte zero
+         * are really V3 specs (in the last 2 bytes), just copy those and drop
+         * the other ones.  Preference order remains unchanged.
+         *
+         * Example:  Netscape Navigator 3.0 (exportable) says:
+         *
+         * 0/3,     SSL_RSA_EXPORT_WITH_RC4_40_MD5
+         * 0/6,     SSL_RSA_EXPORT_WITH_RC2_CBC_40_MD5
+         *
+         * Microsoft Internet Explorer 3.0 (exportable) supports only
+         *
+         * 0/3,     SSL_RSA_EXPORT_WITH_RC4_40_MD5
+         */
+        int j;
+
+<span class="nc" id="L801">        offset -= cipherSpecLen;</span>
+<span class="nc" id="L802">        j = count + 2;</span>
+
+<span class="nc bnc" id="L804" title="All 2 branches missed.">        for (i = 0; i &lt; cipherSpecLen; i += 3) {</span>
+<span class="nc bnc" id="L805" title="All 2 branches missed.">            if (v2Msg [offset + i] != 0)</span>
+<span class="nc" id="L806">                continue;</span>
+<span class="nc" id="L807">            buf [j++] = v2Msg [offset + i + 1];</span>
+<span class="nc" id="L808">            buf [j++] = v2Msg [offset + i + 2];</span>
+        }
+
+<span class="nc" id="L811">        j -= count + 2;</span>
+<span class="nc" id="L812">        buf [count++] = (byte) (j &gt;&gt;&gt; 8);</span>
+<span class="nc" id="L813">        buf [count++] = (byte) j;</span>
+<span class="nc" id="L814">        count += j;</span>
+
+        /*
+         * Append compression methods (default/null only)
+         */
+<span class="nc" id="L819">        buf [count++] = 1;</span>
+<span class="nc" id="L820">        buf [count++] = 0;      // Session.compression_null</span>
+
+        /*
+         * Fill in lengths of the messages we synthesized (nested:
+         * V3 handshake message within V3 record) and then return
+         */
+<span class="nc" id="L826">        buf [3] = (byte) (count - headerSize);</span>
+<span class="nc" id="L827">        buf [4] = (byte) ((count - headerSize) &gt;&gt;&gt; 8);</span>
+
+<span class="nc" id="L829">        buf [headerSize + 1] = 0;</span>
+<span class="nc" id="L830">        buf [headerSize + 2] = (byte) (((count - headerSize) - 4) &gt;&gt;&gt; 8);</span>
+<span class="nc" id="L831">        buf [headerSize + 3] = (byte) ((count - headerSize) - 4);</span>
+
+<span class="nc" id="L833">        pos = headerSize;</span>
+<span class="nc" id="L834">    }</span>
+
+    /**
+     * Return a description for the given content type. This method should be
+     * in Record, but since that is an interface this is not possible.
+     * Called from InputRecord and OutputRecord.
+     */
+    static String contentName(int contentType) {
+<span class="nc bnc" id="L842" title="All 5 branches missed.">        switch (contentType) {</span>
+        case ct_change_cipher_spec:
+<span class="nc" id="L844">            return &quot;Change Cipher Spec&quot;;</span>
+        case ct_alert:
+<span class="nc" id="L846">            return &quot;Alert&quot;;</span>
+        case ct_handshake:
+<span class="nc" id="L848">            return &quot;Handshake&quot;;</span>
+        case ct_application_data:
+<span class="nc" id="L850">            return &quot;Application Data&quot;;</span>
+        default:
+<span class="nc" id="L852">            return &quot;contentType = &quot; + contentType;</span>
+        }
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

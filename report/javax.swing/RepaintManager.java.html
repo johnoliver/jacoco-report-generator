@@ -1,0 +1,1691 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>RepaintManager.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">javax.swing</a> &gt; <span class="el_source">RepaintManager.java</span></div><h1>RepaintManager.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1997, 2011, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package javax.swing;
+
+
+import java.awt.*;
+import java.awt.event.*;
+import java.awt.image.VolatileImage;
+import java.security.AccessControlContext;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.applet.*;
+
+import sun.awt.AWTAccessor;
+import sun.awt.AppContext;
+import sun.awt.DisplayChangedListener;
+import sun.awt.SunToolkit;
+import sun.java2d.SunGraphicsEnvironment;
+import sun.misc.JavaSecurityAccess;
+import sun.misc.SharedSecrets;
+import sun.security.action.GetPropertyAction;
+
+import com.sun.java.swing.SwingUtilities3;
+
+/**
+ * This class manages repaint requests, allowing the number
+ * of repaints to be minimized, for example by collapsing multiple
+ * requests into a single repaint for members of a component tree.
+ * &lt;p&gt;
+ * As of 1.6 &lt;code&gt;RepaintManager&lt;/code&gt; handles repaint requests
+ * for Swing's top level components (&lt;code&gt;JApplet&lt;/code&gt;,
+ * &lt;code&gt;JWindow&lt;/code&gt;, &lt;code&gt;JFrame&lt;/code&gt; and &lt;code&gt;JDialog&lt;/code&gt;).
+ * Any calls to &lt;code&gt;repaint&lt;/code&gt; on one of these will call into the
+ * appropriate &lt;code&gt;addDirtyRegion&lt;/code&gt; method.
+ *
+ * @author Arnaud Weber
+ */
+public class RepaintManager
+{
+    /**
+     * Whether or not the RepaintManager should handle paint requests
+     * for top levels.
+     */
+    static final boolean HANDLE_TOP_LEVEL_PAINT;
+
+    private static final short BUFFER_STRATEGY_NOT_SPECIFIED = 0;
+    private static final short BUFFER_STRATEGY_SPECIFIED_ON = 1;
+    private static final short BUFFER_STRATEGY_SPECIFIED_OFF = 2;
+
+    private static final short BUFFER_STRATEGY_TYPE;
+
+    /**
+     * Maps from GraphicsConfiguration to VolatileImage.
+     */
+<span class="nc" id="L79">    private Map&lt;GraphicsConfiguration,VolatileImage&gt; volatileMap = new</span>
+                        HashMap&lt;GraphicsConfiguration,VolatileImage&gt;(1);
+
+    //
+    // As of 1.6 Swing handles scheduling of paint events from native code.
+    // That is, SwingPaintEventDispatcher is invoked on the toolkit thread,
+    // which in turn invokes nativeAddDirtyRegion.  Because this is invoked
+    // from the native thread we can not invoke any public methods and so
+    // we introduce these added maps.  So, any time nativeAddDirtyRegion is
+    // invoked the region is added to hwDirtyComponents and a work request
+    // is scheduled.  When the work request is processed all entries in
+    // this map are pushed to the real map (dirtyComponents) and then
+    // painted with the rest of the components.
+    //
+    private Map&lt;Container,Rectangle&gt; hwDirtyComponents;
+
+    private Map&lt;Component,Rectangle&gt; dirtyComponents;
+    private Map&lt;Component,Rectangle&gt; tmpDirtyComponents;
+    private java.util.List&lt;Component&gt; invalidComponents;
+
+    // List of Runnables that need to be processed before painting from AWT.
+    private java.util.List&lt;Runnable&gt; runnableList;
+
+<span class="nc" id="L102">    boolean   doubleBufferingEnabled = true;</span>
+
+    private Dimension doubleBufferMaxSize;
+
+    // Support for both the standard and volatile offscreen buffers exists to
+    // provide backwards compatibility for the [rare] programs which may be
+    // calling getOffScreenBuffer() and not expecting to get a VolatileImage.
+    // Swing internally is migrating to use *only* the volatile image buffer.
+
+    // Support for standard offscreen buffer
+    //
+    DoubleBufferInfo standardDoubleBuffer;
+
+    /**
+     * Object responsible for hanlding core paint functionality.
+     */
+    private PaintManager paintManager;
+
+<span class="fc" id="L120">    private static final Object repaintManagerKey = RepaintManager.class;</span>
+
+    // Whether or not a VolatileImage should be used for double-buffered painting
+<span class="fc" id="L123">    static boolean volatileImageBufferEnabled = true;</span>
+    /**
+     * Type of VolatileImage which should be used for double-buffered
+     * painting.
+     */
+    private static final int volatileBufferType;
+    /**
+     * Value of the system property awt.nativeDoubleBuffering.
+     */
+    private static boolean nativeDoubleBuffering;
+
+    // The maximum number of times Swing will attempt to use the VolatileImage
+    // buffer during a paint operation.
+    private static final int VOLATILE_LOOP_MAX = 2;
+
+    /**
+     * Number of &lt;code&gt;beginPaint&lt;/code&gt; that have been invoked.
+     */
+<span class="nc" id="L141">    private int paintDepth = 0;</span>
+
+    /**
+     * Type of buffer strategy to use.  Will be one of the BUFFER_STRATEGY_
+     * constants.
+     */
+    private short bufferStrategyType;
+
+    //
+    // BufferStrategyPaintManager has the unique characteristic that it
+    // must deal with the buffer being lost while painting to it.  For
+    // example, if we paint a component and show it and the buffer has
+    // become lost we must repaint the whole window.  To deal with that
+    // the PaintManager calls into repaintRoot, and if we're still in
+    // the process of painting the repaintRoot field is set to the JRootPane
+    // and after the current JComponent.paintImmediately call finishes
+    // paintImmediately will be invoked on the repaintRoot.  In this
+    // way we don't try to show garbage to the screen.
+    //
+    /**
+     * True if we're in the process of painting the dirty regions.  This is
+     * set to true in &lt;code&gt;paintDirtyRegions&lt;/code&gt;.
+     */
+    private boolean painting;
+    /**
+     * If the PaintManager calls into repaintRoot during painting this field
+     * will be set to the root.
+     */
+    private JComponent repaintRoot;
+
+    /**
+     * The Thread that has initiated painting.  If null it
+     * indicates painting is not currently in progress.
+     */
+    private Thread paintThread;
+
+    /**
+     * Runnable used to process all repaint/revalidate requests.
+     */
+    private final ProcessingRunnable processingRunnable;
+
+    private final static JavaSecurityAccess javaSecurityAccess =
+<span class="fc" id="L183">        SharedSecrets.getJavaSecurityAccess();</span>
+
+
+    static {
+<span class="fc" id="L187">        volatileImageBufferEnabled = &quot;true&quot;.equals(AccessController.</span>
+<span class="fc" id="L188">                doPrivileged(new GetPropertyAction(</span>
+                &quot;swing.volatileImageBufferEnabled&quot;, &quot;true&quot;)));
+<span class="fc" id="L190">        boolean headless = GraphicsEnvironment.isHeadless();</span>
+<span class="pc bpc" id="L191" title="2 of 4 branches missed.">        if (volatileImageBufferEnabled &amp;&amp; headless) {</span>
+<span class="fc" id="L192">            volatileImageBufferEnabled = false;</span>
+        }
+<span class="fc" id="L194">        nativeDoubleBuffering = &quot;true&quot;.equals(AccessController.doPrivileged(</span>
+                    new GetPropertyAction(&quot;awt.nativeDoubleBuffering&quot;)));
+<span class="fc" id="L196">        String bs = AccessController.doPrivileged(</span>
+                          new GetPropertyAction(&quot;swing.bufferPerWindow&quot;));
+<span class="pc bpc" id="L198" title="1 of 2 branches missed.">        if (headless) {</span>
+<span class="fc" id="L199">            BUFFER_STRATEGY_TYPE = BUFFER_STRATEGY_SPECIFIED_OFF;</span>
+        }
+<span class="nc bnc" id="L201" title="All 2 branches missed.">        else if (bs == null) {</span>
+<span class="nc" id="L202">            BUFFER_STRATEGY_TYPE = BUFFER_STRATEGY_NOT_SPECIFIED;</span>
+        }
+<span class="nc bnc" id="L204" title="All 2 branches missed.">        else if (&quot;true&quot;.equals(bs)) {</span>
+<span class="nc" id="L205">            BUFFER_STRATEGY_TYPE = BUFFER_STRATEGY_SPECIFIED_ON;</span>
+        }
+        else {
+<span class="nc" id="L208">            BUFFER_STRATEGY_TYPE = BUFFER_STRATEGY_SPECIFIED_OFF;</span>
+        }
+<span class="fc" id="L210">        HANDLE_TOP_LEVEL_PAINT = &quot;true&quot;.equals(AccessController.doPrivileged(</span>
+               new GetPropertyAction(&quot;swing.handleTopLevelPaint&quot;, &quot;true&quot;)));
+        GraphicsEnvironment ge = GraphicsEnvironment.
+<span class="fc" id="L213">                getLocalGraphicsEnvironment();</span>
+<span class="pc bpc" id="L214" title="1 of 2 branches missed.">        if (ge instanceof SunGraphicsEnvironment) {</span>
+<span class="nc" id="L215">            ((SunGraphicsEnvironment)ge).addDisplayChangedListener(</span>
+                    new DisplayChangedHandler());
+        }
+<span class="fc" id="L218">        Toolkit tk = Toolkit.getDefaultToolkit();</span>
+<span class="pc bpc" id="L219" title="1 of 2 branches missed.">        if ((tk instanceof SunToolkit)</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">                &amp;&amp; ((SunToolkit) tk).isSwingBackbufferTranslucencySupported()) {</span>
+<span class="nc" id="L221">            volatileBufferType = Transparency.TRANSLUCENT;</span>
+        } else {
+<span class="fc" id="L223">            volatileBufferType = Transparency.OPAQUE;</span>
+        }
+<span class="fc" id="L225">    }</span>
+
+    /**
+     * Return the RepaintManager for the calling thread given a Component.
+     *
+     * @param c a Component -- unused in the default implementation, but could
+     *          be used by an overridden version to return a different RepaintManager
+     *          depending on the Component
+     * @return the RepaintManager object
+     */
+    public static RepaintManager currentManager(Component c) {
+        // Note: DisplayChangedRunnable passes in null as the component, so if
+        // component is ever used to determine the current
+        // RepaintManager, DisplayChangedRunnable will need to be modified
+        // accordingly.
+<span class="nc" id="L240">        return currentManager(AppContext.getAppContext());</span>
+    }
+
+    /**
+     * Returns the RepaintManager for the specified AppContext.  If
+     * a RepaintManager has not been created for the specified
+     * AppContext this will return null.
+     */
+    static RepaintManager currentManager(AppContext appContext) {
+<span class="nc" id="L249">        RepaintManager rm = (RepaintManager)appContext.get(repaintManagerKey);</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">        if (rm == null) {</span>
+<span class="nc" id="L251">            rm = new RepaintManager(BUFFER_STRATEGY_TYPE);</span>
+<span class="nc" id="L252">            appContext.put(repaintManagerKey, rm);</span>
+        }
+<span class="nc" id="L254">        return rm;</span>
+    }
+
+    /**
+     * Return the RepaintManager for the calling thread given a JComponent.
+     * &lt;p&gt;
+    * Note: This method exists for backward binary compatibility with earlier
+     * versions of the Swing library. It simply returns the result returned by
+     * {@link #currentManager(Component)}.
+     *
+     * @param c a JComponent -- unused
+     * @return the RepaintManager object
+     */
+    public static RepaintManager currentManager(JComponent c) {
+<span class="nc" id="L268">        return currentManager((Component)c);</span>
+    }
+
+
+    /**
+     * Set the RepaintManager that should be used for the calling
+     * thread. &lt;b&gt;aRepaintManager&lt;/b&gt; will become the current RepaintManager
+     * for the calling thread's thread group.
+     * @param aRepaintManager  the RepaintManager object to use
+     */
+    public static void setCurrentManager(RepaintManager aRepaintManager) {
+<span class="nc bnc" id="L279" title="All 2 branches missed.">        if (aRepaintManager != null) {</span>
+<span class="nc" id="L280">            SwingUtilities.appContextPut(repaintManagerKey, aRepaintManager);</span>
+        } else {
+<span class="nc" id="L282">            SwingUtilities.appContextRemove(repaintManagerKey);</span>
+        }
+<span class="nc" id="L284">    }</span>
+
+    /**
+     * Create a new RepaintManager instance. You rarely call this constructor.
+     * directly. To get the default RepaintManager, use
+     * RepaintManager.currentManager(JComponent) (normally &quot;this&quot;).
+     */
+    public RepaintManager() {
+        // Because we can't know what a subclass is doing with the
+        // volatile image we immediately punt in subclasses.  If this
+        // poses a problem we'll need a more sophisticated detection algorithm,
+        // or API.
+<span class="nc" id="L296">        this(BUFFER_STRATEGY_SPECIFIED_OFF);</span>
+<span class="nc" id="L297">    }</span>
+
+<span class="nc" id="L299">    private RepaintManager(short bufferStrategyType) {</span>
+        // If native doublebuffering is being used, do NOT use
+        // Swing doublebuffering.
+<span class="nc bnc" id="L302" title="All 2 branches missed.">        doubleBufferingEnabled = !nativeDoubleBuffering;</span>
+<span class="nc" id="L303">        synchronized(this) {</span>
+<span class="nc" id="L304">            dirtyComponents = new IdentityHashMap&lt;Component,Rectangle&gt;();</span>
+<span class="nc" id="L305">            tmpDirtyComponents = new IdentityHashMap&lt;Component,Rectangle&gt;();</span>
+<span class="nc" id="L306">            this.bufferStrategyType = bufferStrategyType;</span>
+<span class="nc" id="L307">            hwDirtyComponents = new IdentityHashMap&lt;Container,Rectangle&gt;();</span>
+<span class="nc" id="L308">        }</span>
+<span class="nc" id="L309">        processingRunnable = new ProcessingRunnable();</span>
+<span class="nc" id="L310">    }</span>
+
+    private void displayChanged() {
+<span class="nc" id="L313">        clearImages();</span>
+<span class="nc" id="L314">    }</span>
+
+    /**
+     * Mark the component as in need of layout and queue a runnable
+     * for the event dispatching thread that will validate the components
+     * first isValidateRoot() ancestor.
+     *
+     * @see JComponent#isValidateRoot
+     * @see #removeInvalidComponent
+     */
+    public synchronized void addInvalidComponent(JComponent invalidComponent)
+    {
+<span class="nc" id="L326">        RepaintManager delegate = getDelegate(invalidComponent);</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">        if (delegate != null) {</span>
+<span class="nc" id="L328">            delegate.addInvalidComponent(invalidComponent);</span>
+<span class="nc" id="L329">            return;</span>
+        }
+<span class="nc" id="L331">        Component validateRoot =</span>
+<span class="nc" id="L332">            SwingUtilities.getValidateRoot(invalidComponent, true);</span>
+
+<span class="nc bnc" id="L334" title="All 2 branches missed.">        if (validateRoot == null) {</span>
+<span class="nc" id="L335">            return;</span>
+        }
+
+        /* Lazily create the invalidateComponents vector and add the
+         * validateRoot if it's not there already.  If this validateRoot
+         * is already in the vector, we're done.
+         */
+<span class="nc bnc" id="L342" title="All 2 branches missed.">        if (invalidComponents == null) {</span>
+<span class="nc" id="L343">            invalidComponents = new ArrayList&lt;Component&gt;();</span>
+        }
+        else {
+<span class="nc" id="L346">            int n = invalidComponents.size();</span>
+<span class="nc bnc" id="L347" title="All 2 branches missed.">            for(int i = 0; i &lt; n; i++) {</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">                if(validateRoot == invalidComponents.get(i)) {</span>
+<span class="nc" id="L349">                    return;</span>
+                }
+            }
+        }
+<span class="nc" id="L353">        invalidComponents.add(validateRoot);</span>
+
+        // Queue a Runnable to invoke paintDirtyRegions and
+        // validateInvalidComponents.
+<span class="nc" id="L357">        scheduleProcessingRunnable(SunToolkit.targetToAppContext(invalidComponent));</span>
+<span class="nc" id="L358">    }</span>
+
+
+    /**
+     * Remove a component from the list of invalid components.
+     *
+     * @see #addInvalidComponent
+     */
+    public synchronized void removeInvalidComponent(JComponent component) {
+<span class="nc" id="L367">        RepaintManager delegate = getDelegate(component);</span>
+<span class="nc bnc" id="L368" title="All 2 branches missed.">        if (delegate != null) {</span>
+<span class="nc" id="L369">            delegate.removeInvalidComponent(component);</span>
+<span class="nc" id="L370">            return;</span>
+        }
+<span class="nc bnc" id="L372" title="All 2 branches missed.">        if(invalidComponents != null) {</span>
+<span class="nc" id="L373">            int index = invalidComponents.indexOf(component);</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">            if(index != -1) {</span>
+<span class="nc" id="L375">                invalidComponents.remove(index);</span>
+            }
+        }
+<span class="nc" id="L378">    }</span>
+
+
+    /**
+     * Add a component in the list of components that should be refreshed.
+     * If &lt;i&gt;c&lt;/i&gt; already has a dirty region, the rectangle &lt;i&gt;(x,y,w,h)&lt;/i&gt;
+     * will be unioned with the region that should be redrawn.
+     *
+     * @see JComponent#repaint
+     */
+    private void addDirtyRegion0(Container c, int x, int y, int w, int h) {
+        /* Special cases we don't have to bother with.
+         */
+<span class="nc bnc" id="L391" title="All 6 branches missed.">        if ((w &lt;= 0) || (h &lt;= 0) || (c == null)) {</span>
+<span class="nc" id="L392">            return;</span>
+        }
+
+<span class="nc bnc" id="L395" title="All 4 branches missed.">        if ((c.getWidth() &lt;= 0) || (c.getHeight() &lt;= 0)) {</span>
+<span class="nc" id="L396">            return;</span>
+        }
+
+<span class="nc bnc" id="L399" title="All 2 branches missed.">        if (extendDirtyRegion(c, x, y, w, h)) {</span>
+            // Component was already marked as dirty, region has been
+            // extended, no need to continue.
+<span class="nc" id="L402">            return;</span>
+        }
+
+        /* Make sure that c and all it ancestors (up to an Applet or
+         * Window) are visible.  This loop has the same effect as
+         * checking c.isShowing() (and note that it's still possible
+         * that c is completely obscured by an opaque ancestor in
+         * the specified rectangle).
+         */
+<span class="nc" id="L411">        Component root = null;</span>
+
+        // Note: We can't synchronize around this, Frame.getExtendedState
+        // is synchronized so that if we were to synchronize around this
+        // it could lead to the possibility of getting locks out
+        // of order and deadlocking.
+<span class="nc bnc" id="L417" title="All 2 branches missed.">        for (Container p = c; p != null; p = p.getParent()) {</span>
+<span class="nc bnc" id="L418" title="All 4 branches missed.">            if (!p.isVisible() || (p.getPeer() == null)) {</span>
+<span class="nc" id="L419">                return;</span>
+            }
+<span class="nc bnc" id="L421" title="All 4 branches missed.">            if ((p instanceof Window) || (p instanceof Applet)) {</span>
+                // Iconified frames are still visible!
+<span class="nc bnc" id="L423" title="All 2 branches missed.">                if (p instanceof Frame &amp;&amp;</span>
+<span class="nc bnc" id="L424" title="All 2 branches missed.">                        (((Frame)p).getExtendedState() &amp; Frame.ICONIFIED) ==</span>
+                                    Frame.ICONIFIED) {
+<span class="nc" id="L426">                    return;</span>
+                }
+<span class="nc" id="L428">                root = p;</span>
+<span class="nc" id="L429">                break;</span>
+            }
+        }
+
+<span class="nc bnc" id="L433" title="All 2 branches missed.">        if (root == null) return;</span>
+
+<span class="nc" id="L435">        synchronized(this) {</span>
+<span class="nc bnc" id="L436" title="All 2 branches missed.">            if (extendDirtyRegion(c, x, y, w, h)) {</span>
+                // In between last check and this check another thread
+                // queued up runnable, can bail here.
+<span class="nc" id="L439">                return;</span>
+            }
+<span class="nc" id="L441">            dirtyComponents.put(c, new Rectangle(x, y, w, h));</span>
+<span class="nc" id="L442">        }</span>
+
+        // Queue a Runnable to invoke paintDirtyRegions and
+        // validateInvalidComponents.
+<span class="nc" id="L446">        scheduleProcessingRunnable(SunToolkit.targetToAppContext(c));</span>
+<span class="nc" id="L447">    }</span>
+
+    /**
+     * Add a component in the list of components that should be refreshed.
+     * If &lt;i&gt;c&lt;/i&gt; already has a dirty region, the rectangle &lt;i&gt;(x,y,w,h)&lt;/i&gt;
+     * will be unioned with the region that should be redrawn.
+     *
+     * @param c Component to repaint, null results in nothing happening.
+     * @param x X coordinate of the region to repaint
+     * @param y Y coordinate of the region to repaint
+     * @param w Width of the region to repaint
+     * @param h Height of the region to repaint
+     * @see JComponent#repaint
+     */
+    public void addDirtyRegion(JComponent c, int x, int y, int w, int h)
+    {
+<span class="nc" id="L463">        RepaintManager delegate = getDelegate(c);</span>
+<span class="nc bnc" id="L464" title="All 2 branches missed.">        if (delegate != null) {</span>
+<span class="nc" id="L465">            delegate.addDirtyRegion(c, x, y, w, h);</span>
+<span class="nc" id="L466">            return;</span>
+        }
+<span class="nc" id="L468">        addDirtyRegion0(c, x, y, w, h);</span>
+<span class="nc" id="L469">    }</span>
+
+    /**
+     * Adds &lt;code&gt;window&lt;/code&gt; to the list of &lt;code&gt;Component&lt;/code&gt;s that
+     * need to be repainted.
+     *
+     * @param window Window to repaint, null results in nothing happening.
+     * @param x X coordinate of the region to repaint
+     * @param y Y coordinate of the region to repaint
+     * @param w Width of the region to repaint
+     * @param h Height of the region to repaint
+     * @see JFrame#repaint
+     * @see JWindow#repaint
+     * @see JDialog#repaint
+     * @since 1.6
+     */
+    public void addDirtyRegion(Window window, int x, int y, int w, int h) {
+<span class="nc" id="L486">        addDirtyRegion0(window, x, y, w, h);</span>
+<span class="nc" id="L487">    }</span>
+
+    /**
+     * Adds &lt;code&gt;applet&lt;/code&gt; to the list of &lt;code&gt;Component&lt;/code&gt;s that
+     * need to be repainted.
+     *
+     * @param applet Applet to repaint, null results in nothing happening.
+     * @param x X coordinate of the region to repaint
+     * @param y Y coordinate of the region to repaint
+     * @param w Width of the region to repaint
+     * @param h Height of the region to repaint
+     * @see JApplet#repaint
+     * @since 1.6
+     */
+    public void addDirtyRegion(Applet applet, int x, int y, int w, int h) {
+<span class="nc" id="L502">        addDirtyRegion0(applet, x, y, w, h);</span>
+<span class="nc" id="L503">    }</span>
+
+    void scheduleHeavyWeightPaints() {
+        Map&lt;Container,Rectangle&gt; hws;
+
+<span class="nc" id="L508">        synchronized(this) {</span>
+<span class="nc bnc" id="L509" title="All 2 branches missed.">            if (hwDirtyComponents.size() == 0) {</span>
+<span class="nc" id="L510">                return;</span>
+            }
+<span class="nc" id="L512">            hws = hwDirtyComponents;</span>
+<span class="nc" id="L513">            hwDirtyComponents =  new IdentityHashMap&lt;Container,Rectangle&gt;();</span>
+<span class="nc" id="L514">        }</span>
+<span class="nc bnc" id="L515" title="All 2 branches missed.">        for (Container hw : hws.keySet()) {</span>
+<span class="nc" id="L516">            Rectangle dirty = hws.get(hw);</span>
+<span class="nc bnc" id="L517" title="All 2 branches missed.">            if (hw instanceof Window) {</span>
+<span class="nc" id="L518">                addDirtyRegion((Window)hw, dirty.x, dirty.y,</span>
+                               dirty.width, dirty.height);
+            }
+<span class="nc bnc" id="L521" title="All 2 branches missed.">            else if (hw instanceof Applet) {</span>
+<span class="nc" id="L522">                addDirtyRegion((Applet)hw, dirty.x, dirty.y,</span>
+                               dirty.width, dirty.height);
+            }
+            else { // SwingHeavyWeight
+<span class="nc" id="L526">                addDirtyRegion0(hw, dirty.x, dirty.y,</span>
+                                dirty.width, dirty.height);
+            }
+<span class="nc" id="L529">        }</span>
+<span class="nc" id="L530">    }</span>
+
+    //
+    // This is called from the toolkit thread when a native expose is
+    // received.
+    //
+    void nativeAddDirtyRegion(AppContext appContext, Container c,
+                              int x, int y, int w, int h) {
+<span class="nc bnc" id="L538" title="All 4 branches missed.">        if (w &gt; 0 &amp;&amp; h &gt; 0) {</span>
+<span class="nc" id="L539">            synchronized(this) {</span>
+<span class="nc" id="L540">                Rectangle dirty = hwDirtyComponents.get(c);</span>
+<span class="nc bnc" id="L541" title="All 2 branches missed.">                if (dirty == null) {</span>
+<span class="nc" id="L542">                    hwDirtyComponents.put(c, new Rectangle(x, y, w, h));</span>
+                }
+                else {
+<span class="nc" id="L545">                    hwDirtyComponents.put(c, SwingUtilities.computeUnion(</span>
+                                              x, y, w, h, dirty));
+                }
+<span class="nc" id="L548">            }</span>
+<span class="nc" id="L549">            scheduleProcessingRunnable(appContext);</span>
+        }
+<span class="nc" id="L551">    }</span>
+
+    //
+    // This is called from the toolkit thread when awt needs to run a
+    // Runnable before we paint.
+    //
+    void nativeQueueSurfaceDataRunnable(AppContext appContext,
+                                        final Component c, final Runnable r)
+    {
+<span class="nc" id="L560">        synchronized(this) {</span>
+<span class="nc bnc" id="L561" title="All 2 branches missed.">            if (runnableList == null) {</span>
+<span class="nc" id="L562">                runnableList = new LinkedList&lt;Runnable&gt;();</span>
+            }
+<span class="nc" id="L564">            runnableList.add(new Runnable() {</span>
+                public void run() {
+<span class="nc" id="L566">                    AccessControlContext stack = AccessController.getContext();</span>
+                    AccessControlContext acc =
+<span class="nc" id="L568">                        AWTAccessor.getComponentAccessor().getAccessControlContext(c);</span>
+<span class="nc" id="L569">                    javaSecurityAccess.doIntersectionPrivilege(new PrivilegedAction&lt;Void&gt;() {</span>
+                        public Void run() {
+<span class="nc" id="L571">                            r.run();</span>
+<span class="nc" id="L572">                            return null;</span>
+                        }
+                    }, stack, acc);
+<span class="nc" id="L575">                }</span>
+            });
+<span class="nc" id="L577">        }</span>
+<span class="nc" id="L578">        scheduleProcessingRunnable(appContext);</span>
+<span class="nc" id="L579">    }</span>
+
+    /**
+     * Extends the dirty region for the specified component to include
+     * the new region.
+     *
+     * @return false if &lt;code&gt;c&lt;/code&gt; is not yet marked dirty.
+     */
+    private synchronized boolean extendDirtyRegion(
+        Component c, int x, int y, int w, int h) {
+<span class="nc" id="L589">        Rectangle r = dirtyComponents.get(c);</span>
+<span class="nc bnc" id="L590" title="All 2 branches missed.">        if (r != null) {</span>
+            // A non-null r implies c is already marked as dirty,
+            // and that the parent is valid. Therefore we can
+            // just union the rect and bail.
+<span class="nc" id="L594">            SwingUtilities.computeUnion(x, y, w, h, r);</span>
+<span class="nc" id="L595">            return true;</span>
+        }
+<span class="nc" id="L597">        return false;</span>
+    }
+
+    /** Return the current dirty region for a component.
+     *  Return an empty rectangle if the component is not
+     *  dirty.
+     */
+    public Rectangle getDirtyRegion(JComponent aComponent) {
+<span class="nc" id="L605">        RepaintManager delegate = getDelegate(aComponent);</span>
+<span class="nc bnc" id="L606" title="All 2 branches missed.">        if (delegate != null) {</span>
+<span class="nc" id="L607">            return delegate.getDirtyRegion(aComponent);</span>
+        }
+        Rectangle r;
+<span class="nc" id="L610">        synchronized(this) {</span>
+<span class="nc" id="L611">            r = dirtyComponents.get(aComponent);</span>
+<span class="nc" id="L612">        }</span>
+<span class="nc bnc" id="L613" title="All 2 branches missed.">        if(r == null)</span>
+<span class="nc" id="L614">            return new Rectangle(0,0,0,0);</span>
+        else
+<span class="nc" id="L616">            return new Rectangle(r);</span>
+    }
+
+    /**
+     * Mark a component completely dirty. &lt;b&gt;aComponent&lt;/b&gt; will be
+     * completely painted during the next paintDirtyRegions() call.
+     */
+    public void markCompletelyDirty(JComponent aComponent) {
+<span class="nc" id="L624">        RepaintManager delegate = getDelegate(aComponent);</span>
+<span class="nc bnc" id="L625" title="All 2 branches missed.">        if (delegate != null) {</span>
+<span class="nc" id="L626">            delegate.markCompletelyDirty(aComponent);</span>
+<span class="nc" id="L627">            return;</span>
+        }
+<span class="nc" id="L629">        addDirtyRegion(aComponent,0,0,Integer.MAX_VALUE,Integer.MAX_VALUE);</span>
+<span class="nc" id="L630">    }</span>
+
+    /**
+     * Mark a component completely clean. &lt;b&gt;aComponent&lt;/b&gt; will not
+     * get painted during the next paintDirtyRegions() call.
+     */
+    public void markCompletelyClean(JComponent aComponent) {
+<span class="nc" id="L637">        RepaintManager delegate = getDelegate(aComponent);</span>
+<span class="nc bnc" id="L638" title="All 2 branches missed.">        if (delegate != null) {</span>
+<span class="nc" id="L639">            delegate.markCompletelyClean(aComponent);</span>
+<span class="nc" id="L640">            return;</span>
+        }
+<span class="nc" id="L642">        synchronized(this) {</span>
+<span class="nc" id="L643">                dirtyComponents.remove(aComponent);</span>
+<span class="nc" id="L644">        }</span>
+<span class="nc" id="L645">    }</span>
+
+    /**
+     * Convenience method that returns true if &lt;b&gt;aComponent&lt;/b&gt; will be completely
+     * painted during the next paintDirtyRegions(). If computing dirty regions is
+     * expensive for your component, use this method and avoid computing dirty region
+     * if it return true.
+     */
+    public boolean isCompletelyDirty(JComponent aComponent) {
+<span class="nc" id="L654">        RepaintManager delegate = getDelegate(aComponent);</span>
+<span class="nc bnc" id="L655" title="All 2 branches missed.">        if (delegate != null) {</span>
+<span class="nc" id="L656">            return delegate.isCompletelyDirty(aComponent);</span>
+        }
+        Rectangle r;
+
+<span class="nc" id="L660">        r = getDirtyRegion(aComponent);</span>
+<span class="nc bnc" id="L661" title="All 4 branches missed.">        if(r.width == Integer.MAX_VALUE &amp;&amp;</span>
+           r.height == Integer.MAX_VALUE)
+<span class="nc" id="L663">            return true;</span>
+        else
+<span class="nc" id="L665">            return false;</span>
+    }
+
+
+    /**
+     * Validate all of the components that have been marked invalid.
+     * @see #addInvalidComponent
+     */
+    public void validateInvalidComponents() {
+        final java.util.List&lt;Component&gt; ic;
+<span class="nc" id="L675">        synchronized(this) {</span>
+<span class="nc bnc" id="L676" title="All 2 branches missed.">            if (invalidComponents == null) {</span>
+<span class="nc" id="L677">                return;</span>
+            }
+<span class="nc" id="L679">            ic = invalidComponents;</span>
+<span class="nc" id="L680">            invalidComponents = null;</span>
+<span class="nc" id="L681">        }</span>
+<span class="nc" id="L682">        int n = ic.size();</span>
+<span class="nc bnc" id="L683" title="All 2 branches missed.">        for(int i = 0; i &lt; n; i++) {</span>
+<span class="nc" id="L684">            final Component c = ic.get(i);</span>
+<span class="nc" id="L685">            AccessControlContext stack = AccessController.getContext();</span>
+            AccessControlContext acc =
+<span class="nc" id="L687">                AWTAccessor.getComponentAccessor().getAccessControlContext(c);</span>
+<span class="nc" id="L688">            javaSecurityAccess.doIntersectionPrivilege(</span>
+<span class="nc" id="L689">                new PrivilegedAction&lt;Void&gt;() {</span>
+                    public Void run() {
+<span class="nc" id="L691">                        c.validate();</span>
+<span class="nc" id="L692">                        return null;</span>
+                    }
+                }, stack, acc);
+        }
+<span class="nc" id="L696">    }</span>
+
+
+    /**
+     * This is invoked to process paint requests.  It's needed
+     * for backward compatibility in so far as RepaintManager would previously
+     * not see paint requests for top levels, so, we have to make sure
+     * a subclass correctly paints any dirty top levels.
+     */
+    private void prePaintDirtyRegions() {
+        Map&lt;Component,Rectangle&gt; dirtyComponents;
+        java.util.List&lt;Runnable&gt; runnableList;
+<span class="nc" id="L708">        synchronized(this) {</span>
+<span class="nc" id="L709">            dirtyComponents = this.dirtyComponents;</span>
+<span class="nc" id="L710">            runnableList = this.runnableList;</span>
+<span class="nc" id="L711">            this.runnableList = null;</span>
+<span class="nc" id="L712">        }</span>
+<span class="nc bnc" id="L713" title="All 2 branches missed.">        if (runnableList != null) {</span>
+<span class="nc bnc" id="L714" title="All 2 branches missed.">            for (Runnable runnable : runnableList) {</span>
+<span class="nc" id="L715">                runnable.run();</span>
+<span class="nc" id="L716">            }</span>
+        }
+<span class="nc" id="L718">        paintDirtyRegions();</span>
+<span class="nc bnc" id="L719" title="All 2 branches missed.">        if (dirtyComponents.size() &gt; 0) {</span>
+            // This'll only happen if a subclass isn't correctly dealing
+            // with toplevels.
+<span class="nc" id="L722">            paintDirtyRegions(dirtyComponents);</span>
+        }
+<span class="nc" id="L724">    }</span>
+
+    private void updateWindows(Map&lt;Component,Rectangle&gt; dirtyComponents) {
+<span class="nc" id="L727">        Toolkit toolkit = Toolkit.getDefaultToolkit();</span>
+<span class="nc bnc" id="L728" title="All 2 branches missed.">        if (!(toolkit instanceof SunToolkit &amp;&amp;</span>
+<span class="nc bnc" id="L729" title="All 2 branches missed.">              ((SunToolkit)toolkit).needUpdateWindow()))</span>
+        {
+<span class="nc" id="L731">            return;</span>
+        }
+
+<span class="nc" id="L734">        Set&lt;Window&gt; windows = new HashSet&lt;Window&gt;();</span>
+<span class="nc" id="L735">        Set&lt;Component&gt; dirtyComps = dirtyComponents.keySet();</span>
+<span class="nc bnc" id="L736" title="All 2 branches missed.">        for (Iterator&lt;Component&gt; it = dirtyComps.iterator(); it.hasNext();) {</span>
+<span class="nc" id="L737">            Component dirty = it.next();</span>
+<span class="nc bnc" id="L738" title="All 2 branches missed.">            Window window = dirty instanceof Window ?</span>
+                (Window)dirty :
+<span class="nc" id="L740">                SwingUtilities.getWindowAncestor(dirty);</span>
+<span class="nc bnc" id="L741" title="All 2 branches missed.">            if (window != null &amp;&amp;</span>
+<span class="nc bnc" id="L742" title="All 2 branches missed.">                !window.isOpaque())</span>
+            {
+<span class="nc" id="L744">                windows.add(window);</span>
+            }
+<span class="nc" id="L746">        }</span>
+
+<span class="nc bnc" id="L748" title="All 2 branches missed.">        for (Window window : windows) {</span>
+<span class="nc" id="L749">            AWTAccessor.getWindowAccessor().updateWindow(window);</span>
+<span class="nc" id="L750">        }</span>
+<span class="nc" id="L751">    }</span>
+
+    boolean isPainting() {
+<span class="nc" id="L754">        return painting;</span>
+    }
+
+    /**
+     * Paint all of the components that have been marked dirty.
+     *
+     * @see #addDirtyRegion
+     */
+    public void paintDirtyRegions() {
+<span class="nc" id="L763">        synchronized(this) {  // swap for thread safety</span>
+<span class="nc" id="L764">            Map&lt;Component,Rectangle&gt; tmp = tmpDirtyComponents;</span>
+<span class="nc" id="L765">            tmpDirtyComponents = dirtyComponents;</span>
+<span class="nc" id="L766">            dirtyComponents = tmp;</span>
+<span class="nc" id="L767">            dirtyComponents.clear();</span>
+<span class="nc" id="L768">        }</span>
+<span class="nc" id="L769">        paintDirtyRegions(tmpDirtyComponents);</span>
+<span class="nc" id="L770">    }</span>
+
+    private void paintDirtyRegions(
+        final Map&lt;Component,Rectangle&gt; tmpDirtyComponents)
+    {
+<span class="nc bnc" id="L775" title="All 2 branches missed.">        if (tmpDirtyComponents.isEmpty()) {</span>
+<span class="nc" id="L776">            return;</span>
+        }
+
+<span class="nc" id="L779">        final java.util.List&lt;Component&gt; roots =</span>
+<span class="nc" id="L780">            new ArrayList&lt;Component&gt;(tmpDirtyComponents.size());</span>
+<span class="nc bnc" id="L781" title="All 2 branches missed.">        for (Component dirty : tmpDirtyComponents.keySet()) {</span>
+<span class="nc" id="L782">            collectDirtyComponents(tmpDirtyComponents, dirty, roots);</span>
+<span class="nc" id="L783">        }</span>
+
+<span class="nc" id="L785">        final AtomicInteger count = new AtomicInteger(roots.size());</span>
+<span class="nc" id="L786">        painting = true;</span>
+        try {
+<span class="nc bnc" id="L788" title="All 2 branches missed.">            for (int j=0 ; j &lt; count.get(); j++) {</span>
+<span class="nc" id="L789">                final int i = j;</span>
+<span class="nc" id="L790">                final Component dirtyComponent = roots.get(j);</span>
+<span class="nc" id="L791">                AccessControlContext stack = AccessController.getContext();</span>
+                AccessControlContext acc =
+<span class="nc" id="L793">                    AWTAccessor.getComponentAccessor().getAccessControlContext(dirtyComponent);</span>
+<span class="nc" id="L794">                javaSecurityAccess.doIntersectionPrivilege(new PrivilegedAction&lt;Void&gt;() {</span>
+                    public Void run() {
+<span class="nc" id="L796">                        Rectangle rect = tmpDirtyComponents.get(dirtyComponent);</span>
+                        // Sometimes when RepaintManager is changed during the painting
+                        // we may get null here, see #6995769 for details
+<span class="nc bnc" id="L799" title="All 2 branches missed.">                        if (rect == null) {</span>
+<span class="nc" id="L800">                            return null;</span>
+                        }
+
+<span class="nc" id="L803">                        int localBoundsH = dirtyComponent.getHeight();</span>
+<span class="nc" id="L804">                        int localBoundsW = dirtyComponent.getWidth();</span>
+<span class="nc" id="L805">                        SwingUtilities.computeIntersection(0,</span>
+                                                           0,
+                                                           localBoundsW,
+                                                           localBoundsH,
+                                                           rect);
+<span class="nc bnc" id="L810" title="All 2 branches missed.">                        if (dirtyComponent instanceof JComponent) {</span>
+<span class="nc" id="L811">                            ((JComponent)dirtyComponent).paintImmediately(</span>
+                                rect.x,rect.y,rect.width, rect.height);
+                        }
+<span class="nc bnc" id="L814" title="All 2 branches missed.">                        else if (dirtyComponent.isShowing()) {</span>
+<span class="nc" id="L815">                            Graphics g = JComponent.safelyGetGraphics(</span>
+                                    dirtyComponent, dirtyComponent);
+                            // If the Graphics goes away, it means someone disposed of
+                            // the window, don't do anything.
+<span class="nc bnc" id="L819" title="All 2 branches missed.">                            if (g != null) {</span>
+<span class="nc" id="L820">                                g.setClip(rect.x, rect.y, rect.width, rect.height);</span>
+                                try {
+<span class="nc" id="L822">                                    dirtyComponent.paint(g);</span>
+                                } finally {
+<span class="nc" id="L824">                                    g.dispose();</span>
+<span class="nc" id="L825">                                }</span>
+                            }
+                        }
+                        // If the repaintRoot has been set, service it now and
+                        // remove any components that are children of repaintRoot.
+<span class="nc bnc" id="L830" title="All 2 branches missed.">                        if (repaintRoot != null) {</span>
+<span class="nc" id="L831">                            adjustRoots(repaintRoot, roots, i + 1);</span>
+<span class="nc" id="L832">                            count.set(roots.size());</span>
+<span class="nc" id="L833">                            paintManager.isRepaintingRoot = true;</span>
+<span class="nc" id="L834">                            repaintRoot.paintImmediately(0, 0, repaintRoot.getWidth(),</span>
+<span class="nc" id="L835">                                                         repaintRoot.getHeight());</span>
+<span class="nc" id="L836">                            paintManager.isRepaintingRoot = false;</span>
+                            // Only service repaintRoot once.
+<span class="nc" id="L838">                            repaintRoot = null;</span>
+                        }
+
+<span class="nc" id="L841">                        return null;</span>
+                    }
+                }, stack, acc);
+            }
+        } finally {
+<span class="nc" id="L846">            painting = false;</span>
+<span class="nc" id="L847">        }</span>
+
+<span class="nc" id="L849">        updateWindows(tmpDirtyComponents);</span>
+
+<span class="nc" id="L851">        tmpDirtyComponents.clear();</span>
+<span class="nc" id="L852">    }</span>
+
+
+    /**
+     * Removes any components from roots that are children of
+     * root.
+     */
+    private void adjustRoots(JComponent root,
+                             java.util.List&lt;Component&gt; roots, int index) {
+<span class="nc bnc" id="L861" title="All 2 branches missed.">        for (int i = roots.size() - 1; i &gt;= index; i--) {</span>
+<span class="nc" id="L862">            Component c = roots.get(i);</span>
+            for(;;) {
+<span class="nc bnc" id="L864" title="All 6 branches missed.">                if (c == root || c == null || !(c instanceof JComponent)) {</span>
+<span class="nc" id="L865">                    break;</span>
+                }
+<span class="nc" id="L867">                c = c.getParent();</span>
+            }
+<span class="nc bnc" id="L869" title="All 2 branches missed.">            if (c == root) {</span>
+<span class="nc" id="L870">                roots.remove(i);</span>
+            }
+        }
+<span class="nc" id="L873">    }</span>
+
+<span class="nc" id="L875">    Rectangle tmp = new Rectangle();</span>
+
+    void collectDirtyComponents(Map&lt;Component,Rectangle&gt; dirtyComponents,
+                                Component dirtyComponent,
+                                java.util.List&lt;Component&gt; roots) {
+        int dx, dy, rootDx, rootDy;
+        Component component, rootDirtyComponent,parent;
+        Rectangle cBounds;
+
+        // Find the highest parent which is dirty.  When we get out of this
+        // rootDx and rootDy will contain the translation from the
+        // rootDirtyComponent's coordinate system to the coordinates of the
+        // original dirty component.  The tmp Rect is also used to compute the
+        // visible portion of the dirtyRect.
+
+<span class="nc" id="L890">        component = rootDirtyComponent = dirtyComponent;</span>
+
+<span class="nc" id="L892">        int x = dirtyComponent.getX();</span>
+<span class="nc" id="L893">        int y = dirtyComponent.getY();</span>
+<span class="nc" id="L894">        int w = dirtyComponent.getWidth();</span>
+<span class="nc" id="L895">        int h = dirtyComponent.getHeight();</span>
+
+<span class="nc" id="L897">        dx = rootDx = 0;</span>
+<span class="nc" id="L898">        dy = rootDy = 0;</span>
+<span class="nc" id="L899">        tmp.setBounds(dirtyComponents.get(dirtyComponent));</span>
+
+        // System.out.println(&quot;Collect dirty component for bound &quot; + tmp +
+        //                                   &quot;component bounds is &quot; + cBounds);;
+<span class="nc" id="L903">        SwingUtilities.computeIntersection(0,0,w,h,tmp);</span>
+
+<span class="nc bnc" id="L905" title="All 2 branches missed.">        if (tmp.isEmpty()) {</span>
+            // System.out.println(&quot;Empty 1&quot;);
+<span class="nc" id="L907">            return;</span>
+        }
+
+        for(;;) {
+<span class="nc bnc" id="L911" title="All 2 branches missed.">            if(!(component instanceof JComponent))</span>
+<span class="nc" id="L912">                break;</span>
+
+<span class="nc" id="L914">            parent = component.getParent();</span>
+<span class="nc bnc" id="L915" title="All 2 branches missed.">            if(parent == null)</span>
+<span class="nc" id="L916">                break;</span>
+
+<span class="nc" id="L918">            component = parent;</span>
+
+<span class="nc" id="L920">            dx += x;</span>
+<span class="nc" id="L921">            dy += y;</span>
+<span class="nc" id="L922">            tmp.setLocation(tmp.x + x, tmp.y + y);</span>
+
+<span class="nc" id="L924">            x = component.getX();</span>
+<span class="nc" id="L925">            y = component.getY();</span>
+<span class="nc" id="L926">            w = component.getWidth();</span>
+<span class="nc" id="L927">            h = component.getHeight();</span>
+<span class="nc" id="L928">            tmp = SwingUtilities.computeIntersection(0,0,w,h,tmp);</span>
+
+<span class="nc bnc" id="L930" title="All 2 branches missed.">            if (tmp.isEmpty()) {</span>
+                // System.out.println(&quot;Empty 2&quot;);
+<span class="nc" id="L932">                return;</span>
+            }
+
+<span class="nc bnc" id="L935" title="All 2 branches missed.">            if (dirtyComponents.get(component) != null) {</span>
+<span class="nc" id="L936">                rootDirtyComponent = component;</span>
+<span class="nc" id="L937">                rootDx = dx;</span>
+<span class="nc" id="L938">                rootDy = dy;</span>
+            }
+        }
+
+<span class="nc bnc" id="L942" title="All 2 branches missed.">        if (dirtyComponent != rootDirtyComponent) {</span>
+            Rectangle r;
+<span class="nc" id="L944">            tmp.setLocation(tmp.x + rootDx - dx,</span>
+                            tmp.y + rootDy - dy);
+<span class="nc" id="L946">            r = dirtyComponents.get(rootDirtyComponent);</span>
+<span class="nc" id="L947">            SwingUtilities.computeUnion(tmp.x,tmp.y,tmp.width,tmp.height,r);</span>
+        }
+
+        // If we haven't seen this root before, then we need to add it to the
+        // list of root dirty Views.
+
+<span class="nc bnc" id="L953" title="All 2 branches missed.">        if (!roots.contains(rootDirtyComponent))</span>
+<span class="nc" id="L954">            roots.add(rootDirtyComponent);</span>
+<span class="nc" id="L955">    }</span>
+
+
+    /**
+     * Returns a string that displays and identifies this
+     * object's properties.
+     *
+     * @return a String representation of this object
+     */
+    public synchronized String toString() {
+<span class="nc" id="L965">        StringBuffer sb = new StringBuffer();</span>
+<span class="nc bnc" id="L966" title="All 2 branches missed.">        if(dirtyComponents != null)</span>
+<span class="nc" id="L967">            sb.append(&quot;&quot; + dirtyComponents);</span>
+<span class="nc" id="L968">        return sb.toString();</span>
+    }
+
+
+   /**
+     * Return the offscreen buffer that should be used as a double buffer with
+     * the component &lt;code&gt;c&lt;/code&gt;.
+     * By default there is a double buffer per RepaintManager.
+     * The buffer might be smaller than &lt;code&gt;(proposedWidth,proposedHeight)&lt;/code&gt;
+     * This happens when the maximum double buffer size as been set for the receiving
+     * repaint manager.
+     */
+    public Image getOffscreenBuffer(Component c,int proposedWidth,int proposedHeight) {
+<span class="nc" id="L981">        RepaintManager delegate = getDelegate(c);</span>
+<span class="nc bnc" id="L982" title="All 2 branches missed.">        if (delegate != null) {</span>
+<span class="nc" id="L983">            return delegate.getOffscreenBuffer(c, proposedWidth, proposedHeight);</span>
+        }
+<span class="nc" id="L985">        return _getOffscreenBuffer(c, proposedWidth, proposedHeight);</span>
+    }
+
+  /**
+   * Return a volatile offscreen buffer that should be used as a
+   * double buffer with the specified component &lt;code&gt;c&lt;/code&gt;.
+   * The image returned will be an instance of VolatileImage, or null
+   * if a VolatileImage object could not be instantiated.
+   * This buffer might be smaller than &lt;code&gt;(proposedWidth,proposedHeight)&lt;/code&gt;.
+   * This happens when the maximum double buffer size has been set for this
+   * repaint manager.
+   *
+   * @see java.awt.image.VolatileImage
+   * @since 1.4
+   */
+    public Image getVolatileOffscreenBuffer(Component c,
+                                            int proposedWidth,int proposedHeight) {
+<span class="nc" id="L1002">        RepaintManager delegate = getDelegate(c);</span>
+<span class="nc bnc" id="L1003" title="All 2 branches missed.">        if (delegate != null) {</span>
+<span class="nc" id="L1004">            return delegate.getVolatileOffscreenBuffer(c, proposedWidth,</span>
+                                                        proposedHeight);
+        }
+
+        // If the window is non-opaque, it's double-buffered at peer's level
+<span class="nc bnc" id="L1009" title="All 2 branches missed.">        Window w = (c instanceof Window) ? (Window)c : SwingUtilities.getWindowAncestor(c);</span>
+<span class="nc bnc" id="L1010" title="All 2 branches missed.">        if (!w.isOpaque()) {</span>
+<span class="nc" id="L1011">            Toolkit tk = Toolkit.getDefaultToolkit();</span>
+<span class="nc bnc" id="L1012" title="All 4 branches missed.">            if ((tk instanceof SunToolkit) &amp;&amp; (((SunToolkit)tk).needUpdateWindow())) {</span>
+<span class="nc" id="L1013">                return null;</span>
+            }
+        }
+
+<span class="nc" id="L1017">        GraphicsConfiguration config = c.getGraphicsConfiguration();</span>
+<span class="nc bnc" id="L1018" title="All 2 branches missed.">        if (config == null) {</span>
+<span class="nc" id="L1019">            config = GraphicsEnvironment.getLocalGraphicsEnvironment().</span>
+<span class="nc" id="L1020">                            getDefaultScreenDevice().getDefaultConfiguration();</span>
+        }
+<span class="nc" id="L1022">        Dimension maxSize = getDoubleBufferMaximumSize();</span>
+<span class="nc bnc" id="L1023" title="All 4 branches missed.">        int width = proposedWidth &lt; 1 ? 1 :</span>
+            (proposedWidth &gt; maxSize.width? maxSize.width : proposedWidth);
+<span class="nc bnc" id="L1025" title="All 4 branches missed.">        int height = proposedHeight &lt; 1 ? 1 :</span>
+            (proposedHeight &gt; maxSize.height? maxSize.height : proposedHeight);
+<span class="nc" id="L1027">        VolatileImage image = volatileMap.get(config);</span>
+<span class="nc bnc" id="L1028" title="All 4 branches missed.">        if (image == null || image.getWidth() &lt; width ||</span>
+<span class="nc bnc" id="L1029" title="All 2 branches missed.">                             image.getHeight() &lt; height) {</span>
+<span class="nc bnc" id="L1030" title="All 2 branches missed.">            if (image != null) {</span>
+<span class="nc" id="L1031">                image.flush();</span>
+            }
+<span class="nc" id="L1033">            image = config.createCompatibleVolatileImage(width, height,</span>
+                                                         volatileBufferType);
+<span class="nc" id="L1035">            volatileMap.put(config, image);</span>
+        }
+<span class="nc" id="L1037">        return image;</span>
+    }
+
+    private Image _getOffscreenBuffer(Component c, int proposedWidth, int proposedHeight) {
+<span class="nc" id="L1041">        Dimension maxSize = getDoubleBufferMaximumSize();</span>
+        DoubleBufferInfo doubleBuffer;
+        int width, height;
+
+        // If the window is non-opaque, it's double-buffered at peer's level
+<span class="nc bnc" id="L1046" title="All 2 branches missed.">        Window w = (c instanceof Window) ? (Window)c : SwingUtilities.getWindowAncestor(c);</span>
+<span class="nc bnc" id="L1047" title="All 2 branches missed.">        if (!w.isOpaque()) {</span>
+<span class="nc" id="L1048">            Toolkit tk = Toolkit.getDefaultToolkit();</span>
+<span class="nc bnc" id="L1049" title="All 4 branches missed.">            if ((tk instanceof SunToolkit) &amp;&amp; (((SunToolkit)tk).needUpdateWindow())) {</span>
+<span class="nc" id="L1050">                return null;</span>
+            }
+        }
+
+<span class="nc bnc" id="L1054" title="All 2 branches missed.">        if (standardDoubleBuffer == null) {</span>
+<span class="nc" id="L1055">            standardDoubleBuffer = new DoubleBufferInfo();</span>
+        }
+<span class="nc" id="L1057">        doubleBuffer = standardDoubleBuffer;</span>
+
+<span class="nc bnc" id="L1059" title="All 4 branches missed.">        width = proposedWidth &lt; 1? 1 :</span>
+                  (proposedWidth &gt; maxSize.width? maxSize.width : proposedWidth);
+<span class="nc bnc" id="L1061" title="All 4 branches missed.">        height = proposedHeight &lt; 1? 1 :</span>
+                  (proposedHeight &gt; maxSize.height? maxSize.height : proposedHeight);
+
+<span class="nc bnc" id="L1064" title="All 8 branches missed.">        if (doubleBuffer.needsReset || (doubleBuffer.image != null &amp;&amp;</span>
+                                        (doubleBuffer.size.width &lt; width ||
+                                         doubleBuffer.size.height &lt; height))) {
+<span class="nc" id="L1067">            doubleBuffer.needsReset = false;</span>
+<span class="nc bnc" id="L1068" title="All 2 branches missed.">            if (doubleBuffer.image != null) {</span>
+<span class="nc" id="L1069">                doubleBuffer.image.flush();</span>
+<span class="nc" id="L1070">                doubleBuffer.image = null;</span>
+            }
+<span class="nc" id="L1072">            width = Math.max(doubleBuffer.size.width, width);</span>
+<span class="nc" id="L1073">            height = Math.max(doubleBuffer.size.height, height);</span>
+        }
+
+<span class="nc" id="L1076">        Image result = doubleBuffer.image;</span>
+
+<span class="nc bnc" id="L1078" title="All 2 branches missed.">        if (doubleBuffer.image == null) {</span>
+<span class="nc" id="L1079">            result = c.createImage(width , height);</span>
+<span class="nc" id="L1080">            doubleBuffer.size = new Dimension(width, height);</span>
+<span class="nc bnc" id="L1081" title="All 2 branches missed.">            if (c instanceof JComponent) {</span>
+<span class="nc" id="L1082">                ((JComponent)c).setCreatedDoubleBuffer(true);</span>
+<span class="nc" id="L1083">                doubleBuffer.image = result;</span>
+            }
+            // JComponent will inform us when it is no longer valid
+            // (via removeNotify) we have no such hook to other components,
+            // therefore we don't keep a ref to the Component
+            // (indirectly through the Image) by stashing the image.
+        }
+<span class="nc" id="L1090">        return result;</span>
+    }
+
+
+    /** Set the maximum double buffer size. **/
+    public void setDoubleBufferMaximumSize(Dimension d) {
+<span class="nc" id="L1096">        doubleBufferMaxSize = d;</span>
+<span class="nc bnc" id="L1097" title="All 2 branches missed.">        if (doubleBufferMaxSize == null) {</span>
+<span class="nc" id="L1098">            clearImages();</span>
+        } else {
+<span class="nc" id="L1100">            clearImages(d.width, d.height);</span>
+        }
+<span class="nc" id="L1102">    }</span>
+
+    private void clearImages() {
+<span class="nc" id="L1105">        clearImages(0, 0);</span>
+<span class="nc" id="L1106">    }</span>
+
+    private void clearImages(int width, int height) {
+<span class="nc bnc" id="L1109" title="All 4 branches missed.">        if (standardDoubleBuffer != null &amp;&amp; standardDoubleBuffer.image != null) {</span>
+<span class="nc bnc" id="L1110" title="All 2 branches missed.">            if (standardDoubleBuffer.image.getWidth(null) &gt; width ||</span>
+<span class="nc bnc" id="L1111" title="All 2 branches missed.">                standardDoubleBuffer.image.getHeight(null) &gt; height) {</span>
+<span class="nc" id="L1112">                standardDoubleBuffer.image.flush();</span>
+<span class="nc" id="L1113">                standardDoubleBuffer.image = null;</span>
+            }
+        }
+        // Clear out the VolatileImages
+<span class="nc" id="L1117">        Iterator&lt;GraphicsConfiguration&gt; gcs = volatileMap.keySet().iterator();</span>
+<span class="nc bnc" id="L1118" title="All 2 branches missed.">        while (gcs.hasNext()) {</span>
+<span class="nc" id="L1119">            GraphicsConfiguration gc = gcs.next();</span>
+<span class="nc" id="L1120">            VolatileImage image = volatileMap.get(gc);</span>
+<span class="nc bnc" id="L1121" title="All 4 branches missed.">            if (image.getWidth() &gt; width || image.getHeight() &gt; height) {</span>
+<span class="nc" id="L1122">                image.flush();</span>
+<span class="nc" id="L1123">                gcs.remove();</span>
+            }
+<span class="nc" id="L1125">        }</span>
+<span class="nc" id="L1126">    }</span>
+
+    /**
+     * Returns the maximum double buffer size.
+     *
+     * @return a Dimension object representing the maximum size
+     */
+    public Dimension getDoubleBufferMaximumSize() {
+<span class="nc bnc" id="L1134" title="All 2 branches missed.">        if (doubleBufferMaxSize == null) {</span>
+            try {
+<span class="nc" id="L1136">                Rectangle virtualBounds = new Rectangle();</span>
+                GraphicsEnvironment ge = GraphicsEnvironment.
+<span class="nc" id="L1138">                                                 getLocalGraphicsEnvironment();</span>
+<span class="nc bnc" id="L1139" title="All 2 branches missed.">                for (GraphicsDevice gd : ge.getScreenDevices()) {</span>
+<span class="nc" id="L1140">                    GraphicsConfiguration gc = gd.getDefaultConfiguration();</span>
+<span class="nc" id="L1141">                    virtualBounds = virtualBounds.union(gc.getBounds());</span>
+                }
+<span class="nc" id="L1143">                doubleBufferMaxSize = new Dimension(virtualBounds.width,</span>
+                                                    virtualBounds.height);
+<span class="nc" id="L1145">            } catch (HeadlessException e) {</span>
+<span class="nc" id="L1146">                doubleBufferMaxSize = new Dimension(Integer.MAX_VALUE, Integer.MAX_VALUE);</span>
+<span class="nc" id="L1147">            }</span>
+        }
+<span class="nc" id="L1149">        return doubleBufferMaxSize;</span>
+    }
+
+    /**
+     * Enables or disables double buffering in this RepaintManager.
+     * CAUTION: The default value for this property is set for optimal
+     * paint performance on the given platform and it is not recommended
+     * that programs modify this property directly.
+     *
+     * @param aFlag  true to activate double buffering
+     * @see #isDoubleBufferingEnabled
+     */
+    public void setDoubleBufferingEnabled(boolean aFlag) {
+<span class="nc" id="L1162">        doubleBufferingEnabled = aFlag;</span>
+<span class="nc" id="L1163">        PaintManager paintManager = getPaintManager();</span>
+<span class="nc bnc" id="L1164" title="All 4 branches missed.">        if (!aFlag &amp;&amp; paintManager.getClass() != PaintManager.class) {</span>
+<span class="nc" id="L1165">            setPaintManager(new PaintManager());</span>
+        }
+<span class="nc" id="L1167">    }</span>
+
+    /**
+     * Returns true if this RepaintManager is double buffered.
+     * The default value for this property may vary from platform
+     * to platform.  On platforms where native double buffering
+     * is supported in the AWT, the default value will be &lt;code&gt;false&lt;/code&gt;
+     * to avoid unnecessary buffering in Swing.
+     * On platforms where native double buffering is not supported,
+     * the default value will be &lt;code&gt;true&lt;/code&gt;.
+     *
+     * @return true if this object is double buffered
+     */
+    public boolean isDoubleBufferingEnabled() {
+<span class="nc" id="L1181">        return doubleBufferingEnabled;</span>
+    }
+
+    /**
+     * This resets the double buffer. Actually, it marks the double buffer
+     * as invalid, the double buffer will then be recreated on the next
+     * invocation of getOffscreenBuffer.
+     */
+    void resetDoubleBuffer() {
+<span class="nc bnc" id="L1190" title="All 2 branches missed.">        if (standardDoubleBuffer != null) {</span>
+<span class="nc" id="L1191">            standardDoubleBuffer.needsReset = true;</span>
+        }
+<span class="nc" id="L1193">    }</span>
+
+    /**
+     * This resets the volatile double buffer.
+     */
+    void resetVolatileDoubleBuffer(GraphicsConfiguration gc) {
+<span class="nc" id="L1199">        Image image = volatileMap.remove(gc);</span>
+<span class="nc bnc" id="L1200" title="All 2 branches missed.">        if (image != null) {</span>
+<span class="nc" id="L1201">            image.flush();</span>
+        }
+<span class="nc" id="L1203">    }</span>
+
+    /**
+     * Returns true if we should use the &lt;code&gt;Image&lt;/code&gt; returned
+     * from &lt;code&gt;getVolatileOffscreenBuffer&lt;/code&gt; to do double buffering.
+     */
+    boolean useVolatileDoubleBuffer() {
+<span class="nc" id="L1210">        return volatileImageBufferEnabled;</span>
+    }
+
+    /**
+     * Returns true if the current thread is the thread painting.  This
+     * will return false if no threads are painting.
+     */
+    private synchronized boolean isPaintingThread() {
+<span class="nc bnc" id="L1218" title="All 2 branches missed.">        return (Thread.currentThread() == paintThread);</span>
+    }
+    //
+    // Paint methods.  You very, VERY rarely need to invoke these.
+    // They are invoked directly from JComponent's painting code and
+    // when painting happens outside the normal flow: DefaultDesktopManager
+    // and JViewport.  If you end up needing these methods in other places be
+    // careful that you don't get stuck in a paint loop.
+    //
+
+    /**
+     * Paints a region of a component
+     *
+     * @param paintingComponent Component to paint
+     * @param bufferComponent Component to obtain buffer for
+     * @param g Graphics to paint to
+     * @param x X-coordinate
+     * @param y Y-coordinate
+     * @param w Width
+     * @param h Height
+     */
+    void paint(JComponent paintingComponent,
+               JComponent bufferComponent, Graphics g,
+               int x, int y, int w, int h) {
+<span class="nc" id="L1242">        PaintManager paintManager = getPaintManager();</span>
+<span class="nc bnc" id="L1243" title="All 2 branches missed.">        if (!isPaintingThread()) {</span>
+            // We're painting to two threads at once.  PaintManager deals
+            // with this a bit better than BufferStrategyPaintManager, use
+            // it to avoid possible exceptions/corruption.
+<span class="nc bnc" id="L1247" title="All 2 branches missed.">            if (paintManager.getClass() != PaintManager.class) {</span>
+<span class="nc" id="L1248">                paintManager = new PaintManager();</span>
+<span class="nc" id="L1249">                paintManager.repaintManager = this;</span>
+            }
+        }
+<span class="nc bnc" id="L1252" title="All 2 branches missed.">        if (!paintManager.paint(paintingComponent, bufferComponent, g,</span>
+                                x, y, w, h)) {
+<span class="nc" id="L1254">            g.setClip(x, y, w, h);</span>
+<span class="nc" id="L1255">            paintingComponent.paintToOffscreen(g, x, y, w, h, x + w, y + h);</span>
+        }
+<span class="nc" id="L1257">    }</span>
+
+    /**
+     * Does a copy area on the specified region.
+     *
+     * @param clip Whether or not the copyArea needs to be clipped to the
+     *             Component's bounds.
+     */
+    void copyArea(JComponent c, Graphics g, int x, int y, int w, int h,
+                  int deltaX, int deltaY, boolean clip) {
+<span class="nc" id="L1267">        getPaintManager().copyArea(c, g, x, y, w, h, deltaX, deltaY, clip);</span>
+<span class="nc" id="L1268">    }</span>
+
+    /**
+     * Invoked prior to any paint/copyArea method calls.  This will
+     * be followed by an invocation of &lt;code&gt;endPaint&lt;/code&gt;.
+     * &lt;b&gt;WARNING&lt;/b&gt;: Callers of this method need to wrap the call
+     * in a &lt;code&gt;try/finally&lt;/code&gt;, otherwise if an exception is thrown
+     * during the course of painting the RepaintManager may
+     * be left in a state in which the screen is not updated, eg:
+     * &lt;pre&gt;
+     * repaintManager.beginPaint();
+     * try {
+     *   repaintManager.paint(...);
+     * } finally {
+     *   repaintManager.endPaint();
+     * }
+     * &lt;/pre&gt;
+     */
+    void beginPaint() {
+<span class="nc" id="L1287">        boolean multiThreadedPaint = false;</span>
+        int paintDepth;
+<span class="nc" id="L1289">        Thread currentThread = Thread.currentThread();</span>
+<span class="nc" id="L1290">        synchronized(this) {</span>
+<span class="nc" id="L1291">            paintDepth = this.paintDepth;</span>
+<span class="nc bnc" id="L1292" title="All 4 branches missed.">            if (paintThread == null || currentThread == paintThread) {</span>
+<span class="nc" id="L1293">                paintThread = currentThread;</span>
+<span class="nc" id="L1294">                this.paintDepth++;</span>
+            } else {
+<span class="nc" id="L1296">                multiThreadedPaint = true;</span>
+            }
+<span class="nc" id="L1298">        }</span>
+<span class="nc bnc" id="L1299" title="All 4 branches missed.">        if (!multiThreadedPaint &amp;&amp; paintDepth == 0) {</span>
+<span class="nc" id="L1300">            getPaintManager().beginPaint();</span>
+        }
+<span class="nc" id="L1302">    }</span>
+
+    /**
+     * Invoked after &lt;code&gt;beginPaint&lt;/code&gt; has been invoked.
+     */
+    void endPaint() {
+<span class="nc bnc" id="L1308" title="All 2 branches missed.">        if (isPaintingThread()) {</span>
+<span class="nc" id="L1309">            PaintManager paintManager = null;</span>
+<span class="nc" id="L1310">            synchronized(this) {</span>
+<span class="nc bnc" id="L1311" title="All 2 branches missed.">                if (--paintDepth == 0) {</span>
+<span class="nc" id="L1312">                    paintManager = getPaintManager();</span>
+                }
+<span class="nc" id="L1314">            }</span>
+<span class="nc bnc" id="L1315" title="All 2 branches missed.">            if (paintManager != null) {</span>
+<span class="nc" id="L1316">                paintManager.endPaint();</span>
+<span class="nc" id="L1317">                synchronized(this) {</span>
+<span class="nc" id="L1318">                    paintThread = null;</span>
+<span class="nc" id="L1319">                }</span>
+            }
+        }
+<span class="nc" id="L1322">    }</span>
+
+    /**
+     * If possible this will show a previously rendered portion of
+     * a Component.  If successful, this will return true, otherwise false.
+     * &lt;p&gt;
+     * WARNING: This method is invoked from the native toolkit thread, be
+     * very careful as to what methods this invokes!
+     */
+    boolean show(Container c, int x, int y, int w, int h) {
+<span class="nc" id="L1332">        return getPaintManager().show(c, x, y, w, h);</span>
+    }
+
+    /**
+     * Invoked when the doubleBuffered or useTrueDoubleBuffering
+     * properties of a JRootPane change.  This may come in on any thread.
+     */
+    void doubleBufferingChanged(JRootPane rootPane) {
+<span class="nc" id="L1340">        getPaintManager().doubleBufferingChanged(rootPane);</span>
+<span class="nc" id="L1341">    }</span>
+
+    /**
+     * Sets the &lt;code&gt;PaintManager&lt;/code&gt; that is used to handle all
+     * double buffered painting.
+     *
+     * @param paintManager The PaintManager to use.  Passing in null indicates
+     *        the fallback PaintManager should be used.
+     */
+    void setPaintManager(PaintManager paintManager) {
+<span class="nc bnc" id="L1351" title="All 2 branches missed.">        if (paintManager == null) {</span>
+<span class="nc" id="L1352">            paintManager = new PaintManager();</span>
+        }
+        PaintManager oldPaintManager;
+<span class="nc" id="L1355">        synchronized(this) {</span>
+<span class="nc" id="L1356">            oldPaintManager = this.paintManager;</span>
+<span class="nc" id="L1357">            this.paintManager = paintManager;</span>
+<span class="nc" id="L1358">            paintManager.repaintManager = this;</span>
+<span class="nc" id="L1359">        }</span>
+<span class="nc bnc" id="L1360" title="All 2 branches missed.">        if (oldPaintManager != null) {</span>
+<span class="nc" id="L1361">            oldPaintManager.dispose();</span>
+        }
+<span class="nc" id="L1363">    }</span>
+
+    private synchronized PaintManager getPaintManager() {
+<span class="nc bnc" id="L1366" title="All 2 branches missed.">        if (paintManager == null) {</span>
+<span class="nc" id="L1367">            PaintManager paintManager = null;</span>
+<span class="nc bnc" id="L1368" title="All 4 branches missed.">            if (doubleBufferingEnabled &amp;&amp; !nativeDoubleBuffering) {</span>
+<span class="nc bnc" id="L1369" title="All 3 branches missed.">                switch (bufferStrategyType) {</span>
+                case BUFFER_STRATEGY_NOT_SPECIFIED:
+<span class="nc" id="L1371">                    Toolkit tk = Toolkit.getDefaultToolkit();</span>
+<span class="nc bnc" id="L1372" title="All 2 branches missed.">                    if (tk instanceof SunToolkit) {</span>
+<span class="nc" id="L1373">                        SunToolkit stk = (SunToolkit) tk;</span>
+<span class="nc bnc" id="L1374" title="All 2 branches missed.">                        if (stk.useBufferPerWindow()) {</span>
+<span class="nc" id="L1375">                            paintManager = new BufferStrategyPaintManager();</span>
+                        }
+<span class="nc" id="L1377">                    }</span>
+                    break;
+                case BUFFER_STRATEGY_SPECIFIED_ON:
+<span class="nc" id="L1380">                    paintManager = new BufferStrategyPaintManager();</span>
+<span class="nc" id="L1381">                    break;</span>
+                default:
+                    break;
+                }
+            }
+            // null case handled in setPaintManager
+<span class="nc" id="L1387">            setPaintManager(paintManager);</span>
+        }
+<span class="nc" id="L1389">        return paintManager;</span>
+    }
+
+    private void scheduleProcessingRunnable(AppContext context) {
+<span class="nc bnc" id="L1393" title="All 2 branches missed.">        if (processingRunnable.markPending()) {</span>
+<span class="nc" id="L1394">            Toolkit tk = Toolkit.getDefaultToolkit();</span>
+<span class="nc bnc" id="L1395" title="All 2 branches missed.">            if (tk instanceof SunToolkit) {</span>
+<span class="nc" id="L1396">                SunToolkit.getSystemEventQueueImplPP(context).</span>
+<span class="nc" id="L1397">                  postEvent(new InvocationEvent(Toolkit.getDefaultToolkit(),</span>
+                                                processingRunnable));
+            } else {
+<span class="nc" id="L1400">                Toolkit.getDefaultToolkit().getSystemEventQueue().</span>
+<span class="nc" id="L1401">                      postEvent(new InvocationEvent(Toolkit.getDefaultToolkit(),</span>
+                                                    processingRunnable));
+            }
+        }
+<span class="nc" id="L1405">    }</span>
+
+
+    /**
+     * PaintManager is used to handle all double buffered painting for
+     * Swing.  Subclasses should call back into the JComponent method
+     * &lt;code&gt;paintToOffscreen&lt;/code&gt; to handle the actual painting.
+     */
+<span class="nc bnc" id="L1413" title="All 2 branches missed.">    static class PaintManager {</span>
+        /**
+         * RepaintManager the PaintManager has been installed on.
+         */
+        protected RepaintManager repaintManager;
+        boolean isRepaintingRoot;
+
+        /**
+         * Paints a region of a component
+         *
+         * @param paintingComponent Component to paint
+         * @param bufferComponent Component to obtain buffer for
+         * @param g Graphics to paint to
+         * @param x X-coordinate
+         * @param y Y-coordinate
+         * @param w Width
+         * @param h Height
+         * @return true if painting was successful.
+         */
+        public boolean paint(JComponent paintingComponent,
+                             JComponent bufferComponent, Graphics g,
+                             int x, int y, int w, int h) {
+            // First attempt to use VolatileImage buffer for performance.
+            // If this fails (which should rarely occur), fallback to a
+            // standard Image buffer.
+<span class="nc" id="L1438">            boolean paintCompleted = false;</span>
+            Image offscreen;
+<span class="nc bnc" id="L1440" title="All 2 branches missed.">            if (repaintManager.useVolatileDoubleBuffer() &amp;&amp;</span>
+<span class="nc bnc" id="L1441" title="All 2 branches missed.">                (offscreen = getValidImage(repaintManager.</span>
+<span class="nc" id="L1442">                getVolatileOffscreenBuffer(bufferComponent, w, h))) != null) {</span>
+<span class="nc" id="L1443">                VolatileImage vImage = (java.awt.image.VolatileImage)offscreen;</span>
+<span class="nc" id="L1444">                GraphicsConfiguration gc = bufferComponent.</span>
+<span class="nc" id="L1445">                                            getGraphicsConfiguration();</span>
+<span class="nc bnc" id="L1446" title="All 4 branches missed.">                for (int i = 0; !paintCompleted &amp;&amp;</span>
+<span class="nc" id="L1447">                         i &lt; RepaintManager.VOLATILE_LOOP_MAX; i++) {</span>
+<span class="nc bnc" id="L1448" title="All 2 branches missed.">                    if (vImage.validate(gc) ==</span>
+                                   VolatileImage.IMAGE_INCOMPATIBLE) {
+<span class="nc" id="L1450">                        repaintManager.resetVolatileDoubleBuffer(gc);</span>
+<span class="nc" id="L1451">                        offscreen = repaintManager.getVolatileOffscreenBuffer(</span>
+                            bufferComponent,w, h);
+<span class="nc" id="L1453">                        vImage = (java.awt.image.VolatileImage)offscreen;</span>
+                    }
+<span class="nc" id="L1455">                    paintDoubleBuffered(paintingComponent, vImage, g, x, y,</span>
+                                        w, h);
+<span class="nc bnc" id="L1457" title="All 2 branches missed.">                    paintCompleted = !vImage.contentsLost();</span>
+                }
+            }
+            // VolatileImage painting loop failed, fallback to regular
+            // offscreen buffer
+<span class="nc bnc" id="L1462" title="All 4 branches missed.">            if (!paintCompleted &amp;&amp; (offscreen = getValidImage(</span>
+<span class="nc" id="L1463">                      repaintManager.getOffscreenBuffer(</span>
+                      bufferComponent, w, h))) != null) {
+<span class="nc" id="L1465">                paintDoubleBuffered(paintingComponent, offscreen, g, x, y, w,</span>
+                                    h);
+<span class="nc" id="L1467">                paintCompleted = true;</span>
+            }
+<span class="nc" id="L1469">            return paintCompleted;</span>
+        }
+
+        /**
+         * Does a copy area on the specified region.
+         */
+        public void copyArea(JComponent c, Graphics g, int x, int y, int w,
+                             int h, int deltaX, int deltaY, boolean clip) {
+<span class="nc" id="L1477">            g.copyArea(x, y, w, h, deltaX, deltaY);</span>
+<span class="nc" id="L1478">        }</span>
+
+        /**
+         * Invoked prior to any calls to paint or copyArea.
+         */
+        public void beginPaint() {
+<span class="nc" id="L1484">        }</span>
+
+        /**
+         * Invoked to indicate painting has been completed.
+         */
+        public void endPaint() {
+<span class="nc" id="L1490">        }</span>
+
+        /**
+         * Shows a region of a previously rendered component.  This
+         * will return true if successful, false otherwise.  The default
+         * implementation returns false.
+         */
+        public boolean show(Container c, int x, int y, int w, int h) {
+<span class="nc" id="L1498">            return false;</span>
+        }
+
+        /**
+         * Invoked when the doubleBuffered or useTrueDoubleBuffering
+         * properties of a JRootPane change.  This may come in on any thread.
+         */
+        public void doubleBufferingChanged(JRootPane rootPane) {
+<span class="nc" id="L1506">        }</span>
+
+        /**
+         * Paints a portion of a component to an offscreen buffer.
+         */
+        protected void paintDoubleBuffered(JComponent c, Image image,
+                            Graphics g, int clipX, int clipY,
+                            int clipW, int clipH) {
+<span class="nc" id="L1514">            Graphics osg = image.getGraphics();</span>
+<span class="nc" id="L1515">            int bw = Math.min(clipW, image.getWidth(null));</span>
+<span class="nc" id="L1516">            int bh = Math.min(clipH, image.getHeight(null));</span>
+            int x,y,maxx,maxy;
+
+            try {
+<span class="nc bnc" id="L1520" title="All 2 branches missed.">                for(x = clipX, maxx = clipX+clipW; x &lt; maxx ;  x += bw ) {</span>
+<span class="nc bnc" id="L1521" title="All 2 branches missed.">                    for(y=clipY, maxy = clipY + clipH; y &lt; maxy ; y += bh) {</span>
+<span class="nc" id="L1522">                        osg.translate(-x, -y);</span>
+<span class="nc" id="L1523">                        osg.setClip(x,y,bw,bh);</span>
+<span class="nc bnc" id="L1524" title="All 4 branches missed.">                        if (volatileBufferType != Transparency.OPAQUE</span>
+                                &amp;&amp; osg instanceof Graphics2D) {
+<span class="nc" id="L1526">                            final Graphics2D g2d = (Graphics2D) osg;</span>
+<span class="nc" id="L1527">                            final Color oldBg = g2d.getBackground();</span>
+<span class="nc" id="L1528">                            g2d.setBackground(c.getBackground());</span>
+<span class="nc" id="L1529">                            g2d.clearRect(x, y, bw, bh);</span>
+<span class="nc" id="L1530">                            g2d.setBackground(oldBg);</span>
+                        }
+<span class="nc" id="L1532">                        c.paintToOffscreen(osg, x, y, bw, bh, maxx, maxy);</span>
+<span class="nc" id="L1533">                        g.setClip(x, y, bw, bh);</span>
+<span class="nc bnc" id="L1534" title="All 4 branches missed.">                        if (volatileBufferType != Transparency.OPAQUE</span>
+                                &amp;&amp; g instanceof Graphics2D) {
+<span class="nc" id="L1536">                            final Graphics2D g2d = (Graphics2D) g;</span>
+<span class="nc" id="L1537">                            final Composite oldComposite = g2d.getComposite();</span>
+<span class="nc" id="L1538">                            g2d.setComposite(AlphaComposite.Src);</span>
+<span class="nc" id="L1539">                            g2d.drawImage(image, x, y, c);</span>
+<span class="nc" id="L1540">                            g2d.setComposite(oldComposite);</span>
+<span class="nc" id="L1541">                        } else {</span>
+<span class="nc" id="L1542">                            g.drawImage(image, x, y, c);</span>
+                        }
+<span class="nc" id="L1544">                        osg.translate(x, y);</span>
+                    }
+                }
+            } finally {
+<span class="nc" id="L1548">                osg.dispose();</span>
+<span class="nc" id="L1549">            }</span>
+<span class="nc" id="L1550">        }</span>
+
+        /**
+         * If &lt;code&gt;image&lt;/code&gt; is non-null with a positive size it
+         * is returned, otherwise null is returned.
+         */
+        private Image getValidImage(Image image) {
+<span class="nc bnc" id="L1557" title="All 4 branches missed.">            if (image != null &amp;&amp; image.getWidth(null) &gt; 0 &amp;&amp;</span>
+<span class="nc bnc" id="L1558" title="All 2 branches missed.">                                 image.getHeight(null) &gt; 0) {</span>
+<span class="nc" id="L1559">                return image;</span>
+            }
+<span class="nc" id="L1561">            return null;</span>
+        }
+
+        /**
+         * Schedules a repaint for the specified component.  This differs
+         * from &lt;code&gt;root.repaint&lt;/code&gt; in that if the RepaintManager is
+         * currently processing paint requests it'll process this request
+         * with the current set of requests.
+         */
+        protected void repaintRoot(JComponent root) {
+<span class="nc bnc" id="L1571" title="All 4 branches missed.">            assert (repaintManager.repaintRoot == null);</span>
+<span class="nc bnc" id="L1572" title="All 2 branches missed.">            if (repaintManager.painting) {</span>
+<span class="nc" id="L1573">                repaintManager.repaintRoot = root;</span>
+            }
+            else {
+<span class="nc" id="L1576">                root.repaint();</span>
+            }
+<span class="nc" id="L1578">        }</span>
+
+        /**
+         * Returns true if the component being painted is the root component
+         * that was previously passed to &lt;code&gt;repaintRoot&lt;/code&gt;.
+         */
+        protected boolean isRepaintingRoot() {
+<span class="nc" id="L1585">            return isRepaintingRoot;</span>
+        }
+
+        /**
+         * Cleans up any state.  After invoked the PaintManager will no
+         * longer be used anymore.
+         */
+        protected void dispose() {
+<span class="nc" id="L1593">        }</span>
+    }
+
+
+<span class="nc" id="L1597">    private class DoubleBufferInfo {</span>
+        public Image image;
+        public Dimension size;
+<span class="nc" id="L1600">        public boolean needsReset = false;</span>
+    }
+
+
+    /**
+     * Listener installed to detect display changes. When display changes,
+     * schedules a callback to notify all RepaintManagers of the display
+     * changes. Only one DisplayChangedHandler is ever installed. The
+     * singleton instance will schedule notification for all AppContexts.
+     */
+<span class="nc" id="L1610">    private static final class DisplayChangedHandler implements</span>
+                                             DisplayChangedListener {
+        public void displayChanged() {
+<span class="nc" id="L1613">            scheduleDisplayChanges();</span>
+<span class="nc" id="L1614">        }</span>
+
+        public void paletteChanged() {
+<span class="nc" id="L1617">        }</span>
+
+        private void scheduleDisplayChanges() {
+            // To avoid threading problems, we notify each RepaintManager
+            // on the thread it was created on.
+<span class="nc bnc" id="L1622" title="All 2 branches missed.">            for (Object c : AppContext.getAppContexts()) {</span>
+<span class="nc" id="L1623">                AppContext context = (AppContext) c;</span>
+<span class="nc" id="L1624">                synchronized(context) {</span>
+<span class="nc bnc" id="L1625" title="All 2 branches missed.">                    if (!context.isDisposed()) {</span>
+<span class="nc" id="L1626">                        EventQueue eventQueue = (EventQueue)context.get(</span>
+                            AppContext.EVENT_QUEUE_KEY);
+<span class="nc bnc" id="L1628" title="All 2 branches missed.">                        if (eventQueue != null) {</span>
+<span class="nc" id="L1629">                            eventQueue.postEvent(new InvocationEvent(</span>
+<span class="nc" id="L1630">                                Toolkit.getDefaultToolkit(),</span>
+                                new DisplayChangedRunnable()));
+                        }
+                    }
+<span class="nc" id="L1634">                }</span>
+<span class="nc" id="L1635">            }</span>
+<span class="nc" id="L1636">        }</span>
+    }
+
+
+<span class="nc" id="L1640">    private static final class DisplayChangedRunnable implements Runnable {</span>
+        public void run() {
+<span class="nc" id="L1642">            RepaintManager.currentManager((JComponent)null).displayChanged();</span>
+<span class="nc" id="L1643">        }</span>
+    }
+
+
+    /**
+     * Runnable used to process all repaint/revalidate requests.
+     */
+<span class="nc" id="L1650">    private final class ProcessingRunnable implements Runnable {</span>
+        // If true, we're wainting on the EventQueue.
+        private boolean pending;
+
+        /**
+         * Marks this processing runnable as pending. If this was not
+         * already marked as pending, true is returned.
+         */
+        public synchronized boolean markPending() {
+<span class="nc bnc" id="L1659" title="All 2 branches missed.">            if (!pending) {</span>
+<span class="nc" id="L1660">                pending = true;</span>
+<span class="nc" id="L1661">                return true;</span>
+            }
+<span class="nc" id="L1663">            return false;</span>
+        }
+
+        public void run() {
+<span class="nc" id="L1667">            synchronized (this) {</span>
+<span class="nc" id="L1668">                pending = false;</span>
+<span class="nc" id="L1669">            }</span>
+            // First pass, flush any heavy paint events into real paint
+            // events.  If there are pending heavy weight requests this will
+            // result in q'ing this request up one more time.  As
+            // long as no other requests come in between now and the time
+            // the second one is processed nothing will happen.  This is not
+            // ideal, but the logic needed to suppress the second request is
+            // more headache than it's worth.
+<span class="nc" id="L1677">            scheduleHeavyWeightPaints();</span>
+            // Do the actual validation and painting.
+<span class="nc" id="L1679">            validateInvalidComponents();</span>
+<span class="nc" id="L1680">            prePaintDirtyRegions();</span>
+<span class="nc" id="L1681">        }</span>
+    }
+    private RepaintManager getDelegate(Component c) {
+<span class="nc" id="L1684">        RepaintManager delegate = SwingUtilities3.getDelegateRepaintManager(c);</span>
+<span class="nc bnc" id="L1685" title="All 2 branches missed.">        if (this == delegate) {</span>
+<span class="nc" id="L1686">            delegate = null;</span>
+        }
+<span class="nc" id="L1688">        return delegate;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

@@ -1,0 +1,872 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>TCPTransport.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.rmi.transport.tcp</a> &gt; <span class="el_source">TCPTransport.java</span></div><h1>TCPTransport.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1996, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package sun.rmi.transport.tcp;
+
+import java.lang.ref.Reference;
+import java.lang.ref.SoftReference;
+import java.lang.ref.WeakReference;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.UndeclaredThrowableException;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.rmi.RemoteException;
+import java.rmi.server.ExportException;
+import java.rmi.server.LogStream;
+import java.rmi.server.RMIFailureHandler;
+import java.rmi.server.RMISocketFactory;
+import java.rmi.server.RemoteCall;
+import java.rmi.server.ServerNotActiveException;
+import java.rmi.server.UID;
+import java.security.AccessControlContext;
+import java.security.AccessController;
+import java.util.ArrayList;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.WeakHashMap;
+import java.util.logging.Level;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import sun.rmi.runtime.Log;
+import sun.rmi.runtime.NewThreadAction;
+import sun.rmi.transport.Channel;
+import sun.rmi.transport.Connection;
+import sun.rmi.transport.DGCAckHandler;
+import sun.rmi.transport.Endpoint;
+import sun.rmi.transport.StreamRemoteCall;
+import sun.rmi.transport.Target;
+import sun.rmi.transport.Transport;
+import sun.rmi.transport.TransportConstants;
+import sun.rmi.transport.proxy.HttpReceiveSocket;
+import sun.security.action.GetIntegerAction;
+import sun.security.action.GetLongAction;
+import sun.security.action.GetPropertyAction;
+
+/**
+ * TCPTransport is the socket-based implementation of the RMI Transport
+ * abstraction.
+ *
+ * @author Ann Wollrath
+ * @author Peter Jones
+ */
+<span class="fc bfc" id="L87" title="All 2 branches covered.">@SuppressWarnings(&quot;deprecation&quot;)</span>
+public class TCPTransport extends Transport {
+
+    /* tcp package log */
+<span class="fc" id="L91">    static final Log tcpLog = Log.getLog(&quot;sun.rmi.transport.tcp&quot;, &quot;tcp&quot;,</span>
+<span class="fc" id="L92">        LogStream.parseLevel(AccessController.doPrivileged(</span>
+            new GetPropertyAction(&quot;sun.rmi.transport.tcp.logLevel&quot;))));
+
+    /** maximum number of connection handler threads */
+<span class="fc" id="L96">    private static final int maxConnectionThreads =     // default no limit</span>
+<span class="fc" id="L97">        AccessController.doPrivileged(</span>
+            new GetIntegerAction(&quot;sun.rmi.transport.tcp.maxConnectionThreads&quot;,
+                                 Integer.MAX_VALUE));
+
+    /** keep alive time for idle connection handler threads */
+<span class="fc" id="L102">    private static final long threadKeepAliveTime =     // default 1 minute</span>
+<span class="fc" id="L103">        AccessController.doPrivileged(</span>
+            new GetLongAction(&quot;sun.rmi.transport.tcp.threadKeepAliveTime&quot;,
+                              60000));
+
+    /** thread pool for connection handlers */
+<span class="fc" id="L108">    private static final ExecutorService connectionThreadPool =</span>
+        new ThreadPoolExecutor(0, maxConnectionThreads,
+            threadKeepAliveTime, TimeUnit.MILLISECONDS,
+            new SynchronousQueue&lt;Runnable&gt;(),
+<span class="fc" id="L112">            new ThreadFactory() {</span>
+                public Thread newThread(Runnable runnable) {
+<span class="fc" id="L114">                    return AccessController.doPrivileged(new NewThreadAction(</span>
+                        runnable, &quot;TCP Connection(idle)&quot;, true, true));
+                }
+            });
+
+    /** total connections handled */
+<span class="fc" id="L120">    private static final AtomicInteger connectionCount = new AtomicInteger(0);</span>
+
+    /** client host for the current thread's connection */
+    private static final ThreadLocal&lt;ConnectionHandler&gt;
+<span class="fc" id="L124">        threadConnectionHandler = new ThreadLocal&lt;&gt;();</span>
+
+    /** endpoints for this transport */
+    private final LinkedList&lt;TCPEndpoint&gt; epList;
+    /** number of objects exported on this transport */
+<span class="fc" id="L129">    private int exportCount = 0;</span>
+    /** server socket for this transport */
+<span class="fc" id="L131">    private ServerSocket server = null;</span>
+    /** table mapping endpoints to channels */
+<span class="fc" id="L133">    private final Map&lt;TCPEndpoint,Reference&lt;TCPChannel&gt;&gt; channelTable =</span>
+        new WeakHashMap&lt;&gt;();
+
+    static final RMISocketFactory defaultSocketFactory =
+<span class="fc" id="L137">        RMISocketFactory.getDefaultSocketFactory();</span>
+
+    /** number of milliseconds in accepted-connection timeout.
+     * Warning: this should be greater than 15 seconds (the client-side
+     * timeout), and defaults to 2 hours.
+     * The maximum representable value is slightly more than 24 days
+     * and 20 hours.
+     */
+<span class="fc" id="L145">    private static final int connectionReadTimeout =    // default 2 hours</span>
+<span class="fc" id="L146">        AccessController.doPrivileged(</span>
+            new GetIntegerAction(&quot;sun.rmi.transport.tcp.readTimeout&quot;,
+                                 2 * 3600 * 1000));
+
+    /**
+     * Constructs a TCPTransport.
+     */
+<span class="fc" id="L153">    TCPTransport(LinkedList&lt;TCPEndpoint&gt; epList)  {</span>
+        // assert ((epList.size() != null) &amp;&amp; (epList.size() &gt;= 1))
+<span class="fc" id="L155">        this.epList = epList;</span>
+<span class="fc bfc" id="L156" title="All 2 branches covered.">        if (tcpLog.isLoggable(Log.BRIEF)) {</span>
+<span class="fc" id="L157">            tcpLog.log(Log.BRIEF, &quot;Version = &quot; +</span>
+<span class="fc" id="L158">                TransportConstants.Version + &quot;, ep = &quot; + getEndpoint());</span>
+        }
+<span class="fc" id="L160">    }</span>
+
+    /**
+     * Closes all cached connections in every channel subordinated to this
+     * transport.  Currently, this only closes outgoing connections.
+     */
+    public void shedConnectionCaches() {
+        List&lt;TCPChannel&gt; channels;
+<span class="fc" id="L168">        synchronized (channelTable) {</span>
+<span class="fc" id="L169">            channels = new ArrayList&lt;TCPChannel&gt;(channelTable.values().size());</span>
+<span class="fc bfc" id="L170" title="All 2 branches covered.">            for (Reference&lt;TCPChannel&gt; ref : channelTable.values()) {</span>
+<span class="fc" id="L171">                TCPChannel ch = ref.get();</span>
+<span class="pc bpc" id="L172" title="1 of 2 branches missed.">                if (ch != null) {</span>
+<span class="fc" id="L173">                    channels.add(ch);</span>
+                }
+<span class="fc" id="L175">            }</span>
+<span class="pc" id="L176">        }</span>
+<span class="fc bfc" id="L177" title="All 2 branches covered.">        for (TCPChannel channel : channels) {</span>
+<span class="fc" id="L178">            channel.shedCache();</span>
+<span class="fc" id="L179">        }</span>
+<span class="fc" id="L180">    }</span>
+
+    /**
+     * Returns a &lt;I&gt;Channel&lt;/I&gt; that generates connections to the
+     * endpoint &lt;I&gt;ep&lt;/I&gt;. A Channel is an object that creates and
+     * manages connections of a particular type to some particular
+     * address space.
+     * @param ep the endpoint to which connections will be generated.
+     * @return the channel or null if the transport cannot
+     * generate connections to this endpoint
+     */
+    public TCPChannel getChannel(Endpoint ep) {
+<span class="fc" id="L192">        TCPChannel ch = null;</span>
+<span class="pc bpc" id="L193" title="1 of 2 branches missed.">        if (ep instanceof TCPEndpoint) {</span>
+<span class="fc" id="L194">            synchronized (channelTable) {</span>
+<span class="fc" id="L195">                Reference&lt;TCPChannel&gt; ref = channelTable.get(ep);</span>
+<span class="fc bfc" id="L196" title="All 2 branches covered.">                if (ref != null) {</span>
+<span class="fc" id="L197">                    ch = ref.get();</span>
+                }
+<span class="fc bfc" id="L199" title="All 2 branches covered.">                if (ch == null) {</span>
+<span class="fc" id="L200">                    TCPEndpoint tcpEndpoint = (TCPEndpoint) ep;</span>
+<span class="fc" id="L201">                    ch = new TCPChannel(this, tcpEndpoint);</span>
+<span class="fc" id="L202">                    channelTable.put(tcpEndpoint,</span>
+                                     new WeakReference&lt;TCPChannel&gt;(ch));
+                }
+<span class="pc" id="L205">            }</span>
+        }
+<span class="fc" id="L207">        return ch;</span>
+    }
+
+    /**
+     * Removes the &lt;I&gt;Channel&lt;/I&gt; that generates connections to the
+     * endpoint &lt;I&gt;ep&lt;/I&gt;.
+     */
+    public void free(Endpoint ep) {
+<span class="pc bpc" id="L215" title="1 of 2 branches missed.">        if (ep instanceof TCPEndpoint) {</span>
+<span class="fc" id="L216">            synchronized (channelTable) {</span>
+<span class="fc" id="L217">                Reference&lt;TCPChannel&gt; ref = channelTable.remove(ep);</span>
+<span class="pc bpc" id="L218" title="1 of 2 branches missed.">                if (ref != null) {</span>
+<span class="fc" id="L219">                    TCPChannel channel = ref.get();</span>
+<span class="pc bpc" id="L220" title="1 of 2 branches missed.">                    if (channel != null) {</span>
+<span class="fc" id="L221">                        channel.shedCache();</span>
+                    }
+                }
+<span class="pc" id="L224">            }</span>
+        }
+<span class="fc" id="L226">    }</span>
+
+    /**
+     * Export the object so that it can accept incoming calls.
+     */
+    public void exportObject(Target target) throws RemoteException {
+        /*
+         * Ensure that a server socket is listening, and count this
+         * export while synchronized to prevent the server socket from
+         * being closed due to concurrent unexports.
+         */
+<span class="fc" id="L237">        synchronized (this) {</span>
+<span class="fc" id="L238">            listen();</span>
+<span class="fc" id="L239">            exportCount++;</span>
+<span class="fc" id="L240">        }</span>
+
+        /*
+         * Try to add the Target to the exported object table; keep
+         * counting this export (to keep server socket open) only if
+         * that succeeds.
+         */
+<span class="fc" id="L247">        boolean ok = false;</span>
+        try {
+<span class="fc" id="L249">            super.exportObject(target);</span>
+<span class="fc" id="L250">            ok = true;</span>
+        } finally {
+<span class="pc bpc" id="L252" title="3 of 4 branches missed.">            if (!ok) {</span>
+<span class="nc" id="L253">                synchronized (this) {</span>
+<span class="nc" id="L254">                    decrementExportCount();</span>
+<span class="nc" id="L255">                }</span>
+            }
+        }
+<span class="fc" id="L258">    }</span>
+
+    protected synchronized void targetUnexported() {
+<span class="fc" id="L261">        decrementExportCount();</span>
+<span class="fc" id="L262">    }</span>
+
+    /**
+     * Decrements the count of exported objects, closing the current
+     * server socket if the count reaches zero.
+     **/
+    private void decrementExportCount() {
+<span class="pc bpc" id="L269" title="1 of 4 branches missed.">        assert Thread.holdsLock(this);</span>
+<span class="fc" id="L270">        exportCount--;</span>
+<span class="fc bfc" id="L271" title="All 4 branches covered.">        if (exportCount == 0 &amp;&amp; getEndpoint().getListenPort() != 0) {</span>
+<span class="fc" id="L272">            ServerSocket ss = server;</span>
+<span class="fc" id="L273">            server = null;</span>
+            try {
+<span class="fc" id="L275">                ss.close();</span>
+<span class="nc" id="L276">            } catch (IOException e) {</span>
+<span class="fc" id="L277">            }</span>
+        }
+<span class="fc" id="L279">    }</span>
+
+    /**
+     * Verify that the current access control context has permission to
+     * accept the connection being dispatched by the current thread.
+     */
+    protected void checkAcceptPermission(AccessControlContext acc) {
+<span class="fc" id="L286">        SecurityManager sm = System.getSecurityManager();</span>
+<span class="fc bfc" id="L287" title="All 2 branches covered.">        if (sm == null) {</span>
+<span class="fc" id="L288">            return;</span>
+        }
+<span class="fc" id="L290">        ConnectionHandler h = threadConnectionHandler.get();</span>
+<span class="pc bpc" id="L291" title="1 of 2 branches missed.">        if (h == null) {</span>
+<span class="nc" id="L292">            throw new Error(</span>
+                &quot;checkAcceptPermission not in ConnectionHandler thread&quot;);
+        }
+<span class="fc" id="L295">        h.checkAcceptPermission(sm, acc);</span>
+<span class="fc" id="L296">    }</span>
+
+    private TCPEndpoint getEndpoint() {
+<span class="fc" id="L299">        synchronized (epList) {</span>
+<span class="fc" id="L300">            return epList.getLast();</span>
+<span class="nc" id="L301">        }</span>
+    }
+
+    /**
+     * Listen on transport's endpoint.
+     */
+    private void listen() throws RemoteException {
+<span class="pc bpc" id="L308" title="1 of 4 branches missed.">        assert Thread.holdsLock(this);</span>
+<span class="fc" id="L309">        TCPEndpoint ep = getEndpoint();</span>
+<span class="fc" id="L310">        int port = ep.getPort();</span>
+
+<span class="fc bfc" id="L312" title="All 2 branches covered.">        if (server == null) {</span>
+<span class="fc bfc" id="L313" title="All 2 branches covered.">            if (tcpLog.isLoggable(Log.BRIEF)) {</span>
+<span class="fc" id="L314">                tcpLog.log(Log.BRIEF,</span>
+                    &quot;(port &quot; + port + &quot;) create server socket&quot;);
+            }
+
+            try {
+<span class="fc" id="L319">                server = ep.newServerSocket();</span>
+                /*
+                 * Don't retry ServerSocket if creation fails since
+                 * &quot;port in use&quot; will cause export to hang if an
+                 * RMIFailureHandler is not installed.
+                 */
+<span class="fc" id="L325">                Thread t = AccessController.doPrivileged(</span>
+                    new NewThreadAction(new AcceptLoop(server),
+                                        &quot;TCP Accept-&quot; + port, true));
+<span class="fc" id="L328">                t.start();</span>
+<span class="fc" id="L329">            } catch (java.net.BindException e) {</span>
+<span class="fc" id="L330">                throw new ExportException(&quot;Port already in use: &quot; + port, e);</span>
+<span class="nc" id="L331">            } catch (IOException e) {</span>
+<span class="nc" id="L332">                throw new ExportException(&quot;Listen failed on port: &quot; + port, e);</span>
+<span class="fc" id="L333">            }</span>
+
+        } else {
+            // otherwise verify security access to existing server socket
+<span class="fc" id="L337">            SecurityManager sm = System.getSecurityManager();</span>
+<span class="fc bfc" id="L338" title="All 2 branches covered.">            if (sm != null) {</span>
+<span class="fc" id="L339">                sm.checkListen(port);</span>
+            }
+        }
+<span class="fc" id="L342">    }</span>
+
+    /**
+     * Worker for accepting connections from a server socket.
+     **/
+    private class AcceptLoop implements Runnable {
+
+        private final ServerSocket serverSocket;
+
+        // state for throttling loop on exceptions (local to accept thread)
+<span class="fc" id="L352">        private long lastExceptionTime = 0L;</span>
+        private int recentExceptionCount;
+
+<span class="fc" id="L355">        AcceptLoop(ServerSocket serverSocket) {</span>
+<span class="fc" id="L356">            this.serverSocket = serverSocket;</span>
+<span class="fc" id="L357">        }</span>
+
+        public void run() {
+            try {
+<span class="fc" id="L361">                executeAcceptLoop();</span>
+            } finally {
+<span class="fc" id="L363">                try {</span>
+                    /*
+                     * Only one accept loop is started per server
+                     * socket, so after no more connections will be
+                     * accepted, ensure that the server socket is no
+                     * longer listening.
+                     */
+<span class="fc" id="L370">                    serverSocket.close();</span>
+<span class="nc" id="L371">                } catch (IOException e) {</span>
+<span class="fc" id="L372">                }</span>
+<span class="nc" id="L373">            }</span>
+<span class="fc" id="L374">        }</span>
+
+        /**
+         * Accepts connections from the server socket and executes
+         * handlers for them in the thread pool.
+         **/
+        private void executeAcceptLoop() {
+<span class="fc bfc" id="L381" title="All 2 branches covered.">            if (tcpLog.isLoggable(Log.BRIEF)) {</span>
+<span class="fc" id="L382">                tcpLog.log(Log.BRIEF, &quot;listening on port &quot; +</span>
+<span class="fc" id="L383">                           getEndpoint().getPort());</span>
+            }
+
+            while (true) {
+<span class="fc" id="L387">                Socket socket = null;</span>
+                try {
+<span class="fc" id="L389">                    socket = serverSocket.accept();</span>
+
+                    /*
+                     * Find client host name (or &quot;0.0.0.0&quot; if unknown)
+                     */
+<span class="fc" id="L394">                    InetAddress clientAddr = socket.getInetAddress();</span>
+<span class="fc bfc" id="L395" title="All 2 branches covered.">                    String clientHost = (clientAddr != null</span>
+<span class="fc" id="L396">                                         ? clientAddr.getHostAddress()</span>
+                                         : &quot;0.0.0.0&quot;);
+
+                    /*
+                     * Execute connection handler in the thread pool,
+                     * which uses non-system threads.
+                     */
+                    try {
+<span class="fc" id="L404">                        connectionThreadPool.execute(</span>
+                            new ConnectionHandler(socket, clientHost));
+<span class="nc" id="L406">                    } catch (RejectedExecutionException e) {</span>
+<span class="nc" id="L407">                        closeSocket(socket);</span>
+<span class="nc" id="L408">                        tcpLog.log(Log.BRIEF,</span>
+                                   &quot;rejected connection from &quot; + clientHost);
+<span class="fc" id="L410">                    }</span>
+
+<span class="fc" id="L412">                } catch (Throwable t) {</span>
+                    try {
+                        /*
+                         * If the server socket has been closed, such
+                         * as because there are no more exported
+                         * objects, then we expect accept to throw an
+                         * exception, so just terminate normally.
+                         */
+<span class="fc bfc" id="L420" title="All 2 branches covered.">                        if (serverSocket.isClosed()) {</span>
+                            break;
+                        }
+
+                        try {
+<span class="pc bpc" id="L425" title="1 of 2 branches missed.">                            if (tcpLog.isLoggable(Level.WARNING)) {</span>
+<span class="fc" id="L426">                                tcpLog.log(Level.WARNING,</span>
+                                           &quot;accept loop for &quot; + serverSocket +
+                                           &quot; throws&quot;, t);
+                            }
+<span class="nc" id="L430">                        } catch (Throwable tt) {</span>
+<span class="fc" id="L431">                        }</span>
+                    } finally {
+                        /*
+                         * Always close the accepted socket (if any)
+                         * if an exception occurs, but only after
+                         * logging an unexpected exception.
+                         */
+<span class="pc bpc" id="L438" title="4 of 6 branches missed.">                        if (socket != null) {</span>
+<span class="pc" id="L439">                            closeSocket(socket);</span>
+                        }
+                    }
+
+                    /*
+                     * In case we're running out of file descriptors,
+                     * release resources held in caches.
+                     */
+<span class="pc bpc" id="L447" title="1 of 2 branches missed.">                    if (!(t instanceof SecurityException)) {</span>
+                        try {
+<span class="fc" id="L449">                            TCPEndpoint.shedConnectionCaches();</span>
+<span class="nc" id="L450">                        } catch (Throwable tt) {</span>
+<span class="fc" id="L451">                        }</span>
+                    }
+
+                    /*
+                     * A NoClassDefFoundError can occur if no file
+                     * descriptors are available, in which case this
+                     * loop should not terminate.
+                     */
+<span class="fc bfc" id="L459" title="All 6 branches covered.">                    if (t instanceof Exception ||</span>
+                        t instanceof OutOfMemoryError ||
+                        t instanceof NoClassDefFoundError)
+                    {
+<span class="pc bpc" id="L463" title="1 of 2 branches missed.">                        if (!continueAfterAcceptFailure(t)) {</span>
+<span class="fc" id="L464">                            return;</span>
+                        }
+                        // continue loop
+<span class="fc bfc" id="L467" title="All 2 branches covered.">                    } else if (t instanceof Error) {</span>
+<span class="fc" id="L468">                        throw (Error) t;</span>
+                    } else {
+<span class="fc" id="L470">                        throw new UndeclaredThrowableException(t);</span>
+                    }
+<span class="fc" id="L472">                }</span>
+<span class="fc" id="L473">            }</span>
+<span class="fc" id="L474">        }</span>
+
+        /**
+         * Returns true if the accept loop should continue after the
+         * specified exception has been caught, or false if the accept
+         * loop should terminate (closing the server socket).  If
+         * there is an RMIFailureHandler, this method returns the
+         * result of passing the specified exception to it; otherwise,
+         * this method always returns true, after sleeping to throttle
+         * the accept loop if necessary.
+         **/
+        private boolean continueAfterAcceptFailure(Throwable t) {
+<span class="fc" id="L486">            RMIFailureHandler fh = RMISocketFactory.getFailureHandler();</span>
+<span class="pc bpc" id="L487" title="1 of 2 branches missed.">            if (fh != null) {</span>
+<span class="fc bfc" id="L488" title="All 2 branches covered.">                return fh.failure(t instanceof Exception ? (Exception) t :</span>
+                                  new InvocationTargetException(t));
+            } else {
+<span class="nc" id="L491">                throttleLoopOnException();</span>
+<span class="nc" id="L492">                return true;</span>
+            }
+        }
+
+        /**
+         * Throttles the accept loop after an exception has been
+         * caught: if a burst of 10 exceptions in 5 seconds occurs,
+         * then wait for 10 seconds to curb busy CPU usage.
+         **/
+        private void throttleLoopOnException() {
+<span class="nc" id="L502">            long now = System.currentTimeMillis();</span>
+<span class="nc bnc" id="L503" title="All 4 branches missed.">            if (lastExceptionTime == 0L || (now - lastExceptionTime) &gt; 5000) {</span>
+                // last exception was long ago (or this is the first)
+<span class="nc" id="L505">                lastExceptionTime = now;</span>
+<span class="nc" id="L506">                recentExceptionCount = 0;</span>
+            } else {
+                // exception burst window was started recently
+<span class="nc bnc" id="L509" title="All 2 branches missed.">                if (++recentExceptionCount &gt;= 10) {</span>
+                    try {
+<span class="nc" id="L511">                        Thread.sleep(10000);</span>
+<span class="nc" id="L512">                    } catch (InterruptedException ignore) {</span>
+<span class="nc" id="L513">                    }</span>
+                }
+            }
+<span class="nc" id="L516">        }</span>
+    }
+
+    /** close socket and eat exception */
+    private static void closeSocket(Socket sock) {
+        try {
+<span class="fc" id="L522">            sock.close();</span>
+<span class="nc" id="L523">        } catch (IOException ex) {</span>
+            // eat exception
+<span class="fc" id="L525">        }</span>
+<span class="fc" id="L526">    }</span>
+
+    /**
+     * handleMessages decodes transport operations and handles messages
+     * appropriately.  If an exception occurs during message handling,
+     * the socket is closed.
+     */
+    void handleMessages(Connection conn, boolean persistent) {
+<span class="fc" id="L534">        int port = getEndpoint().getPort();</span>
+
+        try {
+<span class="fc" id="L537">            DataInputStream in = new DataInputStream(conn.getInputStream());</span>
+            do {
+<span class="fc" id="L539">                int op = in.read();     // transport op</span>
+<span class="fc bfc" id="L540" title="All 2 branches covered.">                if (op == -1) {</span>
+<span class="pc bpc" id="L541" title="1 of 2 branches missed.">                    if (tcpLog.isLoggable(Log.BRIEF)) {</span>
+<span class="nc" id="L542">                        tcpLog.log(Log.BRIEF, &quot;(port &quot; +</span>
+                            port + &quot;) connection closed&quot;);
+                    }
+                    break;
+                }
+
+<span class="fc bfc" id="L548" title="All 2 branches covered.">                if (tcpLog.isLoggable(Log.BRIEF)) {</span>
+<span class="fc" id="L549">                    tcpLog.log(Log.BRIEF, &quot;(port &quot; + port +</span>
+                        &quot;) op = &quot; + op);
+                }
+
+<span class="fc bfc" id="L553" title="All 4 branches covered.">                switch (op) {</span>
+                case TransportConstants.Call:
+                    // service incoming RMI call
+<span class="fc" id="L556">                    RemoteCall call = new StreamRemoteCall(conn);</span>
+<span class="pc bpc" id="L557" title="1 of 2 branches missed.">                    if (serviceCall(call) == false)</span>
+<span class="nc" id="L558">                        return;</span>
+                    break;
+
+                case TransportConstants.Ping:
+                    // send ack for ping
+<span class="fc" id="L563">                    DataOutputStream out =</span>
+<span class="fc" id="L564">                        new DataOutputStream(conn.getOutputStream());</span>
+<span class="fc" id="L565">                    out.writeByte(TransportConstants.PingAck);</span>
+<span class="fc" id="L566">                    conn.releaseOutputStream();</span>
+<span class="fc" id="L567">                    break;</span>
+
+                case TransportConstants.DGCAck:
+<span class="fc" id="L570">                    DGCAckHandler.received(UID.read(in));</span>
+<span class="fc" id="L571">                    break;</span>
+
+                default:
+<span class="fc" id="L574">                    throw new IOException(&quot;unknown transport op &quot; + op);</span>
+                }
+<span class="fc bfc" id="L576" title="All 2 branches covered.">            } while (persistent);</span>
+
+<span class="fc" id="L578">        } catch (IOException e) {</span>
+            // exception during processing causes connection to close (below)
+<span class="pc bpc" id="L580" title="1 of 2 branches missed.">            if (tcpLog.isLoggable(Log.BRIEF)) {</span>
+<span class="nc" id="L581">                tcpLog.log(Log.BRIEF, &quot;(port &quot; + port +</span>
+                    &quot;) exception: &quot;, e);
+            }
+        } finally {
+<span class="nc" id="L585">            try {</span>
+<span class="pc" id="L586">                conn.close();</span>
+<span class="nc" id="L587">            } catch (IOException ex) {</span>
+                // eat exception
+<span class="pc" id="L589">            }</span>
+<span class="nc" id="L590">        }</span>
+<span class="fc" id="L591">    }</span>
+
+    /**
+     * Returns the client host for the current thread's connection.  Throws
+     * ServerNotActiveException if no connection is active for this thread.
+     */
+    public static String getClientHost() throws ServerNotActiveException {
+<span class="fc" id="L598">        ConnectionHandler h = threadConnectionHandler.get();</span>
+<span class="fc bfc" id="L599" title="All 2 branches covered.">        if (h != null) {</span>
+<span class="fc" id="L600">            return h.getClientHost();</span>
+        } else {
+<span class="fc" id="L602">            throw new ServerNotActiveException(&quot;not in a remote call&quot;);</span>
+        }
+    }
+
+    /**
+     * Services messages on accepted connection
+     */
+    private class ConnectionHandler implements Runnable {
+
+        /** int value of &quot;POST&quot; in ASCII (Java's specified data formats
+         *  make this once-reviled tactic again socially acceptable) */
+        private static final int POST = 0x504f5354;
+
+        /** most recently accept-authorized AccessControlContext */
+        private AccessControlContext okContext;
+        /** cache of accept-authorized AccessControlContexts */
+        private Map&lt;AccessControlContext,
+                    Reference&lt;AccessControlContext&gt;&gt; authCache;
+        /** security manager which authorized contexts in authCache */
+<span class="fc" id="L621">        private SecurityManager cacheSecurityManager = null;</span>
+
+        private Socket socket;
+        private String remoteHost;
+
+<span class="fc" id="L626">        ConnectionHandler(Socket socket, String remoteHost) {</span>
+<span class="fc" id="L627">            this.socket = socket;</span>
+<span class="fc" id="L628">            this.remoteHost = remoteHost;</span>
+<span class="fc" id="L629">        }</span>
+
+        String getClientHost() {
+<span class="fc" id="L632">            return remoteHost;</span>
+        }
+
+        /**
+         * Verify that the given AccessControlContext has permission to
+         * accept this connection.
+         */
+        void checkAcceptPermission(SecurityManager sm,
+                                   AccessControlContext acc)
+        {
+            /*
+             * Note: no need to synchronize on cache-related fields, since this
+             * method only gets called from the ConnectionHandler's thread.
+             */
+<span class="fc bfc" id="L646" title="All 2 branches covered.">            if (sm != cacheSecurityManager) {</span>
+<span class="fc" id="L647">                okContext = null;</span>
+<span class="fc" id="L648">                authCache = new WeakHashMap&lt;AccessControlContext,</span>
+                                            Reference&lt;AccessControlContext&gt;&gt;();
+<span class="fc" id="L650">                cacheSecurityManager = sm;</span>
+            }
+<span class="fc bfc" id="L652" title="All 4 branches covered.">            if (acc.equals(okContext) || authCache.containsKey(acc)) {</span>
+<span class="fc" id="L653">                return;</span>
+            }
+<span class="fc" id="L655">            InetAddress addr = socket.getInetAddress();</span>
+<span class="fc bfc" id="L656" title="All 2 branches covered.">            String host = (addr != null) ? addr.getHostAddress() : &quot;*&quot;;</span>
+
+<span class="fc" id="L658">            sm.checkAccept(host, socket.getPort());</span>
+
+<span class="fc" id="L660">            authCache.put(acc, new SoftReference&lt;AccessControlContext&gt;(acc));</span>
+<span class="fc" id="L661">            okContext = acc;</span>
+<span class="fc" id="L662">        }</span>
+
+        public void run() {
+<span class="fc" id="L665">            Thread t = Thread.currentThread();</span>
+<span class="fc" id="L666">            String name = t.getName();</span>
+            try {
+<span class="fc" id="L668">                t.setName(&quot;RMI TCP Connection(&quot; +</span>
+<span class="fc" id="L669">                          connectionCount.incrementAndGet() +</span>
+                          &quot;)-&quot; + remoteHost);
+<span class="fc" id="L671">                run0();</span>
+            } finally {
+<span class="pc" id="L673">                t.setName(name);</span>
+<span class="fc" id="L674">            }</span>
+<span class="fc" id="L675">        }</span>
+
+        private void run0() {
+<span class="fc" id="L678">            TCPEndpoint endpoint = getEndpoint();</span>
+<span class="fc" id="L679">            int port = endpoint.getPort();</span>
+
+<span class="fc" id="L681">            threadConnectionHandler.set(this);</span>
+
+            // set socket to disable Nagle's algorithm (always send
+            // immediately)
+            // TBD: should this be left up to socket factory instead?
+            try {
+<span class="fc" id="L687">                socket.setTcpNoDelay(true);</span>
+<span class="nc" id="L688">            } catch (Exception e) {</span>
+                // if we fail to set this, ignore and proceed anyway
+<span class="fc" id="L690">            }</span>
+            // set socket to timeout after excessive idle time
+            try {
+<span class="pc bpc" id="L693" title="1 of 2 branches missed.">                if (connectionReadTimeout &gt; 0)</span>
+<span class="fc" id="L694">                    socket.setSoTimeout(connectionReadTimeout);</span>
+<span class="nc" id="L695">            } catch (Exception e) {</span>
+                // too bad, continue anyway
+<span class="fc" id="L697">            }</span>
+
+            try {
+<span class="fc" id="L700">                InputStream sockIn = socket.getInputStream();</span>
+<span class="fc bfc" id="L701" title="All 2 branches covered.">                InputStream bufIn = sockIn.markSupported()</span>
+                        ? sockIn
+                        : new BufferedInputStream(sockIn);
+
+                // Read magic (or HTTP wrapper)
+<span class="fc" id="L706">                bufIn.mark(4);</span>
+<span class="fc" id="L707">                DataInputStream in = new DataInputStream(bufIn);</span>
+<span class="fc" id="L708">                int magic = in.readInt();</span>
+
+<span class="fc bfc" id="L710" title="All 2 branches covered.">                if (magic == POST) {</span>
+<span class="fc" id="L711">                    tcpLog.log(Log.BRIEF, &quot;decoding HTTP-wrapped call&quot;);</span>
+
+                    // It's really a HTTP-wrapped request.  Repackage
+                    // the socket in a HttpReceiveSocket, reinitialize
+                    // sockIn and in, and reread magic.
+<span class="fc" id="L716">                    bufIn.reset();      // unread &quot;POST&quot;</span>
+
+                    try {
+<span class="fc" id="L719">                        socket = new HttpReceiveSocket(socket, bufIn, null);</span>
+<span class="fc" id="L720">                        remoteHost = &quot;0.0.0.0&quot;;</span>
+<span class="fc" id="L721">                        sockIn = socket.getInputStream();</span>
+<span class="fc" id="L722">                        bufIn = new BufferedInputStream(sockIn);</span>
+<span class="fc" id="L723">                        in = new DataInputStream(bufIn);</span>
+<span class="fc" id="L724">                        magic = in.readInt();</span>
+
+<span class="nc" id="L726">                    } catch (IOException e) {</span>
+<span class="nc" id="L727">                        throw new RemoteException(&quot;Error HTTP-unwrapping call&quot;,</span>
+                                                  e);
+<span class="fc" id="L729">                    }</span>
+                }
+                // bufIn's mark will invalidate itself when it overflows
+                // so it doesn't have to be turned off
+
+                // read and verify transport header
+<span class="fc" id="L735">                short version = in.readShort();</span>
+<span class="pc bpc" id="L736" title="2 of 4 branches missed.">                if (magic != TransportConstants.Magic ||</span>
+                    version != TransportConstants.Version) {
+                    // protocol mismatch detected...
+                    // just close socket: this would recurse if we marshal an
+                    // exception to the client and the protocol at other end
+                    // doesn't match.
+<span class="nc" id="L742">                    closeSocket(socket);</span>
+<span class="nc" id="L743">                    return;</span>
+                }
+
+<span class="fc" id="L746">                OutputStream sockOut = socket.getOutputStream();</span>
+<span class="fc" id="L747">                BufferedOutputStream bufOut =</span>
+                    new BufferedOutputStream(sockOut);
+<span class="fc" id="L749">                DataOutputStream out = new DataOutputStream(bufOut);</span>
+
+<span class="fc" id="L751">                int remotePort = socket.getPort();</span>
+
+<span class="fc bfc" id="L753" title="All 2 branches covered.">                if (tcpLog.isLoggable(Log.BRIEF)) {</span>
+<span class="fc" id="L754">                    tcpLog.log(Log.BRIEF, &quot;accepted socket from [&quot; +</span>
+                                     remoteHost + &quot;:&quot; + remotePort + &quot;]&quot;);
+                }
+
+                TCPEndpoint ep;
+                TCPChannel ch;
+                TCPConnection conn;
+
+                // send ack (or nack) for protocol
+<span class="fc" id="L763">                byte protocol = in.readByte();</span>
+<span class="pc bpc" id="L764" title="2 of 4 branches missed.">                switch (protocol) {</span>
+                case TransportConstants.SingleOpProtocol:
+                    // no ack for protocol
+
+                    // create dummy channel for receiving messages
+<span class="fc" id="L769">                    ep = new TCPEndpoint(remoteHost, socket.getLocalPort(),</span>
+<span class="fc" id="L770">                                         endpoint.getClientSocketFactory(),</span>
+<span class="fc" id="L771">                                         endpoint.getServerSocketFactory());</span>
+<span class="fc" id="L772">                    ch = new TCPChannel(TCPTransport.this, ep);</span>
+<span class="fc" id="L773">                    conn = new TCPConnection(ch, socket, bufIn, bufOut);</span>
+
+                    // read input messages
+<span class="fc" id="L776">                    handleMessages(conn, false);</span>
+<span class="fc" id="L777">                    break;</span>
+
+                case TransportConstants.StreamProtocol:
+                    // send ack
+<span class="fc" id="L781">                    out.writeByte(TransportConstants.ProtocolAck);</span>
+
+                    // suggest endpoint (in case client doesn't know host name)
+<span class="fc bfc" id="L784" title="All 2 branches covered.">                    if (tcpLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="fc" id="L785">                        tcpLog.log(Log.VERBOSE, &quot;(port &quot; + port +</span>
+                            &quot;) &quot; + &quot;suggesting &quot; + remoteHost + &quot;:&quot; +
+                            remotePort);
+                    }
+
+<span class="fc" id="L790">                    out.writeUTF(remoteHost);</span>
+<span class="fc" id="L791">                    out.writeInt(remotePort);</span>
+<span class="fc" id="L792">                    out.flush();</span>
+
+                    // read and discard (possibly bogus) endpoint
+                    // REMIND: would be faster to read 2 bytes then skip N+4
+<span class="fc" id="L796">                    String clientHost = in.readUTF();</span>
+<span class="fc" id="L797">                    int    clientPort = in.readInt();</span>
+<span class="fc bfc" id="L798" title="All 2 branches covered.">                    if (tcpLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="fc" id="L799">                        tcpLog.log(Log.VERBOSE, &quot;(port &quot; + port +</span>
+                            &quot;) client using &quot; + clientHost + &quot;:&quot; + clientPort);
+                    }
+
+                    // create dummy channel for receiving messages
+                    // (why not use clientHost and clientPort?)
+<span class="fc" id="L805">                    ep = new TCPEndpoint(remoteHost, socket.getLocalPort(),</span>
+<span class="fc" id="L806">                                         endpoint.getClientSocketFactory(),</span>
+<span class="fc" id="L807">                                         endpoint.getServerSocketFactory());</span>
+<span class="fc" id="L808">                    ch = new TCPChannel(TCPTransport.this, ep);</span>
+<span class="fc" id="L809">                    conn = new TCPConnection(ch, socket, bufIn, bufOut);</span>
+
+                    // read input messages
+<span class="fc" id="L812">                    handleMessages(conn, true);</span>
+<span class="fc" id="L813">                    break;</span>
+
+                case TransportConstants.MultiplexProtocol:
+<span class="nc bnc" id="L816" title="All 2 branches missed.">                    if (tcpLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="nc" id="L817">                        tcpLog.log(Log.VERBOSE, &quot;(port &quot; + port +</span>
+                            &quot;) accepting multiplex protocol&quot;);
+                    }
+
+                    // send ack
+<span class="nc" id="L822">                    out.writeByte(TransportConstants.ProtocolAck);</span>
+
+                    // suggest endpoint (in case client doesn't already have one)
+<span class="nc bnc" id="L825" title="All 2 branches missed.">                    if (tcpLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="nc" id="L826">                        tcpLog.log(Log.VERBOSE, &quot;(port &quot; + port +</span>
+                            &quot;) suggesting &quot; + remoteHost + &quot;:&quot; + remotePort);
+                    }
+
+<span class="nc" id="L830">                    out.writeUTF(remoteHost);</span>
+<span class="nc" id="L831">                    out.writeInt(remotePort);</span>
+<span class="nc" id="L832">                    out.flush();</span>
+
+                    // read endpoint client has decided to use
+<span class="nc" id="L835">                    ep = new TCPEndpoint(in.readUTF(), in.readInt(),</span>
+<span class="nc" id="L836">                                         endpoint.getClientSocketFactory(),</span>
+<span class="nc" id="L837">                                         endpoint.getServerSocketFactory());</span>
+<span class="nc bnc" id="L838" title="All 2 branches missed.">                    if (tcpLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="nc" id="L839">                        tcpLog.log(Log.VERBOSE, &quot;(port &quot; +</span>
+                            port + &quot;) client using &quot; +
+<span class="nc" id="L841">                            ep.getHost() + &quot;:&quot; + ep.getPort());</span>
+                    }
+
+                    ConnectionMultiplexer multiplexer;
+<span class="nc" id="L845">                    synchronized (channelTable) {</span>
+                        // create or find channel for this endpoint
+<span class="nc" id="L847">                        ch = getChannel(ep);</span>
+<span class="nc" id="L848">                        multiplexer =</span>
+                            new ConnectionMultiplexer(ch, bufIn, sockOut,
+                                                      false);
+<span class="nc" id="L851">                        ch.useMultiplexer(multiplexer);</span>
+<span class="nc" id="L852">                    }</span>
+<span class="nc" id="L853">                    multiplexer.run();</span>
+<span class="nc" id="L854">                    break;</span>
+
+                default:
+                    // protocol not understood, send nack and close socket
+<span class="nc" id="L858">                    out.writeByte(TransportConstants.ProtocolNack);</span>
+<span class="nc" id="L859">                    out.flush();</span>
+                    break;
+                }
+
+<span class="fc" id="L863">            } catch (IOException e) {</span>
+                // socket in unknown state: destroy socket
+<span class="fc" id="L865">                tcpLog.log(Log.BRIEF, &quot;terminated with exception:&quot;, e);</span>
+            } finally {
+<span class="pc" id="L867">                closeSocket(socket);</span>
+<span class="fc" id="L868">            }</span>
+<span class="fc" id="L869">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

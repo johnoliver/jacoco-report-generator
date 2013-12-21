@@ -1,0 +1,1617 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>LdapClient.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">com.sun.jndi.ldap</a> &gt; <span class="el_source">LdapClient.java</span></div><h1>LdapClient.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1999, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package com.sun.jndi.ldap;
+
+import java.io.*;
+import java.util.Locale;
+import java.util.Vector;
+import java.util.Hashtable;
+
+import javax.naming.*;
+import javax.naming.directory.*;
+import javax.naming.ldap.*;
+
+import com.sun.jndi.ldap.pool.PooledConnection;
+import com.sun.jndi.ldap.pool.PoolCallback;
+import com.sun.jndi.ldap.sasl.LdapSasl;
+import com.sun.jndi.ldap.sasl.SaslInputStream;
+
+/**
+ * LDAP (RFC-1777) and LDAPv3 (RFC-2251) compliant client
+ *
+ * This class represents a connection to an LDAP client.
+ * Callers interact with this class at an LDAP operation level.
+ * That is, the caller invokes a method to do a SEARCH or MODRDN
+ * operation and gets back the result.
+ * The caller uses the constructor to create a connection to the server.
+ * It then needs to use authenticate() to perform an LDAP BIND.
+ * Note that for v3, BIND is optional so authenticate() might not
+ * actually send a BIND. authenticate() can be used later on to issue
+ * a BIND, for example, for a v3 client that wants to change the connection's
+ * credentials.
+ *&lt;p&gt;
+ * Multiple LdapCtx might share the same LdapClient. For example, contexts
+ * derived from the same initial context would share the same LdapClient
+ * until changes to a context's properties necessitates its own LdapClient.
+ * LdapClient methods that access shared data are thread-safe (i.e., caller
+ * does not have to sync).
+ *&lt;p&gt;
+ * Fields:
+ *   isLdapv3 - no sync; initialized and updated within sync authenticate();
+ *       always updated when connection is &quot;quiet&quot; and not shared;
+ *       read access from outside LdapClient not sync
+ *   referenceCount - sync within LdapClient; exception is forceClose() which
+ *       is used by Connection thread to close connection upon receiving
+ *       an Unsolicited Notification.
+ *       access from outside LdapClient must sync;
+ *   conn - no sync; Connection takes care of its own sync
+ *   unsolicited - sync Vector; multiple operations sync'ed
+ *
+ * @author Vincent Ryan
+ * @author Jagane Sundar
+ * @author Rosanna Lee
+ */
+
+public final class LdapClient implements PooledConnection {
+    // ---------------------- Constants ----------------------------------
+    private static final int debug = 0;
+    static final boolean caseIgnore = true;
+
+    // Default list of binary attributes
+<span class="fc" id="L84">    private static final Hashtable&lt;String, Boolean&gt; defaultBinaryAttrs =</span>
+            new Hashtable&lt;&gt;(23,0.75f);
+    static {
+<span class="fc" id="L87">        defaultBinaryAttrs.put(&quot;userpassword&quot;, Boolean.TRUE);      //2.5.4.35</span>
+<span class="fc" id="L88">        defaultBinaryAttrs.put(&quot;javaserializeddata&quot;, Boolean.TRUE);</span>
+                                                //1.3.6.1.4.1.42.2.27.4.1.8
+<span class="fc" id="L90">        defaultBinaryAttrs.put(&quot;javaserializedobject&quot;, Boolean.TRUE);</span>
+                                                // 1.3.6.1.4.1.42.2.27.4.1.2
+<span class="fc" id="L92">        defaultBinaryAttrs.put(&quot;jpegphoto&quot;, Boolean.TRUE);</span>
+                                                //0.9.2342.19200300.100.1.60
+<span class="fc" id="L94">        defaultBinaryAttrs.put(&quot;audio&quot;, Boolean.TRUE);  //0.9.2342.19200300.100.1.55</span>
+<span class="fc" id="L95">        defaultBinaryAttrs.put(&quot;thumbnailphoto&quot;, Boolean.TRUE);</span>
+                                                //1.3.6.1.4.1.1466.101.120.35
+<span class="fc" id="L97">        defaultBinaryAttrs.put(&quot;thumbnaillogo&quot;, Boolean.TRUE);</span>
+                                                //1.3.6.1.4.1.1466.101.120.36
+<span class="fc" id="L99">        defaultBinaryAttrs.put(&quot;usercertificate&quot;, Boolean.TRUE);     //2.5.4.36</span>
+<span class="fc" id="L100">        defaultBinaryAttrs.put(&quot;cacertificate&quot;, Boolean.TRUE);       //2.5.4.37</span>
+<span class="fc" id="L101">        defaultBinaryAttrs.put(&quot;certificaterevocationlist&quot;, Boolean.TRUE);</span>
+                                                //2.5.4.39
+<span class="fc" id="L103">        defaultBinaryAttrs.put(&quot;authorityrevocationlist&quot;, Boolean.TRUE); //2.5.4.38</span>
+<span class="fc" id="L104">        defaultBinaryAttrs.put(&quot;crosscertificatepair&quot;, Boolean.TRUE);    //2.5.4.40</span>
+<span class="fc" id="L105">        defaultBinaryAttrs.put(&quot;photo&quot;, Boolean.TRUE);   //0.9.2342.19200300.100.1.7</span>
+<span class="fc" id="L106">        defaultBinaryAttrs.put(&quot;personalsignature&quot;, Boolean.TRUE);</span>
+                                                //0.9.2342.19200300.100.1.53
+<span class="fc" id="L108">        defaultBinaryAttrs.put(&quot;x500uniqueidentifier&quot;, Boolean.TRUE); //2.5.4.45</span>
+    }
+
+    private static final String DISCONNECT_OID = &quot;1.3.6.1.4.1.1466.20036&quot;;
+
+
+    // ----------------------- instance fields ------------------------
+    boolean isLdapv3;         // Used by LdapCtx
+<span class="fc" id="L116">    int referenceCount = 1;   // Used by LdapCtx for check for sharing</span>
+
+    Connection conn;  // Connection to server; has reader thread
+                      // used by LdapCtx for StartTLS
+
+    final private PoolCallback pcb;
+    final private boolean pooled;
+<span class="fc" id="L123">    private boolean authenticateCalled = false;</span>
+
+    ////////////////////////////////////////////////////////////////////////////
+    //
+    // constructor: Create an authenticated connection to server
+    //
+    ////////////////////////////////////////////////////////////////////////////
+
+    LdapClient(String host, int port, String socketFactory,
+        int connectTimeout, int readTimeout, OutputStream trace, PoolCallback pcb)
+<span class="fc" id="L133">        throws NamingException {</span>
+
+        if (debug &gt; 0)
+            System.err.println(&quot;LdapClient: constructor called &quot; + host + &quot;:&quot; + port );
+<span class="fc" id="L137">        conn = new Connection(this, host, port, socketFactory, connectTimeout, readTimeout,</span>
+            trace);
+
+<span class="fc" id="L140">        this.pcb = pcb;</span>
+<span class="pc bpc" id="L141" title="1 of 2 branches missed.">        pooled = (pcb != null);</span>
+<span class="fc" id="L142">    }</span>
+
+    synchronized boolean authenticateCalled() {
+<span class="fc" id="L145">        return authenticateCalled;</span>
+    }
+
+    synchronized LdapResult
+    authenticate(boolean initial, String name, Object pw, int version,
+        String authMechanism, Control[] ctls,  Hashtable&lt;?,?&gt; env)
+        throws NamingException {
+
+<span class="fc" id="L153">        int readTimeout = conn.readTimeout;</span>
+<span class="fc" id="L154">        conn.readTimeout = conn.connectTimeout;</span>
+<span class="fc" id="L155">        LdapResult res = null;</span>
+
+        try {
+<span class="fc" id="L158">            authenticateCalled = true;</span>
+
+            try {
+<span class="fc" id="L161">                ensureOpen();</span>
+<span class="nc" id="L162">            } catch (IOException e) {</span>
+<span class="nc" id="L163">                NamingException ne = new CommunicationException();</span>
+<span class="nc" id="L164">                ne.setRootCause(e);</span>
+<span class="nc" id="L165">                throw ne;</span>
+<span class="fc" id="L166">            }</span>
+
+<span class="pc bpc" id="L168" title="2 of 3 branches missed.">            switch (version) {</span>
+            case LDAP_VERSION3_VERSION2:
+            case LDAP_VERSION3:
+<span class="fc" id="L171">                isLdapv3 = true;</span>
+<span class="fc" id="L172">                break;</span>
+            case LDAP_VERSION2:
+<span class="nc" id="L174">                isLdapv3 = false;</span>
+<span class="nc" id="L175">                break;</span>
+            default:
+<span class="nc" id="L177">                throw new CommunicationException(&quot;Protocol version &quot; + version +</span>
+                    &quot; not supported&quot;);
+            }
+
+<span class="fc bfc" id="L181" title="All 2 branches covered.">            if (authMechanism.equalsIgnoreCase(&quot;none&quot;) ||</span>
+<span class="pc bpc" id="L182" title="1 of 2 branches missed.">                authMechanism.equalsIgnoreCase(&quot;anonymous&quot;)) {</span>
+
+                // Perform LDAP bind if we are reauthenticating, using LDAPv2,
+                // supporting failover to LDAPv2, or controls have been supplied.
+<span class="pc bpc" id="L186" title="5 of 10 branches missed.">                if (!initial ||</span>
+                    (version == LDAP_VERSION2) ||
+                    (version == LDAP_VERSION3_VERSION2) ||
+                    ((ctls != null) &amp;&amp; (ctls.length &gt; 0))) {
+                    try {
+                        // anonymous bind; update name/pw for LDAPv2 retry
+<span class="fc" id="L192">                        res = ldapBind(name=null, (byte[])(pw=null), ctls, null,</span>
+                            false);
+<span class="pc bpc" id="L194" title="1 of 2 branches missed.">                        if (res.status == LdapClient.LDAP_SUCCESS) {</span>
+<span class="fc" id="L195">                            conn.setBound();</span>
+                        }
+<span class="nc" id="L197">                    } catch (IOException e) {</span>
+<span class="nc" id="L198">                        NamingException ne =</span>
+                            new CommunicationException(&quot;anonymous bind failed: &quot; +
+                            conn.host + &quot;:&quot; + conn.port);
+<span class="nc" id="L201">                        ne.setRootCause(e);</span>
+<span class="nc" id="L202">                        throw ne;</span>
+<span class="fc" id="L203">                    }</span>
+                } else {
+                    // Skip LDAP bind for LDAPv3 anonymous bind
+<span class="fc" id="L206">                    res = new LdapResult();</span>
+<span class="fc" id="L207">                    res.status = LdapClient.LDAP_SUCCESS;</span>
+                }
+<span class="pc bpc" id="L209" title="1 of 2 branches missed.">            } else if (authMechanism.equalsIgnoreCase(&quot;simple&quot;)) {</span>
+                // simple authentication
+<span class="fc" id="L211">                byte[] encodedPw = null;</span>
+                try {
+<span class="nc" id="L213">                    encodedPw = encodePassword(pw, isLdapv3);</span>
+<span class="nc" id="L214">                    res = ldapBind(name, encodedPw, ctls, null, false);</span>
+<span class="nc bnc" id="L215" title="All 2 branches missed.">                    if (res.status == LdapClient.LDAP_SUCCESS) {</span>
+<span class="nc" id="L216">                        conn.setBound();</span>
+                    }
+<span class="nc" id="L218">                } catch (IOException e) {</span>
+<span class="nc" id="L219">                    NamingException ne =</span>
+                        new CommunicationException(&quot;simple bind failed: &quot; +
+                            conn.host + &quot;:&quot; + conn.port);
+<span class="nc" id="L222">                    ne.setRootCause(e);</span>
+<span class="nc" id="L223">                    throw ne;</span>
+                } finally {
+                    // If pw was copied to a new array, clear that array as
+                    // a security precaution.
+<span class="pc bpc" id="L227" title="6 of 8 branches missed.">                    if (encodedPw != pw &amp;&amp; encodedPw != null) {</span>
+<span class="pc bpc" id="L228" title="2 of 4 branches missed.">                        for (int i = 0; i &lt; encodedPw.length; i++) {</span>
+<span class="pc" id="L229">                            encodedPw[i] = 0;</span>
+                        }
+                    }
+                }
+<span class="nc bnc" id="L233" title="All 2 branches missed.">            } else if (isLdapv3) {</span>
+                // SASL authentication
+                try {
+<span class="nc" id="L236">                    res = LdapSasl.saslBind(this, conn, conn.host, name, pw,</span>
+                        authMechanism, env, ctls);
+<span class="nc bnc" id="L238" title="All 2 branches missed.">                    if (res.status == LdapClient.LDAP_SUCCESS) {</span>
+<span class="nc" id="L239">                        conn.setBound();</span>
+                    }
+<span class="nc" id="L241">                } catch (IOException e) {</span>
+<span class="nc" id="L242">                    NamingException ne =</span>
+                        new CommunicationException(&quot;SASL bind failed: &quot; +
+                        conn.host + &quot;:&quot; + conn.port);
+<span class="nc" id="L245">                    ne.setRootCause(e);</span>
+<span class="nc" id="L246">                    throw ne;</span>
+<span class="nc" id="L247">                }</span>
+            } else {
+<span class="nc" id="L249">                throw new AuthenticationNotSupportedException(authMechanism);</span>
+            }
+
+            //
+            // re-try login using v2 if failing over
+            //
+<span class="pc bpc" id="L255" title="4 of 6 branches missed.">            if (initial &amp;&amp;</span>
+                (res.status == LdapClient.LDAP_PROTOCOL_ERROR) &amp;&amp;
+                (version == LdapClient.LDAP_VERSION3_VERSION2) &amp;&amp;
+<span class="nc bnc" id="L258" title="All 2 branches missed.">                (authMechanism.equalsIgnoreCase(&quot;none&quot;) ||</span>
+<span class="nc bnc" id="L259" title="All 2 branches missed.">                    authMechanism.equalsIgnoreCase(&quot;anonymous&quot;) ||</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">                    authMechanism.equalsIgnoreCase(&quot;simple&quot;))) {</span>
+
+<span class="nc" id="L262">                byte[] encodedPw = null;</span>
+                try {
+<span class="nc" id="L264">                    isLdapv3 = false;</span>
+<span class="nc" id="L265">                    encodedPw = encodePassword(pw, false);</span>
+<span class="nc" id="L266">                    res = ldapBind(name, encodedPw, ctls, null, false);</span>
+<span class="nc bnc" id="L267" title="All 2 branches missed.">                    if (res.status == LdapClient.LDAP_SUCCESS) {</span>
+<span class="nc" id="L268">                        conn.setBound();</span>
+                    }
+<span class="nc" id="L270">                } catch (IOException e) {</span>
+<span class="nc" id="L271">                    NamingException ne =</span>
+                        new CommunicationException(authMechanism + &quot;:&quot; +
+                            conn.host +     &quot;:&quot; + conn.port);
+<span class="nc" id="L274">                    ne.setRootCause(e);</span>
+<span class="nc" id="L275">                    throw ne;</span>
+                } finally {
+                    // If pw was copied to a new array, clear that array as
+                    // a security precaution.
+<span class="nc bnc" id="L279" title="All 8 branches missed.">                    if (encodedPw != pw &amp;&amp; encodedPw != null) {</span>
+<span class="nc bnc" id="L280" title="All 4 branches missed.">                        for (int i = 0; i &lt; encodedPw.length; i++) {</span>
+<span class="nc" id="L281">                            encodedPw[i] = 0;</span>
+                        }
+                    }
+                }
+            }
+
+            // principal name not found
+            // (map NameNotFoundException to AuthenticationException)
+            // %%% This is a workaround for Netscape servers returning
+            // %%% no such object when the principal name is not found
+            // %%% Note that when this workaround is applied, it does not allow
+            // %%% response controls to be recorded by the calling context
+<span class="pc bpc" id="L293" title="1 of 2 branches missed.">            if (res.status == LdapClient.LDAP_NO_SUCH_OBJECT) {</span>
+<span class="nc" id="L294">                throw new AuthenticationException(</span>
+<span class="nc" id="L295">                    getErrorMessage(res.status, res.errorMessage));</span>
+            }
+<span class="fc" id="L297">            conn.setV3(isLdapv3);</span>
+<span class="fc" id="L298">            return res;</span>
+        } finally {
+<span class="fc" id="L300">            conn.readTimeout = readTimeout;</span>
+        }
+    }
+
+    /**
+     * Sends an LDAP Bind request.
+     * Cannot be private; called by LdapSasl
+     * @param dn The possibly null DN to use in the BIND request. null if anonymous.
+     * @param toServer The possibly null array of bytes to send to the server.
+     * @param auth The authentication mechanism
+     *
+     */
+    synchronized public LdapResult ldapBind(String dn, byte[]toServer,
+        Control[] bindCtls, String auth, boolean pauseAfterReceipt)
+        throws java.io.IOException, NamingException {
+
+<span class="fc" id="L316">        ensureOpen();</span>
+
+        // flush outstanding requests
+<span class="fc" id="L319">        conn.abandonOutstandingReqs(null);</span>
+
+<span class="fc" id="L321">        BerEncoder ber = new BerEncoder();</span>
+<span class="fc" id="L322">        int curMsgId = conn.getMsgId();</span>
+<span class="fc" id="L323">        LdapResult res = new LdapResult();</span>
+<span class="fc" id="L324">        res.status = LDAP_OPERATIONS_ERROR;</span>
+
+        //
+        // build the bind request.
+        //
+<span class="fc" id="L329">        ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);</span>
+<span class="fc" id="L330">            ber.encodeInt(curMsgId);</span>
+<span class="fc" id="L331">            ber.beginSeq(LdapClient.LDAP_REQ_BIND);</span>
+<span class="pc bpc" id="L332" title="1 of 2 branches missed.">                ber.encodeInt(isLdapv3 ? LDAP_VERSION3 : LDAP_VERSION2);</span>
+<span class="fc" id="L333">                ber.encodeString(dn, isLdapv3);</span>
+
+                // if authentication mechanism specified, it is SASL
+<span class="pc bpc" id="L336" title="1 of 2 branches missed.">                if (auth != null) {</span>
+<span class="nc" id="L337">                    ber.beginSeq(Ber.ASN_CONTEXT | Ber.ASN_CONSTRUCTOR | 3);</span>
+<span class="nc" id="L338">                        ber.encodeString(auth, isLdapv3);    // SASL mechanism</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">                        if (toServer != null) {</span>
+<span class="nc" id="L340">                            ber.encodeOctetString(toServer,</span>
+                                Ber.ASN_OCTET_STR);
+                        }
+<span class="nc" id="L343">                    ber.endSeq();</span>
+                } else {
+<span class="fc bfc" id="L345" title="All 2 branches covered.">                    if (toServer != null) {</span>
+<span class="fc" id="L346">                        ber.encodeOctetString(toServer, Ber.ASN_CONTEXT);</span>
+                    } else {
+<span class="fc" id="L348">                        ber.encodeOctetString(null, Ber.ASN_CONTEXT, 0, 0);</span>
+                    }
+                }
+<span class="fc" id="L351">            ber.endSeq();</span>
+
+            // Encode controls
+<span class="pc bpc" id="L354" title="1 of 2 branches missed.">            if (isLdapv3) {</span>
+<span class="fc" id="L355">                encodeControls(ber, bindCtls);</span>
+            }
+<span class="fc" id="L357">        ber.endSeq();</span>
+
+<span class="fc" id="L359">        LdapRequest req = conn.writeRequest(ber, curMsgId, pauseAfterReceipt);</span>
+<span class="fc bfc" id="L360" title="All 2 branches covered.">        if (toServer != null) {</span>
+<span class="fc" id="L361">            ber.reset();        // clear internally-stored password</span>
+        }
+
+        // Read reply
+<span class="fc" id="L365">        BerDecoder rber = conn.readReply(req);</span>
+
+<span class="fc" id="L367">        rber.parseSeq(null);    // init seq</span>
+<span class="fc" id="L368">        rber.parseInt();        // msg id</span>
+<span class="pc bpc" id="L369" title="1 of 2 branches missed.">        if (rber.parseByte() !=  LDAP_REP_BIND) {</span>
+<span class="nc" id="L370">            return res;</span>
+        }
+
+<span class="fc" id="L373">        rber.parseLength();</span>
+<span class="fc" id="L374">        parseResult(rber, res, isLdapv3);</span>
+
+        // handle server's credentials (if present)
+<span class="pc bpc" id="L377" title="1 of 2 branches missed.">        if (isLdapv3 &amp;&amp;</span>
+<span class="pc bpc" id="L378" title="1 of 2 branches missed.">            (rber.bytesLeft() &gt; 0) &amp;&amp;</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">            (rber.peekByte() == (Ber.ASN_CONTEXT | 7))) {</span>
+<span class="nc" id="L380">            res.serverCreds = rber.parseOctetString((Ber.ASN_CONTEXT | 7), null);</span>
+        }
+
+<span class="pc bpc" id="L383" title="1 of 2 branches missed.">        res.resControls = isLdapv3 ? parseControls(rber) : null;</span>
+
+<span class="fc" id="L385">        conn.removeRequest(req);</span>
+<span class="fc" id="L386">        return res;</span>
+    }
+
+    /**
+     * Determines whether SASL encryption/integrity is in progress.
+     * This check is made prior to reauthentication. You cannot reauthenticate
+     * over an encrypted/integrity-protected SASL channel. You must
+     * close the channel and open a new one.
+     */
+    boolean usingSaslStreams() {
+<span class="nc" id="L396">        return (conn.inStream instanceof SaslInputStream);</span>
+    }
+
+    synchronized void incRefCount() {
+<span class="nc" id="L400">        ++referenceCount;</span>
+        if (debug &gt; 1) {
+            System.err.println(&quot;LdapClient.incRefCount: &quot; + referenceCount + &quot; &quot; + this);
+        }
+
+<span class="nc" id="L405">    }</span>
+
+    /**
+     * Returns the encoded password.
+     */
+    private static byte[] encodePassword(Object pw, boolean v3) throws IOException {
+
+<span class="pc bpc" id="L412" title="1 of 2 branches missed.">        if (pw instanceof char[]) {</span>
+<span class="nc" id="L413">            pw = new String((char[])pw);</span>
+        }
+
+<span class="pc bpc" id="L416" title="1 of 2 branches missed.">        if (pw instanceof String) {</span>
+<span class="pc bpc" id="L417" title="1 of 2 branches missed.">            if (v3) {</span>
+<span class="fc" id="L418">                return ((String)pw).getBytes(&quot;UTF8&quot;);</span>
+            } else {
+<span class="nc" id="L420">                return ((String)pw).getBytes(&quot;8859_1&quot;);</span>
+            }
+        } else {
+<span class="nc" id="L423">            return (byte[])pw;</span>
+        }
+    }
+
+    synchronized void close(Control[] reqCtls, boolean hardClose) {
+<span class="fc" id="L428">        --referenceCount;</span>
+
+        if (debug &gt; 1) {
+            System.err.println(&quot;LdapClient: &quot; + this);
+            System.err.println(&quot;LdapClient: close() called: &quot; + referenceCount);
+            (new Throwable()).printStackTrace();
+        }
+
+<span class="pc bpc" id="L436" title="2 of 4 branches missed.">        if (referenceCount &lt;= 0 &amp;&amp; conn != null) {</span>
+            if (debug &gt; 0) System.err.println(&quot;LdapClient: closed connection &quot; + this);
+<span class="pc bpc" id="L438" title="1 of 2 branches missed.">            if (!pooled) {</span>
+                // Not being pooled; continue with closing
+<span class="fc" id="L440">                conn.cleanup(reqCtls, false);</span>
+<span class="fc" id="L441">                conn = null;</span>
+            } else {
+                // Pooled
+
+                // Is this a real close or a request to return conn to pool
+<span class="nc bnc" id="L446" title="All 2 branches missed.">                if (hardClose) {</span>
+<span class="nc" id="L447">                    conn.cleanup(reqCtls, false);</span>
+<span class="nc" id="L448">                    conn = null;</span>
+<span class="nc" id="L449">                    pcb.removePooledConnection(this);</span>
+                } else {
+<span class="nc" id="L451">                    pcb.releasePooledConnection(this);</span>
+                }
+            }
+        }
+<span class="fc" id="L455">    }</span>
+
+    // NOTE: Should NOT be synchronized otherwise won't be able to close
+    private void forceClose(boolean cleanPool) {
+<span class="fc" id="L459">        referenceCount = 0; // force closing of connection</span>
+
+        if (debug &gt; 1) {
+            System.err.println(&quot;LdapClient: forceClose() of &quot; + this);
+        }
+
+<span class="pc bpc" id="L465" title="1 of 2 branches missed.">        if (conn != null) {</span>
+            if (debug &gt; 0) System.err.println(
+                &quot;LdapClient: forced close of connection &quot; + this);
+<span class="nc" id="L468">            conn.cleanup(null, false);</span>
+<span class="nc" id="L469">            conn = null;</span>
+
+<span class="nc bnc" id="L471" title="All 2 branches missed.">            if (cleanPool) {</span>
+<span class="nc" id="L472">                pcb.removePooledConnection(this);</span>
+            }
+        }
+<span class="fc" id="L475">    }</span>
+
+    protected void finalize() {
+        if (debug &gt; 0) System.err.println(&quot;LdapClient: finalize &quot; + this);
+<span class="fc" id="L479">        forceClose(pooled);</span>
+<span class="fc" id="L480">    }</span>
+
+    /*
+     * Used by connection pooling to close physical connection.
+     */
+    synchronized public void closeConnection() {
+<span class="nc" id="L486">        forceClose(false); // this is a pool callback so no need to clean pool</span>
+<span class="nc" id="L487">    }</span>
+
+    /**
+     * Called by Connection.cleanup(). LdapClient should
+     * notify any unsolicited listeners and removing itself from any pool.
+     * This is almost like forceClose(), except it doesn't call
+     * Connection.cleanup() (because this is called from cleanup()).
+     */
+    void processConnectionClosure() {
+        // Notify listeners
+<span class="fc" id="L497">        synchronized (unsolicited) {</span>
+<span class="pc bpc" id="L498" title="1 of 2 branches missed.">            if (unsolicited.size() &gt; 0) {</span>
+                String msg;
+<span class="nc bnc" id="L500" title="All 2 branches missed.">                if (conn != null) {</span>
+<span class="nc" id="L501">                    msg = conn.host + &quot;:&quot; + conn.port + &quot; connection closed&quot;;</span>
+                } else {
+<span class="nc" id="L503">                    msg = &quot;Connection closed&quot;;</span>
+                }
+<span class="nc" id="L505">                notifyUnsolicited(new CommunicationException(msg));</span>
+            }
+<span class="pc" id="L507">        }</span>
+
+        // Remove from pool
+<span class="pc bpc" id="L510" title="1 of 2 branches missed.">        if (pooled) {</span>
+<span class="nc" id="L511">            pcb.removePooledConnection(this);</span>
+        }
+<span class="fc" id="L513">    }</span>
+
+    ////////////////////////////////////////////////////////////////////////////
+    //
+    // LDAP search. also includes methods to encode rfc 1558 compliant filters
+    //
+    ////////////////////////////////////////////////////////////////////////////
+
+    static final int SCOPE_BASE_OBJECT = 0;
+    static final int SCOPE_ONE_LEVEL = 1;
+    static final int SCOPE_SUBTREE = 2;
+
+    LdapResult search(String dn, int scope, int deref, int sizeLimit,
+                      int timeLimit, boolean attrsOnly, String attrs[],
+                      String filter, int batchSize, Control[] reqCtls,
+                      Hashtable&lt;String, Boolean&gt; binaryAttrs,
+                      boolean waitFirstReply, int replyQueueCapacity)
+        throws IOException, NamingException {
+
+<span class="fc" id="L532">        ensureOpen();</span>
+
+<span class="fc" id="L534">        LdapResult res = new LdapResult();</span>
+
+<span class="fc" id="L536">        BerEncoder ber = new BerEncoder();</span>
+<span class="fc" id="L537">        int curMsgId = conn.getMsgId();</span>
+
+<span class="fc" id="L539">            ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);</span>
+<span class="fc" id="L540">                ber.encodeInt(curMsgId);</span>
+<span class="fc" id="L541">                ber.beginSeq(LDAP_REQ_SEARCH);</span>
+<span class="pc bpc" id="L542" title="1 of 2 branches missed.">                    ber.encodeString(dn == null ? &quot;&quot; : dn, isLdapv3);</span>
+<span class="fc" id="L543">                    ber.encodeInt(scope, LBER_ENUMERATED);</span>
+<span class="fc" id="L544">                    ber.encodeInt(deref, LBER_ENUMERATED);</span>
+<span class="fc" id="L545">                    ber.encodeInt(sizeLimit);</span>
+<span class="fc" id="L546">                    ber.encodeInt(timeLimit);</span>
+<span class="fc" id="L547">                    ber.encodeBoolean(attrsOnly);</span>
+<span class="fc" id="L548">                    Filter.encodeFilterString(ber, filter, isLdapv3);</span>
+<span class="fc" id="L549">                    ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);</span>
+<span class="fc" id="L550">                        ber.encodeStringArray(attrs, isLdapv3);</span>
+<span class="fc" id="L551">                    ber.endSeq();</span>
+<span class="fc" id="L552">                ber.endSeq();</span>
+<span class="pc bpc" id="L553" title="1 of 2 branches missed.">                if (isLdapv3) encodeControls(ber, reqCtls);</span>
+<span class="fc" id="L554">            ber.endSeq();</span>
+
+<span class="fc" id="L556">         LdapRequest req =</span>
+<span class="fc" id="L557">                conn.writeRequest(ber, curMsgId, false, replyQueueCapacity);</span>
+
+<span class="fc" id="L559">         res.msgId = curMsgId;</span>
+<span class="fc" id="L560">         res.status = LdapClient.LDAP_SUCCESS; //optimistic</span>
+<span class="pc bpc" id="L561" title="1 of 2 branches missed.">         if (waitFirstReply) {</span>
+             // get first reply
+<span class="nc" id="L563">             res = getSearchReply(req, batchSize, res, binaryAttrs);</span>
+         }
+<span class="fc" id="L565">         return res;</span>
+    }
+
+    /*
+     * Abandon the search operation and remove it from the message queue.
+     */
+    void clearSearchReply(LdapResult res, Control[] ctls) {
+<span class="pc bpc" id="L572" title="2 of 4 branches missed.">        if (res != null &amp;&amp; conn != null) {</span>
+
+            // Only send an LDAP abandon operation when clearing the search
+            // reply from a one-level or subtree search.
+<span class="fc" id="L576">            LdapRequest req = conn.findRequest(res.msgId);</span>
+<span class="pc bpc" id="L577" title="1 of 2 branches missed.">            if (req == null) {</span>
+<span class="nc" id="L578">                return;</span>
+            }
+
+            // OK if req got removed after check; double removal attempt
+            // but otherwise no harm done
+
+            // Send an LDAP abandon only if the search operation has not yet
+            // completed.
+<span class="pc bpc" id="L586" title="1 of 2 branches missed.">            if (req.hasSearchCompleted()) {</span>
+<span class="nc" id="L587">                conn.removeRequest(req);</span>
+            } else {
+<span class="fc" id="L589">                conn.abandonRequest(req, ctls);</span>
+            }
+        }
+<span class="fc" id="L592">    }</span>
+
+    /*
+     * Retrieve the next batch of entries and/or referrals.
+     */
+    LdapResult getSearchReply(int batchSize, LdapResult res,
+        Hashtable&lt;String, Boolean&gt; binaryAttrs) throws IOException, NamingException {
+
+<span class="nc" id="L600">        ensureOpen();</span>
+
+        LdapRequest req;
+
+<span class="nc bnc" id="L604" title="All 2 branches missed.">        if ((req = conn.findRequest(res.msgId)) == null) {</span>
+<span class="nc" id="L605">            return null;</span>
+        }
+
+<span class="nc" id="L608">        return getSearchReply(req, batchSize, res, binaryAttrs);</span>
+    }
+
+    private LdapResult getSearchReply(LdapRequest req,
+        int batchSize, LdapResult res, Hashtable&lt;String, Boolean&gt; binaryAttrs)
+        throws IOException, NamingException {
+
+<span class="pc bpc" id="L615" title="1 of 2 branches missed.">        if (batchSize == 0)</span>
+<span class="nc" id="L616">            batchSize = Integer.MAX_VALUE;</span>
+
+<span class="pc bpc" id="L618" title="1 of 2 branches missed.">        if (res.entries != null) {</span>
+<span class="nc" id="L619">            res.entries.setSize(0); // clear the (previous) set of entries</span>
+        } else {
+<span class="pc bpc" id="L621" title="1 of 2 branches missed.">            res.entries =</span>
+                new Vector&lt;&gt;(batchSize == Integer.MAX_VALUE ? 32 : batchSize);
+        }
+
+<span class="pc bpc" id="L625" title="1 of 2 branches missed.">        if (res.referrals != null) {</span>
+<span class="nc" id="L626">            res.referrals.setSize(0); // clear the (previous) set of referrals</span>
+        }
+
+        BerDecoder replyBer;    // Decoder for response
+        int seq;                // Request id
+
+        Attributes lattrs;      // Attribute set read from response
+        Attribute la;           // Attribute read from response
+        String DN;              // DN read from response
+        LdapEntry le;           // LDAP entry representing response
+        int[] seqlen;           // Holder for response length
+        int endseq;             // Position of end of response
+
+<span class="pc bnc" id="L639" title="All 2 branches missed.">        for (int i = 0; i &lt; batchSize;) {</span>
+<span class="nc" id="L640">            replyBer = conn.readReply(req);</span>
+
+            //
+            // process search reply
+            //
+<span class="nc" id="L645">            replyBer.parseSeq(null);                    // init seq</span>
+<span class="nc" id="L646">            replyBer.parseInt();                        // req id</span>
+<span class="nc" id="L647">            seq = replyBer.parseSeq(null);</span>
+
+<span class="nc bnc" id="L649" title="All 2 branches missed.">            if (seq == LDAP_REP_SEARCH) {</span>
+
+                // handle LDAPv3 search entries
+<span class="nc" id="L652">                lattrs = new BasicAttributes(caseIgnore);</span>
+<span class="nc" id="L653">                DN = replyBer.parseString(isLdapv3);</span>
+<span class="nc" id="L654">                le = new LdapEntry(DN, lattrs);</span>
+<span class="nc" id="L655">                seqlen = new int[1];</span>
+
+<span class="nc" id="L657">                replyBer.parseSeq(seqlen);</span>
+<span class="nc" id="L658">                endseq = replyBer.getParsePosition() + seqlen[0];</span>
+<span class="nc bnc" id="L659" title="All 2 branches missed.">                while ((replyBer.getParsePosition() &lt; endseq) &amp;&amp;</span>
+<span class="nc bnc" id="L660" title="All 2 branches missed.">                    (replyBer.bytesLeft() &gt; 0)) {</span>
+<span class="nc" id="L661">                    la = parseAttribute(replyBer, binaryAttrs);</span>
+<span class="nc" id="L662">                    lattrs.put(la);</span>
+                }
+<span class="nc bnc" id="L664" title="All 2 branches missed.">                le.respCtls = isLdapv3 ? parseControls(replyBer) : null;</span>
+
+<span class="nc" id="L666">                res.entries.addElement(le);</span>
+<span class="nc" id="L667">                i++;</span>
+
+<span class="nc bnc" id="L669" title="All 4 branches missed.">            } else if ((seq == LDAP_REP_SEARCH_REF) &amp;&amp; isLdapv3) {</span>
+
+                // handle LDAPv3 search reference
+<span class="nc" id="L672">                Vector&lt;String&gt; URLs = new Vector&lt;&gt;(4);</span>
+
+                // %%% Although not strictly correct, some LDAP servers
+                //     encode the SEQUENCE OF tag in the SearchResultRef
+<span class="nc bnc" id="L676" title="All 2 branches missed.">                if (replyBer.peekByte() ==</span>
+                    (Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR)) {
+<span class="nc" id="L678">                    replyBer.parseSeq(null);</span>
+                }
+
+<span class="nc bnc" id="L681" title="All 2 branches missed.">                while ((replyBer.bytesLeft() &gt; 0) &amp;&amp;</span>
+<span class="nc bnc" id="L682" title="All 2 branches missed.">                    (replyBer.peekByte() == Ber.ASN_OCTET_STR)) {</span>
+
+<span class="nc" id="L684">                    URLs.addElement(replyBer.parseString(isLdapv3));</span>
+                }
+
+<span class="nc bnc" id="L687" title="All 2 branches missed.">                if (res.referrals == null) {</span>
+<span class="nc" id="L688">                    res.referrals = new Vector&lt;&gt;(4);</span>
+                }
+<span class="nc" id="L690">                res.referrals.addElement(URLs);</span>
+<span class="nc bnc" id="L691" title="All 2 branches missed.">                res.resControls = isLdapv3 ? parseControls(replyBer) : null;</span>
+
+                // Save referral and continue to get next search result
+
+<span class="nc bnc" id="L695" title="All 2 branches missed.">            } else if (seq == LDAP_REP_EXTENSION) {</span>
+
+<span class="nc" id="L697">                parseExtResponse(replyBer, res); //%%% ignore for now</span>
+
+<span class="nc bnc" id="L699" title="All 2 branches missed.">            } else if (seq == LDAP_REP_RESULT) {</span>
+
+<span class="nc" id="L701">                parseResult(replyBer, res, isLdapv3);</span>
+<span class="nc bnc" id="L702" title="All 2 branches missed.">                res.resControls = isLdapv3 ? parseControls(replyBer) : null;</span>
+
+<span class="nc" id="L704">                conn.removeRequest(req);</span>
+<span class="nc" id="L705">                return res;     // Done with search</span>
+            }
+        }
+
+<span class="nc" id="L709">        return res;</span>
+    }
+
+    private Attribute parseAttribute(BerDecoder ber,
+                                     Hashtable&lt;String, Boolean&gt; binaryAttrs)
+        throws IOException {
+
+<span class="nc" id="L716">        int len[] = new int[1];</span>
+<span class="nc" id="L717">        int seq = ber.parseSeq(null);</span>
+<span class="nc" id="L718">        String attrid = ber.parseString(isLdapv3);</span>
+<span class="nc" id="L719">        boolean hasBinaryValues = isBinaryValued(attrid, binaryAttrs);</span>
+<span class="nc" id="L720">        Attribute la = new LdapAttribute(attrid);</span>
+
+<span class="nc bnc" id="L722" title="All 2 branches missed.">        if ((seq = ber.parseSeq(len)) == LBER_SET) {</span>
+<span class="nc" id="L723">            int attrlen = len[0];</span>
+<span class="nc bnc" id="L724" title="All 4 branches missed.">            while (ber.bytesLeft() &gt; 0 &amp;&amp; attrlen &gt; 0) {</span>
+                try {
+<span class="nc" id="L726">                    attrlen -= parseAttributeValue(ber, la, hasBinaryValues);</span>
+<span class="nc" id="L727">                } catch (IOException ex) {</span>
+<span class="nc" id="L728">                    ber.seek(attrlen);</span>
+<span class="nc" id="L729">                    break;</span>
+<span class="nc" id="L730">                }</span>
+            }
+<span class="nc" id="L732">        } else {</span>
+            // Skip the rest of the sequence because it is not what we want
+<span class="nc" id="L734">            ber.seek(len[0]);</span>
+        }
+<span class="nc" id="L736">        return la;</span>
+    }
+
+    //
+    // returns number of bytes that were parsed. Adds the values to attr
+    //
+    private int parseAttributeValue(BerDecoder ber, Attribute la,
+        boolean hasBinaryValues) throws IOException {
+
+<span class="nc" id="L745">        int len[] = new int[1];</span>
+
+<span class="nc bnc" id="L747" title="All 2 branches missed.">        if (hasBinaryValues) {</span>
+<span class="nc" id="L748">            la.add(ber.parseOctetString(ber.peekByte(), len));</span>
+        } else {
+<span class="nc" id="L750">            la.add(ber.parseStringWithTag(</span>
+                                    Ber.ASN_SIMPLE_STRING, isLdapv3, len));
+        }
+<span class="nc" id="L753">        return len[0];</span>
+    }
+
+    private boolean isBinaryValued(String attrid,
+                                   Hashtable&lt;String, Boolean&gt; binaryAttrs) {
+<span class="nc" id="L758">        String id = attrid.toLowerCase(Locale.ENGLISH);</span>
+
+<span class="nc bnc" id="L760" title="All 2 branches missed.">        return ((id.indexOf(&quot;;binary&quot;) != -1) ||</span>
+<span class="nc bnc" id="L761" title="All 4 branches missed.">            defaultBinaryAttrs.containsKey(id) ||</span>
+<span class="nc bnc" id="L762" title="All 2 branches missed.">            ((binaryAttrs != null) &amp;&amp; (binaryAttrs.containsKey(id))));</span>
+    }
+
+    // package entry point; used by Connection
+    static void parseResult(BerDecoder replyBer, LdapResult res,
+            boolean isLdapv3) throws IOException {
+
+<span class="fc" id="L769">        res.status = replyBer.parseEnumeration();</span>
+<span class="fc" id="L770">        res.matchedDN = replyBer.parseString(isLdapv3);</span>
+<span class="fc" id="L771">        res.errorMessage = replyBer.parseString(isLdapv3);</span>
+
+        // handle LDAPv3 referrals (if present)
+<span class="pc bpc" id="L774" title="1 of 2 branches missed.">        if (isLdapv3 &amp;&amp;</span>
+<span class="pc bpc" id="L775" title="1 of 2 branches missed.">            (replyBer.bytesLeft() &gt; 0) &amp;&amp;</span>
+<span class="nc bnc" id="L776" title="All 2 branches missed.">            (replyBer.peekByte() == LDAP_REP_REFERRAL)) {</span>
+
+<span class="nc" id="L778">            Vector&lt;String&gt; URLs = new Vector&lt;&gt;(4);</span>
+<span class="nc" id="L779">            int[] seqlen = new int[1];</span>
+
+<span class="nc" id="L781">            replyBer.parseSeq(seqlen);</span>
+<span class="nc" id="L782">            int endseq = replyBer.getParsePosition() + seqlen[0];</span>
+<span class="nc bnc" id="L783" title="All 2 branches missed.">            while ((replyBer.getParsePosition() &lt; endseq) &amp;&amp;</span>
+<span class="nc bnc" id="L784" title="All 2 branches missed.">                (replyBer.bytesLeft() &gt; 0)) {</span>
+
+<span class="nc" id="L786">                URLs.addElement(replyBer.parseString(isLdapv3));</span>
+            }
+
+<span class="nc bnc" id="L789" title="All 2 branches missed.">            if (res.referrals == null) {</span>
+<span class="nc" id="L790">                res.referrals = new Vector&lt;&gt;(4);</span>
+            }
+<span class="nc" id="L792">            res.referrals.addElement(URLs);</span>
+        }
+<span class="fc" id="L794">    }</span>
+
+    // package entry point; used by Connection
+    static Vector&lt;Control&gt; parseControls(BerDecoder replyBer) throws IOException {
+
+        // handle LDAPv3 controls (if present)
+<span class="pc bpc" id="L800" title="3 of 4 branches missed.">        if ((replyBer.bytesLeft() &gt; 0) &amp;&amp; (replyBer.peekByte() == LDAP_CONTROLS)) {</span>
+<span class="nc" id="L801">            Vector&lt;Control&gt; ctls = new Vector&lt;&gt;(4);</span>
+            String controlOID;
+<span class="nc" id="L803">            boolean criticality = false; // default</span>
+<span class="nc" id="L804">            byte[] controlValue = null;  // optional</span>
+<span class="nc" id="L805">            int[] seqlen = new int[1];</span>
+
+<span class="nc" id="L807">            replyBer.parseSeq(seqlen);</span>
+<span class="nc" id="L808">            int endseq = replyBer.getParsePosition() + seqlen[0];</span>
+<span class="nc bnc" id="L809" title="All 2 branches missed.">            while ((replyBer.getParsePosition() &lt; endseq) &amp;&amp;</span>
+<span class="nc bnc" id="L810" title="All 2 branches missed.">                (replyBer.bytesLeft() &gt; 0)) {</span>
+
+<span class="nc" id="L812">                replyBer.parseSeq(null);</span>
+<span class="nc" id="L813">                controlOID = replyBer.parseString(true);</span>
+
+<span class="nc bnc" id="L815" title="All 2 branches missed.">                if ((replyBer.bytesLeft() &gt; 0) &amp;&amp;</span>
+<span class="nc bnc" id="L816" title="All 2 branches missed.">                    (replyBer.peekByte() == Ber.ASN_BOOLEAN)) {</span>
+<span class="nc" id="L817">                    criticality = replyBer.parseBoolean();</span>
+                }
+<span class="nc bnc" id="L819" title="All 2 branches missed.">                if ((replyBer.bytesLeft() &gt; 0) &amp;&amp;</span>
+<span class="nc bnc" id="L820" title="All 2 branches missed.">                    (replyBer.peekByte() == Ber.ASN_OCTET_STR)) {</span>
+<span class="nc" id="L821">                    controlValue =</span>
+<span class="nc" id="L822">                        replyBer.parseOctetString(Ber.ASN_OCTET_STR, null);</span>
+                }
+<span class="nc bnc" id="L824" title="All 2 branches missed.">                if (controlOID != null) {</span>
+<span class="nc" id="L825">                    ctls.addElement(</span>
+                        new BasicControl(controlOID, criticality, controlValue));
+                }
+            }
+<span class="nc" id="L829">            return ctls;</span>
+        } else {
+<span class="fc" id="L831">            return null;</span>
+        }
+    }
+
+    private void parseExtResponse(BerDecoder replyBer, LdapResult res)
+        throws IOException {
+
+<span class="nc" id="L838">        parseResult(replyBer, res, isLdapv3);</span>
+
+<span class="nc bnc" id="L840" title="All 2 branches missed.">        if ((replyBer.bytesLeft() &gt; 0) &amp;&amp;</span>
+<span class="nc bnc" id="L841" title="All 2 branches missed.">            (replyBer.peekByte() == LDAP_REP_EXT_OID)) {</span>
+<span class="nc" id="L842">            res.extensionId =</span>
+<span class="nc" id="L843">                replyBer.parseStringWithTag(LDAP_REP_EXT_OID, isLdapv3, null);</span>
+        }
+<span class="nc bnc" id="L845" title="All 2 branches missed.">        if ((replyBer.bytesLeft() &gt; 0) &amp;&amp;</span>
+<span class="nc bnc" id="L846" title="All 2 branches missed.">            (replyBer.peekByte() == LDAP_REP_EXT_VAL)) {</span>
+<span class="nc" id="L847">            res.extensionValue =</span>
+<span class="nc" id="L848">                replyBer.parseOctetString(LDAP_REP_EXT_VAL, null);</span>
+        }
+
+<span class="nc" id="L851">        res.resControls = parseControls(replyBer);</span>
+<span class="nc" id="L852">    }</span>
+
+    //
+    // Encode LDAPv3 controls
+    //
+    static void encodeControls(BerEncoder ber, Control[] reqCtls)
+        throws IOException {
+
+<span class="pc bpc" id="L860" title="1 of 4 branches missed.">        if ((reqCtls == null) || (reqCtls.length == 0)) {</span>
+<span class="fc" id="L861">            return;</span>
+        }
+
+        byte[] controlVal;
+
+<span class="fc" id="L866">        ber.beginSeq(LdapClient.LDAP_CONTROLS);</span>
+
+<span class="fc bfc" id="L868" title="All 2 branches covered.">            for (int i = 0; i &lt; reqCtls.length; i++) {</span>
+<span class="fc" id="L869">                ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);</span>
+<span class="fc" id="L870">                    ber.encodeString(reqCtls[i].getID(), true); // control OID</span>
+<span class="pc bpc" id="L871" title="1 of 2 branches missed.">                    if (reqCtls[i].isCritical()) {</span>
+<span class="nc" id="L872">                        ber.encodeBoolean(true); // critical control</span>
+                    }
+<span class="pc bpc" id="L874" title="1 of 2 branches missed.">                    if ((controlVal = reqCtls[i].getEncodedValue()) != null) {</span>
+<span class="nc" id="L875">                        ber.encodeOctetString(controlVal, Ber.ASN_OCTET_STR);</span>
+                    }
+<span class="fc" id="L877">                ber.endSeq();</span>
+            }
+<span class="fc" id="L879">        ber.endSeq();</span>
+<span class="fc" id="L880">    }</span>
+
+    /**
+     * Reads the next reply corresponding to msgId, outstanding on requestBer.
+     * Processes the result and any controls.
+     */
+    private LdapResult processReply(LdapRequest req,
+        LdapResult res, int responseType) throws IOException, NamingException {
+
+<span class="nc" id="L889">        BerDecoder rber = conn.readReply(req);</span>
+
+<span class="nc" id="L891">        rber.parseSeq(null);    // init seq</span>
+<span class="nc" id="L892">        rber.parseInt();        // msg id</span>
+<span class="nc bnc" id="L893" title="All 2 branches missed.">        if (rber.parseByte() !=  responseType) {</span>
+<span class="nc" id="L894">            return res;</span>
+        }
+
+<span class="nc" id="L897">        rber.parseLength();</span>
+<span class="nc" id="L898">        parseResult(rber, res, isLdapv3);</span>
+<span class="nc bnc" id="L899" title="All 2 branches missed.">        res.resControls = isLdapv3 ? parseControls(rber) : null;</span>
+
+<span class="nc" id="L901">        conn.removeRequest(req);</span>
+
+<span class="nc" id="L903">        return res;     // Done with operation</span>
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
+    //
+    // LDAP modify:
+    //  Modify the DN dn with the operations on attributes attrs.
+    //  ie, operations[0] is the operation to be performed on
+    //  attrs[0];
+    //          dn - DN to modify
+    //          operations - add, delete or replace
+    //          attrs - array of Attribute
+    //          reqCtls - array of request controls
+    //
+    ////////////////////////////////////////////////////////////////////////////
+
+    static final int ADD = 0;
+    static final int DELETE = 1;
+    static final int REPLACE = 2;
+
+    LdapResult modify(String dn, int operations[], Attribute attrs[],
+                      Control[] reqCtls)
+        throws IOException, NamingException {
+
+<span class="nc" id="L927">        ensureOpen();</span>
+
+<span class="nc" id="L929">        LdapResult res = new LdapResult();</span>
+<span class="nc" id="L930">        res.status = LDAP_OPERATIONS_ERROR;</span>
+
+<span class="nc bnc" id="L932" title="All 4 branches missed.">        if (dn == null || operations.length != attrs.length)</span>
+<span class="nc" id="L933">            return res;</span>
+
+<span class="nc" id="L935">        BerEncoder ber = new BerEncoder();</span>
+<span class="nc" id="L936">        int curMsgId = conn.getMsgId();</span>
+
+<span class="nc" id="L938">        ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);</span>
+<span class="nc" id="L939">            ber.encodeInt(curMsgId);</span>
+<span class="nc" id="L940">            ber.beginSeq(LDAP_REQ_MODIFY);</span>
+<span class="nc" id="L941">                ber.encodeString(dn, isLdapv3);</span>
+<span class="nc" id="L942">                ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);</span>
+<span class="nc bnc" id="L943" title="All 2 branches missed.">                    for (int i = 0; i &lt; operations.length; i++) {</span>
+<span class="nc" id="L944">                        ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);</span>
+<span class="nc" id="L945">                            ber.encodeInt(operations[i], LBER_ENUMERATED);</span>
+
+                            // zero values is not permitted for the add op.
+<span class="nc bnc" id="L948" title="All 4 branches missed.">                            if ((operations[i] == ADD) &amp;&amp; hasNoValue(attrs[i])) {</span>
+<span class="nc" id="L949">                                throw new InvalidAttributeValueException(</span>
+<span class="nc" id="L950">                                    &quot;'&quot; + attrs[i].getID() + &quot;' has no values.&quot;);</span>
+                            } else {
+<span class="nc" id="L952">                                encodeAttribute(ber, attrs[i]);</span>
+                            }
+<span class="nc" id="L954">                        ber.endSeq();</span>
+                    }
+<span class="nc" id="L956">                ber.endSeq();</span>
+<span class="nc" id="L957">            ber.endSeq();</span>
+<span class="nc bnc" id="L958" title="All 2 branches missed.">            if (isLdapv3) encodeControls(ber, reqCtls);</span>
+<span class="nc" id="L959">        ber.endSeq();</span>
+
+<span class="nc" id="L961">        LdapRequest req = conn.writeRequest(ber, curMsgId);</span>
+
+<span class="nc" id="L963">        return processReply(req, res, LDAP_REP_MODIFY);</span>
+    }
+
+    private void encodeAttribute(BerEncoder ber, Attribute attr)
+        throws IOException, NamingException {
+
+<span class="nc" id="L969">        ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);</span>
+<span class="nc" id="L970">            ber.encodeString(attr.getID(), isLdapv3);</span>
+<span class="nc" id="L971">            ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR | 1);</span>
+<span class="nc" id="L972">                NamingEnumeration&lt;?&gt; enum_ = attr.getAll();</span>
+                Object val;
+<span class="nc bnc" id="L974" title="All 2 branches missed.">                while (enum_.hasMore()) {</span>
+<span class="nc" id="L975">                    val = enum_.next();</span>
+<span class="nc bnc" id="L976" title="All 2 branches missed.">                    if (val instanceof String) {</span>
+<span class="nc" id="L977">                        ber.encodeString((String)val, isLdapv3);</span>
+<span class="nc bnc" id="L978" title="All 2 branches missed.">                    } else if (val instanceof byte[]) {</span>
+<span class="nc" id="L979">                        ber.encodeOctetString((byte[])val, Ber.ASN_OCTET_STR);</span>
+<span class="nc bnc" id="L980" title="All 2 branches missed.">                    } else if (val == null) {</span>
+                        // no attribute value
+                    } else {
+<span class="nc" id="L983">                        throw new InvalidAttributeValueException(</span>
+<span class="nc" id="L984">                            &quot;Malformed '&quot; + attr.getID() + &quot;' attribute value&quot;);</span>
+                    }
+                }
+<span class="nc" id="L987">            ber.endSeq();</span>
+<span class="nc" id="L988">        ber.endSeq();</span>
+<span class="nc" id="L989">    }</span>
+
+    private static boolean hasNoValue(Attribute attr) throws NamingException {
+<span class="nc bnc" id="L992" title="All 6 branches missed.">        return attr.size() == 0 || (attr.size() == 1 &amp;&amp; attr.get() == null);</span>
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
+    //
+    // LDAP add
+    //          Adds entry to the Directory
+    //
+    ////////////////////////////////////////////////////////////////////////////
+
+    LdapResult add(LdapEntry entry, Control[] reqCtls)
+        throws IOException, NamingException {
+
+<span class="nc" id="L1005">        ensureOpen();</span>
+
+<span class="nc" id="L1007">        LdapResult res = new LdapResult();</span>
+<span class="nc" id="L1008">        res.status = LDAP_OPERATIONS_ERROR;</span>
+
+<span class="nc bnc" id="L1010" title="All 4 branches missed.">        if (entry == null || entry.DN == null)</span>
+<span class="nc" id="L1011">            return res;</span>
+
+<span class="nc" id="L1013">        BerEncoder ber = new BerEncoder();</span>
+<span class="nc" id="L1014">        int curMsgId = conn.getMsgId();</span>
+        Attribute attr;
+
+<span class="nc" id="L1017">            ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);</span>
+<span class="nc" id="L1018">                ber.encodeInt(curMsgId);</span>
+<span class="nc" id="L1019">                ber.beginSeq(LDAP_REQ_ADD);</span>
+<span class="nc" id="L1020">                    ber.encodeString(entry.DN, isLdapv3);</span>
+<span class="nc" id="L1021">                    ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);</span>
+<span class="nc" id="L1022">                        NamingEnumeration&lt;? extends Attribute&gt; enum_ =</span>
+<span class="nc" id="L1023">                                entry.attributes.getAll();</span>
+<span class="nc bnc" id="L1024" title="All 2 branches missed.">                        while (enum_.hasMore()) {</span>
+<span class="nc" id="L1025">                            attr = enum_.next();</span>
+
+                            // zero values is not permitted
+<span class="nc bnc" id="L1028" title="All 2 branches missed.">                            if (hasNoValue(attr)) {</span>
+<span class="nc" id="L1029">                                throw new InvalidAttributeValueException(</span>
+<span class="nc" id="L1030">                                    &quot;'&quot; + attr.getID() + &quot;' has no values.&quot;);</span>
+                            } else {
+<span class="nc" id="L1032">                                encodeAttribute(ber, attr);</span>
+                            }
+                        }
+<span class="nc" id="L1035">                    ber.endSeq();</span>
+<span class="nc" id="L1036">                ber.endSeq();</span>
+<span class="nc bnc" id="L1037" title="All 2 branches missed.">                if (isLdapv3) encodeControls(ber, reqCtls);</span>
+<span class="nc" id="L1038">            ber.endSeq();</span>
+
+<span class="nc" id="L1040">        LdapRequest req = conn.writeRequest(ber, curMsgId);</span>
+<span class="nc" id="L1041">        return processReply(req, res, LDAP_REP_ADD);</span>
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
+    //
+    // LDAP delete
+    //          deletes entry from the Directory
+    //
+    ////////////////////////////////////////////////////////////////////////////
+
+    LdapResult delete(String DN, Control[] reqCtls)
+        throws IOException, NamingException {
+
+<span class="nc" id="L1054">        ensureOpen();</span>
+
+<span class="nc" id="L1056">        LdapResult res = new LdapResult();</span>
+<span class="nc" id="L1057">        res.status = LDAP_OPERATIONS_ERROR;</span>
+
+<span class="nc bnc" id="L1059" title="All 2 branches missed.">        if (DN == null)</span>
+<span class="nc" id="L1060">            return res;</span>
+
+<span class="nc" id="L1062">        BerEncoder ber = new BerEncoder();</span>
+<span class="nc" id="L1063">        int curMsgId = conn.getMsgId();</span>
+
+<span class="nc" id="L1065">            ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);</span>
+<span class="nc" id="L1066">                ber.encodeInt(curMsgId);</span>
+<span class="nc" id="L1067">                ber.encodeString(DN, LDAP_REQ_DELETE, isLdapv3);</span>
+<span class="nc bnc" id="L1068" title="All 2 branches missed.">                if (isLdapv3) encodeControls(ber, reqCtls);</span>
+<span class="nc" id="L1069">            ber.endSeq();</span>
+
+<span class="nc" id="L1071">        LdapRequest req = conn.writeRequest(ber, curMsgId);</span>
+
+<span class="nc" id="L1073">        return processReply(req, res, LDAP_REP_DELETE);</span>
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
+    //
+    // LDAP modrdn
+    //  Changes the last element of DN to newrdn
+    //          dn - DN to change
+    //          newrdn - new RDN to rename to
+    //          deleteoldrdn - boolean whether to delete old attrs or not
+    //          newSuperior - new place to put the entry in the tree
+    //                        (ignored if server is LDAPv2)
+    //          reqCtls - array of request controls
+    //
+    ////////////////////////////////////////////////////////////////////////////
+
+    LdapResult moddn(String DN, String newrdn, boolean deleteOldRdn,
+                     String newSuperior, Control[] reqCtls)
+        throws IOException, NamingException {
+
+<span class="nc" id="L1093">        ensureOpen();</span>
+
+<span class="nc bnc" id="L1095" title="All 2 branches missed.">        boolean changeSuperior = (newSuperior != null &amp;&amp;</span>
+<span class="nc bnc" id="L1096" title="All 2 branches missed.">                                  newSuperior.length() &gt; 0);</span>
+
+<span class="nc" id="L1098">        LdapResult res = new LdapResult();</span>
+<span class="nc" id="L1099">        res.status = LDAP_OPERATIONS_ERROR;</span>
+
+<span class="nc bnc" id="L1101" title="All 4 branches missed.">        if (DN == null || newrdn == null)</span>
+<span class="nc" id="L1102">            return res;</span>
+
+<span class="nc" id="L1104">        BerEncoder ber = new BerEncoder();</span>
+<span class="nc" id="L1105">        int curMsgId = conn.getMsgId();</span>
+
+<span class="nc" id="L1107">            ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);</span>
+<span class="nc" id="L1108">                ber.encodeInt(curMsgId);</span>
+<span class="nc" id="L1109">                ber.beginSeq(LDAP_REQ_MODRDN);</span>
+<span class="nc" id="L1110">                    ber.encodeString(DN, isLdapv3);</span>
+<span class="nc" id="L1111">                    ber.encodeString(newrdn, isLdapv3);</span>
+<span class="nc" id="L1112">                    ber.encodeBoolean(deleteOldRdn);</span>
+<span class="nc bnc" id="L1113" title="All 4 branches missed.">                    if(isLdapv3 &amp;&amp; changeSuperior) {</span>
+                        //System.err.println(&quot;changin superior&quot;);
+<span class="nc" id="L1115">                        ber.encodeString(newSuperior, LDAP_SUPERIOR_DN, isLdapv3);</span>
+                    }
+<span class="nc" id="L1117">                ber.endSeq();</span>
+<span class="nc bnc" id="L1118" title="All 2 branches missed.">                if (isLdapv3) encodeControls(ber, reqCtls);</span>
+<span class="nc" id="L1119">            ber.endSeq();</span>
+
+
+<span class="nc" id="L1122">        LdapRequest req = conn.writeRequest(ber, curMsgId);</span>
+
+<span class="nc" id="L1124">        return processReply(req, res, LDAP_REP_MODRDN);</span>
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
+    //
+    // LDAP compare
+    //  Compare attribute-&gt;value pairs in dn
+    //
+    ////////////////////////////////////////////////////////////////////////////
+
+    LdapResult compare(String DN, String type, String value, Control[] reqCtls)
+        throws IOException, NamingException {
+
+<span class="nc" id="L1137">        ensureOpen();</span>
+
+<span class="nc" id="L1139">        LdapResult res = new LdapResult();</span>
+<span class="nc" id="L1140">        res.status = LDAP_OPERATIONS_ERROR;</span>
+
+<span class="nc bnc" id="L1142" title="All 6 branches missed.">        if (DN == null || type == null || value == null)</span>
+<span class="nc" id="L1143">            return res;</span>
+
+<span class="nc" id="L1145">        BerEncoder ber = new BerEncoder();</span>
+<span class="nc" id="L1146">        int curMsgId = conn.getMsgId();</span>
+
+<span class="nc" id="L1148">            ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);</span>
+<span class="nc" id="L1149">                ber.encodeInt(curMsgId);</span>
+<span class="nc" id="L1150">                ber.beginSeq(LDAP_REQ_COMPARE);</span>
+<span class="nc" id="L1151">                    ber.encodeString(DN, isLdapv3);</span>
+<span class="nc" id="L1152">                    ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);</span>
+<span class="nc" id="L1153">                        ber.encodeString(type, isLdapv3);</span>
+
+                        // replace any escaped characters in the value
+<span class="nc bnc" id="L1156" title="All 2 branches missed.">                        byte[] val = isLdapv3 ?</span>
+<span class="nc" id="L1157">                            value.getBytes(&quot;UTF8&quot;) : value.getBytes(&quot;8859_1&quot;);</span>
+<span class="nc" id="L1158">                        ber.encodeOctetString(</span>
+<span class="nc" id="L1159">                            Filter.unescapeFilterValue(val, 0, val.length),</span>
+                            Ber.ASN_OCTET_STR);
+
+<span class="nc" id="L1162">                    ber.endSeq();</span>
+<span class="nc" id="L1163">                ber.endSeq();</span>
+<span class="nc bnc" id="L1164" title="All 2 branches missed.">                if (isLdapv3) encodeControls(ber, reqCtls);</span>
+<span class="nc" id="L1165">            ber.endSeq();</span>
+
+<span class="nc" id="L1167">        LdapRequest req = conn.writeRequest(ber, curMsgId);</span>
+
+<span class="nc" id="L1169">        return processReply(req, res, LDAP_REP_COMPARE);</span>
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
+    //
+    // LDAP extended operation
+    //
+    ////////////////////////////////////////////////////////////////////////////
+
+    LdapResult extendedOp(String id, byte[] request, Control[] reqCtls,
+        boolean pauseAfterReceipt) throws IOException, NamingException {
+
+<span class="nc" id="L1181">        ensureOpen();</span>
+
+<span class="nc" id="L1183">        LdapResult res = new LdapResult();</span>
+<span class="nc" id="L1184">        res.status = LDAP_OPERATIONS_ERROR;</span>
+
+<span class="nc bnc" id="L1186" title="All 2 branches missed.">        if (id == null)</span>
+<span class="nc" id="L1187">            return res;</span>
+
+<span class="nc" id="L1189">        BerEncoder ber = new BerEncoder();</span>
+<span class="nc" id="L1190">        int curMsgId = conn.getMsgId();</span>
+
+<span class="nc" id="L1192">            ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);</span>
+<span class="nc" id="L1193">                ber.encodeInt(curMsgId);</span>
+<span class="nc" id="L1194">                ber.beginSeq(LDAP_REQ_EXTENSION);</span>
+<span class="nc" id="L1195">                    ber.encodeString(id,</span>
+                        Ber.ASN_CONTEXT | 0, isLdapv3);//[0]
+<span class="nc bnc" id="L1197" title="All 2 branches missed.">                    if (request != null) {</span>
+<span class="nc" id="L1198">                        ber.encodeOctetString(request,</span>
+                            Ber.ASN_CONTEXT | 1);//[1]
+                    }
+<span class="nc" id="L1201">                ber.endSeq();</span>
+<span class="nc" id="L1202">                encodeControls(ber, reqCtls); // always v3</span>
+<span class="nc" id="L1203">            ber.endSeq();</span>
+
+<span class="nc" id="L1205">        LdapRequest req = conn.writeRequest(ber, curMsgId, pauseAfterReceipt);</span>
+
+<span class="nc" id="L1207">        BerDecoder rber = conn.readReply(req);</span>
+
+<span class="nc" id="L1209">        rber.parseSeq(null);    // init seq</span>
+<span class="nc" id="L1210">        rber.parseInt();        // msg id</span>
+<span class="nc bnc" id="L1211" title="All 2 branches missed.">        if (rber.parseByte() !=  LDAP_REP_EXTENSION) {</span>
+<span class="nc" id="L1212">            return res;</span>
+        }
+
+<span class="nc" id="L1215">        rber.parseLength();</span>
+<span class="nc" id="L1216">        parseExtResponse(rber, res);</span>
+<span class="nc" id="L1217">        conn.removeRequest(req);</span>
+
+<span class="nc" id="L1219">        return res;     // Done with operation</span>
+    }
+
+
+
+    ////////////////////////////////////////////////////////////////////////////
+    //
+    // Some BER definitions convenient for LDAP
+    //
+    ////////////////////////////////////////////////////////////////////////////
+
+    static final int LDAP_VERSION3_VERSION2 = 32;
+    static final int LDAP_VERSION2 = 0x02;
+    static final int LDAP_VERSION3 = 0x03;              // LDAPv3
+    static final int LDAP_VERSION = LDAP_VERSION3;
+
+    static final int LDAP_REF_FOLLOW = 0x01;            // follow referrals
+    static final int LDAP_REF_THROW = 0x02;             // throw referral ex.
+    static final int LDAP_REF_IGNORE = 0x03;            // ignore referrals
+
+    static final String LDAP_URL = &quot;ldap://&quot;;           // LDAPv3
+    static final String LDAPS_URL = &quot;ldaps://&quot;;         // LDAPv3
+
+    static final int LBER_BOOLEAN = 0x01;
+    static final int LBER_INTEGER = 0x02;
+    static final int LBER_BITSTRING = 0x03;
+    static final int LBER_OCTETSTRING = 0x04;
+    static final int LBER_NULL = 0x05;
+    static final int LBER_ENUMERATED = 0x0a;
+    static final int LBER_SEQUENCE = 0x30;
+    static final int LBER_SET = 0x31;
+
+    static final int LDAP_SUPERIOR_DN = 0x80;
+
+    static final int LDAP_REQ_BIND = 0x60;      // app + constructed
+    static final int LDAP_REQ_UNBIND = 0x42;    // app + primitive
+    static final int LDAP_REQ_SEARCH = 0x63;    // app + constructed
+    static final int LDAP_REQ_MODIFY = 0x66;    // app + constructed
+    static final int LDAP_REQ_ADD = 0x68;       // app + constructed
+    static final int LDAP_REQ_DELETE = 0x4a;    // app + primitive
+    static final int LDAP_REQ_MODRDN = 0x6c;    // app + constructed
+    static final int LDAP_REQ_COMPARE = 0x6e;   // app + constructed
+    static final int LDAP_REQ_ABANDON = 0x50;   // app + primitive
+    static final int LDAP_REQ_EXTENSION = 0x77; // app + constructed    (LDAPv3)
+
+    static final int LDAP_REP_BIND = 0x61;      // app + constructed | 1
+    static final int LDAP_REP_SEARCH = 0x64;    // app + constructed | 4
+    static final int LDAP_REP_SEARCH_REF = 0x73;// app + constructed    (LDAPv3)
+    static final int LDAP_REP_RESULT = 0x65;    // app + constructed | 5
+    static final int LDAP_REP_MODIFY = 0x67;    // app + constructed | 7
+    static final int LDAP_REP_ADD = 0x69;       // app + constructed | 9
+    static final int LDAP_REP_DELETE = 0x6b;    // app + primitive | b
+    static final int LDAP_REP_MODRDN = 0x6d;    // app + primitive | d
+    static final int LDAP_REP_COMPARE = 0x6f;   // app + primitive | f
+    static final int LDAP_REP_EXTENSION = 0x78; // app + constructed    (LDAPv3)
+
+    static final int LDAP_REP_REFERRAL = 0xa3;  // ctx + constructed    (LDAPv3)
+    static final int LDAP_REP_EXT_OID = 0x8a;   // ctx + primitive      (LDAPv3)
+    static final int LDAP_REP_EXT_VAL = 0x8b;   // ctx + primitive      (LDAPv3)
+
+    // LDAPv3 Controls
+
+    static final int LDAP_CONTROLS = 0xa0;      // ctx + constructed    (LDAPv3)
+    static final String LDAP_CONTROL_MANAGE_DSA_IT = &quot;2.16.840.1.113730.3.4.2&quot;;
+    static final String LDAP_CONTROL_PREFERRED_LANG = &quot;1.3.6.1.4.1.1466.20035&quot;;
+    static final String LDAP_CONTROL_PAGED_RESULTS = &quot;1.2.840.113556.1.4.319&quot;;
+    static final String LDAP_CONTROL_SERVER_SORT_REQ = &quot;1.2.840.113556.1.4.473&quot;;
+    static final String LDAP_CONTROL_SERVER_SORT_RES = &quot;1.2.840.113556.1.4.474&quot;;
+
+    ////////////////////////////////////////////////////////////////////////////
+    //
+    // return codes
+    //
+    ////////////////////////////////////////////////////////////////////////////
+
+    static final int LDAP_SUCCESS = 0;
+    static final int LDAP_OPERATIONS_ERROR = 1;
+    static final int LDAP_PROTOCOL_ERROR = 2;
+    static final int LDAP_TIME_LIMIT_EXCEEDED = 3;
+    static final int LDAP_SIZE_LIMIT_EXCEEDED = 4;
+    static final int LDAP_COMPARE_FALSE = 5;
+    static final int LDAP_COMPARE_TRUE = 6;
+    static final int LDAP_AUTH_METHOD_NOT_SUPPORTED = 7;
+    static final int LDAP_STRONG_AUTH_REQUIRED = 8;
+    static final int LDAP_PARTIAL_RESULTS = 9;                  // Slapd
+    static final int LDAP_REFERRAL = 10;                        // LDAPv3
+    static final int LDAP_ADMIN_LIMIT_EXCEEDED = 11;            // LDAPv3
+    static final int LDAP_UNAVAILABLE_CRITICAL_EXTENSION = 12;  // LDAPv3
+    static final int LDAP_CONFIDENTIALITY_REQUIRED = 13;        // LDAPv3
+    static final int LDAP_SASL_BIND_IN_PROGRESS = 14;           // LDAPv3
+    static final int LDAP_NO_SUCH_ATTRIBUTE = 16;
+    static final int LDAP_UNDEFINED_ATTRIBUTE_TYPE = 17;
+    static final int LDAP_INAPPROPRIATE_MATCHING = 18;
+    static final int LDAP_CONSTRAINT_VIOLATION = 19;
+    static final int LDAP_ATTRIBUTE_OR_VALUE_EXISTS = 20;
+    static final int LDAP_INVALID_ATTRIBUTE_SYNTAX = 21;
+    static final int LDAP_NO_SUCH_OBJECT = 32;
+    static final int LDAP_ALIAS_PROBLEM = 33;
+    static final int LDAP_INVALID_DN_SYNTAX = 34;
+    static final int LDAP_IS_LEAF = 35;
+    static final int LDAP_ALIAS_DEREFERENCING_PROBLEM = 36;
+    static final int LDAP_INAPPROPRIATE_AUTHENTICATION = 48;
+    static final int LDAP_INVALID_CREDENTIALS = 49;
+    static final int LDAP_INSUFFICIENT_ACCESS_RIGHTS = 50;
+    static final int LDAP_BUSY = 51;
+    static final int LDAP_UNAVAILABLE = 52;
+    static final int LDAP_UNWILLING_TO_PERFORM = 53;
+    static final int LDAP_LOOP_DETECT = 54;
+    static final int LDAP_NAMING_VIOLATION = 64;
+    static final int LDAP_OBJECT_CLASS_VIOLATION = 65;
+    static final int LDAP_NOT_ALLOWED_ON_NON_LEAF = 66;
+    static final int LDAP_NOT_ALLOWED_ON_RDN = 67;
+    static final int LDAP_ENTRY_ALREADY_EXISTS = 68;
+    static final int LDAP_OBJECT_CLASS_MODS_PROHIBITED = 69;
+    static final int LDAP_AFFECTS_MULTIPLE_DSAS = 71;           // LDAPv3
+    static final int LDAP_OTHER = 80;
+
+<span class="fc" id="L1336">    static final String[] ldap_error_message = {</span>
+        &quot;Success&quot;,                                      // 0
+        &quot;Operations Error&quot;,                             // 1
+        &quot;Protocol Error&quot;,                               // 2
+        &quot;Timelimit Exceeded&quot;,                           // 3
+        &quot;Sizelimit Exceeded&quot;,                           // 4
+        &quot;Compare False&quot;,                                // 5
+        &quot;Compare True&quot;,                                 // 6
+        &quot;Authentication Method Not Supported&quot;,          // 7
+        &quot;Strong Authentication Required&quot;,               // 8
+        null,
+        &quot;Referral&quot;,                                     // 10
+        &quot;Administrative Limit Exceeded&quot;,                // 11
+        &quot;Unavailable Critical Extension&quot;,               // 12
+        &quot;Confidentiality Required&quot;,                     // 13
+        &quot;SASL Bind In Progress&quot;,                        // 14
+        null,
+        &quot;No Such Attribute&quot;,                            // 16
+        &quot;Undefined Attribute Type&quot;,                     // 17
+        &quot;Inappropriate Matching&quot;,                       // 18
+        &quot;Constraint Violation&quot;,                         // 19
+        &quot;Attribute Or Value Exists&quot;,                    // 20
+        &quot;Invalid Attribute Syntax&quot;,                     // 21
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        &quot;No Such Object&quot;,                               // 32
+        &quot;Alias Problem&quot;,                                // 33
+        &quot;Invalid DN Syntax&quot;,                            // 34
+        null,
+        &quot;Alias Dereferencing Problem&quot;,                  // 36
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        &quot;Inappropriate Authentication&quot;,                 // 48
+        &quot;Invalid Credentials&quot;,                          // 49
+        &quot;Insufficient Access Rights&quot;,                   // 50
+        &quot;Busy&quot;,                                         // 51
+        &quot;Unavailable&quot;,                                  // 52
+        &quot;Unwilling To Perform&quot;,                         // 53
+        &quot;Loop Detect&quot;,                                  // 54
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        &quot;Naming Violation&quot;,                             // 64
+        &quot;Object Class Violation&quot;,                       // 65
+        &quot;Not Allowed On Non-leaf&quot;,                      // 66
+        &quot;Not Allowed On RDN&quot;,                           // 67
+        &quot;Entry Already Exists&quot;,                         // 68
+        &quot;Object Class Modifications Prohibited&quot;,        // 69
+        null,
+        &quot;Affects Multiple DSAs&quot;,                        // 71
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        &quot;Other&quot;,                                        // 80
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+    };
+
+
+    /*
+     * Generate an error message from the LDAP error code and error diagnostic.
+     * The message format is:
+     *
+     *     &quot;[LDAP: error code &lt;errorCode&gt; - &lt;errorMessage&gt;]&quot;
+     *
+     * where &lt;errorCode&gt; is a numeric error code
+     * and &lt;errorMessage&gt; is a textual description of the error (if available)
+     *
+     */
+    static String getErrorMessage(int errorCode, String errorMessage) {
+
+<span class="fc" id="L1443">        String message = &quot;[LDAP: error code &quot; + errorCode;</span>
+
+<span class="pc bpc" id="L1445" title="3 of 4 branches missed.">        if ((errorMessage != null) &amp;&amp; (errorMessage.length() != 0)) {</span>
+
+            // append error message from the server
+<span class="nc" id="L1448">            message = message + &quot; - &quot; + errorMessage + &quot;]&quot;;</span>
+
+        } else {
+
+            // append built-in error message
+            try {
+<span class="pc bpc" id="L1454" title="1 of 2 branches missed.">                if (ldap_error_message[errorCode] != null) {</span>
+<span class="fc" id="L1455">                    message = message + &quot; - &quot; + ldap_error_message[errorCode] +</span>
+                                &quot;]&quot;;
+                }
+<span class="nc" id="L1458">            } catch (ArrayIndexOutOfBoundsException ex) {</span>
+<span class="nc" id="L1459">                message = message + &quot;]&quot;;</span>
+<span class="fc" id="L1460">            }</span>
+        }
+<span class="fc" id="L1462">        return message;</span>
+    }
+
+
+    ////////////////////////////////////////////////////////////////////////////
+    //
+    // Unsolicited notification support.
+    //
+    // An LdapClient maintains a list of LdapCtx that have registered
+    // for UnsolicitedNotifications. This is a list because a single
+    // LdapClient might be shared among multiple contexts.
+    //
+    // When addUnsolicited() is invoked, the LdapCtx is added to the list.
+    //
+    // When Connection receives an unsolicited notification (msgid == 0),
+    // it invokes LdapClient.processUnsolicited(). processUnsolicited()
+    // parses the Extended Response. If there are registered listeners,
+    // LdapClient creates an UnsolicitedNotification from the response
+    // and informs each LdapCtx to fire an event for the notification.
+    // If it is a DISCONNECT notification, the connection is closed and a
+    // NamingExceptionEvent is fired to the listeners.
+    //
+    // When the connection is closed out-of-band like this, the next
+    // time a method is invoked on LdapClient, an IOException is thrown.
+    //
+    // removeUnsolicited() is invoked to remove an LdapCtx from this client.
+    //
+    ////////////////////////////////////////////////////////////////////////////
+<span class="fc" id="L1490">    private Vector&lt;LdapCtx&gt; unsolicited = new Vector&lt;&gt;(3);</span>
+    void addUnsolicited(LdapCtx ctx) {
+        if (debug &gt; 0) {
+            System.err.println(&quot;LdapClient.addUnsolicited&quot; + ctx);
+        }
+<span class="nc" id="L1495">        unsolicited.addElement(ctx);</span>
+<span class="nc" id="L1496">    }</span>
+
+    void removeUnsolicited(LdapCtx ctx) {
+        if (debug &gt; 0) {
+            System.err.println(&quot;LdapClient.removeUnsolicited&quot; + ctx);
+        }
+<span class="nc" id="L1502">        synchronized (unsolicited) {</span>
+<span class="nc bnc" id="L1503" title="All 2 branches missed.">            if (unsolicited.size() == 0) {</span>
+<span class="nc" id="L1504">                return;</span>
+            }
+<span class="nc" id="L1506">            unsolicited.removeElement(ctx);</span>
+<span class="nc" id="L1507">        }</span>
+<span class="nc" id="L1508">    }</span>
+
+    // NOTE: Cannot be synchronized because this is called asynchronously
+    // by the reader thread in Connection. Instead, sync on 'unsolicited' Vector.
+    void processUnsolicited(BerDecoder ber) {
+        if (debug &gt; 0) {
+            System.err.println(&quot;LdapClient.processUnsolicited&quot;);
+        }
+<span class="nc" id="L1516">        synchronized (unsolicited) {</span>
+            try {
+                // Parse the response
+<span class="nc" id="L1519">                LdapResult res = new LdapResult();</span>
+
+<span class="nc" id="L1521">                ber.parseSeq(null); // init seq</span>
+<span class="nc" id="L1522">                ber.parseInt();             // msg id; should be 0; ignored</span>
+<span class="nc bnc" id="L1523" title="All 2 branches missed.">                if (ber.parseByte() != LDAP_REP_EXTENSION) {</span>
+<span class="nc" id="L1524">                    throw new IOException(</span>
+                        &quot;Unsolicited Notification must be an Extended Response&quot;);
+                }
+<span class="nc" id="L1527">                ber.parseLength();</span>
+<span class="nc" id="L1528">                parseExtResponse(ber, res);</span>
+
+<span class="nc bnc" id="L1530" title="All 2 branches missed.">                if (DISCONNECT_OID.equals(res.extensionId)) {</span>
+                    // force closing of connection
+<span class="nc" id="L1532">                    forceClose(pooled);</span>
+                }
+
+<span class="nc bnc" id="L1535" title="All 2 branches missed.">                if (unsolicited.size() &gt; 0) {</span>
+                    // Create an UnsolicitedNotification using the parsed data
+                    // Need a 'ctx' object because we want to use the context's
+                    // list of provider control factories.
+<span class="nc bnc" id="L1539" title="All 2 branches missed.">                    UnsolicitedNotification notice = new UnsolicitedResponseImpl(</span>
+                        res.extensionId,
+                        res.extensionValue,
+                        res.referrals,
+                        res.status,
+                        res.errorMessage,
+                        res.matchedDN,
+                        (res.resControls != null) ?
+<span class="nc" id="L1547">                        unsolicited.elementAt(0).convertControls(res.resControls) :</span>
+                        null);
+
+                    // Fire UnsolicitedNotification events to listeners
+<span class="nc" id="L1551">                    notifyUnsolicited(notice);</span>
+
+                    // If &quot;disconnect&quot; notification,
+                    // notify unsolicited listeners via NamingException
+<span class="nc bnc" id="L1555" title="All 2 branches missed.">                    if (DISCONNECT_OID.equals(res.extensionId)) {</span>
+<span class="nc" id="L1556">                        notifyUnsolicited(</span>
+                            new CommunicationException(&quot;Connection closed&quot;));
+                    }
+                }
+<span class="nc" id="L1560">            } catch (IOException e) {</span>
+<span class="nc bnc" id="L1561" title="All 2 branches missed.">                if (unsolicited.size() == 0)</span>
+<span class="nc" id="L1562">                    return;  // no one registered; ignore</span>
+
+<span class="nc" id="L1564">                NamingException ne = new CommunicationException(</span>
+                    &quot;Problem parsing unsolicited notification&quot;);
+<span class="nc" id="L1566">                ne.setRootCause(e);</span>
+
+<span class="nc" id="L1568">                notifyUnsolicited(ne);</span>
+
+<span class="nc" id="L1570">            } catch (NamingException e) {</span>
+<span class="nc" id="L1571">                notifyUnsolicited(e);</span>
+<span class="nc" id="L1572">            }</span>
+<span class="nc" id="L1573">        }</span>
+<span class="nc" id="L1574">    }</span>
+
+
+    private void notifyUnsolicited(Object e) {
+<span class="nc bnc" id="L1578" title="All 2 branches missed.">        for (int i = 0; i &lt; unsolicited.size(); i++) {</span>
+<span class="nc" id="L1579">            unsolicited.elementAt(i).fireUnsolicited(e);</span>
+        }
+<span class="nc bnc" id="L1581" title="All 2 branches missed.">        if (e instanceof NamingException) {</span>
+<span class="nc" id="L1582">            unsolicited.setSize(0);  // no more listeners after exception</span>
+        }
+<span class="nc" id="L1584">    }</span>
+
+    private void ensureOpen() throws IOException {
+<span class="pc bpc" id="L1587" title="2 of 4 branches missed.">        if (conn == null || !conn.useable) {</span>
+<span class="nc bnc" id="L1588" title="All 4 branches missed.">            if (conn != null &amp;&amp; conn.closureReason != null) {</span>
+<span class="nc" id="L1589">                throw conn.closureReason;</span>
+            } else {
+<span class="nc" id="L1591">                throw new IOException(&quot;connection closed&quot;);</span>
+            }
+        }
+<span class="fc" id="L1594">    }</span>
+
+    // package private (used by LdapCtx)
+    static LdapClient getInstance(boolean usePool, String hostname, int port,
+        String factory, int connectTimeout, int readTimeout, OutputStream trace,
+        int version, String authMechanism, Control[] ctls, String protocol,
+        String user, Object passwd, Hashtable&lt;?,?&gt; env) throws NamingException {
+
+<span class="pc bpc" id="L1602" title="1 of 2 branches missed.">        if (usePool) {</span>
+<span class="nc bnc" id="L1603" title="All 2 branches missed.">            if (LdapPoolManager.isPoolingAllowed(factory, trace,</span>
+                    authMechanism, protocol, env)) {
+<span class="nc" id="L1605">                LdapClient answer = LdapPoolManager.getLdapClient(</span>
+                        hostname, port, factory, connectTimeout, readTimeout,
+                        trace, version, authMechanism, ctls, protocol, user,
+                        passwd, env);
+<span class="nc" id="L1609">                answer.referenceCount = 1;   // always one when starting out</span>
+<span class="nc" id="L1610">                return answer;</span>
+            }
+        }
+<span class="fc" id="L1613">        return new LdapClient(hostname, port, factory, connectTimeout,</span>
+                                        readTimeout, trace, null);
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

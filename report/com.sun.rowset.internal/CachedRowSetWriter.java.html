@@ -1,0 +1,1474 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>CachedRowSetWriter.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">com.sun.rowset.internal</a> &gt; <span class="el_source">CachedRowSetWriter.java</span></div><h1>CachedRowSetWriter.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2003, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package com.sun.rowset.internal;
+
+import java.sql.*;
+import javax.sql.*;
+import java.util.*;
+import java.io.*;
+
+import com.sun.rowset.*;
+import java.text.MessageFormat;
+import javax.sql.rowset.*;
+import javax.sql.rowset.serial.SQLInputImpl;
+import javax.sql.rowset.serial.SerialArray;
+import javax.sql.rowset.serial.SerialBlob;
+import javax.sql.rowset.serial.SerialClob;
+import javax.sql.rowset.serial.SerialStruct;
+import javax.sql.rowset.spi.*;
+
+
+/**
+ * The facility called on internally by the &lt;code&gt;RIOptimisticProvider&lt;/code&gt; implementation to
+ * propagate changes back to the data source from which the rowset got its data.
+ * &lt;P&gt;
+ * A &lt;code&gt;CachedRowSetWriter&lt;/code&gt; object, called a writer, has the public
+ * method &lt;code&gt;writeData&lt;/code&gt; for writing modified data to the underlying data source.
+ * This method is invoked by the rowset internally and is never invoked directly by an application.
+ * A writer also has public methods for setting and getting
+ * the &lt;code&gt;CachedRowSetReader&lt;/code&gt; object, called a reader, that is associated
+ * with the writer. The remainder of the methods in this class are private and
+ * are invoked internally, either directly or indirectly, by the method
+ * &lt;code&gt;writeData&lt;/code&gt;.
+ * &lt;P&gt;
+ * Typically the &lt;code&gt;SyncFactory&lt;/code&gt; manages the &lt;code&gt;RowSetReader&lt;/code&gt; and
+ * the &lt;code&gt;RowSetWriter&lt;/code&gt; implementations using &lt;code&gt;SyncProvider&lt;/code&gt; objects.
+ * Standard JDBC RowSet implementations provide an object instance of this
+ * writer by invoking the &lt;code&gt;SyncProvider.getRowSetWriter()&lt;/code&gt; method.
+ *
+ * @version 0.2
+ * @author Jonathan Bruce
+ * @see javax.sql.rowset.spi.SyncProvider
+ * @see javax.sql.rowset.spi.SyncFactory
+ * @see javax.sql.rowset.spi.SyncFactoryException
+ */
+public class CachedRowSetWriter implements TransactionalWriter, Serializable {
+
+/**
+ * The &lt;code&gt;Connection&lt;/code&gt; object that this writer will use to make a
+ * connection to the data source to which it will write data.
+ *
+ */
+    private transient Connection con;
+
+/**
+ * The SQL &lt;code&gt;SELECT&lt;/code&gt; command that this writer will call
+ * internally. The method &lt;code&gt;initSQLStatements&lt;/code&gt; builds this
+ * command by supplying the words &quot;SELECT&quot; and &quot;FROM,&quot; and using
+ * metadata to get the table name and column names .
+ *
+ * @serial
+ */
+    private String selectCmd;
+
+/**
+ * The SQL &lt;code&gt;UPDATE&lt;/code&gt; command that this writer will call
+ * internally to write data to the rowset's underlying data source.
+ * The method &lt;code&gt;initSQLStatements&lt;/code&gt; builds this &lt;code&gt;String&lt;/code&gt;
+ * object.
+ *
+ * @serial
+ */
+    private String updateCmd;
+
+/**
+ * The SQL &lt;code&gt;WHERE&lt;/code&gt; clause the writer will use for update
+ * statements in the &lt;code&gt;PreparedStatement&lt;/code&gt; object
+ * it sends to the underlying data source.
+ *
+ * @serial
+ */
+    private String updateWhere;
+
+/**
+ * The SQL &lt;code&gt;DELETE&lt;/code&gt; command that this writer will call
+ * internally to delete a row in the rowset's underlying data source.
+ *
+ * @serial
+ */
+    private String deleteCmd;
+
+/**
+ * The SQL &lt;code&gt;WHERE&lt;/code&gt; clause the writer will use for delete
+ * statements in the &lt;code&gt;PreparedStatement&lt;/code&gt; object
+ * it sends to the underlying data source.
+ *
+ * @serial
+ */
+    private String deleteWhere;
+
+/**
+ * The SQL &lt;code&gt;INSERT INTO&lt;/code&gt; command that this writer will internally use
+ * to insert data into the rowset's underlying data source.  The method
+ * &lt;code&gt;initSQLStatements&lt;/code&gt; builds this command with a question
+ * mark parameter placeholder for each column in the rowset.
+ *
+ * @serial
+ */
+    private String insertCmd;
+
+/**
+ * An array containing the column numbers of the columns that are
+ * needed to uniquely identify a row in the &lt;code&gt;CachedRowSet&lt;/code&gt; object
+ * for which this &lt;code&gt;CachedRowSetWriter&lt;/code&gt; object is the writer.
+ *
+ * @serial
+ */
+    private int[] keyCols;
+
+/**
+ * An array of the parameters that should be used to set the parameter
+ * placeholders in a &lt;code&gt;PreparedStatement&lt;/code&gt; object that this
+ * writer will execute.
+ *
+ * @serial
+ */
+    private Object[] params;
+
+/**
+ * The &lt;code&gt;CachedRowSetReader&lt;/code&gt; object that has been
+ * set as the reader for the &lt;code&gt;CachedRowSet&lt;/code&gt; object
+ * for which this &lt;code&gt;CachedRowSetWriter&lt;/code&gt; object is the writer.
+ *
+ * @serial
+ */
+    private CachedRowSetReader reader;
+
+/**
+ * The &lt;code&gt;ResultSetMetaData&lt;/code&gt; object that contains information
+ * about the columns in the &lt;code&gt;CachedRowSet&lt;/code&gt; object
+ * for which this &lt;code&gt;CachedRowSetWriter&lt;/code&gt; object is the writer.
+ *
+ * @serial
+ */
+    private ResultSetMetaData callerMd;
+
+/**
+ * The number of columns in the &lt;code&gt;CachedRowSet&lt;/code&gt; object
+ * for which this &lt;code&gt;CachedRowSetWriter&lt;/code&gt; object is the writer.
+ *
+ * @serial
+ */
+    private int callerColumnCount;
+
+/**
+ * This &lt;code&gt;CachedRowSet&lt;code&gt; will hold the conflicting values
+ *  retrieved from the db and hold it.
+ */
+    private CachedRowSetImpl crsResolve;
+
+/**
+ * This &lt;code&gt;ArrayList&lt;code&gt; will hold the values of SyncResolver.*
+ */
+    private ArrayList&lt;Integer&gt; status;
+
+/**
+ * This will check whether the same field value has changed both
+ * in database and CachedRowSet.
+ */
+    private int iChangedValsInDbAndCRS;
+
+/**
+ * This will hold the number of cols for which the values have
+ * changed only in database.
+ */
+    private int iChangedValsinDbOnly ;
+
+    private JdbcRowSetResourceBundle resBundle;
+
+<span class="nc" id="L202">    public CachedRowSetWriter() {</span>
+       try {
+<span class="nc" id="L204">               resBundle = JdbcRowSetResourceBundle.getJdbcRowSetResourceBundle();</span>
+<span class="nc" id="L205">       } catch(IOException ioe) {</span>
+<span class="nc" id="L206">               throw new RuntimeException(ioe);</span>
+<span class="nc" id="L207">       }</span>
+<span class="nc" id="L208">    }</span>
+
+/**
+ * Propagates changes in the given &lt;code&gt;RowSet&lt;/code&gt; object
+ * back to its underlying data source and returns &lt;code&gt;true&lt;/code&gt;
+ * if successful. The writer will check to see if
+ * the data in the pre-modified rowset (the original values) differ
+ * from the data in the underlying data source.  If data in the data
+ * source has been modified by someone else, there is a conflict,
+ * and in that case, the writer will not write to the data source.
+ * In other words, the writer uses an optimistic concurrency algorithm:
+ * It checks for conflicts before making changes rather than restricting
+ * access for concurrent users.
+ * &lt;P&gt;
+ * This method is called by the rowset internally when
+ * the application invokes the method &lt;code&gt;acceptChanges&lt;/code&gt;.
+ * The &lt;code&gt;writeData&lt;/code&gt; method in turn calls private methods that
+ * it defines internally.
+ * The following is a general summary of what the method
+ * &lt;code&gt;writeData&lt;/code&gt; does, much of which is accomplished
+ * through calls to its own internal methods.
+ * &lt;OL&gt;
+ * &lt;LI&gt;Creates a &lt;code&gt;CachedRowSet&lt;/code&gt; object from the given
+ *     &lt;code&gt;RowSet&lt;/code&gt; object
+ * &lt;LI&gt;Makes a connection with the data source
+ *   &lt;UL&gt;
+ *      &lt;LI&gt;Disables autocommit mode if it is not already disabled
+ *      &lt;LI&gt;Sets the transaction isolation level to that of the rowset
+ *   &lt;/UL&gt;
+ * &lt;LI&gt;Checks to see if the reader has read new data since the writer
+ *     was last called and, if so, calls the method
+ *    &lt;code&gt;initSQLStatements&lt;/code&gt; to initialize new SQL statements
+ *   &lt;UL&gt;
+ *       &lt;LI&gt;Builds new &lt;code&gt;SELECT&lt;/code&gt;, &lt;code&gt;UPDATE&lt;/code&gt;,
+ *           &lt;code&gt;INSERT&lt;/code&gt;, and &lt;code&gt;DELETE&lt;/code&gt; statements
+ *       &lt;LI&gt;Uses the &lt;code&gt;CachedRowSet&lt;/code&gt; object's metadata to
+ *           determine the table name, column names, and the columns
+ *           that make up the primary key
+ *   &lt;/UL&gt;
+ * &lt;LI&gt;When there is no conflict, propagates changes made to the
+ *     &lt;code&gt;CachedRowSet&lt;/code&gt; object back to its underlying data source
+ *   &lt;UL&gt;
+ *      &lt;LI&gt;Iterates through each row of the &lt;code&gt;CachedRowSet&lt;/code&gt; object
+ *          to determine whether it has been updated, inserted, or deleted
+ *      &lt;LI&gt;If the corresponding row in the data source has not been changed
+ *          since the rowset last read its
+ *          values, the writer will use the appropriate command to update,
+ *          insert, or delete the row
+ *      &lt;LI&gt;If any data in the data source does not match the original values
+ *          for the &lt;code&gt;CachedRowSet&lt;/code&gt; object, the writer will roll
+ *          back any changes it has made to the row in the data source.
+ *   &lt;/UL&gt;
+ * &lt;/OL&gt;
+ *
+ * @return &lt;code&gt;true&lt;/code&gt; if changes to the rowset were successfully
+ *         written to the rowset's underlying data source;
+ *         &lt;code&gt;false&lt;/code&gt; otherwise
+ */
+    public boolean writeData(RowSetInternal caller) throws SQLException {
+<span class="nc" id="L267">        long conflicts = 0;</span>
+<span class="nc" id="L268">        boolean showDel = false;</span>
+<span class="nc" id="L269">        PreparedStatement pstmtIns = null;</span>
+<span class="nc" id="L270">        iChangedValsInDbAndCRS = 0;</span>
+<span class="nc" id="L271">        iChangedValsinDbOnly = 0;</span>
+
+        // We assume caller is a CachedRowSet
+<span class="nc" id="L274">        CachedRowSetImpl crs = (CachedRowSetImpl)caller;</span>
+        // crsResolve = new CachedRowSetImpl();
+<span class="nc" id="L276">        this.crsResolve = new CachedRowSetImpl();;</span>
+
+        // The reader is registered with the writer at design time.
+        // This is not required, in general.  The reader has logic
+        // to get a JDBC connection, so call it.
+
+<span class="nc" id="L282">        con = reader.connect(caller);</span>
+
+
+<span class="nc bnc" id="L285" title="All 2 branches missed.">        if (con == null) {</span>
+<span class="nc" id="L286">            throw new SQLException(resBundle.handleGetObject(&quot;crswriter.connect&quot;).toString());</span>
+        }
+
+        /*
+         // Fix 6200646.
+         // Don't change the connection or transaction properties. This will fail in a
+         // J2EE container.
+        if (con.getAutoCommit() == true)  {
+            con.setAutoCommit(false);
+        }
+
+        con.setTransactionIsolation(crs.getTransactionIsolation());
+        */
+
+<span class="nc" id="L300">        initSQLStatements(crs);</span>
+        int iColCount;
+
+<span class="nc" id="L303">        RowSetMetaDataImpl rsmdWrite = (RowSetMetaDataImpl)crs.getMetaData();</span>
+<span class="nc" id="L304">        RowSetMetaDataImpl rsmdResolv = new RowSetMetaDataImpl();</span>
+
+<span class="nc" id="L306">        iColCount = rsmdWrite.getColumnCount();</span>
+<span class="nc" id="L307">        int sz= crs.size()+1;</span>
+<span class="nc" id="L308">        status = new ArrayList&lt;&gt;(sz);</span>
+
+<span class="nc" id="L310">        status.add(0,null);</span>
+<span class="nc" id="L311">        rsmdResolv.setColumnCount(iColCount);</span>
+
+<span class="nc bnc" id="L313" title="All 2 branches missed.">        for(int i =1; i &lt;= iColCount; i++) {</span>
+<span class="nc" id="L314">            rsmdResolv.setColumnType(i, rsmdWrite.getColumnType(i));</span>
+<span class="nc" id="L315">            rsmdResolv.setColumnName(i, rsmdWrite.getColumnName(i));</span>
+<span class="nc" id="L316">            rsmdResolv.setNullable(i, ResultSetMetaData.columnNullableUnknown);</span>
+        }
+<span class="nc" id="L318">        this.crsResolve.setMetaData(rsmdResolv);</span>
+
+        // moved outside the insert inner loop
+        //pstmtIns = con.prepareStatement(insertCmd);
+
+<span class="nc bnc" id="L323" title="All 2 branches missed.">        if (callerColumnCount &lt; 1) {</span>
+            // No data, so return success.
+<span class="nc bnc" id="L325" title="All 2 branches missed.">            if (reader.getCloseConnection() == true)</span>
+<span class="nc" id="L326">                    con.close();</span>
+<span class="nc" id="L327">            return true;</span>
+        }
+        // We need to see rows marked for deletion.
+<span class="nc" id="L330">        showDel = crs.getShowDeleted();</span>
+<span class="nc" id="L331">        crs.setShowDeleted(true);</span>
+
+        // Look at all the rows.
+<span class="nc" id="L334">        crs.beforeFirst();</span>
+
+<span class="nc" id="L336">        int rows =1;</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">        while (crs.next()) {</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">            if (crs.rowDeleted()) {</span>
+                // The row has been deleted.
+<span class="nc bnc" id="L340" title="All 2 branches missed.">                if (deleteOriginalRow(crs, this.crsResolve)) {</span>
+<span class="nc" id="L341">                       status.add(rows, SyncResolver.DELETE_ROW_CONFLICT);</span>
+<span class="nc" id="L342">                       conflicts++;</span>
+                } else {
+                      // delete happened without any occurrence of conflicts
+                      // so update status accordingly
+<span class="nc" id="L346">                       status.add(rows, SyncResolver.NO_ROW_CONFLICT);</span>
+                }
+
+<span class="nc bnc" id="L349" title="All 2 branches missed.">           } else if (crs.rowInserted()) {</span>
+                // The row has been inserted.
+
+<span class="nc" id="L352">                pstmtIns = con.prepareStatement(insertCmd);</span>
+<span class="nc bnc" id="L353" title="All 2 branches missed.">                if (insertNewRow(crs, pstmtIns, this.crsResolve)) {</span>
+<span class="nc" id="L354">                          status.add(rows, SyncResolver.INSERT_ROW_CONFLICT);</span>
+<span class="nc" id="L355">                          conflicts++;</span>
+                } else {
+                      // insert happened without any occurrence of conflicts
+                      // so update status accordingly
+<span class="nc" id="L359">                       status.add(rows, SyncResolver.NO_ROW_CONFLICT);</span>
+                }
+<span class="nc bnc" id="L361" title="All 2 branches missed.">            } else  if (crs.rowUpdated()) {</span>
+                  // The row has been updated.
+<span class="nc bnc" id="L363" title="All 2 branches missed.">                       if (updateOriginalRow(crs)) {</span>
+<span class="nc" id="L364">                             status.add(rows, SyncResolver.UPDATE_ROW_CONFLICT);</span>
+<span class="nc" id="L365">                             conflicts++;</span>
+               } else {
+                      // update happened without any occurrence of conflicts
+                      // so update status accordingly
+<span class="nc" id="L369">                      status.add(rows, SyncResolver.NO_ROW_CONFLICT);</span>
+               }
+
+            } else {
+               /** The row is neither of inserted, updated or deleted.
+                *  So set nulls in the this.crsResolve for this row,
+                *  as nothing is to be done for such rows.
+                *  Also note that if such a row has been changed in database
+                *  and we have not changed(inserted, updated or deleted)
+                *  that is fine.
+                **/
+<span class="nc" id="L380">                int icolCount = crs.getMetaData().getColumnCount();</span>
+<span class="nc" id="L381">                status.add(rows, SyncResolver.NO_ROW_CONFLICT);</span>
+
+<span class="nc" id="L383">                this.crsResolve.moveToInsertRow();</span>
+<span class="nc bnc" id="L384" title="All 2 branches missed.">                for(int cols=0;cols&lt;iColCount;cols++) {</span>
+<span class="nc" id="L385">                   this.crsResolve.updateNull(cols+1);</span>
+                } //end for
+
+<span class="nc" id="L388">                this.crsResolve.insertRow();</span>
+<span class="nc" id="L389">                this.crsResolve.moveToCurrentRow();</span>
+
+                } //end if
+<span class="nc" id="L392">         rows++;</span>
+      } //end while
+
+        // close the insert statement
+<span class="nc bnc" id="L396" title="All 2 branches missed.">        if(pstmtIns!=null)</span>
+<span class="nc" id="L397">        pstmtIns.close();</span>
+        // reset
+<span class="nc" id="L399">        crs.setShowDeleted(showDel);</span>
+
+<span class="nc" id="L401">        crs.beforeFirst();</span>
+<span class="nc" id="L402">        this.crsResolve.beforeFirst();</span>
+
+<span class="nc bnc" id="L404" title="All 2 branches missed.">    if(conflicts != 0) {</span>
+<span class="nc" id="L405">        SyncProviderException spe = new SyncProviderException(conflicts + &quot; &quot; +</span>
+<span class="nc" id="L406">                resBundle.handleGetObject(&quot;crswriter.conflictsno&quot;).toString());</span>
+        //SyncResolver syncRes = spe.getSyncResolver();
+
+<span class="nc" id="L409">         SyncResolverImpl syncResImpl = (SyncResolverImpl) spe.getSyncResolver();</span>
+
+<span class="nc" id="L411">         syncResImpl.setCachedRowSet(crs);</span>
+<span class="nc" id="L412">         syncResImpl.setCachedRowSetResolver(this.crsResolve);</span>
+
+<span class="nc" id="L414">         syncResImpl.setStatus(status);</span>
+<span class="nc" id="L415">         syncResImpl.setCachedRowSetWriter(this);</span>
+
+<span class="nc" id="L417">        throw spe;</span>
+    } else {
+<span class="nc" id="L419">         return true;</span>
+    }
+       /*
+       if (conflict == true) {
+            con.rollback();
+            return false;
+        } else {
+            con.commit();
+                if (reader.getCloseConnection() == true) {
+                       con.close();
+                }
+            return true;
+        }
+        */
+
+  } //end writeData
+
+/**
+ * Updates the given &lt;code&gt;CachedRowSet&lt;/code&gt; object's underlying data
+ * source so that updates to the rowset are reflected in the original
+ * data source, and returns &lt;code&gt;false&lt;/code&gt; if the update was successful.
+ * A return value of &lt;code&gt;true&lt;/code&gt; indicates that there is a conflict,
+ * meaning that a value updated in the rowset has already been changed by
+ * someone else in the underlying data source.  A conflict can also exist
+ * if, for example, more than one row in the data source would be affected
+ * by the update or if no rows would be affected.  In any case, if there is
+ * a conflict, this method does not update the underlying data source.
+ * &lt;P&gt;
+ * This method is called internally by the method &lt;code&gt;writeData&lt;/code&gt;
+ * if a row in the &lt;code&gt;CachedRowSet&lt;/code&gt; object for which this
+ * &lt;code&gt;CachedRowSetWriter&lt;/code&gt; object is the writer has been updated.
+ *
+ * @return &lt;code&gt;false&lt;/code&gt; if the update to the underlying data source is
+ *         successful; &lt;code&gt;true&lt;/code&gt; otherwise
+ * @throws SQLException if a database access error occurs
+ */
+    private boolean updateOriginalRow(CachedRowSet crs)
+        throws SQLException {
+        PreparedStatement pstmt;
+<span class="nc" id="L458">        int i = 0;</span>
+<span class="nc" id="L459">        int idx = 0;</span>
+
+        // Select the row from the database.
+<span class="nc" id="L462">        ResultSet origVals = crs.getOriginalRow();</span>
+<span class="nc" id="L463">        origVals.next();</span>
+
+        try {
+<span class="nc" id="L466">            updateWhere = buildWhereClause(updateWhere, origVals);</span>
+
+
+             /**
+              *  The following block of code is for checking a particular type of
+              *  query where in there is a where clause. Without this block, if a
+              *  SQL statement is built the &quot;where&quot; clause will appear twice hence
+              *  the DB errors out and a SQLException is thrown. This code also
+              *  considers that the where clause is in the right place as the
+              *  CachedRowSet object would already have been populated with this
+              *  query before coming to this point.
+              **/
+
+
+<span class="nc" id="L480">            String tempselectCmd = selectCmd.toLowerCase();</span>
+
+<span class="nc" id="L482">            int idxWhere = tempselectCmd.indexOf(&quot;where&quot;);</span>
+
+<span class="nc bnc" id="L484" title="All 2 branches missed.">            if(idxWhere != -1)</span>
+            {
+<span class="nc" id="L486">               String tempSelect = selectCmd.substring(0,idxWhere);</span>
+<span class="nc" id="L487">               selectCmd = tempSelect;</span>
+            }
+
+<span class="nc" id="L490">            pstmt = con.prepareStatement(selectCmd + updateWhere,</span>
+                        ResultSet.TYPE_SCROLL_SENSITIVE, ResultSet.CONCUR_READ_ONLY);
+
+<span class="nc bnc" id="L493" title="All 2 branches missed.">            for (i = 0; i &lt; keyCols.length; i++) {</span>
+<span class="nc bnc" id="L494" title="All 2 branches missed.">                if (params[i] != null) {</span>
+<span class="nc" id="L495">                    pstmt.setObject(++idx, params[i]);</span>
+                } else {
+                    continue;
+                }
+            }
+
+            try {
+<span class="nc" id="L502">                pstmt.setMaxRows(crs.getMaxRows());</span>
+<span class="nc" id="L503">                pstmt.setMaxFieldSize(crs.getMaxFieldSize());</span>
+<span class="nc" id="L504">                pstmt.setEscapeProcessing(crs.getEscapeProcessing());</span>
+<span class="nc" id="L505">                pstmt.setQueryTimeout(crs.getQueryTimeout());</span>
+<span class="nc" id="L506">            } catch (Exception ex) {</span>
+                // Older driver don't support these operations.
+<span class="nc" id="L508">            }</span>
+
+<span class="nc" id="L510">            ResultSet rs = null;</span>
+<span class="nc" id="L511">            rs = pstmt.executeQuery();</span>
+<span class="nc" id="L512">            ResultSetMetaData rsmd = rs.getMetaData();</span>
+
+<span class="nc bnc" id="L514" title="All 2 branches missed.">            if (rs.next()) {</span>
+<span class="nc bnc" id="L515" title="All 2 branches missed.">                if (rs.next()) {</span>
+                   /** More than one row conflict.
+                    *  If rs has only one row we are able to
+                    *  uniquely identify the row where update
+                    *  have to happen else if more than one
+                    *  row implies we cannot uniquely identify the row
+                    *  where we have to do updates.
+                    *  crs.setKeyColumns needs to be set to
+                    *  come out of this situation.
+                    */
+
+<span class="nc" id="L526">                   return true;</span>
+                }
+
+                // don't close the rs
+                // we require the record in rs to be used.
+                // rs.close();
+                // pstmt.close();
+<span class="nc" id="L533">                rs.first();</span>
+
+                // how many fields need to be updated
+<span class="nc" id="L536">                int colsNotChanged = 0;</span>
+<span class="nc" id="L537">                Vector&lt;Integer&gt; cols = new Vector&lt;&gt;();</span>
+<span class="nc" id="L538">                String updateExec = updateCmd;</span>
+                Object orig;
+                Object curr;
+                Object rsval;
+<span class="nc" id="L542">                boolean boolNull = true;</span>
+<span class="nc" id="L543">                Object objVal = null;</span>
+
+                // There's only one row and the cursor
+                // needs to be on that row.
+
+<span class="nc" id="L548">                boolean first = true;</span>
+<span class="nc" id="L549">                boolean flag = true;</span>
+
+<span class="nc" id="L551">          this.crsResolve.moveToInsertRow();</span>
+
+<span class="nc bnc" id="L553" title="All 2 branches missed.">          for (i = 1; i &lt;= callerColumnCount; i++) {</span>
+<span class="nc" id="L554">                orig = origVals.getObject(i);</span>
+<span class="nc" id="L555">                curr = crs.getObject(i);</span>
+<span class="nc" id="L556">                rsval = rs.getObject(i);</span>
+                /*
+                 * the following block creates equivalent objects
+                 * that would have been created if this rs is populated
+                 * into a CachedRowSet so that comparison of the column values
+                 * from the ResultSet and CachedRowSet are possible
+                 */
+<span class="nc bnc" id="L563" title="All 2 branches missed.">                Map&lt;String, Class&lt;?&gt;&gt; map = (crs.getTypeMap() == null)?con.getTypeMap():crs.getTypeMap();</span>
+<span class="nc bnc" id="L564" title="All 2 branches missed.">                if (rsval instanceof Struct) {</span>
+
+<span class="nc" id="L566">                    Struct s = (Struct)rsval;</span>
+
+                    // look up the class in the map
+<span class="nc" id="L569">                    Class&lt;?&gt; c = null;</span>
+<span class="nc" id="L570">                    c = map.get(s.getSQLTypeName());</span>
+<span class="nc bnc" id="L571" title="All 2 branches missed.">                    if (c != null) {</span>
+                        // create new instance of the class
+<span class="nc" id="L573">                        SQLData obj = null;</span>
+                        try {
+<span class="nc" id="L575">                            obj = (SQLData)c.newInstance();</span>
+<span class="nc" id="L576">                        } catch (java.lang.InstantiationException ex) {</span>
+<span class="nc" id="L577">                            throw new SQLException(MessageFormat.format(resBundle.handleGetObject(&quot;cachedrowsetimpl.unableins&quot;).toString(),</span>
+<span class="nc" id="L578">                            ex.getMessage()));</span>
+<span class="nc" id="L579">                        } catch (java.lang.IllegalAccessException ex) {</span>
+<span class="nc" id="L580">                            throw new SQLException(MessageFormat.format(resBundle.handleGetObject(&quot;cachedrowsetimpl.unableins&quot;).toString(),</span>
+<span class="nc" id="L581">                            ex.getMessage()));</span>
+<span class="nc" id="L582">                        }</span>
+                        // get the attributes from the struct
+<span class="nc" id="L584">                        Object attribs[] = s.getAttributes(map);</span>
+                        // create the SQLInput &quot;stream&quot;
+<span class="nc" id="L586">                        SQLInputImpl sqlInput = new SQLInputImpl(attribs, map);</span>
+                        // read the values...
+<span class="nc" id="L588">                        obj.readSQL(sqlInput, s.getSQLTypeName());</span>
+<span class="nc" id="L589">                        rsval = obj;</span>
+                    }
+<span class="nc bnc" id="L591" title="All 2 branches missed.">                } else if (rsval instanceof SQLData) {</span>
+<span class="nc" id="L592">                    rsval = new SerialStruct((SQLData)rsval, map);</span>
+<span class="nc bnc" id="L593" title="All 2 branches missed.">                } else if (rsval instanceof Blob) {</span>
+<span class="nc" id="L594">                    rsval = new SerialBlob((Blob)rsval);</span>
+<span class="nc bnc" id="L595" title="All 2 branches missed.">                } else if (rsval instanceof Clob) {</span>
+<span class="nc" id="L596">                    rsval = new SerialClob((Clob)rsval);</span>
+<span class="nc bnc" id="L597" title="All 2 branches missed.">                } else if (rsval instanceof java.sql.Array) {</span>
+<span class="nc" id="L598">                    rsval = new SerialArray((java.sql.Array)rsval, map);</span>
+                }
+
+                // reset boolNull if it had been set
+<span class="nc" id="L602">                boolNull = true;</span>
+
+                /** This addtional checking has been added when the current value
+                 *  in the DB is null, but the DB had a different value when the
+                 *  data was actaully fetched into the CachedRowSet.
+                 **/
+
+<span class="nc bnc" id="L609" title="All 4 branches missed.">                if(rsval == null &amp;&amp; orig != null) {</span>
+                   // value in db has changed
+                    // don't proceed with synchronization
+                    // get the value in db and pass it to the resolver.
+
+<span class="nc" id="L614">                    iChangedValsinDbOnly++;</span>
+                   // Set the boolNull to false,
+                   // in order to set the actual value;
+<span class="nc" id="L617">                     boolNull = false;</span>
+<span class="nc" id="L618">                     objVal = rsval;</span>
+                }
+
+                /** Adding the checking for rsval to be &quot;not&quot; null or else
+                 *  it would through a NullPointerException when the values
+                 *  are compared.
+                 **/
+
+<span class="nc bnc" id="L626" title="All 4 branches missed.">                else if(rsval != null &amp;&amp; (!rsval.equals(orig)))</span>
+                {
+                    // value in db has changed
+                    // don't proceed with synchronization
+                    // get the value in db and pass it to the resolver.
+
+<span class="nc" id="L632">                    iChangedValsinDbOnly++;</span>
+                   // Set the boolNull to false,
+                   // in order to set the actual value;
+<span class="nc" id="L635">                     boolNull = false;</span>
+<span class="nc" id="L636">                     objVal = rsval;</span>
+<span class="nc bnc" id="L637" title="All 4 branches missed.">                } else if (  (orig == null || curr == null) ) {</span>
+
+                        /** Adding the additonal condition of checking for &quot;flag&quot;
+                         *  boolean variable, which would otherwise result in
+                         *  building a invalid query, as the comma would not be
+                         *  added to the query string.
+                         **/
+
+<span class="nc bnc" id="L645" title="All 4 branches missed.">                        if (first == false || flag == false) {</span>
+<span class="nc" id="L646">                          updateExec += &quot;, &quot;;</span>
+                         }
+<span class="nc" id="L648">                        updateExec += crs.getMetaData().getColumnName(i);</span>
+<span class="nc" id="L649">                        cols.add(i);</span>
+<span class="nc" id="L650">                        updateExec += &quot; = ? &quot;;</span>
+<span class="nc" id="L651">                        first = false;</span>
+
+                /** Adding the extra condition for orig to be &quot;not&quot; null as the
+                 *  condition for orig to be null is take prior to this, if this
+                 *  is not added it will result in a NullPointerException when
+                 *  the values are compared.
+                 **/
+
+<span class="nc bnc" id="L659" title="All 2 branches missed.">                }  else if (orig.equals(curr)) {</span>
+<span class="nc" id="L660">                       colsNotChanged++;</span>
+                     //nothing to update in this case since values are equal
+
+                /** Adding the extra condition for orig to be &quot;not&quot; null as the
+                 *  condition for orig to be null is take prior to this, if this
+                 *  is not added it will result in a NullPointerException when
+                 *  the values are compared.
+                 **/
+
+<span class="nc bnc" id="L669" title="All 2 branches missed.">                } else if(orig.equals(curr) == false) {</span>
+                      // When values from db and values in CachedRowSet are not equal,
+                      // if db value is same as before updation for each col in
+                      // the row before fetching into CachedRowSet,
+                      // only then we go ahead with updation, else we
+                      // throw SyncProviderException.
+
+                      // if value has changed in db after fetching from db
+                      // for some cols of the row and at the same time, some other cols
+                      // have changed in CachedRowSet, no synchronization happens
+
+                      // Synchronization happens only when data when fetching is
+                      // same or at most has changed in cachedrowset
+
+                      // check orig value with what is there in crs for a column
+                      // before updation in crs.
+
+<span class="nc bnc" id="L686" title="All 2 branches missed.">                         if(crs.columnUpdated(i)) {</span>
+<span class="nc bnc" id="L687" title="All 2 branches missed.">                             if(rsval.equals(orig)) {</span>
+                               // At this point we are sure that
+                               // the value updated in crs was from
+                               // what is in db now and has not changed
+<span class="nc bnc" id="L691" title="All 4 branches missed.">                                 if (flag == false || first == false) {</span>
+<span class="nc" id="L692">                                    updateExec += &quot;, &quot;;</span>
+                                 }
+<span class="nc" id="L694">                                updateExec += crs.getMetaData().getColumnName(i);</span>
+<span class="nc" id="L695">                                cols.add(i);</span>
+<span class="nc" id="L696">                                updateExec += &quot; = ? &quot;;</span>
+<span class="nc" id="L697">                                flag = false;</span>
+                             } else {
+                               // Here the value has changed in the db after
+                               // data was fetched
+                               // Plus store this row from CachedRowSet and keep it
+                               // in a new CachedRowSet
+<span class="nc" id="L703">                               boolNull= false;</span>
+<span class="nc" id="L704">                               objVal = rsval;</span>
+<span class="nc" id="L705">                               iChangedValsInDbAndCRS++;</span>
+                             }
+                         }
+                  }
+
+<span class="nc bnc" id="L710" title="All 2 branches missed.">                    if(!boolNull) {</span>
+<span class="nc" id="L711">                        this.crsResolve.updateObject(i,objVal);</span>
+                                 } else {
+<span class="nc" id="L713">                                      this.crsResolve.updateNull(i);</span>
+                                 }
+                } //end for
+
+<span class="nc" id="L717">                rs.close();</span>
+<span class="nc" id="L718">                pstmt.close();</span>
+
+<span class="nc" id="L720">               this.crsResolve.insertRow();</span>
+<span class="nc" id="L721">                   this.crsResolve.moveToCurrentRow();</span>
+
+                /**
+                 * if nothing has changed return now - this can happen
+                 * if column is updated to the same value.
+                 * if colsNotChanged == callerColumnCount implies we are updating
+                 * the database with ALL COLUMNS HAVING SAME VALUES,
+                 * so skip going to database, else do as usual.
+                 **/
+<span class="nc bnc" id="L730" title="All 6 branches missed.">                if ( (first == false &amp;&amp; cols.size() == 0)  ||</span>
+                     colsNotChanged == callerColumnCount ) {
+<span class="nc" id="L732">                    return false;</span>
+                }
+
+<span class="nc bnc" id="L735" title="All 4 branches missed.">                if(iChangedValsInDbAndCRS != 0 || iChangedValsinDbOnly != 0) {</span>
+<span class="nc" id="L736">                   return true;</span>
+                }
+
+
+<span class="nc" id="L740">                updateExec += updateWhere;</span>
+
+<span class="nc" id="L742">                pstmt = con.prepareStatement(updateExec);</span>
+
+                // Comments needed here
+<span class="nc bnc" id="L745" title="All 2 branches missed.">                for (i = 0; i &lt; cols.size(); i++) {</span>
+<span class="nc" id="L746">                    Object obj = crs.getObject(cols.get(i));</span>
+<span class="nc bnc" id="L747" title="All 2 branches missed.">                    if (obj != null)</span>
+<span class="nc" id="L748">                        pstmt.setObject(i + 1, obj);</span>
+                    else
+<span class="nc" id="L750">                        pstmt.setNull(i + 1,crs.getMetaData().getColumnType(i + 1));</span>
+                }
+<span class="nc" id="L752">                idx = i;</span>
+
+                // Comments needed here
+<span class="nc bnc" id="L755" title="All 2 branches missed.">                for (i = 0; i &lt; keyCols.length; i++) {</span>
+<span class="nc bnc" id="L756" title="All 2 branches missed.">                    if (params[i] != null) {</span>
+<span class="nc" id="L757">                        pstmt.setObject(++idx, params[i]);</span>
+                    } else {
+                        continue;
+                    }
+                }
+
+<span class="nc" id="L763">                i = pstmt.executeUpdate();</span>
+
+               /**
+                * i should be equal to 1(row count), because we update
+                * one row(returned as row count) at a time, if all goes well.
+                * if 1 != 1, this implies we have not been able to
+                * do updations properly i.e there is a conflict in database
+                * versus what is in CachedRowSet for this particular row.
+                **/
+
+<span class="nc" id="L773">                 return false;</span>
+
+            } else {
+                /**
+                 * Cursor will be here, if the ResultSet may not return even a single row
+                 * i.e. we can't find the row where to update because it has been deleted
+                 * etc. from the db.
+                 * Present the whole row as null to user, to force null to be sync'ed
+                 * and hence nothing to be synced.
+                 *
+                 * NOTE:
+                 * ------
+                 * In the database if a column that is mapped to java.sql.Types.REAL stores
+                 * a Double value and is compared with value got from ResultSet.getFloat()
+                 * no row is retrieved and will throw a SyncProviderException. For details
+                 * see bug Id 5053830
+                 **/
+<span class="nc" id="L790">                return true;</span>
+            }
+<span class="nc" id="L792">        } catch (SQLException ex) {</span>
+<span class="nc" id="L793">            ex.printStackTrace();</span>
+            // if executeUpdate fails it will come here,
+            // update crsResolve with null rows
+<span class="nc" id="L796">            this.crsResolve.moveToInsertRow();</span>
+
+<span class="nc bnc" id="L798" title="All 2 branches missed.">            for(i = 1; i &lt;= callerColumnCount; i++) {</span>
+<span class="nc" id="L799">               this.crsResolve.updateNull(i);</span>
+            }
+
+<span class="nc" id="L802">            this.crsResolve.insertRow();</span>
+<span class="nc" id="L803">            this.crsResolve.moveToCurrentRow();</span>
+
+<span class="nc" id="L805">            return true;</span>
+        }
+    }
+
+   /**
+    * Inserts a row that has been inserted into the given
+    * &lt;code&gt;CachedRowSet&lt;/code&gt; object into the data source from which
+    * the rowset is derived, returning &lt;code&gt;false&lt;/code&gt; if the insertion
+    * was successful.
+    *
+    * @param crs the &lt;code&gt;CachedRowSet&lt;/code&gt; object that has had a row inserted
+    *            and to whose underlying data source the row will be inserted
+    * @param pstmt the &lt;code&gt;PreparedStatement&lt;/code&gt; object that will be used
+    *              to execute the insertion
+    * @return &lt;code&gt;false&lt;/code&gt; to indicate that the insertion was successful;
+    *         &lt;code&gt;true&lt;/code&gt; otherwise
+    * @throws SQLException if a database access error occurs
+    */
+   private boolean insertNewRow(CachedRowSet crs,
+       PreparedStatement pstmt, CachedRowSetImpl crsRes) throws SQLException {
+
+<span class="nc" id="L826">       boolean returnVal = false;</span>
+
+<span class="nc" id="L828">       try (PreparedStatement pstmtSel = con.prepareStatement(selectCmd,</span>
+                       ResultSet.TYPE_SCROLL_SENSITIVE,
+                       ResultSet.CONCUR_READ_ONLY);
+<span class="nc" id="L831">            ResultSet rs = pstmtSel.executeQuery();</span>
+<span class="nc" id="L832">            ResultSet rs2 = con.getMetaData().getPrimaryKeys(null, null,</span>
+<span class="nc" id="L833">                       crs.getTableName())</span>
+       ) {
+
+<span class="nc" id="L836">           ResultSetMetaData rsmd = crs.getMetaData();</span>
+<span class="nc" id="L837">           int icolCount = rsmd.getColumnCount();</span>
+<span class="nc" id="L838">           String[] primaryKeys = new String[icolCount];</span>
+<span class="nc" id="L839">           int k = 0;</span>
+<span class="nc bnc" id="L840" title="All 2 branches missed.">           while (rs2.next()) {</span>
+<span class="nc" id="L841">               primaryKeys[k] = rs2.getString(&quot;COLUMN_NAME&quot;);</span>
+<span class="nc" id="L842">               k++;</span>
+           }
+
+<span class="nc bnc" id="L845" title="All 2 branches missed.">           if (rs.next()) {</span>
+<span class="nc bnc" id="L846" title="All 2 branches missed.">               for (String pkName : primaryKeys) {</span>
+<span class="nc bnc" id="L847" title="All 2 branches missed.">                   if (!isPKNameValid(pkName, rsmd)) {</span>
+
+                       /* We came here as one of the the primary keys
+                        * of the table is not present in the cached
+                        * rowset object, it should be an autoincrement column
+                        * and not included while creating CachedRowSet
+                        * Object, proceed to check for other primary keys
+                        */
+<span class="nc" id="L855">                       continue;</span>
+                   }
+
+<span class="nc" id="L858">                   Object crsPK = crs.getObject(pkName);</span>
+<span class="nc bnc" id="L859" title="All 2 branches missed.">                   if (crsPK == null) {</span>
+                       /*
+                        * It is possible that the PK is null on some databases
+                        * and will be filled in at insert time (MySQL for example)
+                        */
+<span class="nc" id="L864">                       break;</span>
+                   }
+
+<span class="nc" id="L867">                   String rsPK = rs.getObject(pkName).toString();</span>
+<span class="nc bnc" id="L868" title="All 2 branches missed.">                   if (crsPK.toString().equals(rsPK)) {</span>
+<span class="nc" id="L869">                       returnVal = true;</span>
+<span class="nc" id="L870">                       this.crsResolve.moveToInsertRow();</span>
+<span class="nc bnc" id="L871" title="All 2 branches missed.">                       for (int i = 1; i &lt;= icolCount; i++) {</span>
+<span class="nc" id="L872">                           String colname = (rs.getMetaData()).getColumnName(i);</span>
+<span class="nc bnc" id="L873" title="All 2 branches missed.">                           if (colname.equals(pkName))</span>
+<span class="nc" id="L874">                               this.crsResolve.updateObject(i,rsPK);</span>
+                           else
+<span class="nc" id="L876">                               this.crsResolve.updateNull(i);</span>
+                       }
+<span class="nc" id="L878">                       this.crsResolve.insertRow();</span>
+<span class="nc" id="L879">                       this.crsResolve.moveToCurrentRow();</span>
+                   }
+               }
+           }
+
+<span class="nc bnc" id="L884" title="All 2 branches missed.">           if (returnVal) {</span>
+<span class="nc" id="L885">               return returnVal;</span>
+           }
+
+           try {
+<span class="nc bnc" id="L889" title="All 2 branches missed.">               for (int i = 1; i &lt;= icolCount; i++) {</span>
+<span class="nc" id="L890">                   Object obj = crs.getObject(i);</span>
+<span class="nc bnc" id="L891" title="All 2 branches missed.">                   if (obj != null) {</span>
+<span class="nc" id="L892">                       pstmt.setObject(i, obj);</span>
+                   } else {
+<span class="nc" id="L894">                       pstmt.setNull(i,crs.getMetaData().getColumnType(i));</span>
+                   }
+               }
+
+<span class="nc" id="L898">               pstmt.executeUpdate();</span>
+<span class="nc" id="L899">               return false;</span>
+
+<span class="nc" id="L901">           } catch (SQLException ex) {</span>
+               /*
+                * Cursor will come here if executeUpdate fails.
+                * There can be many reasons why the insertion failed,
+                * one can be violation of primary key.
+                * Hence we cannot exactly identify why the insertion failed,
+                * present the current row as a null row to the caller.
+                */
+<span class="nc" id="L909">               this.crsResolve.moveToInsertRow();</span>
+
+<span class="nc bnc" id="L911" title="All 2 branches missed.">               for (int i = 1; i &lt;= icolCount; i++) {</span>
+<span class="nc" id="L912">                   this.crsResolve.updateNull(i);</span>
+               }
+
+<span class="nc" id="L915">               this.crsResolve.insertRow();</span>
+<span class="nc" id="L916">               this.crsResolve.moveToCurrentRow();</span>
+
+<span class="nc" id="L918">               return true;</span>
+           }
+<span class="nc bnc" id="L920" title="All 48 branches missed.">       }</span>
+   }
+
+/**
+ * Deletes the row in the underlying data source that corresponds to
+ * a row that has been deleted in the given &lt;code&gt; CachedRowSet&lt;/code&gt; object
+ * and returns &lt;code&gt;false&lt;/code&gt; if the deletion was successful.
+ * &lt;P&gt;
+ * This method is called internally by this writer's &lt;code&gt;writeData&lt;/code&gt;
+ * method when a row in the rowset has been deleted. The values in the
+ * deleted row are the same as those that are stored in the original row
+ * of the given &lt;code&gt;CachedRowSet&lt;/code&gt; object.  If the values in the
+ * original row differ from the row in the underlying data source, the row
+ * in the data source is not deleted, and &lt;code&gt;deleteOriginalRow&lt;/code&gt;
+ * returns &lt;code&gt;true&lt;/code&gt; to indicate that there was a conflict.
+ *
+ *
+ * @return &lt;code&gt;false&lt;/code&gt; if the deletion was successful, which means that
+ *         there was no conflict; &lt;code&gt;true&lt;/code&gt; otherwise
+ * @throws SQLException if there was a database access error
+ */
+    private boolean deleteOriginalRow(CachedRowSet crs, CachedRowSetImpl crsRes) throws SQLException {
+        PreparedStatement pstmt;
+        int i;
+<span class="nc" id="L944">        int idx = 0;</span>
+        String strSelect;
+    // Select the row from the database.
+<span class="nc" id="L947">        ResultSet origVals = crs.getOriginalRow();</span>
+<span class="nc" id="L948">        origVals.next();</span>
+
+<span class="nc" id="L950">        deleteWhere = buildWhereClause(deleteWhere, origVals);</span>
+<span class="nc" id="L951">        pstmt = con.prepareStatement(selectCmd + deleteWhere,</span>
+                ResultSet.TYPE_SCROLL_SENSITIVE, ResultSet.CONCUR_READ_ONLY);
+
+<span class="nc bnc" id="L954" title="All 2 branches missed.">        for (i = 0; i &lt; keyCols.length; i++) {</span>
+<span class="nc bnc" id="L955" title="All 2 branches missed.">            if (params[i] != null) {</span>
+<span class="nc" id="L956">                pstmt.setObject(++idx, params[i]);</span>
+            } else {
+                continue;
+            }
+        }
+
+        try {
+<span class="nc" id="L963">            pstmt.setMaxRows(crs.getMaxRows());</span>
+<span class="nc" id="L964">            pstmt.setMaxFieldSize(crs.getMaxFieldSize());</span>
+<span class="nc" id="L965">            pstmt.setEscapeProcessing(crs.getEscapeProcessing());</span>
+<span class="nc" id="L966">            pstmt.setQueryTimeout(crs.getQueryTimeout());</span>
+<span class="nc" id="L967">        } catch (Exception ex) {</span>
+            /*
+             * Older driver don't support these operations...
+             */
+            ;
+<span class="nc" id="L972">        }</span>
+
+<span class="nc" id="L974">        ResultSet rs = pstmt.executeQuery();</span>
+
+<span class="nc bnc" id="L976" title="All 2 branches missed.">        if (rs.next() == true) {</span>
+<span class="nc bnc" id="L977" title="All 2 branches missed.">            if (rs.next()) {</span>
+                // more than one row
+<span class="nc" id="L979">                return true;</span>
+            }
+<span class="nc" id="L981">            rs.first();</span>
+
+            // Now check all the values in rs to be same in
+            // db also before actually going ahead with deleting
+<span class="nc" id="L985">            boolean boolChanged = false;</span>
+
+<span class="nc" id="L987">            crsRes.moveToInsertRow();</span>
+
+<span class="nc bnc" id="L989" title="All 2 branches missed.">            for (i = 1; i &lt;= crs.getMetaData().getColumnCount(); i++) {</span>
+
+<span class="nc" id="L991">                Object original = origVals.getObject(i);</span>
+<span class="nc" id="L992">                Object changed = rs.getObject(i);</span>
+
+<span class="nc bnc" id="L994" title="All 4 branches missed.">                if(original != null &amp;&amp; changed != null ) {</span>
+<span class="nc bnc" id="L995" title="All 2 branches missed.">                  if(! (original.toString()).equals(changed.toString()) ) {</span>
+<span class="nc" id="L996">                      boolChanged = true;</span>
+<span class="nc" id="L997">                      crsRes.updateObject(i,origVals.getObject(i));</span>
+                  }
+                } else {
+<span class="nc" id="L1000">                   crsRes.updateNull(i);</span>
+               }
+            }
+
+<span class="nc" id="L1004">           crsRes.insertRow();</span>
+<span class="nc" id="L1005">           crsRes.moveToCurrentRow();</span>
+
+<span class="nc bnc" id="L1007" title="All 2 branches missed.">           if(boolChanged) {</span>
+               // do not delete as values in db have changed
+               // deletion will not happen for this row from db
+                   // exit now returning true. i.e. conflict
+<span class="nc" id="L1011">               return true;</span>
+            } else {
+                // delete the row.
+                // Go ahead with deleting,
+                // don't do anything here
+            }
+
+<span class="nc" id="L1018">            String cmd = deleteCmd + deleteWhere;</span>
+<span class="nc" id="L1019">            pstmt = con.prepareStatement(cmd);</span>
+
+<span class="nc" id="L1021">            idx = 0;</span>
+<span class="nc bnc" id="L1022" title="All 2 branches missed.">            for (i = 0; i &lt; keyCols.length; i++) {</span>
+<span class="nc bnc" id="L1023" title="All 2 branches missed.">                if (params[i] != null) {</span>
+<span class="nc" id="L1024">                    pstmt.setObject(++idx, params[i]);</span>
+                } else {
+                    continue;
+                }
+            }
+
+<span class="nc bnc" id="L1030" title="All 2 branches missed.">            if (pstmt.executeUpdate() != 1) {</span>
+<span class="nc" id="L1031">                return true;</span>
+            }
+<span class="nc" id="L1033">            pstmt.close();</span>
+<span class="nc" id="L1034">        } else {</span>
+            // didn't find the row
+<span class="nc" id="L1036">            return true;</span>
+        }
+
+        // no conflict
+<span class="nc" id="L1040">        return false;</span>
+    }
+
+    /**
+     * Sets the reader for this writer to the given reader.
+     *
+     * @throws SQLException if a database access error occurs
+     */
+    public void setReader(CachedRowSetReader reader) throws SQLException {
+<span class="nc" id="L1049">        this.reader = reader;</span>
+<span class="nc" id="L1050">    }</span>
+
+    /**
+     * Gets the reader for this writer.
+     *
+     * @throws SQLException if a database access error occurs
+     */
+    public CachedRowSetReader getReader() throws SQLException {
+<span class="nc" id="L1058">        return reader;</span>
+    }
+
+    /**
+     * Composes a &lt;code&gt;SELECT&lt;/code&gt;, &lt;code&gt;UPDATE&lt;/code&gt;, &lt;code&gt;INSERT&lt;/code&gt;,
+     * and &lt;code&gt;DELETE&lt;/code&gt; statement that can be used by this writer to
+     * write data to the data source backing the given &lt;code&gt;CachedRowSet&lt;/code&gt;
+     * object.
+     *
+     * @ param caller a &lt;code&gt;CachedRowSet&lt;/code&gt; object for which this
+     *                &lt;code&gt;CachedRowSetWriter&lt;/code&gt; object is the writer
+     * @throws SQLException if a database access error occurs
+     */
+    private void initSQLStatements(CachedRowSet caller) throws SQLException {
+
+        int i;
+
+<span class="nc" id="L1075">        callerMd = caller.getMetaData();</span>
+<span class="nc" id="L1076">        callerColumnCount = callerMd.getColumnCount();</span>
+<span class="nc bnc" id="L1077" title="All 2 branches missed.">        if (callerColumnCount &lt; 1)</span>
+            // No data, so return.
+<span class="nc" id="L1079">            return;</span>
+
+        /*
+         * If the RowSet has a Table name we should use it.
+         * This is really a hack to get round the fact that
+         * a lot of the jdbc drivers can't provide the tab.
+         */
+<span class="nc" id="L1086">        String table = caller.getTableName();</span>
+<span class="nc bnc" id="L1087" title="All 2 branches missed.">        if (table == null) {</span>
+            /*
+             * attempt to build a table name using the info
+             * that the driver gave us for the first column
+             * in the source result set.
+             */
+<span class="nc" id="L1093">            table = callerMd.getTableName(1);</span>
+<span class="nc bnc" id="L1094" title="All 4 branches missed.">            if (table == null || table.length() == 0) {</span>
+<span class="nc" id="L1095">                throw new SQLException(resBundle.handleGetObject(&quot;crswriter.tname&quot;).toString());</span>
+            }
+        }
+<span class="nc" id="L1098">        String catalog = callerMd.getCatalogName(1);</span>
+<span class="nc" id="L1099">            String schema = callerMd.getSchemaName(1);</span>
+<span class="nc" id="L1100">        DatabaseMetaData dbmd = con.getMetaData();</span>
+
+        /*
+         * Compose a SELECT statement.  There are three parts.
+         */
+
+        // Project List
+<span class="nc" id="L1107">        selectCmd = &quot;SELECT &quot;;</span>
+<span class="nc bnc" id="L1108" title="All 2 branches missed.">        for (i=1; i &lt;= callerColumnCount; i++) {</span>
+<span class="nc" id="L1109">            selectCmd += callerMd.getColumnName(i);</span>
+<span class="nc bnc" id="L1110" title="All 2 branches missed.">            if ( i &lt;  callerMd.getColumnCount() )</span>
+<span class="nc" id="L1111">                selectCmd += &quot;, &quot;;</span>
+            else
+<span class="nc" id="L1113">                selectCmd += &quot; &quot;;</span>
+        }
+
+        // FROM clause.
+<span class="nc" id="L1117">        selectCmd += &quot;FROM &quot; + buildTableName(dbmd, catalog, schema, table);</span>
+
+        /*
+         * Compose an UPDATE statement.
+         */
+<span class="nc" id="L1122">        updateCmd = &quot;UPDATE &quot; + buildTableName(dbmd, catalog, schema, table);</span>
+
+
+        /**
+         *  The following block of code is for checking a particular type of
+         *  query where in there is a where clause. Without this block, if a
+         *  SQL statement is built the &quot;where&quot; clause will appear twice hence
+         *  the DB errors out and a SQLException is thrown. This code also
+         *  considers that the where clause is in the right place as the
+         *  CachedRowSet object would already have been populated with this
+         *  query before coming to this point.
+         **/
+
+<span class="nc" id="L1135">        String tempupdCmd = updateCmd.toLowerCase();</span>
+
+<span class="nc" id="L1137">        int idxupWhere = tempupdCmd.indexOf(&quot;where&quot;);</span>
+
+<span class="nc bnc" id="L1139" title="All 2 branches missed.">        if(idxupWhere != -1)</span>
+        {
+<span class="nc" id="L1141">           updateCmd = updateCmd.substring(0,idxupWhere);</span>
+        }
+<span class="nc" id="L1143">        updateCmd += &quot;SET &quot;;</span>
+
+        /*
+         * Compose an INSERT statement.
+         */
+<span class="nc" id="L1148">        insertCmd = &quot;INSERT INTO &quot; + buildTableName(dbmd, catalog, schema, table);</span>
+        // Column list
+<span class="nc" id="L1150">        insertCmd += &quot;(&quot;;</span>
+<span class="nc bnc" id="L1151" title="All 2 branches missed.">        for (i=1; i &lt;= callerColumnCount; i++) {</span>
+<span class="nc" id="L1152">            insertCmd += callerMd.getColumnName(i);</span>
+<span class="nc bnc" id="L1153" title="All 2 branches missed.">            if ( i &lt;  callerMd.getColumnCount() )</span>
+<span class="nc" id="L1154">                insertCmd += &quot;, &quot;;</span>
+            else
+<span class="nc" id="L1156">                insertCmd += &quot;) VALUES (&quot;;</span>
+        }
+<span class="nc bnc" id="L1158" title="All 2 branches missed.">        for (i=1; i &lt;= callerColumnCount; i++) {</span>
+<span class="nc" id="L1159">            insertCmd += &quot;?&quot;;</span>
+<span class="nc bnc" id="L1160" title="All 2 branches missed.">            if (i &lt; callerColumnCount)</span>
+<span class="nc" id="L1161">                insertCmd += &quot;, &quot;;</span>
+            else
+<span class="nc" id="L1163">                insertCmd += &quot;)&quot;;</span>
+        }
+
+        /*
+         * Compose a DELETE statement.
+         */
+<span class="nc" id="L1169">        deleteCmd = &quot;DELETE FROM &quot; + buildTableName(dbmd, catalog, schema, table);</span>
+
+        /*
+         * set the key desriptors that will be
+         * needed to construct where clauses.
+         */
+<span class="nc" id="L1175">        buildKeyDesc(caller);</span>
+<span class="nc" id="L1176">    }</span>
+
+    /**
+     * Returns a fully qualified table name built from the given catalog and
+     * table names. The given metadata object is used to get the proper order
+     * and separator.
+     *
+     * @param dbmd a &lt;code&gt;DatabaseMetaData&lt;/code&gt; object that contains metadata
+     *          about this writer's &lt;code&gt;CachedRowSet&lt;/code&gt; object
+     * @param catalog a &lt;code&gt;String&lt;/code&gt; object with the rowset's catalog
+     *          name
+     * @param table a &lt;code&gt;String&lt;/code&gt; object with the name of the table from
+     *          which this writer's rowset was derived
+     * @return a &lt;code&gt;String&lt;/code&gt; object with the fully qualified name of the
+     *          table from which this writer's rowset was derived
+     * @throws SQLException if a database access error occurs
+     */
+    private String buildTableName(DatabaseMetaData dbmd,
+        String catalog, String schema, String table) throws SQLException {
+
+       // trim all the leading and trailing whitespaces,
+       // white spaces can never be catalog, schema or a table name.
+
+<span class="nc" id="L1199">        String cmd = &quot;&quot;;</span>
+
+<span class="nc" id="L1201">        catalog = catalog.trim();</span>
+<span class="nc" id="L1202">        schema = schema.trim();</span>
+<span class="nc" id="L1203">        table = table.trim();</span>
+
+<span class="nc bnc" id="L1205" title="All 2 branches missed.">        if (dbmd.isCatalogAtStart() == true) {</span>
+<span class="nc bnc" id="L1206" title="All 4 branches missed.">            if (catalog != null &amp;&amp; catalog.length() &gt; 0) {</span>
+<span class="nc" id="L1207">                cmd += catalog + dbmd.getCatalogSeparator();</span>
+            }
+<span class="nc bnc" id="L1209" title="All 4 branches missed.">            if (schema != null &amp;&amp; schema.length() &gt; 0) {</span>
+<span class="nc" id="L1210">                cmd += schema + &quot;.&quot;;</span>
+            }
+<span class="nc" id="L1212">            cmd += table;</span>
+        } else {
+<span class="nc bnc" id="L1214" title="All 4 branches missed.">            if (schema != null &amp;&amp; schema.length() &gt; 0) {</span>
+<span class="nc" id="L1215">                cmd += schema + &quot;.&quot;;</span>
+            }
+<span class="nc" id="L1217">            cmd += table;</span>
+<span class="nc bnc" id="L1218" title="All 4 branches missed.">            if (catalog != null &amp;&amp; catalog.length() &gt; 0) {</span>
+<span class="nc" id="L1219">                cmd += dbmd.getCatalogSeparator() + catalog;</span>
+            }
+        }
+<span class="nc" id="L1222">        cmd += &quot; &quot;;</span>
+<span class="nc" id="L1223">        return cmd;</span>
+    }
+
+    /**
+     * Assigns to the given &lt;code&gt;CachedRowSet&lt;/code&gt; object's
+     * &lt;code&gt;params&lt;/code&gt;
+     * field an array whose length equals the number of columns needed
+     * to uniquely identify a row in the rowset. The array is given
+     * values by the method &lt;code&gt;buildWhereClause&lt;/code&gt;.
+     * &lt;P&gt;
+     * If the &lt;code&gt;CachedRowSet&lt;/code&gt; object's &lt;code&gt;keyCols&lt;/code&gt;
+     * field has length &lt;code&gt;0&lt;/code&gt; or is &lt;code&gt;null&lt;/code&gt;, the array
+     * is set with the column number of every column in the rowset.
+     * Otherwise, the array in the field &lt;code&gt;keyCols&lt;/code&gt; is set with only
+     * the column numbers of the columns that are required to form a unique
+     * identifier for a row.
+     *
+     * @param crs the &lt;code&gt;CachedRowSet&lt;/code&gt; object for which this
+     *     &lt;code&gt;CachedRowSetWriter&lt;/code&gt; object is the writer
+     *
+     * @throws SQLException if a database access error occurs
+     */
+    private void buildKeyDesc(CachedRowSet crs) throws SQLException {
+
+<span class="nc" id="L1247">        keyCols = crs.getKeyColumns();</span>
+<span class="nc" id="L1248">        ResultSetMetaData resultsetmd = crs.getMetaData();</span>
+<span class="nc bnc" id="L1249" title="All 4 branches missed.">        if (keyCols == null || keyCols.length == 0) {</span>
+<span class="nc" id="L1250">            ArrayList&lt;Integer&gt; listKeys = new ArrayList&lt;Integer&gt;();</span>
+
+<span class="nc bnc" id="L1252" title="All 2 branches missed.">            for (int i = 0; i &lt; callerColumnCount; i++ ) {</span>
+<span class="nc bnc" id="L1253" title="All 2 branches missed.">                if(resultsetmd.getColumnType(i+1) != java.sql.Types.CLOB &amp;&amp;</span>
+<span class="nc bnc" id="L1254" title="All 2 branches missed.">                        resultsetmd.getColumnType(i+1) != java.sql.Types.STRUCT &amp;&amp;</span>
+<span class="nc bnc" id="L1255" title="All 2 branches missed.">                        resultsetmd.getColumnType(i+1) != java.sql.Types.SQLXML &amp;&amp;</span>
+<span class="nc bnc" id="L1256" title="All 2 branches missed.">                        resultsetmd.getColumnType(i+1) != java.sql.Types.BLOB &amp;&amp;</span>
+<span class="nc bnc" id="L1257" title="All 2 branches missed.">                        resultsetmd.getColumnType(i+1) != java.sql.Types.ARRAY &amp;&amp;</span>
+<span class="nc bnc" id="L1258" title="All 2 branches missed.">                        resultsetmd.getColumnType(i+1) != java.sql.Types.OTHER )</span>
+<span class="nc" id="L1259">                    listKeys.add(i+1);</span>
+            }
+<span class="nc" id="L1261">            keyCols = new int[listKeys.size()];</span>
+<span class="nc bnc" id="L1262" title="All 2 branches missed.">            for (int i = 0; i &lt; listKeys.size(); i++ )</span>
+<span class="nc" id="L1263">                keyCols[i] = listKeys.get(i);</span>
+        }
+<span class="nc" id="L1265">        params = new Object[keyCols.length];</span>
+<span class="nc" id="L1266">    }</span>
+
+    /**
+         * Constructs an SQL &lt;code&gt;WHERE&lt;/code&gt; clause using the given
+         * string as a starting point. The resulting clause will contain
+         * a column name and &quot; = ?&quot; for each key column, that is, each column
+         * that is needed to form a unique identifier for a row in the rowset.
+         * This &lt;code&gt;WHERE&lt;/code&gt; clause can be added to
+         * a &lt;code&gt;PreparedStatement&lt;/code&gt; object that updates, inserts, or
+         * deletes a row.
+         * &lt;P&gt;
+         * This method uses the given result set to access values in the
+         * &lt;code&gt;CachedRowSet&lt;/code&gt; object that called this writer.  These
+         * values are used to build the array of parameters that will serve as
+         * replacements for the &quot;?&quot; parameter placeholders in the
+         * &lt;code&gt;PreparedStatement&lt;/code&gt; object that is sent to the
+         * &lt;code&gt;CachedRowSet&lt;/code&gt; object's underlying data source.
+         *
+         * @param whereClause a &lt;code&gt;String&lt;/code&gt; object that is an empty
+         *                    string (&quot;&quot;)
+         * @param rs a &lt;code&gt;ResultSet&lt;/code&gt; object that can be used
+         *           to access the &lt;code&gt;CachedRowSet&lt;/code&gt; object's data
+         * @return a &lt;code&gt;WHERE&lt;/code&gt; clause of the form &quot;&lt;code&gt;WHERE&lt;/code&gt;
+         *         columnName = ? AND columnName = ? AND columnName = ? ...&quot;
+         * @throws SQLException if a database access error occurs
+         */
+    private String buildWhereClause(String whereClause,
+                                    ResultSet rs) throws SQLException {
+<span class="nc" id="L1294">        whereClause = &quot;WHERE &quot;;</span>
+
+<span class="nc bnc" id="L1296" title="All 2 branches missed.">        for (int i = 0; i &lt; keyCols.length; i++) {</span>
+<span class="nc bnc" id="L1297" title="All 2 branches missed.">            if (i &gt; 0) {</span>
+<span class="nc" id="L1298">                    whereClause += &quot;AND &quot;;</span>
+            }
+<span class="nc" id="L1300">            whereClause += callerMd.getColumnName(keyCols[i]);</span>
+<span class="nc" id="L1301">            params[i] = rs.getObject(keyCols[i]);</span>
+<span class="nc bnc" id="L1302" title="All 2 branches missed.">            if (rs.wasNull() == true) {</span>
+<span class="nc" id="L1303">                whereClause += &quot; IS NULL &quot;;</span>
+            } else {
+<span class="nc" id="L1305">                whereClause += &quot; = ? &quot;;</span>
+            }
+        }
+<span class="nc" id="L1308">        return whereClause;</span>
+    }
+
+    void updateResolvedConflictToDB(CachedRowSet crs, Connection con) throws SQLException {
+          //String updateExe = ;
+          PreparedStatement pStmt  ;
+<span class="nc" id="L1314">          String strWhere = &quot;WHERE &quot; ;</span>
+<span class="nc" id="L1315">          String strExec =&quot; &quot;;</span>
+<span class="nc" id="L1316">          String strUpdate = &quot;UPDATE &quot;;</span>
+<span class="nc" id="L1317">          int icolCount = crs.getMetaData().getColumnCount();</span>
+<span class="nc" id="L1318">          int keyColumns[] = crs.getKeyColumns();</span>
+          Object param[];
+<span class="nc" id="L1320">          String strSet=&quot;&quot;;</span>
+
+<span class="nc" id="L1322">        strWhere = buildWhereClause(strWhere, crs);</span>
+
+<span class="nc bnc" id="L1324" title="All 4 branches missed.">        if (keyColumns == null || keyColumns.length == 0) {</span>
+<span class="nc" id="L1325">            keyColumns = new int[icolCount];</span>
+<span class="nc bnc" id="L1326" title="All 2 branches missed.">            for (int i = 0; i &lt; keyColumns.length; ) {</span>
+<span class="nc" id="L1327">                keyColumns[i] = ++i;</span>
+            }
+          }
+<span class="nc" id="L1330">          param = new Object[keyColumns.length];</span>
+
+<span class="nc" id="L1332">         strUpdate = &quot;UPDATE &quot; + buildTableName(con.getMetaData(),</span>
+<span class="nc" id="L1333">                            crs.getMetaData().getCatalogName(1),</span>
+<span class="nc" id="L1334">                           crs.getMetaData().getSchemaName(1),</span>
+<span class="nc" id="L1335">                           crs.getTableName());</span>
+
+         // changed or updated values will become part of
+         // set clause here
+<span class="nc" id="L1339">         strUpdate += &quot;SET &quot;;</span>
+
+<span class="nc" id="L1341">        boolean first = true;</span>
+
+<span class="nc bnc" id="L1343" title="All 2 branches missed.">        for (int i=1; i&lt;=icolCount;i++) {</span>
+<span class="nc bnc" id="L1344" title="All 2 branches missed.">           if (crs.columnUpdated(i)) {</span>
+<span class="nc bnc" id="L1345" title="All 2 branches missed.">                  if (first == false) {</span>
+<span class="nc" id="L1346">                    strSet += &quot;, &quot;;</span>
+                  }
+<span class="nc" id="L1348">                 strSet += crs.getMetaData().getColumnName(i);</span>
+<span class="nc" id="L1349">                 strSet += &quot; = ? &quot;;</span>
+<span class="nc" id="L1350">                 first = false;</span>
+         } //end if
+      } //end for
+
+         // keycols will become part of where clause
+<span class="nc" id="L1355">         strUpdate += strSet;</span>
+<span class="nc" id="L1356">         strWhere = &quot;WHERE &quot;;</span>
+
+<span class="nc bnc" id="L1358" title="All 2 branches missed.">        for (int i = 0; i &lt; keyColumns.length; i++) {</span>
+<span class="nc bnc" id="L1359" title="All 2 branches missed.">            if (i &gt; 0) {</span>
+<span class="nc" id="L1360">                    strWhere += &quot;AND &quot;;</span>
+            }
+<span class="nc" id="L1362">            strWhere += crs.getMetaData().getColumnName(keyColumns[i]);</span>
+<span class="nc" id="L1363">            param[i] = crs.getObject(keyColumns[i]);</span>
+<span class="nc bnc" id="L1364" title="All 2 branches missed.">            if (crs.wasNull() == true) {</span>
+<span class="nc" id="L1365">                strWhere += &quot; IS NULL &quot;;</span>
+            } else {
+<span class="nc" id="L1367">                strWhere += &quot; = ? &quot;;</span>
+            }
+        }
+<span class="nc" id="L1370">          strUpdate += strWhere;</span>
+
+<span class="nc" id="L1372">        pStmt = con.prepareStatement(strUpdate);</span>
+
+<span class="nc" id="L1374">        int idx =0;</span>
+<span class="nc bnc" id="L1375" title="All 2 branches missed.">          for (int i = 0; i &lt; icolCount; i++) {</span>
+<span class="nc bnc" id="L1376" title="All 2 branches missed.">             if(crs.columnUpdated(i+1)) {</span>
+<span class="nc" id="L1377">              Object obj = crs.getObject(i+1);</span>
+<span class="nc bnc" id="L1378" title="All 2 branches missed.">              if (obj != null) {</span>
+<span class="nc" id="L1379">                  pStmt.setObject(++idx, obj);</span>
+              } else {
+<span class="nc" id="L1381">                  pStmt.setNull(i + 1,crs.getMetaData().getColumnType(i + 1));</span>
+             } //end if ..else
+           } //end if crs.column...
+        } //end for
+
+          // Set the key cols for after WHERE =? clause
+<span class="nc bnc" id="L1387" title="All 2 branches missed.">          for (int i = 0; i &lt; keyColumns.length; i++) {</span>
+<span class="nc bnc" id="L1388" title="All 2 branches missed.">              if (param[i] != null) {</span>
+<span class="nc" id="L1389">                  pStmt.setObject(++idx, param[i]);</span>
+              }
+          }
+
+<span class="nc" id="L1393">        int id = pStmt.executeUpdate();</span>
+<span class="nc" id="L1394">      }</span>
+
+
+    /**
+     *
+     */
+    public void commit() throws SQLException {
+<span class="nc" id="L1401">        con.commit();</span>
+<span class="nc bnc" id="L1402" title="All 2 branches missed.">        if (reader.getCloseConnection() == true) {</span>
+<span class="nc" id="L1403">            con.close();</span>
+        }
+<span class="nc" id="L1405">    }</span>
+
+     public void commit(CachedRowSetImpl crs, boolean updateRowset) throws SQLException {
+<span class="nc" id="L1408">        con.commit();</span>
+<span class="nc bnc" id="L1409" title="All 2 branches missed.">        if(updateRowset) {</span>
+<span class="nc bnc" id="L1410" title="All 2 branches missed.">          if(crs.getCommand() != null)</span>
+<span class="nc" id="L1411">            crs.execute(con);</span>
+        }
+
+<span class="nc bnc" id="L1414" title="All 2 branches missed.">        if (reader.getCloseConnection() == true) {</span>
+<span class="nc" id="L1415">            con.close();</span>
+        }
+<span class="nc" id="L1417">    }</span>
+
+    /**
+     *
+     */
+    public void rollback() throws SQLException {
+<span class="nc" id="L1423">        con.rollback();</span>
+<span class="nc bnc" id="L1424" title="All 2 branches missed.">        if (reader.getCloseConnection() == true) {</span>
+<span class="nc" id="L1425">            con.close();</span>
+        }
+<span class="nc" id="L1427">    }</span>
+
+    /**
+     *
+     */
+    public void rollback(Savepoint s) throws SQLException {
+<span class="nc" id="L1433">        con.rollback(s);</span>
+<span class="nc bnc" id="L1434" title="All 2 branches missed.">        if (reader.getCloseConnection() == true) {</span>
+<span class="nc" id="L1435">            con.close();</span>
+        }
+<span class="nc" id="L1437">    }</span>
+
+    private void readObject(ObjectInputStream ois) throws IOException, ClassNotFoundException {
+        // Default state initialization happens here
+<span class="nc" id="L1441">        ois.defaultReadObject();</span>
+        // Initialization of  Res Bundle happens here .
+        try {
+<span class="nc" id="L1444">           resBundle = JdbcRowSetResourceBundle.getJdbcRowSetResourceBundle();</span>
+<span class="nc" id="L1445">        } catch(IOException ioe) {</span>
+<span class="nc" id="L1446">            throw new RuntimeException(ioe);</span>
+<span class="nc" id="L1447">        }</span>
+
+<span class="nc" id="L1449">    }</span>
+
+    static final long serialVersionUID =-8506030970299413976L;
+
+    /**
+     * Validate whether the Primary Key is known to the CachedRowSet.  If it is
+     * not, it is an auto-generated key
+     * @param pk - Primary Key to validate
+     * @param rsmd - ResultSetMetadata for the RowSet
+     * @return true if found, false otherwise (auto generated key)
+     */
+    private boolean isPKNameValid(String pk, ResultSetMetaData rsmd) throws SQLException {
+<span class="nc" id="L1461">        boolean isValid = false;</span>
+<span class="nc" id="L1462">        int cols = rsmd.getColumnCount();</span>
+<span class="nc bnc" id="L1463" title="All 2 branches missed.">        for(int i = 1; i&lt;= cols; i++) {</span>
+<span class="nc" id="L1464">            String colName = rsmd.getColumnClassName(i);</span>
+<span class="nc bnc" id="L1465" title="All 2 branches missed.">            if(colName.equalsIgnoreCase(pk)) {</span>
+<span class="nc" id="L1466">                isValid = true;</span>
+<span class="nc" id="L1467">                break;</span>
+            }
+        }
+
+<span class="nc" id="L1471">        return isValid;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

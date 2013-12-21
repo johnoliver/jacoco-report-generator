@@ -1,0 +1,431 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>LdapPoolManager.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">com.sun.jndi.ldap</a> &gt; <span class="el_source">LdapPoolManager.java</span></div><h1>LdapPoolManager.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2002, 2011, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package com.sun.jndi.ldap;
+
+import java.io.PrintStream;
+import java.io.OutputStream;
+import java.util.Hashtable;
+import java.util.Locale;
+import java.util.StringTokenizer;
+
+import javax.naming.ldap.Control;
+import javax.naming.NamingException;
+import javax.naming.CommunicationException;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
+
+import com.sun.jndi.ldap.pool.PoolCleaner;
+import com.sun.jndi.ldap.pool.Pool;
+
+/**
+ * Contains utilities for managing connection pools of LdapClient.
+ * Contains method for
+ * - checking whether attempted connection creation may be pooled
+ * - creating a pooled connection
+ * - closing idle connections.
+ *
+ * If a timeout period has been configured, then it will automatically
+ * close and remove idle connections (those that have not been
+ * used for the duration of the timeout period).
+ *
+ * @author Rosanna Lee
+ */
+
+public final class LdapPoolManager {
+    private static final String DEBUG =
+        &quot;com.sun.jndi.ldap.connect.pool.debug&quot;;
+
+<span class="nc" id="L61">    public static final boolean debug =</span>
+<span class="nc" id="L62">        &quot;all&quot;.equalsIgnoreCase(getProperty(DEBUG, null));</span>
+
+<span class="nc bnc" id="L64" title="All 2 branches missed.">    public static final boolean trace = debug ||</span>
+<span class="nc bnc" id="L65" title="All 2 branches missed.">        &quot;fine&quot;.equalsIgnoreCase(getProperty(DEBUG, null));</span>
+
+    // ---------- System properties for connection pooling
+
+    // Authentication mechanisms of connections that may be pooled
+    private static final String POOL_AUTH =
+        &quot;com.sun.jndi.ldap.connect.pool.authentication&quot;;
+
+    // Protocol types of connections that may be pooled
+    private static final String POOL_PROTOCOL =
+        &quot;com.sun.jndi.ldap.connect.pool.protocol&quot;;
+
+    // Maximum number of identical connections per pool
+    private static final String MAX_POOL_SIZE =
+        &quot;com.sun.jndi.ldap.connect.pool.maxsize&quot;;
+
+    // Preferred number of identical connections per pool
+    private static final String PREF_POOL_SIZE =
+        &quot;com.sun.jndi.ldap.connect.pool.prefsize&quot;;
+
+    // Initial number of identical connections per pool
+    private static final String INIT_POOL_SIZE =
+        &quot;com.sun.jndi.ldap.connect.pool.initsize&quot;;
+
+    // Milliseconds to wait before closing idle connections
+    private static final String POOL_TIMEOUT =
+        &quot;com.sun.jndi.ldap.connect.pool.timeout&quot;;
+
+    // Properties for DIGEST
+    private static final String SASL_CALLBACK =
+        &quot;java.naming.security.sasl.callback&quot;;
+
+    // --------- Constants
+    private static final int DEFAULT_MAX_POOL_SIZE = 0;
+    private static final int DEFAULT_PREF_POOL_SIZE = 0;
+    private static final int DEFAULT_INIT_POOL_SIZE = 1;
+    private static final int DEFAULT_TIMEOUT = 0;    // no timeout
+    private static final String DEFAULT_AUTH_MECHS = &quot;none simple&quot;;
+    private static final String DEFAULT_PROTOCOLS = &quot;plain&quot;;
+
+    private static final int NONE = 0;    // indices into pools
+    private static final int SIMPLE = 1;
+    private static final int DIGEST = 2;
+
+    // --------- static fields
+    private static final long idleTimeout;// ms to wait before closing idle conn
+    private static final int maxSize;     // max num of identical conns/pool
+    private static final int prefSize;    // preferred num of identical conns/pool
+    private static final int initSize;    // initial num of identical conns/pool
+
+<span class="nc" id="L115">    private static boolean supportPlainProtocol = false;</span>
+<span class="nc" id="L116">    private static boolean supportSslProtocol = false;</span>
+
+    // List of pools used for different auth types
+<span class="nc" id="L119">    private static final Pool[] pools = new Pool[3];</span>
+
+    static {
+<span class="nc" id="L122">        maxSize = getInteger(MAX_POOL_SIZE, DEFAULT_MAX_POOL_SIZE);</span>
+
+<span class="nc" id="L124">        prefSize = getInteger(PREF_POOL_SIZE, DEFAULT_PREF_POOL_SIZE);</span>
+
+<span class="nc" id="L126">        initSize = getInteger(INIT_POOL_SIZE, DEFAULT_INIT_POOL_SIZE);</span>
+
+<span class="nc" id="L128">        idleTimeout = getLong(POOL_TIMEOUT, DEFAULT_TIMEOUT);</span>
+
+        // Determine supported authentication mechanisms
+<span class="nc" id="L131">        String str = getProperty(POOL_AUTH, DEFAULT_AUTH_MECHS);</span>
+<span class="nc" id="L132">        StringTokenizer parser = new StringTokenizer(str);</span>
+<span class="nc" id="L133">        int count = parser.countTokens();</span>
+        String mech;
+        int p;
+<span class="nc bnc" id="L136" title="All 2 branches missed.">        for (int i = 0; i &lt; count; i++) {</span>
+<span class="nc" id="L137">            mech = parser.nextToken().toLowerCase(Locale.ENGLISH);</span>
+<span class="nc bnc" id="L138" title="All 2 branches missed.">            if (mech.equals(&quot;anonymous&quot;)) {</span>
+<span class="nc" id="L139">                mech = &quot;none&quot;;</span>
+            }
+
+<span class="nc" id="L142">            p = findPool(mech);</span>
+<span class="nc bnc" id="L143" title="All 4 branches missed.">            if (p &gt;= 0 &amp;&amp; pools[p] == null) {</span>
+<span class="nc" id="L144">                pools[p] = new Pool(initSize, prefSize, maxSize);</span>
+            }
+        }
+
+        // Determine supported protocols
+<span class="nc" id="L149">        str= getProperty(POOL_PROTOCOL, DEFAULT_PROTOCOLS);</span>
+<span class="nc" id="L150">        parser = new StringTokenizer(str);</span>
+<span class="nc" id="L151">        count = parser.countTokens();</span>
+        String proto;
+<span class="nc bnc" id="L153" title="All 2 branches missed.">        for (int i = 0; i &lt; count; i++) {</span>
+<span class="nc" id="L154">            proto = parser.nextToken();</span>
+<span class="nc bnc" id="L155" title="All 2 branches missed.">            if (&quot;plain&quot;.equalsIgnoreCase(proto)) {</span>
+<span class="nc" id="L156">                supportPlainProtocol = true;</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">            } else if (&quot;ssl&quot;.equalsIgnoreCase(proto)) {</span>
+<span class="nc" id="L158">                supportSslProtocol = true;</span>
+            } else {
+                // ignore
+            }
+        }
+
+<span class="nc bnc" id="L164" title="All 2 branches missed.">        if (idleTimeout &gt; 0) {</span>
+            // Create cleaner to expire idle connections
+<span class="nc" id="L166">            new PoolCleaner(idleTimeout, pools).start();</span>
+        }
+
+<span class="nc bnc" id="L169" title="All 2 branches missed.">        if (debug) {</span>
+<span class="nc" id="L170">            showStats(System.err);</span>
+        }
+<span class="nc" id="L172">    }</span>
+
+    // Cannot instantiate one of these
+<span class="nc" id="L175">    private LdapPoolManager() {</span>
+<span class="nc" id="L176">    }</span>
+
+    /**
+     * Find the index of the pool for the specified mechanism. If not
+     * one of &quot;none&quot;, &quot;simple&quot;, &quot;DIGEST-MD5&quot;, or &quot;GSSAPI&quot;,
+     * return -1.
+     * @param mech mechanism type
+     */
+    private static int findPool(String mech) {
+<span class="nc bnc" id="L185" title="All 2 branches missed.">        if (&quot;none&quot;.equalsIgnoreCase(mech)) {</span>
+<span class="nc" id="L186">            return NONE;</span>
+<span class="nc bnc" id="L187" title="All 2 branches missed.">        } else if (&quot;simple&quot;.equalsIgnoreCase(mech)) {</span>
+<span class="nc" id="L188">            return SIMPLE;</span>
+<span class="nc bnc" id="L189" title="All 2 branches missed.">        } else if (&quot;digest-md5&quot;.equalsIgnoreCase(mech)) {</span>
+<span class="nc" id="L190">            return DIGEST;</span>
+        }
+<span class="nc" id="L192">        return -1;</span>
+    }
+
+    /**
+     * Determines whether pooling is allowed given information on how
+     * the connection will be used.
+     *
+     * Non-configurable rejections:
+     * - nonstandard socketFactory has been specified: the pool manager
+     *   cannot track input or parameters used by the socket factory and
+     *   thus has no way of determining whether two connection requests
+     *   are equivalent. Maybe in the future it might add a list of allowed
+     *   socket factories to be configured
+     * - trace enabled (except when debugging)
+     * - for Digest authentication, if a callback handler has been specified:
+     *  the pool manager cannot track input collected by the handler
+     *  and thus has no way of determining whether two connection requests are
+     *  equivalent. Maybe in the future it might add a list of allowed
+     *  callback handlers.
+     *
+     * Configurable tests:
+     * - Pooling for the requested protocol (plain or ssl) is supported
+     * - Pooling for the requested authentication mechanism is supported
+     *
+     */
+    static boolean isPoolingAllowed(String socketFactory, OutputStream trace,
+        String authMech, String protocol, Hashtable&lt;?,?&gt; env)
+                throws NamingException {
+
+<span class="nc bnc" id="L221" title="All 8 branches missed.">        if (trace != null &amp;&amp; !debug</span>
+
+                // Requesting plain protocol but it is not supported
+                || (protocol == null &amp;&amp; !supportPlainProtocol)
+
+                // Requesting ssl protocol but it is not supported
+<span class="nc bnc" id="L227" title="All 4 branches missed.">                || (&quot;ssl&quot;.equalsIgnoreCase(protocol) &amp;&amp; !supportSslProtocol)) {</span>
+
+<span class="nc" id="L229">            d(&quot;Pooling disallowed due to tracing or unsupported pooling of protocol&quot;);</span>
+<span class="nc" id="L230">            return false;</span>
+        }
+        // pooling of custom socket factory is possible only if the
+        // socket factory interface implements java.util.comparator
+<span class="nc" id="L234">        String COMPARATOR = &quot;java.util.Comparator&quot;;</span>
+<span class="nc" id="L235">        boolean foundSockCmp = false;</span>
+<span class="nc bnc" id="L236" title="All 2 branches missed.">        if ((socketFactory != null) &amp;&amp;</span>
+<span class="nc bnc" id="L237" title="All 2 branches missed.">             !socketFactory.equals(LdapCtx.DEFAULT_SSL_FACTORY)) {</span>
+            try {
+<span class="nc" id="L239">                Class&lt;?&gt; socketFactoryClass = Obj.helper.loadClass(socketFactory);</span>
+<span class="nc" id="L240">                Class&lt;?&gt;[] interfaces = socketFactoryClass.getInterfaces();</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">                for (int i = 0; i &lt; interfaces.length; i++) {</span>
+<span class="nc bnc" id="L242" title="All 2 branches missed.">                    if (interfaces[i].getCanonicalName().equals(COMPARATOR)) {</span>
+<span class="nc" id="L243">                        foundSockCmp = true;</span>
+                    }
+                }
+<span class="nc" id="L246">            } catch (Exception e) {</span>
+<span class="nc" id="L247">                CommunicationException ce =</span>
+                    new CommunicationException(&quot;Loading the socket factory&quot;);
+<span class="nc" id="L249">                ce.setRootCause(e);</span>
+<span class="nc" id="L250">                throw ce;</span>
+<span class="nc" id="L251">            }</span>
+<span class="nc bnc" id="L252" title="All 2 branches missed.">            if (!foundSockCmp) {</span>
+<span class="nc" id="L253">                return false;</span>
+            }
+        }
+        // Cannot use pooling if authMech is not a supported mechs
+        // Cannot use pooling if authMech contains multiple mechs
+<span class="nc" id="L258">        int p = findPool(authMech);</span>
+<span class="nc bnc" id="L259" title="All 4 branches missed.">        if (p &lt; 0 || pools[p] == null) {</span>
+<span class="nc" id="L260">            d(&quot;authmech not found: &quot;, authMech);</span>
+
+<span class="nc" id="L262">            return false;</span>
+        }
+
+<span class="nc" id="L265">        d(&quot;using authmech: &quot;, authMech);</span>
+
+<span class="nc bnc" id="L267" title="All 3 branches missed.">        switch (p) {</span>
+        case NONE:
+        case SIMPLE:
+<span class="nc" id="L270">            return true;</span>
+
+        case DIGEST:
+            // Provider won't be able to determine connection identity
+            // if an alternate callback handler is used
+<span class="nc bnc" id="L275" title="All 4 branches missed.">            return (env == null || env.get(SASL_CALLBACK) == null);</span>
+        }
+<span class="nc" id="L277">        return false;</span>
+    }
+
+    /**
+     * Obtains a pooled connection that either already exists or is
+     * newly created using the parameters supplied. If it is newly
+     * created, it needs to go through the authentication checks to
+     * determine whether an LDAP bind is necessary.
+     *
+     * Caller needs to invoke ldapClient.authenticateCalled() to
+     * determine whether ldapClient.authenticate() needs to be invoked.
+     * Caller has that responsibility because caller needs to deal
+     * with the LDAP bind response, which might involve referrals,
+     * response controls, errors, etc. This method is responsible only
+     * for establishing the connection.
+     *
+     * @return an LdapClient that is pooled.
+     */
+    static LdapClient getLdapClient(String host, int port, String socketFactory,
+        int connTimeout, int readTimeout, OutputStream trace, int version,
+        String authMech, Control[] ctls, String protocol, String user,
+        Object passwd, Hashtable&lt;?,?&gt; env) throws NamingException {
+
+        // Create base identity for LdapClient
+<span class="nc" id="L301">        ClientId id = null;</span>
+        Pool pool;
+
+<span class="nc" id="L304">        int p = findPool(authMech);</span>
+<span class="nc bnc" id="L305" title="All 4 branches missed.">        if (p &lt; 0 || (pool=pools[p]) == null) {</span>
+<span class="nc" id="L306">            throw new IllegalArgumentException(</span>
+                &quot;Attempting to use pooling for an unsupported mechanism: &quot; +
+                authMech);
+        }
+<span class="nc bnc" id="L310" title="All 4 branches missed.">        switch (p) {</span>
+        case NONE:
+<span class="nc" id="L312">            id = new ClientId(version, host, port, protocol,</span>
+                        ctls, trace, socketFactory);
+<span class="nc" id="L314">            break;</span>
+
+        case SIMPLE:
+            // Add identity information used in simple authentication
+<span class="nc" id="L318">            id = new SimpleClientId(version, host, port, protocol,</span>
+                ctls, trace, socketFactory, user, passwd);
+<span class="nc" id="L320">            break;</span>
+
+        case DIGEST:
+            // Add user/passwd/realm/authzid/qop/strength/maxbuf/mutual/policy*
+<span class="nc" id="L324">            id = new DigestClientId(version, host, port, protocol,</span>
+                ctls, trace, socketFactory, user, passwd, env);
+            break;
+        }
+
+<span class="nc" id="L329">        return (LdapClient) pool.getPooledConnection(id, connTimeout,</span>
+            new LdapClientFactory(host, port, socketFactory, connTimeout,
+                                readTimeout, trace));
+    }
+
+    public static void showStats(PrintStream out) {
+<span class="nc" id="L335">        out.println(&quot;***** start *****&quot;);</span>
+<span class="nc" id="L336">        out.println(&quot;idle timeout: &quot; + idleTimeout);</span>
+<span class="nc" id="L337">        out.println(&quot;maximum pool size: &quot; + maxSize);</span>
+<span class="nc" id="L338">        out.println(&quot;preferred pool size: &quot; + prefSize);</span>
+<span class="nc" id="L339">        out.println(&quot;initial pool size: &quot; + initSize);</span>
+<span class="nc bnc" id="L340" title="All 4 branches missed.">        out.println(&quot;protocol types: &quot; + (supportPlainProtocol ? &quot;plain &quot; : &quot;&quot;) +</span>
+            (supportSslProtocol ? &quot;ssl&quot; : &quot;&quot;));
+<span class="nc bnc" id="L342" title="All 6 branches missed.">        out.println(&quot;authentication types: &quot; +</span>
+            (pools[NONE] != null ? &quot;none &quot; : &quot;&quot;) +
+            (pools[SIMPLE] != null ? &quot;simple &quot; : &quot;&quot;) +
+            (pools[DIGEST] != null ? &quot;DIGEST-MD5 &quot; : &quot;&quot;));
+
+<span class="nc bnc" id="L347" title="All 2 branches missed.">        for (int i = 0; i &lt; pools.length; i++) {</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">            if (pools[i] != null) {</span>
+<span class="nc bnc" id="L349" title="All 6 branches missed.">                out.println(</span>
+                    (i == NONE ? &quot;anonymous pools&quot; :
+                        i == SIMPLE ? &quot;simple auth pools&quot; :
+                        i == DIGEST ? &quot;digest pools&quot; : &quot;&quot;)
+                            + &quot;:&quot;);
+<span class="nc" id="L354">                pools[i].showStats(out);</span>
+            }
+        }
+<span class="nc" id="L357">        out.println(&quot;***** end *****&quot;);</span>
+<span class="nc" id="L358">    }</span>
+
+    /**
+     * Closes idle connections idle since specified time.
+     *
+     * @param threshold Close connections idle since this time, as
+     * specified in milliseconds since &quot;the epoch&quot;.
+     * @see java.util.Date
+     */
+    public static void expire(long threshold) {
+<span class="nc bnc" id="L368" title="All 2 branches missed.">        for (int i = 0; i &lt; pools.length; i++) {</span>
+<span class="nc bnc" id="L369" title="All 2 branches missed.">            if (pools[i] != null) {</span>
+<span class="nc" id="L370">                pools[i].expire(threshold);</span>
+            }
+        }
+<span class="nc" id="L373">    }</span>
+
+    private static void d(String msg) {
+<span class="nc bnc" id="L376" title="All 2 branches missed.">        if (debug) {</span>
+<span class="nc" id="L377">            System.err.println(&quot;LdapPoolManager: &quot; + msg);</span>
+        }
+<span class="nc" id="L379">    }</span>
+
+    private static void d(String msg, String o) {
+<span class="nc bnc" id="L382" title="All 2 branches missed.">        if (debug) {</span>
+<span class="nc" id="L383">            System.err.println(&quot;LdapPoolManager: &quot; + msg + o);</span>
+        }
+<span class="nc" id="L385">    }</span>
+
+    private static final String getProperty(final String propName,
+        final String defVal) {
+<span class="nc" id="L389">        return AccessController.doPrivileged(</span>
+<span class="nc" id="L390">            new PrivilegedAction&lt;String&gt;() {</span>
+            public String run() {
+                try {
+<span class="nc" id="L393">                    return System.getProperty(propName, defVal);</span>
+<span class="nc" id="L394">                } catch (SecurityException e) {</span>
+<span class="nc" id="L395">                    return defVal;</span>
+                }
+            }
+        });
+    }
+
+    private static final int getInteger(final String propName,
+        final int defVal) {
+<span class="nc" id="L403">        Integer val = AccessController.doPrivileged(</span>
+<span class="nc" id="L404">            new PrivilegedAction&lt;Integer&gt;() {</span>
+            public Integer run() {
+                try {
+<span class="nc" id="L407">                    return Integer.getInteger(propName, defVal);</span>
+<span class="nc" id="L408">                } catch (SecurityException e) {</span>
+<span class="nc" id="L409">                    return new Integer(defVal);</span>
+                }
+            }
+        });
+<span class="nc" id="L413">        return val.intValue();</span>
+    }
+
+    private static final long getLong(final String propName,
+        final long defVal) {
+<span class="nc" id="L418">        Long val = AccessController.doPrivileged(</span>
+<span class="nc" id="L419">            new PrivilegedAction&lt;Long&gt;() {</span>
+            public Long run() {
+                try {
+<span class="nc" id="L422">                    return Long.getLong(propName, defVal);</span>
+<span class="nc" id="L423">                } catch (SecurityException e) {</span>
+<span class="nc" id="L424">                    return new Long(defVal);</span>
+                }
+            }
+        });
+<span class="nc" id="L428">        return val.longValue();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

@@ -1,0 +1,475 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>BufferedContext.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.java2d.pipe</a> &gt; <span class="el_source">BufferedContext.java</span></div><h1>BufferedContext.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2005, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.java2d.pipe;
+
+import java.awt.AlphaComposite;
+import java.awt.Color;
+import java.awt.Composite;
+import java.awt.Paint;
+import java.awt.geom.AffineTransform;
+import sun.java2d.pipe.hw.AccelSurface;
+import sun.java2d.InvalidPipeException;
+import sun.java2d.SunGraphics2D;
+import sun.java2d.loops.XORComposite;
+import static sun.java2d.pipe.BufferedOpCodes.*;
+import static sun.java2d.pipe.BufferedRenderPipe.BYTES_PER_SPAN;
+
+import java.lang.annotation.Native;
+
+/**
+ * Base context class for managing state in a single-threaded rendering
+ * environment.  Each state-setting operation (e.g. SET_COLOR) is added to
+ * the provided RenderQueue, which will be processed at a later time by a
+ * single thread.  Note that the RenderQueue lock must be acquired before
+ * calling the validate() method (or any other method in this class).  See
+ * the RenderQueue class comments for a sample usage scenario.
+ *
+ * @see RenderQueue
+ */
+public abstract class BufferedContext {
+
+    /*
+     * The following flags help the internals of validate() determine
+     * the appropriate (meaning correct, or optimal) code path when
+     * setting up the current context.  The flags can be bitwise OR'd
+     * together as needed.
+     */
+
+    /**
+     * Indicates that no flags are needed; take all default code paths.
+     */
+    @Native public static final int NO_CONTEXT_FLAGS = (0 &lt;&lt; 0);
+    /**
+     * Indicates that the source surface (or color value, if it is a simple
+     * rendering operation) is opaque (has an alpha value of 1.0).  If this
+     * flag is present, it allows us to disable blending in certain
+     * situations in order to improve performance.
+     */
+    @Native public static final int SRC_IS_OPAQUE    = (1 &lt;&lt; 0);
+    /**
+     * Indicates that the operation uses an alpha mask, which may determine
+     * the code path that is used when setting up the current paint state.
+     */
+    @Native public static final int USE_MASK         = (1 &lt;&lt; 1);
+
+    protected RenderQueue rq;
+    protected RenderBuffer buf;
+
+    /**
+     * This is a reference to the most recently validated BufferedContext.  If
+     * this value is null, it means that there is no current context.  It is
+     * provided here so that validate() only needs to do a quick reference
+     * check to see if the BufferedContext passed to that method is the same
+     * as the one we've cached here.
+     */
+    protected static BufferedContext currentContext;
+
+    private AccelSurface    validatedSrcData;
+    private AccelSurface    validatedDstData;
+    private Region          validatedClip;
+    private Composite       validatedComp;
+    private Paint           validatedPaint;
+    // renamed from isValidatedPaintAColor as part of a work around for 6764257
+    private boolean         isValidatedPaintJustAColor;
+    private int             validatedRGB;
+    private int             validatedFlags;
+    private boolean         xformInUse;
+    private AffineTransform transform;
+
+<span class="nc" id="L102">    protected BufferedContext(RenderQueue rq) {</span>
+<span class="nc" id="L103">        this.rq = rq;</span>
+<span class="nc" id="L104">        this.buf = rq.getBuffer();</span>
+<span class="nc" id="L105">    }</span>
+
+    /**
+     * Fetches the BufferedContextContext associated with the dst. surface
+     * and validates the context using the given parameters.  Most rendering
+     * operations will call this method first in order to set the necessary
+     * state before issuing rendering commands.
+     *
+     * Note: must be called while the RenderQueue lock is held.
+     *
+     * It's assumed that the type of surfaces has been checked by the Renderer
+     *
+     * @throws InvalidPipeException if either src or dest surface is not valid
+     * or lost
+     * @see RenderQueue#lock
+     * @see RenderQueue#unlock
+     */
+    public static void validateContext(AccelSurface srcData,
+                                       AccelSurface dstData,
+                                       Region clip, Composite comp,
+                                       AffineTransform xform,
+                                       Paint paint, SunGraphics2D sg2d,
+                                       int flags)
+    {
+        // assert rq.lock.isHeldByCurrentThread();
+<span class="nc" id="L130">        BufferedContext d3dc = dstData.getContext();</span>
+<span class="nc" id="L131">        d3dc.validate(srcData, dstData,</span>
+                      clip, comp, xform, paint, sg2d, flags);
+<span class="nc" id="L133">    }</span>
+
+    /**
+     * Fetches the BufferedContextassociated with the surface
+     * and disables all context state settings.
+     *
+     * Note: must be called while the RenderQueue lock is held.
+     *
+     * It's assumed that the type of surfaces has been checked by the Renderer
+     *
+     * @throws InvalidPipeException if the surface is not valid
+     * or lost
+     * @see RenderQueue#lock
+     * @see RenderQueue#unlock
+     */
+    public static void validateContext(AccelSurface surface) {
+        // assert rt.lock.isHeldByCurrentThread();
+<span class="nc" id="L150">        validateContext(surface, surface,</span>
+                        null, null, null, null, null, NO_CONTEXT_FLAGS);
+<span class="nc" id="L152">    }</span>
+
+    /**
+     * Validates the given parameters against the current state for this
+     * context.  If this context is not current, it will be made current
+     * for the given source and destination surfaces, and the viewport will
+     * be updated.  Then each part of the context state (clip, composite,
+     * etc.) is checked against the previous value.  If the value has changed
+     * since the last call to validate(), it will be updated accordingly.
+     *
+     * Note that the SunGraphics2D parameter is only used for the purposes
+     * of validating a (non-null) Paint parameter.  In all other cases it
+     * is safe to pass a null SunGraphics2D and it will be ignored.
+     *
+     * Note: must be called while the RenderQueue lock is held.
+     *
+     * It's assumed that the type of surfaces has been checked by the Renderer
+     *
+     * @throws InvalidPipeException if either src or dest surface is not valid
+     * or lost
+     */
+    public void validate(AccelSurface srcData, AccelSurface dstData,
+                         Region clip, Composite comp,
+                         AffineTransform xform,
+                         Paint paint, SunGraphics2D sg2d, int flags)
+    {
+        // assert rq.lock.isHeldByCurrentThread();
+
+<span class="nc" id="L180">        boolean updateClip = false;</span>
+<span class="nc" id="L181">        boolean updatePaint = false;</span>
+
+<span class="nc bnc" id="L183" title="All 2 branches missed.">        if (!dstData.isValid() ||</span>
+<span class="nc bnc" id="L184" title="All 4 branches missed.">            dstData.isSurfaceLost() || srcData.isSurfaceLost())</span>
+        {
+<span class="nc" id="L186">            invalidateContext();</span>
+<span class="nc" id="L187">            throw new InvalidPipeException(&quot;bounds changed or surface lost&quot;);</span>
+        }
+
+<span class="nc bnc" id="L190" title="All 2 branches missed.">        if (paint instanceof Color) {</span>
+            // REMIND: not 30-bit friendly
+<span class="nc" id="L192">            int newRGB = ((Color)paint).getRGB();</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">            if (isValidatedPaintJustAColor) {</span>
+<span class="nc bnc" id="L194" title="All 2 branches missed.">                if (newRGB != validatedRGB) {</span>
+<span class="nc" id="L195">                    validatedRGB = newRGB;</span>
+<span class="nc" id="L196">                    updatePaint = true;</span>
+                }
+            } else {
+<span class="nc" id="L199">                validatedRGB = newRGB;</span>
+<span class="nc" id="L200">                updatePaint = true;</span>
+<span class="nc" id="L201">                isValidatedPaintJustAColor = true;</span>
+            }
+<span class="nc bnc" id="L203" title="All 2 branches missed.">        } else if (validatedPaint != paint) {</span>
+<span class="nc" id="L204">            updatePaint = true;</span>
+            // this should be set when we are switching from paint to color
+            // in which case this condition will be true
+<span class="nc" id="L207">            isValidatedPaintJustAColor = false;</span>
+        }
+
+<span class="nc bnc" id="L210" title="All 6 branches missed.">        if ((currentContext != this) ||</span>
+            (srcData != validatedSrcData) ||
+            (dstData != validatedDstData))
+        {
+<span class="nc bnc" id="L214" title="All 2 branches missed.">            if (dstData != validatedDstData) {</span>
+                // the clip is dependent on the destination surface, so we
+                // need to update it if we have a new destination surface
+<span class="nc" id="L217">                updateClip = true;</span>
+            }
+
+<span class="nc bnc" id="L220" title="All 2 branches missed.">            if (paint == null) {</span>
+                // make sure we update the color state (otherwise, it might
+                // not be updated if this is the first time the context
+                // is being validated)
+<span class="nc" id="L224">                updatePaint = true;</span>
+            }
+
+            // update the current source and destination surfaces
+<span class="nc" id="L228">            setSurfaces(srcData, dstData);</span>
+
+<span class="nc" id="L230">            currentContext = this;</span>
+<span class="nc" id="L231">            validatedSrcData = srcData;</span>
+<span class="nc" id="L232">            validatedDstData = dstData;</span>
+        }
+
+        // validate clip
+<span class="nc bnc" id="L236" title="All 4 branches missed.">        if ((clip != validatedClip) || updateClip) {</span>
+<span class="nc bnc" id="L237" title="All 2 branches missed.">            if (clip != null) {</span>
+<span class="nc bnc" id="L238" title="All 4 branches missed.">                if (updateClip ||</span>
+                    validatedClip == null ||
+<span class="nc bnc" id="L240" title="All 4 branches missed.">                    !(validatedClip.isRectangular() &amp;&amp; clip.isRectangular()) ||</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">                    ((clip.getLoX() != validatedClip.getLoX() ||</span>
+<span class="nc bnc" id="L242" title="All 2 branches missed.">                      clip.getLoY() != validatedClip.getLoY() ||</span>
+<span class="nc bnc" id="L243" title="All 2 branches missed.">                      clip.getHiX() != validatedClip.getHiX() ||</span>
+<span class="nc bnc" id="L244" title="All 2 branches missed.">                      clip.getHiY() != validatedClip.getHiY())))</span>
+                {
+<span class="nc" id="L246">                    setClip(clip);</span>
+                }
+            } else {
+<span class="nc" id="L249">                resetClip();</span>
+            }
+<span class="nc" id="L251">            validatedClip = clip;</span>
+        }
+
+        // validate composite (note that a change in the context flags
+        // may require us to update the composite state, even if the
+        // composite has not changed)
+<span class="nc bnc" id="L257" title="All 4 branches missed.">        if ((comp != validatedComp) || (flags != validatedFlags)) {</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">            if (comp != null) {</span>
+<span class="nc" id="L259">                setComposite(comp, flags);</span>
+            } else {
+<span class="nc" id="L261">                resetComposite();</span>
+            }
+            // the paint state is dependent on the composite state, so make
+            // sure we update the color below
+<span class="nc" id="L265">            updatePaint = true;</span>
+<span class="nc" id="L266">            validatedComp = comp;</span>
+<span class="nc" id="L267">            validatedFlags = flags;</span>
+        }
+
+        // validate transform
+<span class="nc" id="L271">        boolean txChanged = false;</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">        if (xform == null) {</span>
+<span class="nc bnc" id="L273" title="All 2 branches missed.">            if (xformInUse) {</span>
+<span class="nc" id="L274">                resetTransform();</span>
+<span class="nc" id="L275">                xformInUse = false;</span>
+<span class="nc" id="L276">                txChanged = true;</span>
+<span class="nc bnc" id="L277" title="All 4 branches missed.">            } else if (sg2d != null &amp;&amp; !sg2d.transform.equals(transform)) {</span>
+<span class="nc" id="L278">                txChanged = true;</span>
+            }
+<span class="nc bnc" id="L280" title="All 4 branches missed.">            if (sg2d != null &amp;&amp; txChanged) {</span>
+<span class="nc" id="L281">                transform = new AffineTransform(sg2d.transform);</span>
+            }
+        } else {
+<span class="nc" id="L284">            setTransform(xform);</span>
+<span class="nc" id="L285">            xformInUse = true;</span>
+<span class="nc" id="L286">            txChanged = true;</span>
+        }
+        // non-Color paints may require paint revalidation
+<span class="nc bnc" id="L289" title="All 4 branches missed.">        if (!isValidatedPaintJustAColor &amp;&amp; txChanged) {</span>
+<span class="nc" id="L290">            updatePaint = true;</span>
+        }
+
+        // validate paint
+<span class="nc bnc" id="L294" title="All 2 branches missed.">        if (updatePaint) {</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">            if (paint != null) {</span>
+<span class="nc" id="L296">                BufferedPaints.setPaint(rq, sg2d, paint, flags);</span>
+            } else {
+<span class="nc" id="L298">                BufferedPaints.resetPaint(rq);</span>
+            }
+<span class="nc" id="L300">            validatedPaint = paint;</span>
+        }
+
+        // mark dstData dirty
+        // REMIND: is this really needed now? we do it in SunGraphics2D..
+<span class="nc" id="L305">        dstData.markDirty();</span>
+<span class="nc" id="L306">    }</span>
+
+    /**
+     * Invalidates the surfaces associated with this context.  This is
+     * useful when the context is no longer needed, and we want to break
+     * the chain caused by these surface references.
+     *
+     * Note: must be called while the RenderQueue lock is held.
+     *
+     * @see RenderQueue#lock
+     * @see RenderQueue#unlock
+     */
+    public void invalidateSurfaces() {
+<span class="nc" id="L319">        validatedSrcData = null;</span>
+<span class="nc" id="L320">        validatedDstData = null;</span>
+<span class="nc" id="L321">    }</span>
+
+    private void setSurfaces(AccelSurface srcData,
+                             AccelSurface dstData)
+    {
+        // assert rq.lock.isHeldByCurrentThread();
+<span class="nc" id="L327">        rq.ensureCapacityAndAlignment(20, 4);</span>
+<span class="nc" id="L328">        buf.putInt(SET_SURFACES);</span>
+<span class="nc" id="L329">        buf.putLong(srcData.getNativeOps());</span>
+<span class="nc" id="L330">        buf.putLong(dstData.getNativeOps());</span>
+<span class="nc" id="L331">    }</span>
+
+    private void resetClip() {
+        // assert rq.lock.isHeldByCurrentThread();
+<span class="nc" id="L335">        rq.ensureCapacity(4);</span>
+<span class="nc" id="L336">        buf.putInt(RESET_CLIP);</span>
+<span class="nc" id="L337">    }</span>
+
+    private void setClip(Region clip) {
+        // assert rq.lock.isHeldByCurrentThread();
+<span class="nc bnc" id="L341" title="All 2 branches missed.">        if (clip.isRectangular()) {</span>
+<span class="nc" id="L342">            rq.ensureCapacity(20);</span>
+<span class="nc" id="L343">            buf.putInt(SET_RECT_CLIP);</span>
+<span class="nc" id="L344">            buf.putInt(clip.getLoX()).putInt(clip.getLoY());</span>
+<span class="nc" id="L345">            buf.putInt(clip.getHiX()).putInt(clip.getHiY());</span>
+        } else {
+<span class="nc" id="L347">            rq.ensureCapacity(28); // so that we have room for at least a span</span>
+<span class="nc" id="L348">            buf.putInt(BEGIN_SHAPE_CLIP);</span>
+<span class="nc" id="L349">            buf.putInt(SET_SHAPE_CLIP_SPANS);</span>
+            // include a placeholder for the span count
+<span class="nc" id="L351">            int countIndex = buf.position();</span>
+<span class="nc" id="L352">            buf.putInt(0);</span>
+<span class="nc" id="L353">            int spanCount = 0;</span>
+<span class="nc" id="L354">            int remainingSpans = buf.remaining() / BYTES_PER_SPAN;</span>
+<span class="nc" id="L355">            int span[] = new int[4];</span>
+<span class="nc" id="L356">            SpanIterator si = clip.getSpanIterator();</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">            while (si.nextSpan(span)) {</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">                if (remainingSpans == 0) {</span>
+<span class="nc" id="L359">                    buf.putInt(countIndex, spanCount);</span>
+<span class="nc" id="L360">                    rq.flushNow();</span>
+<span class="nc" id="L361">                    buf.putInt(SET_SHAPE_CLIP_SPANS);</span>
+<span class="nc" id="L362">                    countIndex = buf.position();</span>
+<span class="nc" id="L363">                    buf.putInt(0);</span>
+<span class="nc" id="L364">                    spanCount = 0;</span>
+<span class="nc" id="L365">                    remainingSpans = buf.remaining() / BYTES_PER_SPAN;</span>
+                }
+<span class="nc" id="L367">                buf.putInt(span[0]); // x1</span>
+<span class="nc" id="L368">                buf.putInt(span[1]); // y1</span>
+<span class="nc" id="L369">                buf.putInt(span[2]); // x2</span>
+<span class="nc" id="L370">                buf.putInt(span[3]); // y2</span>
+<span class="nc" id="L371">                spanCount++;</span>
+<span class="nc" id="L372">                remainingSpans--;</span>
+            }
+<span class="nc" id="L374">            buf.putInt(countIndex, spanCount);</span>
+<span class="nc" id="L375">            rq.ensureCapacity(4);</span>
+<span class="nc" id="L376">            buf.putInt(END_SHAPE_CLIP);</span>
+        }
+<span class="nc" id="L378">    }</span>
+
+    private void resetComposite() {
+        // assert rq.lock.isHeldByCurrentThread();
+<span class="nc" id="L382">        rq.ensureCapacity(4);</span>
+<span class="nc" id="L383">        buf.putInt(RESET_COMPOSITE);</span>
+<span class="nc" id="L384">    }</span>
+
+    private void setComposite(Composite comp, int flags) {
+        // assert rq.lock.isHeldByCurrentThread();
+<span class="nc bnc" id="L388" title="All 2 branches missed.">        if (comp instanceof AlphaComposite) {</span>
+<span class="nc" id="L389">            AlphaComposite ac = (AlphaComposite)comp;</span>
+<span class="nc" id="L390">            rq.ensureCapacity(16);</span>
+<span class="nc" id="L391">            buf.putInt(SET_ALPHA_COMPOSITE);</span>
+<span class="nc" id="L392">            buf.putInt(ac.getRule());</span>
+<span class="nc" id="L393">            buf.putFloat(ac.getAlpha());</span>
+<span class="nc" id="L394">            buf.putInt(flags);</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">        } else if (comp instanceof XORComposite) {</span>
+<span class="nc" id="L396">            int xorPixel = ((XORComposite)comp).getXorPixel();</span>
+<span class="nc" id="L397">            rq.ensureCapacity(8);</span>
+<span class="nc" id="L398">            buf.putInt(SET_XOR_COMPOSITE);</span>
+<span class="nc" id="L399">            buf.putInt(xorPixel);</span>
+<span class="nc" id="L400">        } else {</span>
+<span class="nc" id="L401">            throw new InternalError(&quot;not yet implemented&quot;);</span>
+        }
+<span class="nc" id="L403">    }</span>
+
+    private void resetTransform() {
+        // assert rq.lock.isHeldByCurrentThread();
+<span class="nc" id="L407">        rq.ensureCapacity(4);</span>
+<span class="nc" id="L408">        buf.putInt(RESET_TRANSFORM);</span>
+<span class="nc" id="L409">    }</span>
+
+    private void setTransform(AffineTransform xform) {
+        // assert rq.lock.isHeldByCurrentThread();
+<span class="nc" id="L413">        rq.ensureCapacityAndAlignment(52, 4);</span>
+<span class="nc" id="L414">        buf.putInt(SET_TRANSFORM);</span>
+<span class="nc" id="L415">        buf.putDouble(xform.getScaleX());</span>
+<span class="nc" id="L416">        buf.putDouble(xform.getShearY());</span>
+<span class="nc" id="L417">        buf.putDouble(xform.getShearX());</span>
+<span class="nc" id="L418">        buf.putDouble(xform.getScaleY());</span>
+<span class="nc" id="L419">        buf.putDouble(xform.getTranslateX());</span>
+<span class="nc" id="L420">        buf.putDouble(xform.getTranslateY());</span>
+<span class="nc" id="L421">    }</span>
+
+    /**
+     * Resets this context's surfaces and all attributes.
+     *
+     * Note: must be called while the RenderQueue lock is held.
+     *
+     * @see RenderQueue#lock
+     * @see RenderQueue#unlock
+     */
+    public void invalidateContext() {
+<span class="nc" id="L432">        resetTransform();</span>
+<span class="nc" id="L433">        resetComposite();</span>
+<span class="nc" id="L434">        resetClip();</span>
+<span class="nc" id="L435">        BufferedPaints.resetPaint(rq);</span>
+<span class="nc" id="L436">        invalidateSurfaces();</span>
+<span class="nc" id="L437">        validatedComp = null;</span>
+<span class="nc" id="L438">        validatedClip = null;</span>
+<span class="nc" id="L439">        validatedPaint = null;</span>
+<span class="nc" id="L440">        isValidatedPaintJustAColor = false;</span>
+<span class="nc" id="L441">        xformInUse = false;</span>
+<span class="nc" id="L442">    }</span>
+
+    /**
+     * Returns a singleton {@code RenderQueue} object used by the rendering
+     * pipeline.
+     *
+     * @return a render queue
+     * @see RenderQueue
+     */
+    public abstract RenderQueue getRenderQueue();
+
+    /**
+     * Saves the the state of this context.
+     * It may reset the current context.
+     *
+     * Note: must be called while the RenderQueue lock is held.
+     *
+     * @see RenderQueue#lock
+     * @see RenderQueue#unlock
+     */
+    public abstract void saveState();
+
+    /**
+     * Restores the native state of this context.
+     * It may reset the current context.
+     *
+     * Note: must be called while the RenderQueue lock is held.
+     *
+     * @see RenderQueue#lock
+     * @see RenderQueue#unlock
+     */
+    public abstract void restoreState();
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

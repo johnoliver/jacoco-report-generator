@@ -1,0 +1,2219 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>FtpClient.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.net.ftp.impl</a> &gt; <span class="el_source">FtpClient.java</span></div><h1>FtpClient.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2009, 2011, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package sun.net.ftp.impl;
+
+import java.net.*;
+import java.io.*;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
+import java.text.DateFormat;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.Iterator;
+import java.util.List;
+import java.util.TimeZone;
+import java.util.Vector;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
+import sun.misc.BASE64Decoder;
+import sun.misc.BASE64Encoder;
+import sun.net.ftp.*;
+import sun.util.logging.PlatformLogger;
+
+
+public class FtpClient extends sun.net.ftp.FtpClient {
+
+    private static int defaultSoTimeout;
+    private static int defaultConnectTimeout;
+<span class="fc" id="L55">    private static final PlatformLogger logger =</span>
+<span class="fc" id="L56">             PlatformLogger.getLogger(&quot;sun.net.ftp.FtpClient&quot;);</span>
+    private Proxy proxy;
+    private Socket server;
+    private PrintStream out;
+    private InputStream in;
+<span class="fc" id="L61">    private int readTimeout = -1;</span>
+<span class="fc" id="L62">    private int connectTimeout = -1;</span>
+
+    /* Name of encoding to use for output */
+<span class="fc" id="L65">    private static String encoding = &quot;ISO8859_1&quot;;</span>
+    /** remember the ftp server name because we may need it */
+    private InetSocketAddress serverAddr;
+<span class="fc" id="L68">    private boolean replyPending = false;</span>
+<span class="fc" id="L69">    private boolean loggedIn = false;</span>
+<span class="fc" id="L70">    private boolean useCrypto = false;</span>
+    private SSLSocketFactory sslFact;
+    private Socket oldSocket;
+    /** Array of strings (usually 1 entry) for the last reply from the server. */
+<span class="fc" id="L74">    private Vector&lt;String&gt; serverResponse = new Vector&lt;String&gt;(1);</span>
+    /** The last reply code from the ftp daemon. */
+<span class="fc" id="L76">    private FtpReplyCode lastReplyCode = null;</span>
+    /** Welcome message from the server, if any. */
+    private String welcomeMsg;
+    /**
+     * Only passive mode used in JDK. See Bug 8010784.
+     */
+<span class="fc" id="L82">    private final boolean passiveMode = true;</span>
+<span class="fc" id="L83">    private TransferType type = TransferType.BINARY;</span>
+<span class="fc" id="L84">    private long restartOffset = 0;</span>
+<span class="fc" id="L85">    private long lastTransSize = -1; // -1 means 'unknown size'</span>
+    private String lastFileName;
+    /**
+     * Static members used by the parser
+     */
+<span class="fc" id="L90">    private static String[] patStrings = {</span>
+        // drwxr-xr-x  1 user01        ftp   512 Jan 29 23:32 prog
+        &quot;([\\-ld](?:[r\\-][w\\-][x\\-]){3})\\s*\\d+ (\\w+)\\s*(\\w+)\\s*(\\d+)\\s*([A-Z][a-z][a-z]\\s*\\d+)\\s*(\\d\\d:\\d\\d)\\s*(\\p{Print}*)&quot;,
+        // drwxr-xr-x  1 user01        ftp   512 Jan 29 1997 prog
+        &quot;([\\-ld](?:[r\\-][w\\-][x\\-]){3})\\s*\\d+ (\\w+)\\s*(\\w+)\\s*(\\d+)\\s*([A-Z][a-z][a-z]\\s*\\d+)\\s*(\\d{4})\\s*(\\p{Print}*)&quot;,
+        // 04/28/2006  09:12a               3,563 genBuffer.sh
+        &quot;(\\d{2}/\\d{2}/\\d{4})\\s*(\\d{2}:\\d{2}[ap])\\s*((?:[0-9,]+)|(?:&lt;DIR&gt;))\\s*(\\p{Graph}*)&quot;,
+        // 01-29-97    11:32PM &lt;DIR&gt; prog
+        &quot;(\\d{2}-\\d{2}-\\d{2})\\s*(\\d{2}:\\d{2}[AP]M)\\s*((?:[0-9,]+)|(?:&lt;DIR&gt;))\\s*(\\p{Graph}*)&quot;
+    };
+<span class="fc" id="L100">    private static int[][] patternGroups = {</span>
+        // 0 - file, 1 - size, 2 - date, 3 - time, 4 - year, 5 - permissions,
+        // 6 - user, 7 - group
+        {7, 4, 5, 6, 0, 1, 2, 3},
+        {7, 4, 5, 0, 6, 1, 2, 3},
+        {4, 3, 1, 2, 0, 0, 0, 0},
+        {4, 3, 1, 2, 0, 0, 0, 0}};
+    private static Pattern[] patterns;
+<span class="fc" id="L108">    private static Pattern linkp = Pattern.compile(&quot;(\\p{Print}+) \\-\\&gt; (\\p{Print}+)$&quot;);</span>
+<span class="fc" id="L109">    private DateFormat df = DateFormat.getDateInstance(DateFormat.MEDIUM, java.util.Locale.US);</span>
+
+    static {
+<span class="fc" id="L112">        final int vals[] = {0, 0};</span>
+<span class="fc" id="L113">        final String encs[] = {null};</span>
+
+<span class="fc" id="L115">        AccessController.doPrivileged(</span>
+<span class="fc" id="L116">                new PrivilegedAction&lt;Object&gt;() {</span>
+
+                    public Object run() {
+<span class="fc" id="L119">                        vals[0] = Integer.getInteger(&quot;sun.net.client.defaultReadTimeout&quot;, 0).intValue();</span>
+<span class="fc" id="L120">                        vals[1] = Integer.getInteger(&quot;sun.net.client.defaultConnectTimeout&quot;, 0).intValue();</span>
+<span class="fc" id="L121">                        encs[0] = System.getProperty(&quot;file.encoding&quot;, &quot;ISO8859_1&quot;);</span>
+<span class="fc" id="L122">                        return null;</span>
+                    }
+                });
+<span class="pc bpc" id="L125" title="1 of 2 branches missed.">        if (vals[0] == 0) {</span>
+<span class="fc" id="L126">            defaultSoTimeout = -1;</span>
+        } else {
+<span class="nc" id="L128">            defaultSoTimeout = vals[0];</span>
+        }
+
+<span class="pc bpc" id="L131" title="1 of 2 branches missed.">        if (vals[1] == 0) {</span>
+<span class="fc" id="L132">            defaultConnectTimeout = -1;</span>
+        } else {
+<span class="nc" id="L134">            defaultConnectTimeout = vals[1];</span>
+        }
+
+<span class="fc" id="L137">        encoding = encs[0];</span>
+        try {
+<span class="pc bpc" id="L139" title="1 of 2 branches missed.">            if (!isASCIISuperset(encoding)) {</span>
+<span class="nc" id="L140">                encoding = &quot;ISO8859_1&quot;;</span>
+            }
+<span class="nc" id="L142">        } catch (Exception e) {</span>
+<span class="nc" id="L143">            encoding = &quot;ISO8859_1&quot;;</span>
+<span class="fc" id="L144">        }</span>
+
+<span class="fc" id="L146">        patterns = new Pattern[patStrings.length];</span>
+<span class="fc bfc" id="L147" title="All 2 branches covered.">        for (int i = 0; i &lt; patStrings.length; i++) {</span>
+<span class="fc" id="L148">            patterns[i] = Pattern.compile(patStrings[i]);</span>
+        }
+    }
+
+    /**
+     * Test the named character encoding to verify that it converts ASCII
+     * characters correctly. We have to use an ASCII based encoding, or else
+     * the NetworkClients will not work correctly in EBCDIC based systems.
+     * However, we cannot just use ASCII or ISO8859_1 universally, because in
+     * Asian locales, non-ASCII characters may be embedded in otherwise
+     * ASCII based protocols (eg. HTTP). The specifications (RFC2616, 2398)
+     * are a little ambiguous in this matter. For instance, RFC2398 [part 2.1]
+     * says that the HTTP request URI should be escaped using a defined
+     * mechanism, but there is no way to specify in the escaped string what
+     * the original character set is. It is not correct to assume that
+     * UTF-8 is always used (as in URLs in HTML 4.0).  For this reason,
+     * until the specifications are updated to deal with this issue more
+     * comprehensively, and more importantly, HTTP servers are known to
+     * support these mechanisms, we will maintain the current behavior
+     * where it is possible to send non-ASCII characters in their original
+     * unescaped form.
+     */
+    private static boolean isASCIISuperset(String encoding) throws Exception {
+<span class="fc" id="L171">        String chkS = &quot;0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ&quot; +</span>
+                &quot;abcdefghijklmnopqrstuvwxyz-_.!~*'();/?:@&amp;=+$,&quot;;
+
+        // Expected byte sequence for string above
+<span class="fc" id="L175">        byte[] chkB = {48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 65, 66, 67, 68, 69, 70, 71, 72,</span>
+            73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 97, 98, 99,
+            100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114,
+            115, 116, 117, 118, 119, 120, 121, 122, 45, 95, 46, 33, 126, 42, 39, 40, 41, 59,
+            47, 63, 58, 64, 38, 61, 43, 36, 44};
+
+<span class="fc" id="L181">        byte[] b = chkS.getBytes(encoding);</span>
+<span class="fc" id="L182">        return java.util.Arrays.equals(b, chkB);</span>
+    }
+
+    private class DefaultParser implements FtpDirParser {
+
+        /**
+         * Possible patterns:
+         *
+         *  drwxr-xr-x  1 user01        ftp   512 Jan 29 23:32 prog
+         *  drwxr-xr-x  1 user01        ftp   512 Jan 29 1997 prog
+         *  drwxr-xr-x  1 1             1     512 Jan 29 23:32 prog
+         *  lrwxr-xr-x  1 user01        ftp   512 Jan 29 23:32 prog -&gt; prog2000
+         *  drwxr-xr-x  1 username      ftp   512 Jan 29 23:32 prog
+         *  -rw-r--r--  1 jcc      staff     105009 Feb  3 15:05 test.1
+         *
+         *  01-29-97    11:32PM &lt;DIR&gt; prog
+         *  04/28/2006  09:12a               3,563 genBuffer.sh
+         *
+         *  drwxr-xr-x  folder   0       Jan 29 23:32 prog
+         *
+         *  0 DIR 01-29-97 23:32 PROG
+         */
+<span class="fc" id="L204">        private DefaultParser() {</span>
+<span class="fc" id="L205">        }</span>
+
+        public FtpDirEntry parseLine(String line) {
+<span class="nc" id="L208">            String fdate = null;</span>
+<span class="nc" id="L209">            String fsize = null;</span>
+<span class="nc" id="L210">            String time = null;</span>
+<span class="nc" id="L211">            String filename = null;</span>
+<span class="nc" id="L212">            String permstring = null;</span>
+<span class="nc" id="L213">            String username = null;</span>
+<span class="nc" id="L214">            String groupname = null;</span>
+<span class="nc" id="L215">            boolean dir = false;</span>
+<span class="nc" id="L216">            Calendar now = Calendar.getInstance();</span>
+<span class="nc" id="L217">            int year = now.get(Calendar.YEAR);</span>
+
+<span class="nc" id="L219">            Matcher m = null;</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">            for (int j = 0; j &lt; patterns.length; j++) {</span>
+<span class="nc" id="L221">                m = patterns[j].matcher(line);</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">                if (m.find()) {</span>
+                    // 0 - file, 1 - size, 2 - date, 3 - time, 4 - year,
+                    // 5 - permissions, 6 - user, 7 - group
+<span class="nc" id="L225">                    filename = m.group(patternGroups[j][0]);</span>
+<span class="nc" id="L226">                    fsize = m.group(patternGroups[j][1]);</span>
+<span class="nc" id="L227">                    fdate = m.group(patternGroups[j][2]);</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">                    if (patternGroups[j][4] &gt; 0) {</span>
+<span class="nc" id="L229">                        fdate += (&quot;, &quot; + m.group(patternGroups[j][4]));</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">                    } else if (patternGroups[j][3] &gt; 0) {</span>
+<span class="nc" id="L231">                        fdate += (&quot;, &quot; + String.valueOf(year));</span>
+                    }
+<span class="nc bnc" id="L233" title="All 2 branches missed.">                    if (patternGroups[j][3] &gt; 0) {</span>
+<span class="nc" id="L234">                        time = m.group(patternGroups[j][3]);</span>
+                    }
+<span class="nc bnc" id="L236" title="All 2 branches missed.">                    if (patternGroups[j][5] &gt; 0) {</span>
+<span class="nc" id="L237">                        permstring = m.group(patternGroups[j][5]);</span>
+<span class="nc" id="L238">                        dir = permstring.startsWith(&quot;d&quot;);</span>
+                    }
+<span class="nc bnc" id="L240" title="All 2 branches missed.">                    if (patternGroups[j][6] &gt; 0) {</span>
+<span class="nc" id="L241">                        username = m.group(patternGroups[j][6]);</span>
+                    }
+<span class="nc bnc" id="L243" title="All 2 branches missed.">                    if (patternGroups[j][7] &gt; 0) {</span>
+<span class="nc" id="L244">                        groupname = m.group(patternGroups[j][7]);</span>
+                    }
+                    // Old DOS format
+<span class="nc bnc" id="L247" title="All 2 branches missed.">                    if (&quot;&lt;DIR&gt;&quot;.equals(fsize)) {</span>
+<span class="nc" id="L248">                        dir = true;</span>
+<span class="nc" id="L249">                        fsize = null;</span>
+                    }
+                }
+            }
+
+<span class="nc bnc" id="L254" title="All 2 branches missed.">            if (filename != null) {</span>
+                Date d;
+                try {
+<span class="nc" id="L257">                    d = df.parse(fdate);</span>
+<span class="nc" id="L258">                } catch (Exception e) {</span>
+<span class="nc" id="L259">                    d = null;</span>
+<span class="nc" id="L260">                }</span>
+<span class="nc bnc" id="L261" title="All 4 branches missed.">                if (d != null &amp;&amp; time != null) {</span>
+<span class="nc" id="L262">                    int c = time.indexOf(&quot;:&quot;);</span>
+<span class="nc" id="L263">                    now.setTime(d);</span>
+<span class="nc" id="L264">                    now.set(Calendar.HOUR, Integer.parseInt(time.substring(0, c)));</span>
+<span class="nc" id="L265">                    now.set(Calendar.MINUTE, Integer.parseInt(time.substring(c + 1)));</span>
+<span class="nc" id="L266">                    d = now.getTime();</span>
+                }
+                // see if it's a symbolic link, i.e. the name if followed
+                // by a -&gt; and a path
+<span class="nc" id="L270">                Matcher m2 = linkp.matcher(filename);</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">                if (m2.find()) {</span>
+                    // Keep only the name then
+<span class="nc" id="L273">                    filename = m2.group(1);</span>
+                }
+<span class="nc" id="L275">                boolean[][] perms = new boolean[3][3];</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">                for (int i = 0; i &lt; 3; i++) {</span>
+<span class="nc bnc" id="L277" title="All 2 branches missed.">                    for (int j = 0; j &lt; 3; j++) {</span>
+<span class="nc bnc" id="L278" title="All 2 branches missed.">                        perms[i][j] = (permstring.charAt((i * 3) + j) != '-');</span>
+                    }
+                }
+<span class="nc" id="L281">                FtpDirEntry file = new FtpDirEntry(filename);</span>
+<span class="nc" id="L282">                file.setUser(username).setGroup(groupname);</span>
+<span class="nc" id="L283">                file.setSize(Long.parseLong(fsize)).setLastModified(d);</span>
+<span class="nc" id="L284">                file.setPermissions(perms);</span>
+<span class="nc bnc" id="L285" title="All 4 branches missed.">                file.setType(dir ? FtpDirEntry.Type.DIR : (line.charAt(0) == 'l' ? FtpDirEntry.Type.LINK : FtpDirEntry.Type.FILE));</span>
+<span class="nc" id="L286">                return file;</span>
+            }
+<span class="nc" id="L288">            return null;</span>
+        }
+    }
+
+<span class="fc" id="L292">    private class MLSxParser implements FtpDirParser {</span>
+
+<span class="fc" id="L294">        private SimpleDateFormat df = new SimpleDateFormat(&quot;yyyyMMddhhmmss&quot;);</span>
+
+        public FtpDirEntry parseLine(String line) {
+<span class="nc" id="L297">            String name = null;</span>
+<span class="nc" id="L298">            int i = line.lastIndexOf(&quot;;&quot;);</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">            if (i &gt; 0) {</span>
+<span class="nc" id="L300">                name = line.substring(i + 1).trim();</span>
+<span class="nc" id="L301">                line = line.substring(0, i);</span>
+            } else {
+<span class="nc" id="L303">                name = line.trim();</span>
+<span class="nc" id="L304">                line = &quot;&quot;;</span>
+            }
+<span class="nc" id="L306">            FtpDirEntry file = new FtpDirEntry(name);</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">            while (!line.isEmpty()) {</span>
+                String s;
+<span class="nc" id="L309">                i = line.indexOf(&quot;;&quot;);</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">                if (i &gt; 0) {</span>
+<span class="nc" id="L311">                    s = line.substring(0, i);</span>
+<span class="nc" id="L312">                    line = line.substring(i + 1);</span>
+                } else {
+<span class="nc" id="L314">                    s = line;</span>
+<span class="nc" id="L315">                    line = &quot;&quot;;</span>
+                }
+<span class="nc" id="L317">                i = s.indexOf(&quot;=&quot;);</span>
+<span class="nc bnc" id="L318" title="All 2 branches missed.">                if (i &gt; 0) {</span>
+<span class="nc" id="L319">                    String fact = s.substring(0, i);</span>
+<span class="nc" id="L320">                    String value = s.substring(i + 1);</span>
+<span class="nc" id="L321">                    file.addFact(fact, value);</span>
+                }
+<span class="nc" id="L323">            }</span>
+<span class="nc" id="L324">            String s = file.getFact(&quot;Size&quot;);</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">            if (s != null) {</span>
+<span class="nc" id="L326">                file.setSize(Long.parseLong(s));</span>
+            }
+<span class="nc" id="L328">            s = file.getFact(&quot;Modify&quot;);</span>
+<span class="nc bnc" id="L329" title="All 2 branches missed.">            if (s != null) {</span>
+<span class="nc" id="L330">                Date d = null;</span>
+                try {
+<span class="nc" id="L332">                    d = df.parse(s);</span>
+<span class="nc" id="L333">                } catch (ParseException ex) {</span>
+<span class="nc" id="L334">                }</span>
+<span class="nc bnc" id="L335" title="All 2 branches missed.">                if (d != null) {</span>
+<span class="nc" id="L336">                    file.setLastModified(d);</span>
+                }
+            }
+<span class="nc" id="L339">            s = file.getFact(&quot;Create&quot;);</span>
+<span class="nc bnc" id="L340" title="All 2 branches missed.">            if (s != null) {</span>
+<span class="nc" id="L341">                Date d = null;</span>
+                try {
+<span class="nc" id="L343">                    d = df.parse(s);</span>
+<span class="nc" id="L344">                } catch (ParseException ex) {</span>
+<span class="nc" id="L345">                }</span>
+<span class="nc bnc" id="L346" title="All 2 branches missed.">                if (d != null) {</span>
+<span class="nc" id="L347">                    file.setCreated(d);</span>
+                }
+            }
+<span class="nc" id="L350">            s = file.getFact(&quot;Type&quot;);</span>
+<span class="nc bnc" id="L351" title="All 2 branches missed.">            if (s != null) {</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">                if (s.equalsIgnoreCase(&quot;file&quot;)) {</span>
+<span class="nc" id="L353">                    file.setType(FtpDirEntry.Type.FILE);</span>
+                }
+<span class="nc bnc" id="L355" title="All 2 branches missed.">                if (s.equalsIgnoreCase(&quot;dir&quot;)) {</span>
+<span class="nc" id="L356">                    file.setType(FtpDirEntry.Type.DIR);</span>
+                }
+<span class="nc bnc" id="L358" title="All 2 branches missed.">                if (s.equalsIgnoreCase(&quot;cdir&quot;)) {</span>
+<span class="nc" id="L359">                    file.setType(FtpDirEntry.Type.CDIR);</span>
+                }
+<span class="nc bnc" id="L361" title="All 2 branches missed.">                if (s.equalsIgnoreCase(&quot;pdir&quot;)) {</span>
+<span class="nc" id="L362">                    file.setType(FtpDirEntry.Type.PDIR);</span>
+                }
+            }
+<span class="nc" id="L365">            return file;</span>
+        }
+    };
+<span class="fc" id="L368">    private FtpDirParser parser = new DefaultParser();</span>
+<span class="fc" id="L369">    private FtpDirParser mlsxParser = new MLSxParser();</span>
+<span class="fc" id="L370">    private static Pattern transPat = null;</span>
+
+    private void getTransferSize() {
+<span class="fc" id="L373">        lastTransSize = -1;</span>
+        /**
+         * If it's a start of data transfer response, let's try to extract
+         * the size from the response string. Usually it looks like that:
+         *
+         * 150 Opening BINARY mode data connection for foo (6701 bytes).
+         */
+<span class="fc" id="L380">        String response = getLastResponseString();</span>
+<span class="fc bfc" id="L381" title="All 2 branches covered.">        if (transPat == null) {</span>
+<span class="fc" id="L382">            transPat = Pattern.compile(&quot;150 Opening .*\\((\\d+) bytes\\).&quot;);</span>
+        }
+<span class="fc" id="L384">        Matcher m = transPat.matcher(response);</span>
+<span class="pc bpc" id="L385" title="1 of 2 branches missed.">        if (m.find()) {</span>
+<span class="nc" id="L386">            String s = m.group(1);</span>
+<span class="nc" id="L387">            lastTransSize = Long.parseLong(s);</span>
+        }
+<span class="fc" id="L389">    }</span>
+
+    /**
+     * extract the created file name from the response string:
+     * 226 Transfer complete (unique file name:toto.txt.1).
+     * Usually happens when a STOU (store unique) command had been issued.
+     */
+    private void getTransferName() {
+<span class="fc" id="L397">        lastFileName = null;</span>
+<span class="fc" id="L398">        String response = getLastResponseString();</span>
+<span class="fc" id="L399">        int i = response.indexOf(&quot;unique file name:&quot;);</span>
+<span class="fc" id="L400">        int e = response.lastIndexOf(')');</span>
+<span class="pc bpc" id="L401" title="1 of 2 branches missed.">        if (i &gt;= 0) {</span>
+<span class="nc" id="L402">            i += 17; // Length of &quot;unique file name:&quot;</span>
+<span class="nc" id="L403">            lastFileName = response.substring(i, e);</span>
+        }
+<span class="fc" id="L405">    }</span>
+
+    /**
+     * Pulls the response from the server and returns the code as a
+     * number. Returns -1 on failure.
+     */
+    private int readServerResponse() throws IOException {
+<span class="fc" id="L412">        StringBuffer replyBuf = new StringBuffer(32);</span>
+        int c;
+<span class="fc" id="L414">        int continuingCode = -1;</span>
+        int code;
+        String response;
+
+<span class="fc" id="L418">        serverResponse.setSize(0);</span>
+        while (true) {
+<span class="pc bpc" id="L420" title="1 of 2 branches missed.">            while ((c = in.read()) != -1) {</span>
+<span class="pc bpc" id="L421" title="1 of 2 branches missed.">                if (c == '\r') {</span>
+<span class="nc bnc" id="L422" title="All 2 branches missed.">                    if ((c = in.read()) != '\n') {</span>
+<span class="nc" id="L423">                        replyBuf.append('\r');</span>
+                    }
+                }
+<span class="fc" id="L426">                replyBuf.append((char) c);</span>
+<span class="fc bfc" id="L427" title="All 2 branches covered.">                if (c == '\n') {</span>
+<span class="fc" id="L428">                    break;</span>
+                }
+            }
+<span class="fc" id="L431">            response = replyBuf.toString();</span>
+<span class="fc" id="L432">            replyBuf.setLength(0);</span>
+<span class="pc bpc" id="L433" title="1 of 2 branches missed.">            if (logger.isLoggable(PlatformLogger.Level.FINEST)) {</span>
+<span class="nc" id="L434">                logger.finest(&quot;Server [&quot; + serverAddr + &quot;] --&gt; &quot; + response);</span>
+            }
+
+<span class="pc bpc" id="L437" title="1 of 2 branches missed.">            if (response.length() == 0) {</span>
+<span class="nc" id="L438">                code = -1;</span>
+            } else {
+                try {
+<span class="fc" id="L441">                    code = Integer.parseInt(response.substring(0, 3));</span>
+<span class="fc" id="L442">                } catch (NumberFormatException e) {</span>
+<span class="fc" id="L443">                    code = -1;</span>
+<span class="nc" id="L444">                } catch (StringIndexOutOfBoundsException e) {</span>
+                    /* this line doesn't contain a response code, so
+                    we just completely ignore it */
+<span class="nc" id="L447">                    continue;</span>
+<span class="fc" id="L448">                }</span>
+            }
+<span class="fc" id="L450">            serverResponse.addElement(response);</span>
+<span class="fc bfc" id="L451" title="All 2 branches covered.">            if (continuingCode != -1) {</span>
+                /* we've seen a ###- sequence */
+<span class="fc bfc" id="L453" title="All 2 branches covered.">                if (code != continuingCode ||</span>
+<span class="pc bpc" id="L454" title="2 of 4 branches missed.">                        (response.length() &gt;= 4 &amp;&amp; response.charAt(3) == '-')) {</span>
+<span class="nc" id="L455">                    continue;</span>
+                } else {
+                    /* seen the end of code sequence */
+<span class="fc" id="L458">                    continuingCode = -1;</span>
+<span class="fc" id="L459">                    break;</span>
+                }
+<span class="pc bpc" id="L461" title="1 of 4 branches missed.">            } else if (response.length() &gt;= 4 &amp;&amp; response.charAt(3) == '-') {</span>
+<span class="fc" id="L462">                continuingCode = code;</span>
+<span class="fc" id="L463">                continue;</span>
+            } else {
+                break;
+            }
+        }
+
+<span class="fc" id="L469">        return code;</span>
+    }
+
+    /** Sends command &lt;i&gt;cmd&lt;/i&gt; to the server. */
+    private void sendServer(String cmd) {
+<span class="fc" id="L474">        out.print(cmd);</span>
+<span class="pc bpc" id="L475" title="1 of 2 branches missed.">        if (logger.isLoggable(PlatformLogger.Level.FINEST)) {</span>
+<span class="nc" id="L476">            logger.finest(&quot;Server [&quot; + serverAddr + &quot;] &lt;-- &quot; + cmd);</span>
+        }
+<span class="fc" id="L478">    }</span>
+
+    /** converts the server response into a string. */
+    private String getResponseString() {
+<span class="fc" id="L482">        return serverResponse.elementAt(0);</span>
+    }
+
+    /** Returns all server response strings. */
+    private Vector&lt;String&gt; getResponseStrings() {
+<span class="nc" id="L487">        return serverResponse;</span>
+    }
+
+    /**
+     * Read the reply from the FTP server.
+     *
+     * @return &lt;code&gt;true&lt;/code&gt; if the command was successful
+     * @throws IOException if an error occurred
+     */
+    private boolean readReply() throws IOException {
+<span class="fc" id="L497">        lastReplyCode = FtpReplyCode.find(readServerResponse());</span>
+
+<span class="fc bfc" id="L499" title="All 2 branches covered.">        if (lastReplyCode.isPositivePreliminary()) {</span>
+<span class="fc" id="L500">            replyPending = true;</span>
+<span class="fc" id="L501">            return true;</span>
+        }
+<span class="fc bfc" id="L503" title="All 4 branches covered.">        if (lastReplyCode.isPositiveCompletion() || lastReplyCode.isPositiveIntermediate()) {</span>
+<span class="fc bfc" id="L504" title="All 2 branches covered.">            if (lastReplyCode == FtpReplyCode.CLOSING_DATA_CONNECTION) {</span>
+<span class="fc" id="L505">                getTransferName();</span>
+            }
+<span class="fc" id="L507">            return true;</span>
+        }
+<span class="fc" id="L509">        return false;</span>
+    }
+
+    /**
+     * Sends a command to the FTP server and returns the error code
+     * (which can be a &quot;success&quot;) sent by the server.
+     *
+     * @param cmd
+     * @return &lt;code&gt;true&lt;/code&gt; if the command was successful
+     * @throws IOException
+     */
+    private boolean issueCommand(String cmd) throws IOException {
+<span class="pc bpc" id="L521" title="1 of 2 branches missed.">        if (!isConnected()) {</span>
+<span class="nc" id="L522">            throw new IllegalStateException(&quot;Not connected&quot;);</span>
+        }
+<span class="fc bfc" id="L524" title="All 2 branches covered.">        if (replyPending) {</span>
+            try {
+<span class="fc" id="L526">                completePending();</span>
+<span class="nc" id="L527">            } catch (sun.net.ftp.FtpProtocolException e) {</span>
+                // ignore...
+<span class="fc" id="L529">            }</span>
+        }
+<span class="fc" id="L531">        sendServer(cmd + &quot;\r\n&quot;);</span>
+<span class="fc" id="L532">        return readReply();</span>
+    }
+
+    /**
+     * Send a command to the FTP server and check for success.
+     *
+     * @param cmd String containing the command
+     *
+     * @throws FtpProtocolException if an error occurred
+     */
+    private void issueCommandCheck(String cmd) throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="fc bfc" id="L543" title="All 2 branches covered.">        if (!issueCommand(cmd)) {</span>
+<span class="fc" id="L544">            throw new sun.net.ftp.FtpProtocolException(cmd + &quot;:&quot; + getResponseString(), getLastReplyCode());</span>
+        }
+<span class="fc" id="L546">    }</span>
+<span class="fc" id="L547">    private static Pattern epsvPat = null;</span>
+<span class="fc" id="L548">    private static Pattern pasvPat = null;</span>
+
+    /**
+     * Opens a &quot;PASSIVE&quot; connection with the server and returns the connected
+     * &lt;code&gt;Socket&lt;/code&gt;.
+     *
+     * @return the connected &lt;code&gt;Socket&lt;/code&gt;
+     * @throws IOException if the connection was unsuccessful.
+     */
+    private Socket openPassiveDataConnection(String cmd) throws sun.net.ftp.FtpProtocolException, IOException {
+        String serverAnswer;
+        int port;
+<span class="fc" id="L560">        InetSocketAddress dest = null;</span>
+
+        /**
+         * Here is the idea:
+         *
+         * - First we want to try the new (and IPv6 compatible) EPSV command
+         *   But since we want to be nice with NAT software, we'll issue the
+         *   EPSV ALL command first.
+         *   EPSV is documented in RFC2428
+         * - If EPSV fails, then we fall back to the older, yet ok, PASV
+         * - If PASV fails as well, then we throw an exception and the calling
+         *   method will have to try the EPRT or PORT command
+         */
+<span class="fc bfc" id="L573" title="All 2 branches covered.">        if (issueCommand(&quot;EPSV ALL&quot;)) {</span>
+            // We can safely use EPSV commands
+<span class="fc" id="L575">            issueCommandCheck(&quot;EPSV&quot;);</span>
+<span class="fc" id="L576">            serverAnswer = getResponseString();</span>
+
+            // The response string from a EPSV command will contain the port number
+            // the format will be :
+            //  229 Entering Extended PASSIVE Mode (|||58210|)
+            //
+            // So we'll use the regular expresions package to parse the output.
+
+<span class="pc bpc" id="L584" title="1 of 2 branches missed.">            if (epsvPat == null) {</span>
+<span class="fc" id="L585">                epsvPat = Pattern.compile(&quot;^229 .* \\(\\|\\|\\|(\\d+)\\|\\)&quot;);</span>
+            }
+<span class="fc" id="L587">            Matcher m = epsvPat.matcher(serverAnswer);</span>
+<span class="pc bpc" id="L588" title="1 of 2 branches missed.">            if (!m.find()) {</span>
+<span class="nc" id="L589">                throw new sun.net.ftp.FtpProtocolException(&quot;EPSV failed : &quot; + serverAnswer);</span>
+            }
+            // Yay! Let's extract the port number
+<span class="fc" id="L592">            String s = m.group(1);</span>
+<span class="fc" id="L593">            port = Integer.parseInt(s);</span>
+<span class="fc" id="L594">            InetAddress add = server.getInetAddress();</span>
+<span class="pc bpc" id="L595" title="1 of 2 branches missed.">            if (add != null) {</span>
+<span class="fc" id="L596">                dest = new InetSocketAddress(add, port);</span>
+            } else {
+                // This means we used an Unresolved address to connect in
+                // the first place. Most likely because the proxy is doing
+                // the name resolution for us, so let's keep using unresolved
+                // address.
+<span class="nc" id="L602">                dest = InetSocketAddress.createUnresolved(serverAddr.getHostName(), port);</span>
+            }
+<span class="fc" id="L604">        } else {</span>
+            // EPSV ALL failed, so Let's try the regular PASV cmd
+<span class="fc" id="L606">            issueCommandCheck(&quot;PASV&quot;);</span>
+<span class="fc" id="L607">            serverAnswer = getResponseString();</span>
+
+            // Let's parse the response String to get the IP &amp; port to connect
+            // to. The String should be in the following format :
+            //
+            // 227 Entering PASSIVE Mode (A1,A2,A3,A4,p1,p2)
+            //
+            // Note that the two parenthesis are optional
+            //
+            // The IP address is A1.A2.A3.A4 and the port is p1 * 256 + p2
+            //
+            // The regular expression is a bit more complex this time, because
+            // the parenthesis are optionals and we have to use 3 groups.
+
+<span class="fc bfc" id="L621" title="All 2 branches covered.">            if (pasvPat == null) {</span>
+<span class="fc" id="L622">                pasvPat = Pattern.compile(&quot;227 .* \\(?(\\d{1,3},\\d{1,3},\\d{1,3},\\d{1,3}),(\\d{1,3}),(\\d{1,3})\\)?&quot;);</span>
+            }
+<span class="fc" id="L624">            Matcher m = pasvPat.matcher(serverAnswer);</span>
+<span class="pc bpc" id="L625" title="1 of 2 branches missed.">            if (!m.find()) {</span>
+<span class="nc" id="L626">                throw new sun.net.ftp.FtpProtocolException(&quot;PASV failed : &quot; + serverAnswer);</span>
+            }
+            // Get port number out of group 2 &amp; 3
+<span class="fc" id="L629">            port = Integer.parseInt(m.group(3)) + (Integer.parseInt(m.group(2)) &lt;&lt; 8);</span>
+            // IP address is simple
+<span class="fc" id="L631">            String s = m.group(1).replace(',', '.');</span>
+<span class="fc" id="L632">            dest = new InetSocketAddress(s, port);</span>
+        }
+        // Got everything, let's open the socket!
+        Socket s;
+<span class="pc bpc" id="L636" title="1 of 2 branches missed.">        if (proxy != null) {</span>
+<span class="pc bpc" id="L637" title="1 of 2 branches missed.">            if (proxy.type() == Proxy.Type.SOCKS) {</span>
+<span class="nc" id="L638">                s = AccessController.doPrivileged(</span>
+<span class="nc" id="L639">                        new PrivilegedAction&lt;Socket&gt;() {</span>
+
+                            public Socket run() {
+<span class="nc" id="L642">                                return new Socket(proxy);</span>
+                            }
+                        });
+            } else {
+<span class="fc" id="L646">                s = new Socket(Proxy.NO_PROXY);</span>
+            }
+        } else {
+<span class="nc" id="L649">            s = new Socket();</span>
+        }
+
+<span class="fc" id="L652">        InetAddress serverAddress = AccessController.doPrivileged(</span>
+<span class="fc" id="L653">                new PrivilegedAction&lt;InetAddress&gt;() {</span>
+                    @Override
+                    public InetAddress run() {
+<span class="fc" id="L656">                        return server.getLocalAddress();</span>
+                    }
+                });
+
+        // Bind the socket to the same address as the control channel. This
+        // is needed in case of multi-homed systems.
+<span class="fc" id="L662">        s.bind(new InetSocketAddress(serverAddress, 0));</span>
+<span class="pc bpc" id="L663" title="1 of 2 branches missed.">        if (connectTimeout &gt;= 0) {</span>
+<span class="nc" id="L664">            s.connect(dest, connectTimeout);</span>
+        } else {
+<span class="pc bpc" id="L666" title="1 of 2 branches missed.">            if (defaultConnectTimeout &gt; 0) {</span>
+<span class="nc" id="L667">                s.connect(dest, defaultConnectTimeout);</span>
+            } else {
+<span class="fc" id="L669">                s.connect(dest);</span>
+            }
+        }
+<span class="pc bpc" id="L672" title="1 of 2 branches missed.">        if (readTimeout &gt;= 0) {</span>
+<span class="nc" id="L673">            s.setSoTimeout(readTimeout);</span>
+<span class="pc bpc" id="L674" title="1 of 2 branches missed.">        } else if (defaultSoTimeout &gt; 0) {</span>
+<span class="nc" id="L675">            s.setSoTimeout(defaultSoTimeout);</span>
+        }
+<span class="pc bpc" id="L677" title="1 of 2 branches missed.">        if (useCrypto) {</span>
+            try {
+<span class="nc" id="L679">                s = sslFact.createSocket(s, dest.getHostName(), dest.getPort(), true);</span>
+<span class="nc" id="L680">            } catch (Exception e) {</span>
+<span class="nc" id="L681">                throw new sun.net.ftp.FtpProtocolException(&quot;Can't open secure data channel: &quot; + e);</span>
+<span class="nc" id="L682">            }</span>
+        }
+<span class="pc bpc" id="L684" title="1 of 2 branches missed.">        if (!issueCommand(cmd)) {</span>
+<span class="nc" id="L685">            s.close();</span>
+<span class="nc bnc" id="L686" title="All 2 branches missed.">            if (getLastReplyCode() == FtpReplyCode.FILE_UNAVAILABLE) {</span>
+                // Ensure backward compatibility
+<span class="nc" id="L688">                throw new FileNotFoundException(cmd);</span>
+            }
+<span class="nc" id="L690">            throw new sun.net.ftp.FtpProtocolException(cmd + &quot;:&quot; + getResponseString(), getLastReplyCode());</span>
+        }
+<span class="fc" id="L692">        return s;</span>
+    }
+
+    /**
+     * Opens a data connection with the server according to the set mode
+     * (ACTIVE or PASSIVE) then send the command passed as an argument.
+     *
+     * @param cmd the &lt;code&gt;String&lt;/code&gt; containing the command to execute
+     * @return the connected &lt;code&gt;Socket&lt;/code&gt;
+     * @throws IOException if the connection or command failed
+     */
+    private Socket openDataConnection(String cmd) throws sun.net.ftp.FtpProtocolException, IOException {
+        Socket clientSocket;
+
+        if (passiveMode) {
+            try {
+<span class="fc" id="L708">                return openPassiveDataConnection(cmd);</span>
+<span class="nc" id="L709">            } catch (sun.net.ftp.FtpProtocolException e) {</span>
+                // If Passive mode failed, fall back on PORT
+                // Otherwise throw exception
+<span class="nc" id="L712">                String errmsg = e.getMessage();</span>
+<span class="nc bnc" id="L713" title="All 4 branches missed.">                if (!errmsg.startsWith(&quot;PASV&quot;) &amp;&amp; !errmsg.startsWith(&quot;EPSV&quot;)) {</span>
+<span class="nc" id="L714">                    throw e;</span>
+                }
+            }
+        }
+        ServerSocket portSocket;
+        InetAddress myAddress;
+        String portCmd;
+
+<span class="nc bnc" id="L722" title="All 4 branches missed.">        if (proxy != null &amp;&amp; proxy.type() == Proxy.Type.SOCKS) {</span>
+            // We're behind a firewall and the passive mode fail,
+            // since we can't accept a connection through SOCKS (yet)
+            // throw an exception
+<span class="nc" id="L726">            throw new sun.net.ftp.FtpProtocolException(&quot;Passive mode failed&quot;);</span>
+        }
+        // Bind the ServerSocket to the same address as the control channel
+        // This is needed for multi-homed systems
+<span class="nc" id="L730">        portSocket = new ServerSocket(0, 1, server.getLocalAddress());</span>
+        try {
+<span class="nc" id="L732">            myAddress = portSocket.getInetAddress();</span>
+<span class="nc bnc" id="L733" title="All 2 branches missed.">            if (myAddress.isAnyLocalAddress()) {</span>
+<span class="nc" id="L734">                myAddress = server.getLocalAddress();</span>
+            }
+            // Let's try the new, IPv6 compatible EPRT command
+            // See RFC2428 for specifics
+            // Some FTP servers (like the one on Solaris) are bugged, they
+            // will accept the EPRT command but then, the subsequent command
+            // (e.g. RETR) will fail, so we have to check BOTH results (the
+            // EPRT cmd then the actual command) to decide whether we should
+            // fall back on the older PORT command.
+<span class="nc bnc" id="L743" title="All 2 branches missed.">            portCmd = &quot;EPRT |&quot; + ((myAddress instanceof Inet6Address) ? &quot;2&quot; : &quot;1&quot;) + &quot;|&quot; +</span>
+<span class="nc" id="L744">                    myAddress.getHostAddress() + &quot;|&quot; + portSocket.getLocalPort() + &quot;|&quot;;</span>
+<span class="nc bnc" id="L745" title="All 4 branches missed.">            if (!issueCommand(portCmd) || !issueCommand(cmd)) {</span>
+                // The EPRT command failed, let's fall back to good old PORT
+<span class="nc" id="L747">                portCmd = &quot;PORT &quot;;</span>
+<span class="nc" id="L748">                byte[] addr = myAddress.getAddress();</span>
+
+                /* append host addr */
+<span class="nc bnc" id="L751" title="All 2 branches missed.">                for (int i = 0; i &lt; addr.length; i++) {</span>
+<span class="nc" id="L752">                    portCmd = portCmd + (addr[i] &amp; 0xFF) + &quot;,&quot;;</span>
+                }
+
+                /* append port number */
+<span class="nc" id="L756">                portCmd = portCmd + ((portSocket.getLocalPort() &gt;&gt;&gt; 8) &amp; 0xff) + &quot;,&quot; + (portSocket.getLocalPort() &amp; 0xff);</span>
+<span class="nc" id="L757">                issueCommandCheck(portCmd);</span>
+<span class="nc" id="L758">                issueCommandCheck(cmd);</span>
+            }
+            // Either the EPRT or the PORT command was successful
+            // Let's create the client socket
+<span class="nc bnc" id="L762" title="All 2 branches missed.">            if (connectTimeout &gt;= 0) {</span>
+<span class="nc" id="L763">                portSocket.setSoTimeout(connectTimeout);</span>
+            } else {
+<span class="nc bnc" id="L765" title="All 2 branches missed.">                if (defaultConnectTimeout &gt; 0) {</span>
+<span class="nc" id="L766">                    portSocket.setSoTimeout(defaultConnectTimeout);</span>
+                }
+            }
+<span class="nc" id="L769">            clientSocket = portSocket.accept();</span>
+<span class="nc bnc" id="L770" title="All 2 branches missed.">            if (readTimeout &gt;= 0) {</span>
+<span class="nc" id="L771">                clientSocket.setSoTimeout(readTimeout);</span>
+            } else {
+<span class="nc bnc" id="L773" title="All 2 branches missed.">                if (defaultSoTimeout &gt; 0) {</span>
+<span class="nc" id="L774">                    clientSocket.setSoTimeout(defaultSoTimeout);</span>
+                }
+            }
+        } finally {
+<span class="nc" id="L778">            portSocket.close();</span>
+<span class="nc" id="L779">        }</span>
+<span class="nc bnc" id="L780" title="All 2 branches missed.">        if (useCrypto) {</span>
+            try {
+<span class="nc" id="L782">                clientSocket = sslFact.createSocket(clientSocket, serverAddr.getHostName(), serverAddr.getPort(), true);</span>
+<span class="nc" id="L783">            } catch (Exception ex) {</span>
+<span class="nc" id="L784">                throw new IOException(ex.getLocalizedMessage());</span>
+<span class="nc" id="L785">            }</span>
+        }
+<span class="nc" id="L787">        return clientSocket;</span>
+    }
+
+    private InputStream createInputStream(InputStream in) {
+<span class="fc bfc" id="L791" title="All 2 branches covered.">        if (type == TransferType.ASCII) {</span>
+<span class="fc" id="L792">            return new sun.net.TelnetInputStream(in, false);</span>
+        }
+<span class="fc" id="L794">        return in;</span>
+    }
+
+    private OutputStream createOutputStream(OutputStream out) {
+<span class="nc bnc" id="L798" title="All 2 branches missed.">        if (type == TransferType.ASCII) {</span>
+<span class="nc" id="L799">            return new sun.net.TelnetOutputStream(out, false);</span>
+        }
+<span class="nc" id="L801">        return out;</span>
+    }
+
+    /**
+     * Creates an instance of FtpClient. The client is not connected to any
+     * server yet.
+     *
+     */
+<span class="fc" id="L809">    protected FtpClient() {</span>
+<span class="fc" id="L810">    }</span>
+
+    /**
+     * Creates an instance of FtpClient. The client is not connected to any
+     * server yet.
+     *
+     */
+    public static sun.net.ftp.FtpClient create() {
+<span class="fc" id="L818">        return new FtpClient();</span>
+    }
+
+    /**
+     * Set the transfer mode to &lt;I&gt;passive&lt;/I&gt;. In that mode, data connections
+     * are established by having the client connect to the server.
+     * This is the recommended default mode as it will work best through
+     * firewalls and NATs.
+     *
+     * @return This FtpClient
+     * @see #setActiveMode()
+     */
+    public sun.net.ftp.FtpClient enablePassiveMode(boolean passive) {
+
+        // Only passive mode used in JDK. See Bug 8010784.
+        // passiveMode = passive;
+<span class="nc" id="L834">        return this;</span>
+    }
+
+    /**
+     * Gets the current transfer mode.
+     *
+     * @return the current &lt;code&gt;FtpTransferMode&lt;/code&gt;
+     */
+    public boolean isPassiveModeEnabled() {
+<span class="nc" id="L843">        return passiveMode;</span>
+    }
+
+    /**
+     * Sets the timeout value to use when connecting to the server,
+     *
+     * @param timeout the timeout value, in milliseconds, to use for the connect
+     *        operation. A value of zero or less, means use the default timeout.
+     *
+     * @return This FtpClient
+     */
+    public sun.net.ftp.FtpClient setConnectTimeout(int timeout) {
+<span class="nc" id="L855">        connectTimeout = timeout;</span>
+<span class="nc" id="L856">        return this;</span>
+    }
+
+    /**
+     * Returns the current connection timeout value.
+     *
+     * @return the value, in milliseconds, of the current connect timeout.
+     * @see #setConnectTimeout(int)
+     */
+    public int getConnectTimeout() {
+<span class="nc" id="L866">        return connectTimeout;</span>
+    }
+
+    /**
+     * Sets the timeout value to use when reading from the server,
+     *
+     * @param timeout the timeout value, in milliseconds, to use for the read
+     *        operation. A value of zero or less, means use the default timeout.
+     * @return This FtpClient
+     */
+    public sun.net.ftp.FtpClient setReadTimeout(int timeout) {
+<span class="nc" id="L877">        readTimeout = timeout;</span>
+<span class="nc" id="L878">        return this;</span>
+    }
+
+    /**
+     * Returns the current read timeout value.
+     *
+     * @return the value, in milliseconds, of the current read timeout.
+     * @see #setReadTimeout(int)
+     */
+    public int getReadTimeout() {
+<span class="nc" id="L888">        return readTimeout;</span>
+    }
+
+    public sun.net.ftp.FtpClient setProxy(Proxy p) {
+<span class="fc" id="L892">        proxy = p;</span>
+<span class="fc" id="L893">        return this;</span>
+    }
+
+    /**
+     * Get the proxy of this FtpClient
+     *
+     * @return the &lt;code&gt;Proxy&lt;/code&gt;, this client is using, or &lt;code&gt;null&lt;/code&gt;
+     *         if none is used.
+     * @see #setProxy(Proxy)
+     */
+    public Proxy getProxy() {
+<span class="nc" id="L904">        return proxy;</span>
+    }
+
+    /**
+     * Connects to the specified destination.
+     *
+     * @param dest the &lt;code&gt;InetSocketAddress&lt;/code&gt; to connect to.
+     * @throws IOException if the connection fails.
+     */
+    private void tryConnect(InetSocketAddress dest, int timeout) throws IOException {
+<span class="pc bpc" id="L914" title="1 of 2 branches missed.">        if (isConnected()) {</span>
+<span class="nc" id="L915">            disconnect();</span>
+        }
+<span class="fc" id="L917">        server = doConnect(dest, timeout);</span>
+        try {
+<span class="fc" id="L919">            out = new PrintStream(new BufferedOutputStream(server.getOutputStream()),</span>
+                    true, encoding);
+<span class="nc" id="L921">        } catch (UnsupportedEncodingException e) {</span>
+<span class="nc" id="L922">            throw new InternalError(encoding + &quot;encoding not found&quot;, e);</span>
+<span class="fc" id="L923">        }</span>
+<span class="fc" id="L924">        in = new BufferedInputStream(server.getInputStream());</span>
+<span class="fc" id="L925">    }</span>
+
+    private Socket doConnect(InetSocketAddress dest, int timeout) throws IOException {
+        Socket s;
+<span class="pc bpc" id="L929" title="1 of 2 branches missed.">        if (proxy != null) {</span>
+<span class="pc bpc" id="L930" title="1 of 2 branches missed.">            if (proxy.type() == Proxy.Type.SOCKS) {</span>
+<span class="nc" id="L931">                s = AccessController.doPrivileged(</span>
+<span class="nc" id="L932">                        new PrivilegedAction&lt;Socket&gt;() {</span>
+
+                            public Socket run() {
+<span class="nc" id="L935">                                return new Socket(proxy);</span>
+                            }
+                        });
+            } else {
+<span class="fc" id="L939">                s = new Socket(Proxy.NO_PROXY);</span>
+            }
+        } else {
+<span class="nc" id="L942">            s = new Socket();</span>
+        }
+        // Instance specific timeouts do have priority, that means
+        // connectTimeout &amp; readTimeout (-1 means not set)
+        // Then global default timeouts
+        // Then no timeout.
+<span class="pc bpc" id="L948" title="1 of 2 branches missed.">        if (timeout &gt;= 0) {</span>
+<span class="nc" id="L949">            s.connect(dest, timeout);</span>
+        } else {
+<span class="pc bpc" id="L951" title="1 of 2 branches missed.">            if (connectTimeout &gt;= 0) {</span>
+<span class="nc" id="L952">                s.connect(dest, connectTimeout);</span>
+            } else {
+<span class="pc bpc" id="L954" title="1 of 2 branches missed.">                if (defaultConnectTimeout &gt; 0) {</span>
+<span class="nc" id="L955">                    s.connect(dest, defaultConnectTimeout);</span>
+                } else {
+<span class="fc" id="L957">                    s.connect(dest);</span>
+                }
+            }
+        }
+<span class="pc bpc" id="L961" title="1 of 2 branches missed.">        if (readTimeout &gt;= 0) {</span>
+<span class="nc" id="L962">            s.setSoTimeout(readTimeout);</span>
+<span class="pc bpc" id="L963" title="1 of 2 branches missed.">        } else if (defaultSoTimeout &gt; 0) {</span>
+<span class="nc" id="L964">            s.setSoTimeout(defaultSoTimeout);</span>
+        }
+<span class="fc" id="L966">        return s;</span>
+    }
+
+    private void disconnect() throws IOException {
+<span class="pc bpc" id="L970" title="1 of 2 branches missed.">        if (isConnected()) {</span>
+<span class="fc" id="L971">            server.close();</span>
+        }
+<span class="fc" id="L973">        server = null;</span>
+<span class="fc" id="L974">        in = null;</span>
+<span class="fc" id="L975">        out = null;</span>
+<span class="fc" id="L976">        lastTransSize = -1;</span>
+<span class="fc" id="L977">        lastFileName = null;</span>
+<span class="fc" id="L978">        restartOffset = 0;</span>
+<span class="fc" id="L979">        welcomeMsg = null;</span>
+<span class="fc" id="L980">        lastReplyCode = null;</span>
+<span class="fc" id="L981">        serverResponse.setSize(0);</span>
+<span class="fc" id="L982">    }</span>
+
+    /**
+     * Tests whether this client is connected or not to a server.
+     *
+     * @return &lt;code&gt;true&lt;/code&gt; if the client is connected.
+     */
+    public boolean isConnected() {
+<span class="fc bfc" id="L990" title="All 2 branches covered.">        return server != null;</span>
+    }
+
+    public SocketAddress getServerAddress() {
+<span class="nc bnc" id="L994" title="All 2 branches missed.">        return server == null ? null : server.getRemoteSocketAddress();</span>
+    }
+
+    public sun.net.ftp.FtpClient connect(SocketAddress dest) throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="fc" id="L998">        return connect(dest, -1);</span>
+    }
+
+    /**
+     * Connects the FtpClient to the specified destination.
+     *
+     * @param dest the address of the destination server
+     * @throws IOException if connection failed.
+     */
+    public sun.net.ftp.FtpClient connect(SocketAddress dest, int timeout) throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="pc bpc" id="L1008" title="1 of 2 branches missed.">        if (!(dest instanceof InetSocketAddress)) {</span>
+<span class="nc" id="L1009">            throw new IllegalArgumentException(&quot;Wrong address type&quot;);</span>
+        }
+<span class="fc" id="L1011">        serverAddr = (InetSocketAddress) dest;</span>
+<span class="fc" id="L1012">        tryConnect(serverAddr, timeout);</span>
+<span class="pc bpc" id="L1013" title="1 of 2 branches missed.">        if (!readReply()) {</span>
+<span class="nc" id="L1014">            throw new sun.net.ftp.FtpProtocolException(&quot;Welcome message: &quot; +</span>
+<span class="nc" id="L1015">                    getResponseString(), lastReplyCode);</span>
+        }
+<span class="fc" id="L1017">        welcomeMsg = getResponseString().substring(4);</span>
+<span class="fc" id="L1018">        return this;</span>
+    }
+
+    private void tryLogin(String user, char[] password) throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="fc" id="L1022">        issueCommandCheck(&quot;USER &quot; + user);</span>
+
+        /*
+         * Checks for &quot;331 User name okay, need password.&quot; answer
+         */
+<span class="fc bfc" id="L1027" title="All 2 branches covered.">        if (lastReplyCode == FtpReplyCode.NEED_PASSWORD) {</span>
+<span class="pc bpc" id="L1028" title="2 of 4 branches missed.">            if ((password != null) &amp;&amp; (password.length &gt; 0)) {</span>
+<span class="fc" id="L1029">                issueCommandCheck(&quot;PASS &quot; + String.valueOf(password));</span>
+            }
+        }
+<span class="fc" id="L1032">    }</span>
+
+    /**
+     * Attempts to log on the server with the specified user name and password.
+     *
+     * @param user The user name
+     * @param password The password for that user
+     * @return &lt;code&gt;true&lt;/code&gt; if the login was successful.
+     * @throws IOException if an error occurred during the transmission
+     */
+    public sun.net.ftp.FtpClient login(String user, char[] password) throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="pc bpc" id="L1043" title="1 of 2 branches missed.">        if (!isConnected()) {</span>
+<span class="nc" id="L1044">            throw new sun.net.ftp.FtpProtocolException(&quot;Not connected yet&quot;, FtpReplyCode.BAD_SEQUENCE);</span>
+        }
+<span class="pc bpc" id="L1046" title="2 of 4 branches missed.">        if (user == null || user.length() == 0) {</span>
+<span class="nc" id="L1047">            throw new IllegalArgumentException(&quot;User name can't be null or empty&quot;);</span>
+        }
+<span class="fc" id="L1049">        tryLogin(user, password);</span>
+
+        // keep the welcome message around so we can
+        // put it in the resulting HTML page.
+        String l;
+<span class="fc" id="L1054">        StringBuffer sb = new StringBuffer();</span>
+<span class="fc bfc" id="L1055" title="All 2 branches covered.">        for (int i = 0; i &lt; serverResponse.size(); i++) {</span>
+<span class="fc" id="L1056">            l = serverResponse.elementAt(i);</span>
+<span class="pc bpc" id="L1057" title="1 of 2 branches missed.">            if (l != null) {</span>
+<span class="pc bpc" id="L1058" title="1 of 4 branches missed.">                if (l.length() &gt;= 4 &amp;&amp; l.startsWith(&quot;230&quot;)) {</span>
+                    // get rid of the &quot;230-&quot; prefix
+<span class="fc" id="L1060">                    l = l.substring(4);</span>
+                }
+<span class="fc" id="L1062">                sb.append(l);</span>
+            }
+        }
+<span class="fc" id="L1065">        welcomeMsg = sb.toString();</span>
+<span class="fc" id="L1066">        loggedIn = true;</span>
+<span class="fc" id="L1067">        return this;</span>
+    }
+
+    /**
+     * Attempts to log on the server with the specified user name, password and
+     * account name.
+     *
+     * @param user The user name
+     * @param password The password for that user.
+     * @param account The account name for that user.
+     * @return &lt;code&gt;true&lt;/code&gt; if the login was successful.
+     * @throws IOException if an error occurs during the transmission.
+     */
+    public sun.net.ftp.FtpClient login(String user, char[] password, String account) throws sun.net.ftp.FtpProtocolException, IOException {
+
+<span class="nc bnc" id="L1082" title="All 2 branches missed.">        if (!isConnected()) {</span>
+<span class="nc" id="L1083">            throw new sun.net.ftp.FtpProtocolException(&quot;Not connected yet&quot;, FtpReplyCode.BAD_SEQUENCE);</span>
+        }
+<span class="nc bnc" id="L1085" title="All 4 branches missed.">        if (user == null || user.length() == 0) {</span>
+<span class="nc" id="L1086">            throw new IllegalArgumentException(&quot;User name can't be null or empty&quot;);</span>
+        }
+<span class="nc" id="L1088">        tryLogin(user, password);</span>
+
+        /*
+         * Checks for &quot;332 Need account for login.&quot; answer
+         */
+<span class="nc bnc" id="L1093" title="All 2 branches missed.">        if (lastReplyCode == FtpReplyCode.NEED_ACCOUNT) {</span>
+<span class="nc" id="L1094">            issueCommandCheck(&quot;ACCT &quot; + account);</span>
+        }
+
+        // keep the welcome message around so we can
+        // put it in the resulting HTML page.
+<span class="nc" id="L1099">        StringBuffer sb = new StringBuffer();</span>
+<span class="nc bnc" id="L1100" title="All 2 branches missed.">        if (serverResponse != null) {</span>
+<span class="nc bnc" id="L1101" title="All 2 branches missed.">            for (String l : serverResponse) {</span>
+<span class="nc bnc" id="L1102" title="All 2 branches missed.">                if (l != null) {</span>
+<span class="nc bnc" id="L1103" title="All 4 branches missed.">                    if (l.length() &gt;= 4 &amp;&amp; l.startsWith(&quot;230&quot;)) {</span>
+                        // get rid of the &quot;230-&quot; prefix
+<span class="nc" id="L1105">                        l = l.substring(4);</span>
+                    }
+<span class="nc" id="L1107">                    sb.append(l);</span>
+                }
+<span class="nc" id="L1109">            }</span>
+        }
+<span class="nc" id="L1111">        welcomeMsg = sb.toString();</span>
+<span class="nc" id="L1112">        loggedIn = true;</span>
+<span class="nc" id="L1113">        return this;</span>
+    }
+
+    /**
+     * Logs out the current user. This is in effect terminates the current
+     * session and the connection to the server will be closed.
+     *
+     */
+    public void close() throws IOException {
+<span class="pc bpc" id="L1122" title="1 of 2 branches missed.">        if (isConnected()) {</span>
+<span class="fc" id="L1123">            issueCommand(&quot;QUIT&quot;);</span>
+<span class="fc" id="L1124">            loggedIn = false;</span>
+        }
+<span class="fc" id="L1126">        disconnect();</span>
+<span class="fc" id="L1127">    }</span>
+
+    /**
+     * Checks whether the client is logged in to the server or not.
+     *
+     * @return &lt;code&gt;true&lt;/code&gt; if the client has already completed a login.
+     */
+    public boolean isLoggedIn() {
+<span class="nc" id="L1135">        return loggedIn;</span>
+    }
+
+    /**
+     * Changes to a specific directory on a remote FTP server
+     *
+     * @param remoteDirectory path of the directory to CD to.
+     * @return &lt;code&gt;true&lt;/code&gt; if the operation was successful.
+     * @exception &lt;code&gt;FtpProtocolException&lt;/code&gt;
+     */
+    public sun.net.ftp.FtpClient changeDirectory(String remoteDirectory) throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="pc bpc" id="L1146" title="2 of 4 branches missed.">        if (remoteDirectory == null || &quot;&quot;.equals(remoteDirectory)) {</span>
+<span class="nc" id="L1147">            throw new IllegalArgumentException(&quot;directory can't be null or empty&quot;);</span>
+        }
+
+<span class="fc" id="L1150">        issueCommandCheck(&quot;CWD &quot; + remoteDirectory);</span>
+<span class="fc" id="L1151">        return this;</span>
+    }
+
+    /**
+     * Changes to the parent directory, sending the CDUP command to the server.
+     *
+     * @return &lt;code&gt;true&lt;/code&gt; if the command was successful.
+     * @throws IOException
+     */
+    public sun.net.ftp.FtpClient changeToParentDirectory() throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc" id="L1161">        issueCommandCheck(&quot;CDUP&quot;);</span>
+<span class="nc" id="L1162">        return this;</span>
+    }
+
+    /**
+     * Returns the server current working directory, or &lt;code&gt;null&lt;/code&gt; if
+     * the PWD command failed.
+     *
+     * @return a &lt;code&gt;String&lt;/code&gt; containing the current working directory,
+     *         or &lt;code&gt;null&lt;/code&gt;
+     * @throws IOException
+     */
+    public String getWorkingDirectory() throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc" id="L1174">        issueCommandCheck(&quot;PWD&quot;);</span>
+        /*
+         * answer will be of the following format :
+         *
+         * 257 &quot;/&quot; is current directory.
+         */
+<span class="nc" id="L1180">        String answ = getResponseString();</span>
+<span class="nc bnc" id="L1181" title="All 2 branches missed.">        if (!answ.startsWith(&quot;257&quot;)) {</span>
+<span class="nc" id="L1182">            return null;</span>
+        }
+<span class="nc" id="L1184">        return answ.substring(5, answ.lastIndexOf('&quot;'));</span>
+    }
+
+    /**
+     * Sets the restart offset to the specified value.  That value will be
+     * sent through a &lt;code&gt;REST&lt;/code&gt; command to server before a file
+     * transfer and has the effect of resuming a file transfer from the
+     * specified point. After a transfer the restart offset is set back to
+     * zero.
+     *
+     * @param offset the offset in the remote file at which to start the next
+     *        transfer. This must be a value greater than or equal to zero.
+     * @throws IllegalArgumentException if the offset is negative.
+     */
+    public sun.net.ftp.FtpClient setRestartOffset(long offset) {
+<span class="nc bnc" id="L1199" title="All 2 branches missed.">        if (offset &lt; 0) {</span>
+<span class="nc" id="L1200">            throw new IllegalArgumentException(&quot;offset can't be negative&quot;);</span>
+        }
+<span class="nc" id="L1202">        restartOffset = offset;</span>
+<span class="nc" id="L1203">        return this;</span>
+    }
+
+    /**
+     * Retrieves a file from the ftp server and writes it to the specified
+     * &lt;code&gt;OutputStream&lt;/code&gt;.
+     * If the restart offset was set, then a &lt;code&gt;REST&lt;/code&gt; command will be
+     * sent before the RETR in order to restart the tranfer from the specified
+     * offset.
+     * The &lt;code&gt;OutputStream&lt;/code&gt; is not closed by this method at the end
+     * of the transfer.
+     *
+     * @param name a &lt;code&gt;String&lt;code&gt; containing the name of the file to
+     *        retreive from the server.
+     * @param local the &lt;code&gt;OutputStream&lt;/code&gt; the file should be written to.
+     * @throws IOException if the transfer fails.
+     */
+    public sun.net.ftp.FtpClient getFile(String name, OutputStream local) throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc" id="L1221">        int mtu = 1500;</span>
+<span class="nc bnc" id="L1222" title="All 2 branches missed.">        if (restartOffset &gt; 0) {</span>
+            Socket s;
+            try {
+<span class="nc" id="L1225">                s = openDataConnection(&quot;REST &quot; + restartOffset);</span>
+            } finally {
+<span class="nc" id="L1227">                restartOffset = 0;</span>
+<span class="nc" id="L1228">            }</span>
+<span class="nc" id="L1229">            issueCommandCheck(&quot;RETR &quot; + name);</span>
+<span class="nc" id="L1230">            getTransferSize();</span>
+<span class="nc" id="L1231">            InputStream remote = createInputStream(s.getInputStream());</span>
+<span class="nc" id="L1232">            byte[] buf = new byte[mtu * 10];</span>
+            int l;
+<span class="nc bnc" id="L1234" title="All 2 branches missed.">            while ((l = remote.read(buf)) &gt;= 0) {</span>
+<span class="nc bnc" id="L1235" title="All 2 branches missed.">                if (l &gt; 0) {</span>
+<span class="nc" id="L1236">                    local.write(buf, 0, l);</span>
+                }
+            }
+<span class="nc" id="L1239">            remote.close();</span>
+<span class="nc" id="L1240">        } else {</span>
+<span class="nc" id="L1241">            Socket s = openDataConnection(&quot;RETR &quot; + name);</span>
+<span class="nc" id="L1242">            getTransferSize();</span>
+<span class="nc" id="L1243">            InputStream remote = createInputStream(s.getInputStream());</span>
+<span class="nc" id="L1244">            byte[] buf = new byte[mtu * 10];</span>
+            int l;
+<span class="nc bnc" id="L1246" title="All 2 branches missed.">            while ((l = remote.read(buf)) &gt;= 0) {</span>
+<span class="nc bnc" id="L1247" title="All 2 branches missed.">                if (l &gt; 0) {</span>
+<span class="nc" id="L1248">                    local.write(buf, 0, l);</span>
+                }
+            }
+<span class="nc" id="L1251">            remote.close();</span>
+        }
+<span class="nc" id="L1253">        return completePending();</span>
+    }
+
+    /**
+     * Retrieves a file from the ftp server, using the RETR command, and
+     * returns the InputStream from* the established data connection.
+     * {@link #completePending()} &lt;b&gt;has&lt;/b&gt; to be called once the application
+     * is done reading from the returned stream.
+     *
+     * @param name the name of the remote file
+     * @return the {@link java.io.InputStream} from the data connection, or
+     *         &lt;code&gt;null&lt;/code&gt; if the command was unsuccessful.
+     * @throws IOException if an error occurred during the transmission.
+     */
+    public InputStream getFileStream(String name) throws sun.net.ftp.FtpProtocolException, IOException {
+        Socket s;
+<span class="pc bpc" id="L1269" title="1 of 2 branches missed.">        if (restartOffset &gt; 0) {</span>
+            try {
+<span class="nc" id="L1271">                s = openDataConnection(&quot;REST &quot; + restartOffset);</span>
+            } finally {
+<span class="nc" id="L1273">                restartOffset = 0;</span>
+<span class="nc" id="L1274">            }</span>
+<span class="nc bnc" id="L1275" title="All 2 branches missed.">            if (s == null) {</span>
+<span class="nc" id="L1276">                return null;</span>
+            }
+<span class="nc" id="L1278">            issueCommandCheck(&quot;RETR &quot; + name);</span>
+<span class="nc" id="L1279">            getTransferSize();</span>
+<span class="nc" id="L1280">            return createInputStream(s.getInputStream());</span>
+        }
+
+<span class="fc" id="L1283">        s = openDataConnection(&quot;RETR &quot; + name);</span>
+<span class="pc bpc" id="L1284" title="1 of 2 branches missed.">        if (s == null) {</span>
+<span class="nc" id="L1285">            return null;</span>
+        }
+<span class="fc" id="L1287">        getTransferSize();</span>
+<span class="fc" id="L1288">        return createInputStream(s.getInputStream());</span>
+    }
+
+    /**
+     * Transfers a file from the client to the server (aka a &lt;I&gt;put&lt;/I&gt;)
+     * by sending the STOR or STOU command, depending on the
+     * &lt;code&gt;unique&lt;/code&gt; argument, and returns the &lt;code&gt;OutputStream&lt;/code&gt;
+     * from the established data connection.
+     * {@link #completePending()} &lt;b&gt;has&lt;/b&gt; to be called once the application
+     * is finished writing to the stream.
+     *
+     * A new file is created at the server site if the file specified does
+     * not already exist.
+     *
+     * If &lt;code&gt;unique&lt;/code&gt; is set to &lt;code&gt;true&lt;/code&gt;, the resultant file
+     * is to be created under a name unique to that directory, meaning
+     * it will not overwrite an existing file, instead the server will
+     * generate a new, unique, file name.
+     * The name of the remote file can be retrieved, after completion of the
+     * transfer, by calling {@link #getLastFileName()}.
+     *
+     * @param name the name of the remote file to write.
+     * @param unique &lt;code&gt;true&lt;/code&gt; if the remote files should be unique,
+     *        in which case the STOU command will be used.
+     * @return the {@link java.io.OutputStream} from the data connection or
+     *         &lt;code&gt;null&lt;/code&gt; if the command was unsuccessful.
+     * @throws IOException if an error occurred during the transmission.
+     */
+    public OutputStream putFileStream(String name, boolean unique)
+        throws sun.net.ftp.FtpProtocolException, IOException
+    {
+<span class="nc bnc" id="L1319" title="All 2 branches missed.">        String cmd = unique ? &quot;STOU &quot; : &quot;STOR &quot;;</span>
+<span class="nc" id="L1320">        Socket s = openDataConnection(cmd + name);</span>
+<span class="nc bnc" id="L1321" title="All 2 branches missed.">        if (s == null) {</span>
+<span class="nc" id="L1322">            return null;</span>
+        }
+<span class="nc bnc" id="L1324" title="All 2 branches missed.">        boolean bm = (type == TransferType.BINARY);</span>
+<span class="nc" id="L1325">        return new sun.net.TelnetOutputStream(s.getOutputStream(), bm);</span>
+    }
+
+    /**
+     * Transfers a file from the client to the server (aka a &lt;I&gt;put&lt;/I&gt;)
+     * by sending the STOR command. The content of the &lt;code&gt;InputStream&lt;/code&gt;
+     * passed in argument is written into the remote file, overwriting any
+     * existing data.
+     *
+     * A new file is created at the server site if the file specified does
+     * not already exist.
+     *
+     * @param name the name of the remote file to write.
+     * @param local the &lt;code&gt;InputStream&lt;/code&gt; that points to the data to
+     *        transfer.
+     * @param unique &lt;code&gt;true&lt;/code&gt; if the remote file should be unique
+     *        (i.e. not already existing), &lt;code&gt;false&lt;/code&gt; otherwise.
+     * @return &lt;code&gt;true&lt;/code&gt; if the transfer was successful.
+     * @throws IOException if an error occurred during the transmission.
+     * @see #getLastFileName()
+     */
+    public sun.net.ftp.FtpClient putFile(String name, InputStream local, boolean unique) throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc bnc" id="L1347" title="All 2 branches missed.">        String cmd = unique ? &quot;STOU &quot; : &quot;STOR &quot;;</span>
+<span class="nc" id="L1348">        int mtu = 1500;</span>
+<span class="nc bnc" id="L1349" title="All 2 branches missed.">        if (type == TransferType.BINARY) {</span>
+<span class="nc" id="L1350">            Socket s = openDataConnection(cmd + name);</span>
+<span class="nc" id="L1351">            OutputStream remote = createOutputStream(s.getOutputStream());</span>
+<span class="nc" id="L1352">            byte[] buf = new byte[mtu * 10];</span>
+            int l;
+<span class="nc bnc" id="L1354" title="All 2 branches missed.">            while ((l = local.read(buf)) &gt;= 0) {</span>
+<span class="nc bnc" id="L1355" title="All 2 branches missed.">                if (l &gt; 0) {</span>
+<span class="nc" id="L1356">                    remote.write(buf, 0, l);</span>
+                }
+            }
+<span class="nc" id="L1359">            remote.close();</span>
+        }
+<span class="nc" id="L1361">        return completePending();</span>
+    }
+
+    /**
+     * Sends the APPE command to the server in order to transfer a data stream
+     * passed in argument and append it to the content of the specified remote
+     * file.
+     *
+     * @param name A &lt;code&gt;String&lt;/code&gt; containing the name of the remote file
+     *        to append to.
+     * @param local The &lt;code&gt;InputStream&lt;/code&gt; providing access to the data
+     *        to be appended.
+     * @return &lt;code&gt;true&lt;/code&gt; if the transfer was successful.
+     * @throws IOException if an error occurred during the transmission.
+     */
+    public sun.net.ftp.FtpClient appendFile(String name, InputStream local) throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc" id="L1377">        int mtu = 1500;</span>
+<span class="nc" id="L1378">        Socket s = openDataConnection(&quot;APPE &quot; + name);</span>
+<span class="nc" id="L1379">        OutputStream remote = createOutputStream(s.getOutputStream());</span>
+<span class="nc" id="L1380">        byte[] buf = new byte[mtu * 10];</span>
+        int l;
+<span class="nc bnc" id="L1382" title="All 2 branches missed.">        while ((l = local.read(buf)) &gt;= 0) {</span>
+<span class="nc bnc" id="L1383" title="All 2 branches missed.">            if (l &gt; 0) {</span>
+<span class="nc" id="L1384">                remote.write(buf, 0, l);</span>
+            }
+        }
+<span class="nc" id="L1387">        remote.close();</span>
+<span class="nc" id="L1388">        return completePending();</span>
+    }
+
+    /**
+     * Renames a file on the server.
+     *
+     * @param from the name of the file being renamed
+     * @param to the new name for the file
+     * @throws IOException if the command fails
+     */
+    public sun.net.ftp.FtpClient rename(String from, String to) throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc" id="L1399">        issueCommandCheck(&quot;RNFR &quot; + from);</span>
+<span class="nc" id="L1400">        issueCommandCheck(&quot;RNTO &quot; + to);</span>
+<span class="nc" id="L1401">        return this;</span>
+    }
+
+    /**
+     * Deletes a file on the server.
+     *
+     * @param name a &lt;code&gt;String&lt;/code&gt; containing the name of the file
+     *        to delete.
+     * @return &lt;code&gt;true&lt;/code&gt; if the command was successful
+     * @throws IOException if an error occurred during the exchange
+     */
+    public sun.net.ftp.FtpClient deleteFile(String name) throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc" id="L1413">        issueCommandCheck(&quot;DELE &quot; + name);</span>
+<span class="nc" id="L1414">        return this;</span>
+    }
+
+    /**
+     * Creates a new directory on the server.
+     *
+     * @param name a &lt;code&gt;String&lt;/code&gt; containing the name of the directory
+     *        to create.
+     * @return &lt;code&gt;true&lt;/code&gt; if the operation was successful.
+     * @throws IOException if an error occurred during the exchange
+     */
+    public sun.net.ftp.FtpClient makeDirectory(String name) throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc" id="L1426">        issueCommandCheck(&quot;MKD &quot; + name);</span>
+<span class="nc" id="L1427">        return this;</span>
+    }
+
+    /**
+     * Removes a directory on the server.
+     *
+     * @param name a &lt;code&gt;String&lt;/code&gt; containing the name of the directory
+     *        to remove.
+     *
+     * @return &lt;code&gt;true&lt;/code&gt; if the operation was successful.
+     * @throws IOException if an error occurred during the exchange.
+     */
+    public sun.net.ftp.FtpClient removeDirectory(String name) throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc" id="L1440">        issueCommandCheck(&quot;RMD &quot; + name);</span>
+<span class="nc" id="L1441">        return this;</span>
+    }
+
+    /**
+     * Sends a No-operation command. It's useful for testing the connection
+     * status or as a &lt;I&gt;keep alive&lt;/I&gt; mechanism.
+     *
+     * @throws FtpProtocolException if the command fails
+     */
+    public sun.net.ftp.FtpClient noop() throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc" id="L1451">        issueCommandCheck(&quot;NOOP&quot;);</span>
+<span class="nc" id="L1452">        return this;</span>
+    }
+
+    /**
+     * Sends the STAT command to the server.
+     * This can be used while a data connection is open to get a status
+     * on the current transfer, in that case the parameter should be
+     * &lt;code&gt;null&lt;/code&gt;.
+     * If used between file transfers, it may have a pathname as argument
+     * in which case it will work as the LIST command except no data
+     * connection will be created.
+     *
+     * @param name an optional &lt;code&gt;String&lt;/code&gt; containing the pathname
+     *        the STAT command should apply to.
+     * @return the response from the server or &lt;code&gt;null&lt;/code&gt; if the
+     *         command failed.
+     * @throws IOException if an error occurred during the transmission.
+     */
+    public String getStatus(String name) throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc bnc" id="L1471" title="All 2 branches missed.">        issueCommandCheck((name == null ? &quot;STAT&quot; : &quot;STAT &quot; + name));</span>
+        /*
+         * A typical response will be:
+         *  213-status of t32.gif:
+         * -rw-r--r--   1 jcc      staff     247445 Feb 17  1998 t32.gif
+         * 213 End of Status
+         *
+         * or
+         *
+         * 211-jsn FTP server status:
+         *     Version wu-2.6.2+Sun
+         *     Connected to localhost (::1)
+         *     Logged in as jccollet
+         *     TYPE: ASCII, FORM: Nonprint; STRUcture: File; transfer MODE: Stream
+         *      No data connection
+         *     0 data bytes received in 0 files
+         *     0 data bytes transmitted in 0 files
+         *     0 data bytes total in 0 files
+         *     53 traffic bytes received in 0 transfers
+         *     485 traffic bytes transmitted in 0 transfers
+         *     587 traffic bytes total in 0 transfers
+         * 211 End of status
+         *
+         * So we need to remove the 1st and last line
+         */
+<span class="nc" id="L1496">        Vector&lt;String&gt; resp = getResponseStrings();</span>
+<span class="nc" id="L1497">        StringBuffer sb = new StringBuffer();</span>
+<span class="nc bnc" id="L1498" title="All 2 branches missed.">        for (int i = 1; i &lt; resp.size() - 1; i++) {</span>
+<span class="nc" id="L1499">            sb.append(resp.get(i));</span>
+        }
+<span class="nc" id="L1501">        return sb.toString();</span>
+    }
+
+    /**
+     * Sends the FEAT command to the server and returns the list of supported
+     * features in the form of strings.
+     *
+     * The features are the supported commands, like AUTH TLS, PROT or PASV.
+     * See the RFCs for a complete list.
+     *
+     * Note that not all FTP servers support that command, in which case
+     * the method will return &lt;code&gt;null&lt;/code&gt;
+     *
+     * @return a &lt;code&gt;List&lt;/code&gt; of &lt;code&gt;Strings&lt;/code&gt; describing the
+     *         supported additional features, or &lt;code&gt;null&lt;/code&gt;
+     *         if the command is not supported.
+     * @throws IOException if an error occurs during the transmission.
+     */
+    public List&lt;String&gt; getFeatures() throws sun.net.ftp.FtpProtocolException, IOException {
+        /*
+         * The FEAT command, when implemented will return something like:
+         *
+         * 211-Features:
+         *   AUTH TLS
+         *   PBSZ
+         *   PROT
+         *   EPSV
+         *   EPRT
+         *   PASV
+         *   REST STREAM
+         *  211 END
+         */
+<span class="nc" id="L1533">        ArrayList&lt;String&gt; features = new ArrayList&lt;String&gt;();</span>
+<span class="nc" id="L1534">        issueCommandCheck(&quot;FEAT&quot;);</span>
+<span class="nc" id="L1535">        Vector&lt;String&gt; resp = getResponseStrings();</span>
+        // Note that we start at index 1 to skip the 1st line (211-...)
+        // and we stop before the last line.
+<span class="nc bnc" id="L1538" title="All 2 branches missed.">        for (int i = 1; i &lt; resp.size() - 1; i++) {</span>
+<span class="nc" id="L1539">            String s = resp.get(i);</span>
+            // Get rid of leading space and trailing newline
+<span class="nc" id="L1541">            features.add(s.substring(1, s.length() - 1));</span>
+        }
+<span class="nc" id="L1543">        return features;</span>
+    }
+
+    /**
+     * sends the ABOR command to the server.
+     * It tells the server to stop the previous command or transfer.
+     *
+     * @return &lt;code&gt;true&lt;/code&gt; if the command was successful.
+     * @throws IOException if an error occurred during the transmission.
+     */
+    public sun.net.ftp.FtpClient abort() throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc" id="L1554">        issueCommandCheck(&quot;ABOR&quot;);</span>
+        // TODO: Must check the ReplyCode:
+        /*
+         * From the RFC:
+         * There are two cases for the server upon receipt of this
+         * command: (1) the FTP service command was already completed,
+         * or (2) the FTP service command is still in progress.
+         * In the first case, the server closes the data connection
+         * (if it is open) and responds with a 226 reply, indicating
+         * that the abort command was successfully processed.
+         * In the second case, the server aborts the FTP service in
+         * progress and closes the data connection, returning a 426
+         * reply to indicate that the service request terminated
+         * abnormally.  The server then sends a 226 reply,
+         * indicating that the abort command was successfully
+         * processed.
+         */
+
+
+<span class="nc" id="L1573">        return this;</span>
+    }
+
+    /**
+     * Some methods do not wait until completion before returning, so this
+     * method can be called to wait until completion. This is typically the case
+     * with commands that trigger a transfer like {@link #getFileStream(String)}.
+     * So this method should be called before accessing information related to
+     * such a command.
+     * &lt;p&gt;This method will actually block reading on the command channel for a
+     * notification from the server that the command is finished. Such a
+     * notification often carries extra information concerning the completion
+     * of the pending action (e.g. number of bytes transfered).&lt;/p&gt;
+     * &lt;p&gt;Note that this will return true immediately if no command or action
+     * is pending&lt;/p&gt;
+     * &lt;p&gt;It should be also noted that most methods issuing commands to the ftp
+     * server will call this method if a previous command is pending.
+     * &lt;p&gt;Example of use:
+     * &lt;pre&gt;
+     * InputStream in = cl.getFileStream(&quot;file&quot;);
+     * ...
+     * cl.completePending();
+     * long size = cl.getLastTransferSize();
+     * &lt;/pre&gt;
+     * On the other hand, it's not necessary in a case like:
+     * &lt;pre&gt;
+     * InputStream in = cl.getFileStream(&quot;file&quot;);
+     * // read content
+     * ...
+     * cl.logout();
+     * &lt;/pre&gt;
+     * &lt;p&gt;Since {@link #logout()} will call completePending() if necessary.&lt;/p&gt;
+     * @return &lt;code&gt;true&lt;/code&gt; if the completion was successful or if no
+     *         action was pending.
+     * @throws IOException
+     */
+    public sun.net.ftp.FtpClient completePending() throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="fc bfc" id="L1610" title="All 2 branches covered.">        while (replyPending) {</span>
+<span class="fc" id="L1611">            replyPending = false;</span>
+<span class="pc bpc" id="L1612" title="1 of 2 branches missed.">            if (!readReply()) {</span>
+<span class="nc" id="L1613">                throw new sun.net.ftp.FtpProtocolException(getLastResponseString(), lastReplyCode);</span>
+            }
+        }
+<span class="fc" id="L1616">        return this;</span>
+    }
+
+    /**
+     * Reinitializes the USER parameters on the FTP server
+     *
+     * @throws FtpProtocolException if the command fails
+     */
+    public sun.net.ftp.FtpClient reInit() throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc" id="L1625">        issueCommandCheck(&quot;REIN&quot;);</span>
+<span class="nc" id="L1626">        loggedIn = false;</span>
+<span class="nc bnc" id="L1627" title="All 2 branches missed.">        if (useCrypto) {</span>
+<span class="nc bnc" id="L1628" title="All 2 branches missed.">            if (server instanceof SSLSocket) {</span>
+<span class="nc" id="L1629">                javax.net.ssl.SSLSession session = ((SSLSocket) server).getSession();</span>
+<span class="nc" id="L1630">                session.invalidate();</span>
+                // Restore previous socket and streams
+<span class="nc" id="L1632">                server = oldSocket;</span>
+<span class="nc" id="L1633">                oldSocket = null;</span>
+                try {
+<span class="nc" id="L1635">                    out = new PrintStream(new BufferedOutputStream(server.getOutputStream()),</span>
+                            true, encoding);
+<span class="nc" id="L1637">                } catch (UnsupportedEncodingException e) {</span>
+<span class="nc" id="L1638">                    throw new InternalError(encoding + &quot;encoding not found&quot;, e);</span>
+<span class="nc" id="L1639">                }</span>
+<span class="nc" id="L1640">                in = new BufferedInputStream(server.getInputStream());</span>
+            }
+        }
+<span class="nc" id="L1643">        useCrypto = false;</span>
+<span class="nc" id="L1644">        return this;</span>
+    }
+
+    /**
+     * Changes the transfer type (binary, ascii, ebcdic) and issue the
+     * proper command (e.g. TYPE A) to the server.
+     *
+     * @param type the &lt;code&gt;FtpTransferType&lt;/code&gt; to use.
+     * @return This FtpClient
+     * @throws IOException if an error occurs during transmission.
+     */
+    public sun.net.ftp.FtpClient setType(TransferType type) throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="fc" id="L1656">        String cmd = &quot;NOOP&quot;;</span>
+
+<span class="fc" id="L1658">        this.type = type;</span>
+<span class="fc bfc" id="L1659" title="All 2 branches covered.">        if (type == TransferType.ASCII) {</span>
+<span class="fc" id="L1660">            cmd = &quot;TYPE A&quot;;</span>
+        }
+<span class="fc bfc" id="L1662" title="All 2 branches covered.">        if (type == TransferType.BINARY) {</span>
+<span class="fc" id="L1663">            cmd = &quot;TYPE I&quot;;</span>
+        }
+<span class="pc bpc" id="L1665" title="1 of 2 branches missed.">        if (type == TransferType.EBCDIC) {</span>
+<span class="nc" id="L1666">            cmd = &quot;TYPE E&quot;;</span>
+        }
+<span class="fc" id="L1668">        issueCommandCheck(cmd);</span>
+<span class="fc" id="L1669">        return this;</span>
+    }
+
+    /**
+     * Issues a LIST command to the server to get the current directory
+     * listing, and returns the InputStream from the data connection.
+     * {@link #completePending()} &lt;b&gt;has&lt;/b&gt; to be called once the application
+     * is finished writing to the stream.
+     *
+     * @param path the pathname of the directory to list, or &lt;code&gt;null&lt;/code&gt;
+     *        for the current working directory.
+     * @return the &lt;code&gt;InputStream&lt;/code&gt; from the resulting data connection
+     * @throws IOException if an error occurs during the transmission.
+     * @see #changeDirectory(String)
+     * @see #listFiles(String)
+     */
+    public InputStream list(String path) throws sun.net.ftp.FtpProtocolException, IOException {
+        Socket s;
+<span class="nc bnc" id="L1687" title="All 2 branches missed.">        s = openDataConnection(path == null ? &quot;LIST&quot; : &quot;LIST &quot; + path);</span>
+<span class="nc bnc" id="L1688" title="All 2 branches missed.">        if (s != null) {</span>
+<span class="nc" id="L1689">            return createInputStream(s.getInputStream());</span>
+        }
+<span class="nc" id="L1691">        return null;</span>
+    }
+
+    /**
+     * Issues a NLST path command to server to get the specified directory
+     * content. It differs from {@link #list(String)} method by the fact that
+     * it will only list the file names which would make the parsing of the
+     * somewhat easier.
+     *
+     * {@link #completePending()} &lt;b&gt;has&lt;/b&gt; to be called once the application
+     * is finished writing to the stream.
+     *
+     * @param path a &lt;code&gt;String&lt;/code&gt; containing the pathname of the
+     *        directory to list or &lt;code&gt;null&lt;/code&gt; for the current working
+     *        directory.
+     * @return the &lt;code&gt;InputStream&lt;/code&gt; from the resulting data connection
+     * @throws IOException if an error occurs during the transmission.
+     */
+    public InputStream nameList(String path) throws sun.net.ftp.FtpProtocolException, IOException {
+        Socket s;
+<span class="fc" id="L1711">        s = openDataConnection(&quot;NLST &quot; + path);</span>
+<span class="pc bpc" id="L1712" title="1 of 2 branches missed.">        if (s != null) {</span>
+<span class="fc" id="L1713">            return createInputStream(s.getInputStream());</span>
+        }
+<span class="nc" id="L1715">        return null;</span>
+    }
+
+    /**
+     * Issues the SIZE [path] command to the server to get the size of a
+     * specific file on the server.
+     * Note that this command may not be supported by the server. In which
+     * case -1 will be returned.
+     *
+     * @param path a &lt;code&gt;String&lt;/code&gt; containing the pathname of the
+     *        file.
+     * @return a &lt;code&gt;long&lt;/code&gt; containing the size of the file or -1 if
+     *         the server returned an error, which can be checked with
+     *         {@link #getLastReplyCode()}.
+     * @throws IOException if an error occurs during the transmission.
+     */
+    public long getSize(String path) throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc bnc" id="L1732" title="All 4 branches missed.">        if (path == null || path.length() == 0) {</span>
+<span class="nc" id="L1733">            throw new IllegalArgumentException(&quot;path can't be null or empty&quot;);</span>
+        }
+<span class="nc" id="L1735">        issueCommandCheck(&quot;SIZE &quot; + path);</span>
+<span class="nc bnc" id="L1736" title="All 2 branches missed.">        if (lastReplyCode == FtpReplyCode.FILE_STATUS) {</span>
+<span class="nc" id="L1737">            String s = getResponseString();</span>
+<span class="nc" id="L1738">            s = s.substring(4, s.length() - 1);</span>
+<span class="nc" id="L1739">            return Long.parseLong(s);</span>
+        }
+<span class="nc" id="L1741">        return -1;</span>
+    }
+<span class="fc" id="L1743">    private static String[] MDTMformats = {</span>
+        &quot;yyyyMMddHHmmss.SSS&quot;,
+        &quot;yyyyMMddHHmmss&quot;
+    };
+<span class="fc" id="L1747">    private static SimpleDateFormat[] dateFormats = new SimpleDateFormat[MDTMformats.length];</span>
+
+    static {
+<span class="fc bfc" id="L1750" title="All 2 branches covered.">        for (int i = 0; i &lt; MDTMformats.length; i++) {</span>
+<span class="fc" id="L1751">            dateFormats[i] = new SimpleDateFormat(MDTMformats[i]);</span>
+<span class="fc" id="L1752">            dateFormats[i].setTimeZone(TimeZone.getTimeZone(&quot;GMT&quot;));</span>
+        }
+<span class="fc" id="L1754">    }</span>
+
+    /**
+     * Issues the MDTM [path] command to the server to get the modification
+     * time of a specific file on the server.
+     * Note that this command may not be supported by the server, in which
+     * case &lt;code&gt;null&lt;/code&gt; will be returned.
+     *
+     * @param path a &lt;code&gt;String&lt;/code&gt; containing the pathname of the file.
+     * @return a &lt;code&gt;Date&lt;/code&gt; representing the last modification time
+     *         or &lt;code&gt;null&lt;/code&gt; if the server returned an error, which
+     *         can be checked with {@link #getLastReplyCode()}.
+     * @throws IOException if an error occurs during the transmission.
+     */
+    public Date getLastModified(String path) throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc" id="L1769">        issueCommandCheck(&quot;MDTM &quot; + path);</span>
+<span class="nc bnc" id="L1770" title="All 2 branches missed.">        if (lastReplyCode == FtpReplyCode.FILE_STATUS) {</span>
+<span class="nc" id="L1771">            String s = getResponseString().substring(4);</span>
+<span class="nc" id="L1772">            Date d = null;</span>
+<span class="nc bnc" id="L1773" title="All 2 branches missed.">            for (SimpleDateFormat dateFormat : dateFormats) {</span>
+                try {
+<span class="nc" id="L1775">                    d = dateFormat.parse(s);</span>
+<span class="nc" id="L1776">                } catch (ParseException ex) {</span>
+<span class="nc" id="L1777">                }</span>
+<span class="nc bnc" id="L1778" title="All 2 branches missed.">                if (d != null) {</span>
+<span class="nc" id="L1779">                    return d;</span>
+                }
+            }
+        }
+<span class="nc" id="L1783">        return null;</span>
+    }
+
+    /**
+     * Sets the parser used to handle the directory output to the specified
+     * one. By default the parser is set to one that can handle most FTP
+     * servers output (Unix base mostly). However it may be necessary for
+     * and application to provide its own parser due to some uncommon
+     * output format.
+     *
+     * @param p The &lt;code&gt;FtpDirParser&lt;/code&gt; to use.
+     * @see #listFiles(String)
+     */
+    public sun.net.ftp.FtpClient setDirParser(FtpDirParser p) {
+<span class="nc" id="L1797">        parser = p;</span>
+<span class="nc" id="L1798">        return this;</span>
+    }
+
+    private class FtpFileIterator implements Iterator&lt;FtpDirEntry&gt;, Closeable {
+
+<span class="nc" id="L1803">        private BufferedReader in = null;</span>
+<span class="nc" id="L1804">        private FtpDirEntry nextFile = null;</span>
+<span class="nc" id="L1805">        private FtpDirParser fparser = null;</span>
+<span class="nc" id="L1806">        private boolean eof = false;</span>
+
+<span class="nc" id="L1808">        public FtpFileIterator(FtpDirParser p, BufferedReader in) {</span>
+<span class="nc" id="L1809">            this.in = in;</span>
+<span class="nc" id="L1810">            this.fparser = p;</span>
+<span class="nc" id="L1811">            readNext();</span>
+<span class="nc" id="L1812">        }</span>
+
+        private void readNext() {
+<span class="nc" id="L1815">            nextFile = null;</span>
+<span class="nc bnc" id="L1816" title="All 2 branches missed.">            if (eof) {</span>
+<span class="nc" id="L1817">                return;</span>
+            }
+<span class="nc" id="L1819">            String line = null;</span>
+            try {
+                do {
+<span class="nc" id="L1822">                    line = in.readLine();</span>
+<span class="nc bnc" id="L1823" title="All 2 branches missed.">                    if (line != null) {</span>
+<span class="nc" id="L1824">                        nextFile = fparser.parseLine(line);</span>
+<span class="nc bnc" id="L1825" title="All 2 branches missed.">                        if (nextFile != null) {</span>
+<span class="nc" id="L1826">                            return;</span>
+                        }
+                    }
+<span class="nc bnc" id="L1829" title="All 2 branches missed.">                } while (line != null);</span>
+<span class="nc" id="L1830">                in.close();</span>
+<span class="nc" id="L1831">            } catch (IOException iOException) {</span>
+<span class="nc" id="L1832">            }</span>
+<span class="nc" id="L1833">            eof = true;</span>
+<span class="nc" id="L1834">        }</span>
+
+        public boolean hasNext() {
+<span class="nc bnc" id="L1837" title="All 2 branches missed.">            return nextFile != null;</span>
+        }
+
+        public FtpDirEntry next() {
+<span class="nc" id="L1841">            FtpDirEntry ret = nextFile;</span>
+<span class="nc" id="L1842">            readNext();</span>
+<span class="nc" id="L1843">            return ret;</span>
+        }
+
+        public void remove() {
+<span class="nc" id="L1847">            throw new UnsupportedOperationException(&quot;Not supported yet.&quot;);</span>
+        }
+
+        public void close() throws IOException {
+<span class="nc bnc" id="L1851" title="All 4 branches missed.">            if (in != null &amp;&amp; !eof) {</span>
+<span class="nc" id="L1852">                in.close();</span>
+            }
+<span class="nc" id="L1854">            eof = true;</span>
+<span class="nc" id="L1855">            nextFile = null;</span>
+<span class="nc" id="L1856">        }</span>
+    }
+
+    /**
+     * Issues a MLSD command to the server to get the specified directory
+     * listing and applies the current parser to create an Iterator of
+     * {@link java.net.ftp.FtpDirEntry}. Note that the Iterator returned is also a
+     * {@link java.io.Closeable}.
+     * If the server doesn't support the MLSD command, the LIST command is used
+     * instead.
+     *
+     * {@link #completePending()} &lt;b&gt;has&lt;/b&gt; to be called once the application
+     * is finished iterating through the files.
+     *
+     * @param path the pathname of the directory to list or &lt;code&gt;null&lt;/code&gt;
+     *        for the current working directoty.
+     * @return a &lt;code&gt;Iterator&lt;/code&gt; of files or &lt;code&gt;null&lt;/code&gt; if the
+     *         command failed.
+     * @throws IOException if an error occurred during the transmission
+     * @see #setDirParser(FtpDirParser)
+     * @see #changeDirectory(String)
+     */
+    public Iterator&lt;FtpDirEntry&gt; listFiles(String path) throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc" id="L1879">        Socket s = null;</span>
+<span class="nc" id="L1880">        BufferedReader sin = null;</span>
+        try {
+<span class="nc bnc" id="L1882" title="All 2 branches missed.">            s = openDataConnection(path == null ? &quot;MLSD&quot; : &quot;MLSD &quot; + path);</span>
+<span class="nc" id="L1883">        } catch (sun.net.ftp.FtpProtocolException FtpException) {</span>
+            // The server doesn't understand new MLSD command, ignore and fall
+            // back to LIST
+<span class="nc" id="L1886">        }</span>
+
+<span class="nc bnc" id="L1888" title="All 2 branches missed.">        if (s != null) {</span>
+<span class="nc" id="L1889">            sin = new BufferedReader(new InputStreamReader(s.getInputStream()));</span>
+<span class="nc" id="L1890">            return new FtpFileIterator(mlsxParser, sin);</span>
+        } else {
+<span class="nc bnc" id="L1892" title="All 2 branches missed.">            s = openDataConnection(path == null ? &quot;LIST&quot; : &quot;LIST &quot; + path);</span>
+<span class="nc bnc" id="L1893" title="All 2 branches missed.">            if (s != null) {</span>
+<span class="nc" id="L1894">                sin = new BufferedReader(new InputStreamReader(s.getInputStream()));</span>
+<span class="nc" id="L1895">                return new FtpFileIterator(parser, sin);</span>
+            }
+        }
+<span class="nc" id="L1898">        return null;</span>
+    }
+
+    private boolean sendSecurityData(byte[] buf) throws IOException {
+<span class="nc" id="L1902">        BASE64Encoder encoder = new BASE64Encoder();</span>
+<span class="nc" id="L1903">        String s = encoder.encode(buf);</span>
+<span class="nc" id="L1904">        return issueCommand(&quot;ADAT &quot; + s);</span>
+    }
+
+    private byte[] getSecurityData() {
+<span class="nc" id="L1908">        String s = getLastResponseString();</span>
+<span class="nc bnc" id="L1909" title="All 2 branches missed.">        if (s.substring(4, 9).equalsIgnoreCase(&quot;ADAT=&quot;)) {</span>
+<span class="nc" id="L1910">            BASE64Decoder decoder = new BASE64Decoder();</span>
+            try {
+                // Need to get rid of the leading '315 ADAT='
+                // and the trailing newline
+<span class="nc" id="L1914">                return decoder.decodeBuffer(s.substring(9, s.length() - 1));</span>
+<span class="nc" id="L1915">            } catch (IOException e) {</span>
+                //
+            }
+        }
+<span class="nc" id="L1919">        return null;</span>
+    }
+
+    /**
+     * Attempts to use Kerberos GSSAPI as an authentication mechanism with the
+     * ftp server. This will issue an &lt;code&gt;AUTH GSSAPI&lt;/code&gt; command, and if
+     * it is accepted by the server, will followup with &lt;code&gt;ADAT&lt;/code&gt;
+     * command to exchange the various tokens until authentification is
+     * successful. This conforms to Appendix I of RFC 2228.
+     *
+     * @return &lt;code&gt;true&lt;/code&gt; if authentication was successful.
+     * @throws IOException if an error occurs during the transmission.
+     */
+    public sun.net.ftp.FtpClient useKerberos() throws sun.net.ftp.FtpProtocolException, IOException {
+        /*
+         * Comment out for the moment since it's not in use and would create
+         * needless cross-package links.
+         *
+        issueCommandCheck(&quot;AUTH GSSAPI&quot;);
+        if (lastReplyCode != FtpReplyCode.NEED_ADAT)
+        throw new sun.net.ftp.FtpProtocolException(&quot;Unexpected reply from server&quot;);
+        try {
+        GSSManager manager = GSSManager.getInstance();
+        GSSName name = manager.createName(&quot;SERVICE:ftp@&quot;+
+        serverAddr.getHostName(), null);
+        GSSContext context = manager.createContext(name, null, null,
+        GSSContext.DEFAULT_LIFETIME);
+        context.requestMutualAuth(true);
+        context.requestReplayDet(true);
+        context.requestSequenceDet(true);
+        context.requestCredDeleg(true);
+        byte []inToken = new byte[0];
+        while (!context.isEstablished()) {
+        byte[] outToken
+        = context.initSecContext(inToken, 0, inToken.length);
+        // send the output token if generated
+        if (outToken != null) {
+        if (sendSecurityData(outToken)) {
+        inToken = getSecurityData();
+        }
+        }
+        }
+        loggedIn = true;
+        } catch (GSSException e) {
+
+        }
+         */
+<span class="nc" id="L1966">        return this;</span>
+    }
+
+    /**
+     * Returns the Welcome string the server sent during initial connection.
+     *
+     * @return a &lt;code&gt;String&lt;/code&gt; containing the message the server
+     *         returned during connection or &lt;code&gt;null&lt;/code&gt;.
+     */
+    public String getWelcomeMsg() {
+<span class="nc" id="L1976">        return welcomeMsg;</span>
+    }
+
+    /**
+     * Returns the last reply code sent by the server.
+     *
+     * @return the lastReplyCode
+     */
+    public FtpReplyCode getLastReplyCode() {
+<span class="fc" id="L1985">        return lastReplyCode;</span>
+    }
+
+    /**
+     * Returns the last response string sent by the server.
+     *
+     * @return the message string, which can be quite long, last returned
+     *         by the server.
+     */
+    public String getLastResponseString() {
+<span class="fc" id="L1995">        StringBuffer sb = new StringBuffer();</span>
+<span class="pc bpc" id="L1996" title="1 of 2 branches missed.">        if (serverResponse != null) {</span>
+<span class="fc bfc" id="L1997" title="All 2 branches covered.">            for (String l : serverResponse) {</span>
+<span class="pc bpc" id="L1998" title="1 of 2 branches missed.">                if (l != null) {</span>
+<span class="fc" id="L1999">                    sb.append(l);</span>
+                }
+<span class="fc" id="L2001">            }</span>
+        }
+<span class="fc" id="L2003">        return sb.toString();</span>
+    }
+
+    /**
+     * Returns, when available, the size of the latest started transfer.
+     * This is retreived by parsing the response string received as an initial
+     * response to a RETR or similar request.
+     *
+     * @return the size of the latest transfer or -1 if either there was no
+     *         transfer or the information was unavailable.
+     */
+    public long getLastTransferSize() {
+<span class="fc" id="L2015">        return lastTransSize;</span>
+    }
+
+    /**
+     * Returns, when available, the remote name of the last transfered file.
+     * This is mainly useful for &quot;put&quot; operation when the unique flag was
+     * set since it allows to recover the unique file name created on the
+     * server which may be different from the one submitted with the command.
+     *
+     * @return the name the latest transfered file remote name, or
+     *         &lt;code&gt;null&lt;/code&gt; if that information is unavailable.
+     */
+    public String getLastFileName() {
+<span class="nc" id="L2028">        return lastFileName;</span>
+    }
+
+    /**
+     * Attempts to switch to a secure, encrypted connection. This is done by
+     * sending the &quot;AUTH TLS&quot; command.
+     * &lt;p&gt;See &lt;a href=&quot;http://www.ietf.org/rfc/rfc4217.txt&quot;&gt;RFC 4217&lt;/a&gt;&lt;/p&gt;
+     * If successful this will establish a secure command channel with the
+     * server, it will also make it so that all other transfers (e.g. a RETR
+     * command) will be done over an encrypted channel as well unless a
+     * {@link #reInit()} command or a {@link #endSecureSession()} command is issued.
+     *
+     * @return &lt;code&gt;true&lt;/code&gt; if the operation was successful.
+     * @throws IOException if an error occurred during the transmission.
+     * @see #endSecureSession()
+     */
+    public sun.net.ftp.FtpClient startSecureSession() throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc bnc" id="L2045" title="All 2 branches missed.">        if (!isConnected()) {</span>
+<span class="nc" id="L2046">            throw new sun.net.ftp.FtpProtocolException(&quot;Not connected yet&quot;, FtpReplyCode.BAD_SEQUENCE);</span>
+        }
+<span class="nc bnc" id="L2048" title="All 2 branches missed.">        if (sslFact == null) {</span>
+            try {
+<span class="nc" id="L2050">                sslFact = (SSLSocketFactory) SSLSocketFactory.getDefault();</span>
+<span class="nc" id="L2051">            } catch (Exception e) {</span>
+<span class="nc" id="L2052">                throw new IOException(e.getLocalizedMessage());</span>
+<span class="nc" id="L2053">            }</span>
+        }
+<span class="nc" id="L2055">        issueCommandCheck(&quot;AUTH TLS&quot;);</span>
+<span class="nc" id="L2056">        Socket s = null;</span>
+        try {
+<span class="nc" id="L2058">            s = sslFact.createSocket(server, serverAddr.getHostName(), serverAddr.getPort(), true);</span>
+<span class="nc" id="L2059">        } catch (javax.net.ssl.SSLException ssle) {</span>
+            try {
+<span class="nc" id="L2061">                disconnect();</span>
+<span class="nc" id="L2062">            } catch (Exception e) {</span>
+<span class="nc" id="L2063">            }</span>
+<span class="nc" id="L2064">            throw ssle;</span>
+<span class="nc" id="L2065">        }</span>
+        // Remember underlying socket so we can restore it later
+<span class="nc" id="L2067">        oldSocket = server;</span>
+<span class="nc" id="L2068">        server = s;</span>
+        try {
+<span class="nc" id="L2070">            out = new PrintStream(new BufferedOutputStream(server.getOutputStream()),</span>
+                    true, encoding);
+<span class="nc" id="L2072">        } catch (UnsupportedEncodingException e) {</span>
+<span class="nc" id="L2073">            throw new InternalError(encoding + &quot;encoding not found&quot;, e);</span>
+<span class="nc" id="L2074">        }</span>
+<span class="nc" id="L2075">        in = new BufferedInputStream(server.getInputStream());</span>
+
+<span class="nc" id="L2077">        issueCommandCheck(&quot;PBSZ 0&quot;);</span>
+<span class="nc" id="L2078">        issueCommandCheck(&quot;PROT P&quot;);</span>
+<span class="nc" id="L2079">        useCrypto = true;</span>
+<span class="nc" id="L2080">        return this;</span>
+    }
+
+    /**
+     * Sends a &lt;code&gt;CCC&lt;/code&gt; command followed by a &lt;code&gt;PROT C&lt;/code&gt;
+     * command to the server terminating an encrypted session and reverting
+     * back to a non crypted transmission.
+     *
+     * @return &lt;code&gt;true&lt;/code&gt; if the operation was successful.
+     * @throws IOException if an error occurred during transmission.
+     * @see #startSecureSession()
+     */
+    public sun.net.ftp.FtpClient endSecureSession() throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc bnc" id="L2093" title="All 2 branches missed.">        if (!useCrypto) {</span>
+<span class="nc" id="L2094">            return this;</span>
+        }
+
+<span class="nc" id="L2097">        issueCommandCheck(&quot;CCC&quot;);</span>
+<span class="nc" id="L2098">        issueCommandCheck(&quot;PROT C&quot;);</span>
+<span class="nc" id="L2099">        useCrypto = false;</span>
+        // Restore previous socket and streams
+<span class="nc" id="L2101">        server = oldSocket;</span>
+<span class="nc" id="L2102">        oldSocket = null;</span>
+        try {
+<span class="nc" id="L2104">            out = new PrintStream(new BufferedOutputStream(server.getOutputStream()),</span>
+                    true, encoding);
+<span class="nc" id="L2106">        } catch (UnsupportedEncodingException e) {</span>
+<span class="nc" id="L2107">            throw new InternalError(encoding + &quot;encoding not found&quot;, e);</span>
+<span class="nc" id="L2108">        }</span>
+<span class="nc" id="L2109">        in = new BufferedInputStream(server.getInputStream());</span>
+
+<span class="nc" id="L2111">        return this;</span>
+    }
+
+    /**
+     * Sends the &quot;Allocate&quot; (ALLO) command to the server telling it to
+     * pre-allocate the specified number of bytes for the next transfer.
+     *
+     * @param size The number of bytes to allocate.
+     * @return &lt;code&gt;true&lt;/code&gt; if the operation was successful.
+     * @throws IOException if an error occurred during the transmission.
+     */
+    public sun.net.ftp.FtpClient allocate(long size) throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc" id="L2123">        issueCommandCheck(&quot;ALLO &quot; + size);</span>
+<span class="nc" id="L2124">        return this;</span>
+    }
+
+    /**
+     * Sends the &quot;Structure Mount&quot; (SMNT) command to the server. This let the
+     * user mount a different file system data structure without altering his
+     * login or accounting information.
+     *
+     * @param struct a &lt;code&gt;String&lt;/code&gt; containing the name of the
+     *        structure to mount.
+     * @return &lt;code&gt;true&lt;/code&gt; if the operation was successful.
+     * @throws IOException if an error occurred during the transmission.
+     */
+    public sun.net.ftp.FtpClient structureMount(String struct) throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc" id="L2138">        issueCommandCheck(&quot;SMNT &quot; + struct);</span>
+<span class="nc" id="L2139">        return this;</span>
+    }
+
+    /**
+     * Sends a SYST (System) command to the server and returns the String
+     * sent back by the server describing the operating system at the
+     * server.
+     *
+     * @return a &lt;code&gt;String&lt;/code&gt; describing the OS, or &lt;code&gt;null&lt;/code&gt;
+     *         if the operation was not successful.
+     * @throws IOException if an error occurred during the transmission.
+     */
+    public String getSystem() throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc" id="L2152">        issueCommandCheck(&quot;SYST&quot;);</span>
+        /*
+         * 215 UNIX Type: L8 Version: SUNOS
+         */
+<span class="nc" id="L2156">        String resp = getResponseString();</span>
+        // Get rid of the leading code and blank
+<span class="nc" id="L2158">        return resp.substring(4);</span>
+    }
+
+    /**
+     * Sends the HELP command to the server, with an optional command, like
+     * SITE, and returns the text sent back by the server.
+     *
+     * @param cmd the command for which the help is requested or
+     *        &lt;code&gt;null&lt;/code&gt; for the general help
+     * @return a &lt;code&gt;String&lt;/code&gt; containing the text sent back by the
+     *         server, or &lt;code&gt;null&lt;/code&gt; if the command failed.
+     * @throws IOException if an error occurred during transmission
+     */
+    public String getHelp(String cmd) throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc" id="L2172">        issueCommandCheck(&quot;HELP &quot; + cmd);</span>
+        /**
+         *
+         * HELP
+         * 214-The following commands are implemented.
+         *   USER    EPRT    STRU    ALLO    DELE    SYST    RMD     MDTM    ADAT
+         *   PASS    EPSV    MODE    REST    CWD     STAT    PWD     PROT
+         *   QUIT    LPRT    RETR    RNFR    LIST    HELP    CDUP    PBSZ
+         *   PORT    LPSV    STOR    RNTO    NLST    NOOP    STOU    AUTH
+         *   PASV    TYPE    APPE    ABOR    SITE    MKD     SIZE    CCC
+         * 214 Direct comments to ftp-bugs@jsn.
+         *
+         * HELP SITE
+         * 214-The following SITE commands are implemented.
+         *   UMASK           HELP            GROUPS
+         *   IDLE            ALIAS           CHECKMETHOD
+         *   CHMOD           CDPATH          CHECKSUM
+         * 214 Direct comments to ftp-bugs@jsn.
+         */
+<span class="nc" id="L2191">        Vector&lt;String&gt; resp = getResponseStrings();</span>
+<span class="nc bnc" id="L2192" title="All 2 branches missed.">        if (resp.size() == 1) {</span>
+            // Single line response
+<span class="nc" id="L2194">            return resp.get(0).substring(4);</span>
+        }
+        // on multiple lines answers, like the ones above, remove 1st and last
+        // line, concat the the others.
+<span class="nc" id="L2198">        StringBuffer sb = new StringBuffer();</span>
+<span class="nc bnc" id="L2199" title="All 2 branches missed.">        for (int i = 1; i &lt; resp.size() - 1; i++) {</span>
+<span class="nc" id="L2200">            sb.append(resp.get(i).substring(3));</span>
+        }
+<span class="nc" id="L2202">        return sb.toString();</span>
+    }
+
+    /**
+     * Sends the SITE command to the server. This is used by the server
+     * to provide services specific to his system that are essential
+     * to file transfer.
+     *
+     * @param cmd the command to be sent.
+     * @return &lt;code&gt;true&lt;/code&gt; if the command was successful.
+     * @throws IOException if an error occurred during transmission
+     */
+    public sun.net.ftp.FtpClient siteCmd(String cmd) throws sun.net.ftp.FtpProtocolException, IOException {
+<span class="nc" id="L2215">        issueCommandCheck(&quot;SITE &quot; + cmd);</span>
+<span class="nc" id="L2216">        return this;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

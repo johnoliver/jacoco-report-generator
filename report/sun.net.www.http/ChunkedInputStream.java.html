@@ -1,0 +1,781 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ChunkedInputStream.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.net.www.http</a> &gt; <span class="el_source">ChunkedInputStream.java</span></div><h1>ChunkedInputStream.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1999, 2006, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package sun.net.www.http;
+
+import java.io.*;
+import java.util.*;
+
+import sun.net.*;
+import sun.net.www.*;
+
+/**
+ * A &lt;code&gt;ChunkedInputStream&lt;/code&gt; provides a stream for reading a body of
+ * a http message that can be sent as a series of chunks, each with its own
+ * size indicator. Optionally the last chunk can be followed by trailers
+ * containing entity-header fields.
+ * &lt;p&gt;
+ * A &lt;code&gt;ChunkedInputStream&lt;/code&gt; is also &lt;code&gt;Hurryable&lt;/code&gt; so it
+ * can be hurried to the end of the stream if the bytes are available on
+ * the underlying stream.
+ */
+public
+class ChunkedInputStream extends InputStream implements Hurryable {
+
+    /**
+     * The underlying stream
+     */
+    private InputStream in;
+
+    /**
+     * The &lt;code&gt;HttpClient&lt;/code&gt; that should be notified when the chunked stream has
+     * completed.
+     */
+    private HttpClient hc;
+
+    /**
+     * The &lt;code&gt;MessageHeader&lt;/code&gt; that is populated with any optional trailer
+     * that appear after the last chunk.
+     */
+    private MessageHeader responses;
+
+    /**
+     * The size, in bytes, of the chunk that is currently being read.
+     * This size is only valid if the current position in the underlying
+     * input stream is inside a chunk (ie: state == STATE_READING_CHUNK).
+     */
+    private int chunkSize;
+
+    /**
+     * The number of bytes read from the underlying stream for the current
+     * chunk. This value is always in the range &lt;code&gt;0&lt;/code&gt; through to
+     * &lt;code&gt;chunkSize&lt;/code&gt;
+     */
+    private int chunkRead;
+
+    /**
+     * The internal buffer array where chunk data is available for the
+     * application to read.
+     */
+<span class="fc" id="L81">    private byte chunkData[] = new byte[4096];</span>
+
+    /**
+     * The current position in the buffer. It contains the index
+     * of the next byte to read from &lt;code&gt;chunkData&lt;/code&gt;
+     */
+    private int chunkPos;
+
+    /**
+     * The index one greater than the index of the last valid byte in the
+     * buffer. This value is always in the range &lt;code&gt;0&lt;/code&gt; through
+     * &lt;code&gt;chunkData.length&lt;/code&gt;.
+     */
+    private int chunkCount;
+
+    /**
+     * The internal buffer where bytes from the underlying stream can be
+     * read. It may contain bytes representing chunk-size, chunk-data, or
+     * trailer fields.
+     */
+<span class="fc" id="L101">    private byte rawData[] = new byte[32];</span>
+
+    /**
+     * The current position in the buffer. It contains the index
+     * of the next byte to read from &lt;code&gt;rawData&lt;/code&gt;
+     */
+    private int rawPos;
+
+    /**
+     * The index one greater than the index of the last valid byte in the
+     * buffer. This value is always in the range &lt;code&gt;0&lt;/code&gt; through
+     * &lt;code&gt;rawData.length&lt;/code&gt;.
+     */
+    private int rawCount;
+
+    /**
+     * Indicates if an error was encountered when processing the chunked
+     * stream.
+     */
+    private boolean error;
+
+    /**
+     * Indicates if the chunked stream has been closed using the
+     * &lt;code&gt;close&lt;/code&gt; method.
+     */
+    private boolean closed;
+
+    /*
+     * Maximum chunk header size of 2KB + 2 bytes for CRLF
+     */
+    private final static int MAX_CHUNK_HEADER_SIZE = 2050;
+
+    /**
+     * State to indicate that next field should be :-
+     *  chunk-size [ chunk-extension ] CRLF
+     */
+    static final int STATE_AWAITING_CHUNK_HEADER    = 1;
+
+    /**
+     * State to indicate that we are currently reading the chunk-data.
+     */
+    static final int STATE_READING_CHUNK            = 2;
+
+    /**
+     * Indicates that a chunk has been completely read and the next
+     * fields to be examine should be CRLF
+     */
+    static final int STATE_AWAITING_CHUNK_EOL       = 3;
+
+    /**
+     * Indicates that all chunks have been read and the next field
+     * should be optional trailers or an indication that the chunked
+     * stream is complete.
+     */
+    static final int STATE_AWAITING_TRAILERS        = 4;
+
+    /**
+     * State to indicate that the chunked stream is complete and
+     * no further bytes should be read from the underlying stream.
+     */
+    static final int STATE_DONE                     = 5;
+
+    /**
+     * Indicates the current state.
+     */
+    private int state;
+
+
+    /**
+     * Check to make sure that this stream has not been closed.
+     */
+    private void ensureOpen() throws IOException {
+<span class="pc bpc" id="L173" title="1 of 2 branches missed.">        if (closed) {</span>
+<span class="nc" id="L174">            throw new IOException(&quot;stream is closed&quot;);</span>
+        }
+<span class="fc" id="L176">    }</span>
+
+
+    /**
+     * Ensures there is &lt;code&gt;size&lt;/code&gt; bytes available in
+     * &lt;code&gt;rawData&lt;/code&gt;. This requires that we either
+     * shift the bytes in use to the begining of the buffer
+     * or allocate a large buffer with sufficient space available.
+     */
+    private void ensureRawAvailable(int size) {
+<span class="fc bfc" id="L186" title="All 2 branches covered.">        if (rawCount + size &gt; rawData.length) {</span>
+<span class="fc" id="L187">            int used = rawCount - rawPos;</span>
+<span class="fc bfc" id="L188" title="All 2 branches covered.">            if (used + size &gt; rawData.length) {</span>
+<span class="fc" id="L189">                byte tmp[] = new byte[used + size];</span>
+<span class="fc bfc" id="L190" title="All 2 branches covered.">                if (used &gt; 0) {</span>
+<span class="fc" id="L191">                    System.arraycopy(rawData, rawPos, tmp, 0, used);</span>
+                }
+<span class="fc" id="L193">                rawData = tmp;</span>
+<span class="fc" id="L194">            } else {</span>
+<span class="pc bpc" id="L195" title="1 of 2 branches missed.">                if (used &gt; 0) {</span>
+<span class="nc" id="L196">                    System.arraycopy(rawData, rawPos, rawData, 0, used);</span>
+                }
+            }
+<span class="fc" id="L199">            rawCount = used;</span>
+<span class="fc" id="L200">            rawPos = 0;</span>
+        }
+<span class="fc" id="L202">    }</span>
+
+
+    /**
+     * Close the underlying input stream by either returning it to the
+     * keep alive cache or closing the stream.
+     * &lt;p&gt;
+     * As a chunked stream is inheritly persistent (see HTTP 1.1 RFC) the
+     * underlying stream can be returned to the keep alive cache if the
+     * stream can be completely read without error.
+     */
+    private void closeUnderlying() throws IOException {
+<span class="fc bfc" id="L214" title="All 2 branches covered.">        if (in == null) {</span>
+<span class="fc" id="L215">            return;</span>
+        }
+
+<span class="pc bpc" id="L218" title="1 of 4 branches missed.">        if (!error &amp;&amp; state == STATE_DONE) {</span>
+<span class="fc" id="L219">            hc.finished();</span>
+        } else {
+<span class="fc bfc" id="L221" title="All 2 branches covered.">            if (!hurry()) {</span>
+<span class="fc" id="L222">                hc.closeServer();</span>
+            }
+        }
+
+<span class="fc" id="L226">        in = null;</span>
+<span class="fc" id="L227">    }</span>
+
+    /**
+     * Attempt to read the remainder of a chunk directly into the
+     * caller's buffer.
+     * &lt;p&gt;
+     * Return the number of bytes read.
+     */
+    private int fastRead(byte[] b, int off, int len) throws IOException {
+
+        // assert state == STATE_READING_CHUNKS;
+
+<span class="fc" id="L239">        int remaining = chunkSize - chunkRead;</span>
+<span class="fc bfc" id="L240" title="All 2 branches covered.">        int cnt = (remaining &lt; len) ? remaining : len;</span>
+<span class="pc bpc" id="L241" title="1 of 2 branches missed.">        if (cnt &gt; 0) {</span>
+            int nread;
+            try {
+<span class="fc" id="L244">                nread = in.read(b, off, cnt);</span>
+<span class="nc" id="L245">            } catch (IOException e) {</span>
+<span class="nc" id="L246">                error = true;</span>
+<span class="nc" id="L247">                throw e;</span>
+<span class="fc" id="L248">            }</span>
+<span class="pc bpc" id="L249" title="1 of 2 branches missed.">            if (nread &gt; 0) {</span>
+<span class="fc" id="L250">                chunkRead += nread;</span>
+<span class="fc bfc" id="L251" title="All 2 branches covered.">                if (chunkRead &gt;= chunkSize) {</span>
+<span class="fc" id="L252">                    state = STATE_AWAITING_CHUNK_EOL;</span>
+                }
+<span class="fc" id="L254">                return nread;</span>
+            }
+<span class="nc" id="L256">            error = true;</span>
+<span class="nc" id="L257">            throw new IOException(&quot;Premature EOF&quot;);</span>
+        } else {
+<span class="nc" id="L259">            return 0;</span>
+        }
+    }
+
+    /**
+     * Process any outstanding bytes that have already been read into
+     * &lt;code&gt;rawData&lt;/code&gt;.
+     * &lt;p&gt;
+     * The parsing of the chunked stream is performed as a state machine with
+     * &lt;code&gt;state&lt;/code&gt; representing the current state of the processing.
+     * &lt;p&gt;
+     * Returns when either all the outstanding bytes in rawData have been
+     * processed or there is insufficient bytes available to continue
+     * processing. When the latter occurs &lt;code&gt;rawPos&lt;/code&gt; will not have
+     * been updated and thus the processing can be restarted once further
+     * bytes have been read into &lt;code&gt;rawData&lt;/code&gt;.
+     */
+    private void processRaw() throws IOException {
+        int pos;
+        int i;
+
+<span class="pc bpc" id="L280" title="1 of 2 branches missed.">        while (state != STATE_DONE) {</span>
+
+<span class="pc bpc" id="L282" title="1 of 5 branches missed.">            switch (state) {</span>
+
+                /**
+                 * We are awaiting a line with a chunk header
+                 */
+                case STATE_AWAITING_CHUNK_HEADER:
+                    /*
+                     * Find \n to indicate end of chunk header. If not found when there is
+                     * insufficient bytes in the raw buffer to parse a chunk header.
+                     */
+<span class="fc" id="L292">                    pos = rawPos;</span>
+<span class="fc bfc" id="L293" title="All 2 branches covered.">                    while (pos &lt; rawCount) {</span>
+<span class="fc bfc" id="L294" title="All 2 branches covered.">                        if (rawData[pos] == '\n') {</span>
+<span class="fc" id="L295">                            break;</span>
+                        }
+<span class="fc" id="L297">                        pos++;</span>
+<span class="pc bpc" id="L298" title="1 of 2 branches missed.">                        if ((pos - rawPos) &gt;= MAX_CHUNK_HEADER_SIZE) {</span>
+<span class="nc" id="L299">                            error = true;</span>
+<span class="nc" id="L300">                            throw new IOException(&quot;Chunk header too long&quot;);</span>
+                        }
+                    }
+<span class="fc bfc" id="L303" title="All 2 branches covered.">                    if (pos &gt;= rawCount) {</span>
+<span class="fc" id="L304">                        return;</span>
+                    }
+
+                    /*
+                     * Extract the chunk size from the header (ignoring extensions).
+                     */
+<span class="fc" id="L310">                    String header = new String(rawData, rawPos, pos-rawPos+1, &quot;US-ASCII&quot;);</span>
+<span class="pc bpc" id="L311" title="1 of 2 branches missed.">                    for (i=0; i &lt; header.length(); i++) {</span>
+<span class="fc bfc" id="L312" title="All 2 branches covered.">                        if (Character.digit(header.charAt(i), 16) == -1)</span>
+<span class="fc" id="L313">                            break;</span>
+                    }
+                    try {
+<span class="fc" id="L316">                        chunkSize = Integer.parseInt(header.substring(0, i), 16);</span>
+<span class="nc" id="L317">                    } catch (NumberFormatException e) {</span>
+<span class="nc" id="L318">                        error = true;</span>
+<span class="nc" id="L319">                        throw new IOException(&quot;Bogus chunk size&quot;);</span>
+<span class="fc" id="L320">                    }</span>
+
+                    /*
+                     * Chunk has been parsed so move rawPos to first byte of chunk
+                     * data.
+                     */
+<span class="fc" id="L326">                    rawPos = pos + 1;</span>
+<span class="fc" id="L327">                    chunkRead = 0;</span>
+
+                    /*
+                     * A chunk size of 0 means EOF.
+                     */
+<span class="fc bfc" id="L332" title="All 2 branches covered.">                    if (chunkSize &gt; 0) {</span>
+<span class="fc" id="L333">                        state = STATE_READING_CHUNK;</span>
+                    } else {
+<span class="fc" id="L335">                        state = STATE_AWAITING_TRAILERS;</span>
+                    }
+<span class="fc" id="L337">                    break;</span>
+
+
+                /**
+                 * We are awaiting raw entity data (some may have already been
+                 * read). chunkSize is the size of the chunk; chunkRead is the
+                 * total read from the underlying stream to date.
+                 */
+                case STATE_READING_CHUNK :
+                    /* no data available yet */
+<span class="pc bpc" id="L347" title="1 of 2 branches missed.">                    if (rawPos &gt;= rawCount) {</span>
+<span class="nc" id="L348">                        return;</span>
+                    }
+
+                    /*
+                     * Compute the number of bytes of chunk data available in the
+                     * raw buffer.
+                     */
+<span class="fc" id="L355">                    int copyLen = Math.min( chunkSize-chunkRead, rawCount-rawPos );</span>
+
+                    /*
+                     * Expand or compact chunkData if needed.
+                     */
+<span class="fc bfc" id="L360" title="All 2 branches covered.">                    if (chunkData.length &lt; chunkCount + copyLen) {</span>
+<span class="fc" id="L361">                        int cnt = chunkCount - chunkPos;</span>
+<span class="pc bpc" id="L362" title="1 of 2 branches missed.">                        if (chunkData.length &lt; cnt + copyLen) {</span>
+<span class="fc" id="L363">                            byte tmp[] = new byte[cnt + copyLen];</span>
+<span class="fc" id="L364">                            System.arraycopy(chunkData, chunkPos, tmp, 0, cnt);</span>
+<span class="fc" id="L365">                            chunkData = tmp;</span>
+<span class="fc" id="L366">                        } else {</span>
+<span class="nc" id="L367">                            System.arraycopy(chunkData, chunkPos, chunkData, 0, cnt);</span>
+                        }
+<span class="fc" id="L369">                        chunkPos = 0;</span>
+<span class="fc" id="L370">                        chunkCount = cnt;</span>
+                    }
+
+                    /*
+                     * Copy the chunk data into chunkData so that it's available
+                     * to the read methods.
+                     */
+<span class="fc" id="L377">                    System.arraycopy(rawData, rawPos, chunkData, chunkCount, copyLen);</span>
+<span class="fc" id="L378">                    rawPos += copyLen;</span>
+<span class="fc" id="L379">                    chunkCount += copyLen;</span>
+<span class="fc" id="L380">                    chunkRead += copyLen;</span>
+
+                    /*
+                     * If all the chunk has been copied into chunkData then the next
+                     * token should be CRLF.
+                     */
+<span class="fc bfc" id="L386" title="All 2 branches covered.">                    if (chunkSize - chunkRead &lt;= 0) {</span>
+<span class="fc" id="L387">                        state = STATE_AWAITING_CHUNK_EOL;</span>
+                    } else {
+<span class="fc" id="L389">                        return;</span>
+                    }
+                    break;
+
+
+                /**
+                 * Awaiting CRLF after the chunk
+                 */
+                case STATE_AWAITING_CHUNK_EOL:
+                    /* not available yet */
+<span class="pc bpc" id="L399" title="1 of 2 branches missed.">                    if (rawPos + 1 &gt;= rawCount) {</span>
+<span class="nc" id="L400">                        return;</span>
+                    }
+
+<span class="pc bpc" id="L403" title="1 of 2 branches missed.">                    if (rawData[rawPos] != '\r') {</span>
+<span class="nc" id="L404">                        error = true;</span>
+<span class="nc" id="L405">                        throw new IOException(&quot;missing CR&quot;);</span>
+                    }
+<span class="pc bpc" id="L407" title="1 of 2 branches missed.">                    if (rawData[rawPos+1] != '\n') {</span>
+<span class="nc" id="L408">                        error = true;</span>
+<span class="nc" id="L409">                        throw new IOException(&quot;missing LF&quot;);</span>
+                    }
+<span class="fc" id="L411">                    rawPos += 2;</span>
+
+                    /*
+                     * Move onto the next chunk
+                     */
+<span class="fc" id="L416">                    state = STATE_AWAITING_CHUNK_HEADER;</span>
+<span class="fc" id="L417">                    break;</span>
+
+
+                /**
+                 * Last chunk has been read so not we're waiting for optional
+                 * trailers.
+                 */
+                case STATE_AWAITING_TRAILERS:
+
+                    /*
+                     * Do we have an entire line in the raw buffer?
+                     */
+<span class="fc" id="L429">                    pos = rawPos;</span>
+<span class="fc bfc" id="L430" title="All 2 branches covered.">                    while (pos &lt; rawCount) {</span>
+<span class="fc bfc" id="L431" title="All 2 branches covered.">                        if (rawData[pos] == '\n') {</span>
+<span class="fc" id="L432">                            break;</span>
+                        }
+<span class="fc" id="L434">                        pos++;</span>
+                    }
+<span class="fc bfc" id="L436" title="All 2 branches covered.">                    if (pos &gt;= rawCount) {</span>
+<span class="fc" id="L437">                        return;</span>
+                    }
+
+<span class="pc bpc" id="L440" title="1 of 2 branches missed.">                    if (pos == rawPos) {</span>
+<span class="nc" id="L441">                        error = true;</span>
+<span class="nc" id="L442">                        throw new IOException(&quot;LF should be proceeded by CR&quot;);</span>
+                    }
+<span class="pc bpc" id="L444" title="1 of 2 branches missed.">                    if (rawData[pos-1] != '\r') {</span>
+<span class="nc" id="L445">                        error = true;</span>
+<span class="nc" id="L446">                        throw new IOException(&quot;LF should be proceeded by CR&quot;);</span>
+                    }
+
+                    /*
+                     * Stream done so close underlying stream.
+                     */
+<span class="fc bfc" id="L452" title="All 2 branches covered.">                    if (pos == (rawPos + 1)) {</span>
+
+<span class="fc" id="L454">                        state = STATE_DONE;</span>
+<span class="fc" id="L455">                        closeUnderlying();</span>
+
+<span class="fc" id="L457">                        return;</span>
+                    }
+
+                    /*
+                     * Extract any tailers and append them to the message
+                     * headers.
+                     */
+<span class="fc" id="L464">                    String trailer = new String(rawData, rawPos, pos-rawPos, &quot;US-ASCII&quot;);</span>
+<span class="fc" id="L465">                    i = trailer.indexOf(':');</span>
+<span class="pc bpc" id="L466" title="1 of 2 branches missed.">                    if (i == -1) {</span>
+<span class="nc" id="L467">                        throw new IOException(&quot;Malformed tailer - format should be key:value&quot;);</span>
+                    }
+<span class="fc" id="L469">                    String key = (trailer.substring(0, i)).trim();</span>
+<span class="fc" id="L470">                    String value = (trailer.substring(i+1, trailer.length())).trim();</span>
+
+<span class="fc" id="L472">                    responses.add(key, value);</span>
+
+                    /*
+                     * Move onto the next trailer.
+                     */
+<span class="fc" id="L477">                    rawPos = pos+1;</span>
+<span class="fc" id="L478">                    break;</span>
+
+            } /* switch */
+        }
+<span class="nc" id="L482">    }</span>
+
+
+    /**
+     * Reads any available bytes from the underlying stream into
+     * &lt;code&gt;rawData&lt;/code&gt; and returns the number of bytes of
+     * chunk data available in &lt;code&gt;chunkData&lt;/code&gt; that the
+     * application can read.
+     */
+    private int readAheadNonBlocking() throws IOException {
+
+        /*
+         * If there's anything available on the underlying stream then we read
+         * it into the raw buffer and process it. Processing ensures that any
+         * available chunk data is made available in chunkData.
+         */
+<span class="fc" id="L498">        int avail = in.available();</span>
+<span class="fc bfc" id="L499" title="All 2 branches covered.">        if (avail &gt; 0) {</span>
+
+            /* ensure that there is space in rawData to read the available */
+<span class="fc" id="L502">            ensureRawAvailable(avail);</span>
+
+            int nread;
+            try {
+<span class="fc" id="L506">                nread = in.read(rawData, rawCount, avail);</span>
+<span class="nc" id="L507">            } catch (IOException e) {</span>
+<span class="nc" id="L508">                error = true;</span>
+<span class="nc" id="L509">                throw e;</span>
+<span class="fc" id="L510">            }</span>
+<span class="pc bpc" id="L511" title="1 of 2 branches missed.">            if (nread &lt; 0) {</span>
+<span class="nc" id="L512">                error = true;   /* premature EOF ? */</span>
+<span class="nc" id="L513">                return -1;</span>
+            }
+<span class="fc" id="L515">            rawCount += nread;</span>
+
+            /*
+             * Process the raw bytes that have been read.
+             */
+<span class="fc" id="L520">            processRaw();</span>
+        }
+
+        /*
+         * Return the number of chunked bytes available to read
+         */
+<span class="fc" id="L526">        return chunkCount - chunkPos;</span>
+    }
+
+    /**
+     * Reads from the underlying stream until there is chunk data
+     * available in &lt;code&gt;chunkData&lt;/code&gt; for the application to
+     * read.
+     */
+    private int readAheadBlocking() throws IOException {
+
+        do {
+            /*
+             * All of chunked response has been read to return EOF.
+             */
+<span class="fc bfc" id="L540" title="All 2 branches covered.">            if (state == STATE_DONE) {</span>
+<span class="fc" id="L541">                return -1;</span>
+            }
+
+            /*
+             * We must read into the raw buffer so make sure there is space
+             * available. We use a size of 32 to avoid too much chunk data
+             * being read into the raw buffer.
+             */
+<span class="fc" id="L549">            ensureRawAvailable(32);</span>
+            int nread;
+            try {
+<span class="fc" id="L552">                nread = in.read(rawData, rawCount, rawData.length-rawCount);</span>
+<span class="nc" id="L553">            } catch (IOException e) {</span>
+<span class="nc" id="L554">                error = true;</span>
+<span class="nc" id="L555">                throw e;</span>
+<span class="fc" id="L556">            }</span>
+
+            /**
+             * If we hit EOF it means there's a problem as we should never
+             * attempt to read once the last chunk and trailers have been
+             * received.
+             */
+<span class="pc bpc" id="L563" title="1 of 2 branches missed.">            if (nread &lt; 0) {</span>
+<span class="nc" id="L564">                error = true;</span>
+<span class="nc" id="L565">                throw new IOException(&quot;Premature EOF&quot;);</span>
+            }
+
+            /**
+             * Process the bytes from the underlying stream
+             */
+<span class="fc" id="L571">            rawCount += nread;</span>
+<span class="fc" id="L572">            processRaw();</span>
+
+<span class="fc bfc" id="L574" title="All 2 branches covered.">        } while (chunkCount &lt;= 0);</span>
+
+        /*
+         * Return the number of chunked bytes available to read
+         */
+<span class="fc" id="L579">        return chunkCount - chunkPos;</span>
+    }
+
+    /**
+     * Read ahead in either blocking or non-blocking mode. This method
+     * is typically used when we run out of available bytes in
+     * &lt;code&gt;chunkData&lt;/code&gt; or we need to determine how many bytes
+     * are available on the input stream.
+     */
+    private int readAhead(boolean allowBlocking) throws IOException {
+
+        /*
+         * Last chunk already received - return EOF
+         */
+<span class="fc bfc" id="L593" title="All 2 branches covered.">        if (state == STATE_DONE) {</span>
+<span class="fc" id="L594">            return -1;</span>
+        }
+
+        /*
+         * Reset position/count if data in chunkData is exhausted.
+         */
+<span class="fc bfc" id="L600" title="All 2 branches covered.">        if (chunkPos &gt;= chunkCount) {</span>
+<span class="fc" id="L601">            chunkCount = 0;</span>
+<span class="fc" id="L602">            chunkPos = 0;</span>
+        }
+
+        /*
+         * Read ahead blocking or non-blocking
+         */
+<span class="fc bfc" id="L608" title="All 2 branches covered.">        if (allowBlocking) {</span>
+<span class="fc" id="L609">            return readAheadBlocking();</span>
+        } else {
+<span class="fc" id="L611">            return readAheadNonBlocking();</span>
+        }
+    }
+
+    /**
+     * Creates a &lt;code&gt;ChunkedInputStream&lt;/code&gt; and saves its  arguments, for
+     * later use.
+     *
+     * @param   in   the underlying input stream.
+     * @param   hc   the HttpClient
+     * @param   responses   the MessageHeader that should be populated with optional
+     *                      trailers.
+     */
+<span class="fc" id="L624">    public ChunkedInputStream(InputStream in, HttpClient hc, MessageHeader responses) throws IOException {</span>
+
+        /* save arguments */
+<span class="fc" id="L627">        this.in = in;</span>
+<span class="fc" id="L628">        this.responses = responses;</span>
+<span class="fc" id="L629">        this.hc = hc;</span>
+
+        /*
+         * Set our initial state to indicate that we are first starting to
+         * look for a chunk header.
+         */
+<span class="fc" id="L635">        state = STATE_AWAITING_CHUNK_HEADER;</span>
+<span class="fc" id="L636">    }</span>
+
+    /**
+     * See
+     * the general contract of the &lt;code&gt;read&lt;/code&gt;
+     * method of &lt;code&gt;InputStream&lt;/code&gt;.
+     *
+     * @return     the next byte of data, or &lt;code&gt;-1&lt;/code&gt; if the end of the
+     *             stream is reached.
+     * @exception  IOException  if an I/O error occurs.
+     * @see        java.io.FilterInputStream#in
+     */
+    public synchronized int read() throws IOException {
+<span class="nc" id="L649">        ensureOpen();</span>
+<span class="nc bnc" id="L650" title="All 2 branches missed.">        if (chunkPos &gt;= chunkCount) {</span>
+<span class="nc bnc" id="L651" title="All 2 branches missed.">            if (readAhead(true) &lt;= 0) {</span>
+<span class="nc" id="L652">                return -1;</span>
+            }
+        }
+<span class="nc" id="L655">        return chunkData[chunkPos++] &amp; 0xff;</span>
+    }
+
+
+    /**
+     * Reads bytes from this stream into the specified byte array, starting at
+     * the given offset.
+     *
+     * @param      b     destination buffer.
+     * @param      off   offset at which to start storing bytes.
+     * @param      len   maximum number of bytes to read.
+     * @return     the number of bytes read, or &lt;code&gt;-1&lt;/code&gt; if the end of
+     *             the stream has been reached.
+     * @exception  IOException  if an I/O error occurs.
+     */
+    public synchronized int read(byte b[], int off, int len)
+        throws IOException
+    {
+<span class="fc" id="L673">        ensureOpen();</span>
+<span class="pc bpc" id="L674" title="5 of 10 branches missed.">        if ((off &lt; 0) || (off &gt; b.length) || (len &lt; 0) ||</span>
+            ((off + len) &gt; b.length) || ((off + len) &lt; 0)) {
+<span class="nc" id="L676">            throw new IndexOutOfBoundsException();</span>
+<span class="pc bpc" id="L677" title="1 of 2 branches missed.">        } else if (len == 0) {</span>
+<span class="nc" id="L678">            return 0;</span>
+        }
+
+<span class="fc" id="L681">        int avail = chunkCount - chunkPos;</span>
+<span class="fc bfc" id="L682" title="All 2 branches covered.">        if (avail &lt;= 0) {</span>
+            /*
+             * Optimization: if we're in the middle of the chunk read
+             * directly from the underlying stream into the caller's
+             * buffer
+             */
+<span class="fc bfc" id="L688" title="All 2 branches covered.">            if (state == STATE_READING_CHUNK) {</span>
+<span class="fc" id="L689">                return fastRead( b, off, len );</span>
+            }
+
+            /*
+             * We're not in the middle of a chunk so we must read ahead
+             * until there is some chunk data available.
+             */
+<span class="fc" id="L696">            avail = readAhead(true);</span>
+<span class="fc bfc" id="L697" title="All 2 branches covered.">            if (avail &lt; 0) {</span>
+<span class="fc" id="L698">                return -1;      /* EOF */</span>
+            }
+        }
+<span class="fc bfc" id="L701" title="All 2 branches covered.">        int cnt = (avail &lt; len) ? avail : len;</span>
+<span class="fc" id="L702">        System.arraycopy(chunkData, chunkPos, b, off, cnt);</span>
+<span class="fc" id="L703">        chunkPos += cnt;</span>
+
+<span class="fc" id="L705">        return cnt;</span>
+    }
+
+    /**
+     * Returns the number of bytes that can be read from this input
+     * stream without blocking.
+     *
+     * @return     the number of bytes that can be read from this input
+     *             stream without blocking.
+     * @exception  IOException  if an I/O error occurs.
+     * @see        java.io.FilterInputStream#in
+     */
+    public synchronized int available() throws IOException {
+<span class="fc" id="L718">        ensureOpen();</span>
+
+<span class="fc" id="L720">        int avail = chunkCount - chunkPos;</span>
+<span class="fc bfc" id="L721" title="All 2 branches covered.">        if(avail &gt; 0) {</span>
+<span class="fc" id="L722">            return avail;</span>
+        }
+
+<span class="fc" id="L725">        avail = readAhead(false);</span>
+
+<span class="pc bpc" id="L727" title="1 of 2 branches missed.">        if (avail &lt; 0) {</span>
+<span class="nc" id="L728">            return 0;</span>
+        } else  {
+<span class="fc" id="L730">            return avail;</span>
+        }
+    }
+
+    /**
+     * Close the stream by either returning the connection to the
+     * keep alive cache or closing the underlying stream.
+     * &lt;p&gt;
+     * If the chunked response hasn't been completely read we
+     * try to &quot;hurry&quot; to the end of the response. If this is
+     * possible (without blocking) then the connection can be
+     * returned to the keep alive cache.
+     *
+     * @exception  IOException  if an I/O error occurs.
+     */
+    public synchronized void close() throws IOException {
+<span class="pc bpc" id="L746" title="1 of 2 branches missed.">        if (closed) {</span>
+<span class="nc" id="L747">            return;</span>
+        }
+<span class="fc" id="L749">        closeUnderlying();</span>
+<span class="fc" id="L750">        closed = true;</span>
+<span class="fc" id="L751">    }</span>
+
+    /**
+     * Hurry the input stream by reading everything from the underlying
+     * stream. If the last chunk (and optional trailers) can be read without
+     * blocking then the stream is considered hurried.
+     * &lt;p&gt;
+     * Note that if an error has occurred or we can't get to last chunk
+     * without blocking then this stream can't be hurried and should be
+     * closed.
+     */
+    public synchronized boolean hurry() {
+<span class="pc bpc" id="L763" title="2 of 4 branches missed.">        if (in == null || error) {</span>
+<span class="nc" id="L764">            return false;</span>
+        }
+
+        try {
+<span class="fc" id="L768">            readAhead(false);</span>
+<span class="nc" id="L769">        } catch (Exception e) {</span>
+<span class="nc" id="L770">            return false;</span>
+<span class="fc" id="L771">        }</span>
+
+<span class="pc bpc" id="L773" title="1 of 2 branches missed.">        if (error) {</span>
+<span class="nc" id="L774">            return false;</span>
+        }
+
+<span class="fc bfc" id="L777" title="All 2 branches covered.">        return (state == STATE_DONE);</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

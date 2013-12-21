@@ -1,0 +1,839 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>X509KeyManagerImpl.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.ssl</a> &gt; <span class="el_source">X509KeyManagerImpl.java</span></div><h1>X509KeyManagerImpl.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2004, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.security.ssl;
+
+import java.lang.ref.*;
+import java.util.*;
+import static java.util.Locale.ENGLISH;
+import java.util.concurrent.atomic.AtomicLong;
+import java.net.Socket;
+
+import java.security.*;
+import java.security.KeyStore.*;
+import java.security.cert.*;
+import java.security.cert.Certificate;
+
+import javax.net.ssl.*;
+
+import sun.security.provider.certpath.AlgorithmChecker;
+
+/**
+ * The new X509 key manager implementation. The main differences to the
+ * old SunX509 key manager are:
+ *  . it is based around the KeyStore.Builder API. This allows it to use
+ *    other forms of KeyStore protection or password input (e.g. a
+ *    CallbackHandler) or to have keys within one KeyStore protected by
+ *    different keys.
+ *  . it can use multiple KeyStores at the same time.
+ *  . it is explicitly designed to accommodate KeyStores that change over
+ *    the lifetime of the process.
+ *  . it makes an effort to choose the key that matches best, i.e. one that
+ *    is not expired and has the appropriate certificate extensions.
+ *
+ * Note that this code is not explicitly performance optimzied yet.
+ *
+ * @author  Andreas Sterbenz
+ */
+final class X509KeyManagerImpl extends X509ExtendedKeyManager
+        implements X509KeyManager {
+
+<span class="nc" id="L63">    private static final Debug debug = Debug.getInstance(&quot;ssl&quot;);</span>
+
+<span class="nc bnc" id="L65" title="All 2 branches missed.">    private final static boolean useDebug =</span>
+<span class="nc bnc" id="L66" title="All 2 branches missed.">                            (debug != null) &amp;&amp; Debug.isOn(&quot;keymanager&quot;);</span>
+
+    // for unit testing only, set via privileged reflection
+    private static Date verificationDate;
+
+    // list of the builders
+    private final List&lt;Builder&gt; builders;
+
+    // counter to generate unique ids for the aliases
+    private final AtomicLong uidCounter;
+
+    // cached entries
+    private final Map&lt;String,Reference&lt;PrivateKeyEntry&gt;&gt; entryCacheMap;
+
+    X509KeyManagerImpl(Builder builder) {
+<span class="nc" id="L81">        this(Collections.singletonList(builder));</span>
+<span class="nc" id="L82">    }</span>
+
+<span class="nc" id="L84">    X509KeyManagerImpl(List&lt;Builder&gt; builders) {</span>
+<span class="nc" id="L85">        this.builders = builders;</span>
+<span class="nc" id="L86">        uidCounter = new AtomicLong();</span>
+<span class="nc" id="L87">        entryCacheMap = Collections.synchronizedMap</span>
+<span class="nc" id="L88">                        (new SizedMap&lt;String,Reference&lt;PrivateKeyEntry&gt;&gt;());</span>
+<span class="nc" id="L89">    }</span>
+
+    // LinkedHashMap with a max size of 10
+    // see LinkedHashMap JavaDocs
+<span class="nc" id="L93">    private static class SizedMap&lt;K,V&gt; extends LinkedHashMap&lt;K,V&gt; {</span>
+        private static final long serialVersionUID = -8211222668790986062L;
+
+        @Override protected boolean removeEldestEntry(Map.Entry&lt;K,V&gt; eldest) {
+<span class="nc bnc" id="L97" title="All 2 branches missed.">            return size() &gt; 10;</span>
+        }
+    }
+
+    //
+    // public methods
+    //
+
+    @Override
+    public X509Certificate[] getCertificateChain(String alias) {
+<span class="nc" id="L107">        PrivateKeyEntry entry = getEntry(alias);</span>
+<span class="nc bnc" id="L108" title="All 2 branches missed.">        return entry == null ? null :</span>
+<span class="nc" id="L109">                (X509Certificate[])entry.getCertificateChain();</span>
+    }
+
+    @Override
+    public PrivateKey getPrivateKey(String alias) {
+<span class="nc" id="L114">        PrivateKeyEntry entry = getEntry(alias);</span>
+<span class="nc bnc" id="L115" title="All 2 branches missed.">        return entry == null ? null : entry.getPrivateKey();</span>
+    }
+
+    @Override
+    public String chooseClientAlias(String[] keyTypes, Principal[] issuers,
+            Socket socket) {
+<span class="nc" id="L121">        return chooseAlias(getKeyTypes(keyTypes), issuers, CheckType.CLIENT,</span>
+<span class="nc" id="L122">                        getAlgorithmConstraints(socket));</span>
+    }
+
+    @Override
+    public String chooseEngineClientAlias(String[] keyTypes,
+            Principal[] issuers, SSLEngine engine) {
+<span class="nc" id="L128">        return chooseAlias(getKeyTypes(keyTypes), issuers, CheckType.CLIENT,</span>
+<span class="nc" id="L129">                        getAlgorithmConstraints(engine));</span>
+    }
+
+    @Override
+    public String chooseServerAlias(String keyType,
+            Principal[] issuers, Socket socket) {
+<span class="nc" id="L135">        return chooseAlias(getKeyTypes(keyType), issuers, CheckType.SERVER,</span>
+<span class="nc" id="L136">            getAlgorithmConstraints(socket),</span>
+<span class="nc" id="L137">            X509TrustManagerImpl.getRequestedServerNames(socket),</span>
+            &quot;HTTPS&quot;);    // The SNI HostName is a fully qualified domain name.
+                         // The certificate selection scheme for SNI HostName
+                         // is similar to HTTPS endpoint identification scheme
+                         // implemented in this provider.
+                         //
+                         // Using HTTPS endpoint identification scheme to guide
+                         // the selection of an appropriate authentication
+                         // certificate according to requested SNI extension.
+                         //
+                         // It is not a really HTTPS endpoint identification.
+    }
+
+    @Override
+    public String chooseEngineServerAlias(String keyType,
+            Principal[] issuers, SSLEngine engine) {
+<span class="nc" id="L153">        return chooseAlias(getKeyTypes(keyType), issuers, CheckType.SERVER,</span>
+<span class="nc" id="L154">            getAlgorithmConstraints(engine),</span>
+<span class="nc" id="L155">            X509TrustManagerImpl.getRequestedServerNames(engine),</span>
+            &quot;HTTPS&quot;);    // The SNI HostName is a fully qualified domain name.
+                         // The certificate selection scheme for SNI HostName
+                         // is similar to HTTPS endpoint identification scheme
+                         // implemented in this provider.
+                         //
+                         // Using HTTPS endpoint identification scheme to guide
+                         // the selection of an appropriate authentication
+                         // certificate according to requested SNI extension.
+                         //
+                         // It is not a really HTTPS endpoint identification.
+    }
+
+    @Override
+    public String[] getClientAliases(String keyType, Principal[] issuers) {
+<span class="nc" id="L170">        return getAliases(keyType, issuers, CheckType.CLIENT, null);</span>
+    }
+
+    @Override
+    public String[] getServerAliases(String keyType, Principal[] issuers) {
+<span class="nc" id="L175">        return getAliases(keyType, issuers, CheckType.SERVER, null);</span>
+    }
+
+    //
+    // implementation private methods
+    //
+
+    // Gets algorithm constraints of the socket.
+    private AlgorithmConstraints getAlgorithmConstraints(Socket socket) {
+<span class="nc bnc" id="L184" title="All 6 branches missed.">        if (socket != null &amp;&amp; socket.isConnected() &amp;&amp;</span>
+                                        socket instanceof SSLSocket) {
+
+<span class="nc" id="L187">            SSLSocket sslSocket = (SSLSocket)socket;</span>
+<span class="nc" id="L188">            SSLSession session = sslSocket.getHandshakeSession();</span>
+
+<span class="nc bnc" id="L190" title="All 2 branches missed.">            if (session != null) {</span>
+<span class="nc" id="L191">                ProtocolVersion protocolVersion =</span>
+<span class="nc" id="L192">                    ProtocolVersion.valueOf(session.getProtocol());</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">                if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L194">                    String[] peerSupportedSignAlgs = null;</span>
+
+<span class="nc bnc" id="L196" title="All 2 branches missed.">                    if (session instanceof ExtendedSSLSession) {</span>
+<span class="nc" id="L197">                        ExtendedSSLSession extSession =</span>
+                            (ExtendedSSLSession)session;
+<span class="nc" id="L199">                        peerSupportedSignAlgs =</span>
+<span class="nc" id="L200">                            extSession.getPeerSupportedSignatureAlgorithms();</span>
+                    }
+
+<span class="nc" id="L203">                    return new SSLAlgorithmConstraints(</span>
+                        sslSocket, peerSupportedSignAlgs, true);
+                }
+            }
+
+<span class="nc" id="L208">            return new SSLAlgorithmConstraints(sslSocket, true);</span>
+        }
+
+<span class="nc" id="L211">        return new SSLAlgorithmConstraints((SSLSocket)null, true);</span>
+    }
+
+    // Gets algorithm constraints of the engine.
+    private AlgorithmConstraints getAlgorithmConstraints(SSLEngine engine) {
+<span class="nc bnc" id="L216" title="All 2 branches missed.">        if (engine != null) {</span>
+<span class="nc" id="L217">            SSLSession session = engine.getHandshakeSession();</span>
+<span class="nc bnc" id="L218" title="All 2 branches missed.">            if (session != null) {</span>
+<span class="nc" id="L219">                ProtocolVersion protocolVersion =</span>
+<span class="nc" id="L220">                    ProtocolVersion.valueOf(session.getProtocol());</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">                if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</span>
+<span class="nc" id="L222">                    String[] peerSupportedSignAlgs = null;</span>
+
+<span class="nc bnc" id="L224" title="All 2 branches missed.">                    if (session instanceof ExtendedSSLSession) {</span>
+<span class="nc" id="L225">                        ExtendedSSLSession extSession =</span>
+                            (ExtendedSSLSession)session;
+<span class="nc" id="L227">                        peerSupportedSignAlgs =</span>
+<span class="nc" id="L228">                            extSession.getPeerSupportedSignatureAlgorithms();</span>
+                    }
+
+<span class="nc" id="L231">                    return new SSLAlgorithmConstraints(</span>
+                        engine, peerSupportedSignAlgs, true);
+                }
+            }
+        }
+
+<span class="nc" id="L237">        return new SSLAlgorithmConstraints(engine, true);</span>
+    }
+
+    // we construct the alias we return to JSSE as seen in the code below
+    // a unique id is included to allow us to reliably cache entries
+    // between the calls to getCertificateChain() and getPrivateKey()
+    // even if tokens are inserted or removed
+    private String makeAlias(EntryStatus entry) {
+<span class="nc" id="L245">        return uidCounter.incrementAndGet() + &quot;.&quot; + entry.builderIndex + &quot;.&quot;</span>
+                + entry.alias;
+    }
+
+    private PrivateKeyEntry getEntry(String alias) {
+        // if the alias is null, return immediately
+<span class="nc bnc" id="L251" title="All 2 branches missed.">        if (alias == null) {</span>
+<span class="nc" id="L252">            return null;</span>
+        }
+
+        // try to get the entry from cache
+<span class="nc" id="L256">        Reference&lt;PrivateKeyEntry&gt; ref = entryCacheMap.get(alias);</span>
+<span class="nc bnc" id="L257" title="All 2 branches missed.">        PrivateKeyEntry entry = (ref != null) ? ref.get() : null;</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">        if (entry != null) {</span>
+<span class="nc" id="L259">            return entry;</span>
+        }
+
+        // parse the alias
+<span class="nc" id="L263">        int firstDot = alias.indexOf('.');</span>
+<span class="nc" id="L264">        int secondDot = alias.indexOf('.', firstDot + 1);</span>
+<span class="nc bnc" id="L265" title="All 4 branches missed.">        if ((firstDot == -1) || (secondDot == firstDot)) {</span>
+            // invalid alias
+<span class="nc" id="L267">            return null;</span>
+        }
+        try {
+<span class="nc" id="L270">            int builderIndex = Integer.parseInt</span>
+<span class="nc" id="L271">                                (alias.substring(firstDot + 1, secondDot));</span>
+<span class="nc" id="L272">            String keyStoreAlias = alias.substring(secondDot + 1);</span>
+<span class="nc" id="L273">            Builder builder = builders.get(builderIndex);</span>
+<span class="nc" id="L274">            KeyStore ks = builder.getKeyStore();</span>
+<span class="nc" id="L275">            Entry newEntry = ks.getEntry</span>
+<span class="nc" id="L276">                    (keyStoreAlias, builder.getProtectionParameter(alias));</span>
+<span class="nc bnc" id="L277" title="All 2 branches missed.">            if (newEntry instanceof PrivateKeyEntry == false) {</span>
+                // unexpected type of entry
+<span class="nc" id="L279">                return null;</span>
+            }
+<span class="nc" id="L281">            entry = (PrivateKeyEntry)newEntry;</span>
+<span class="nc" id="L282">            entryCacheMap.put(alias, new SoftReference&lt;PrivateKeyEntry&gt;(entry));</span>
+<span class="nc" id="L283">            return entry;</span>
+<span class="nc" id="L284">        } catch (Exception e) {</span>
+            // ignore
+<span class="nc" id="L286">            return null;</span>
+        }
+    }
+
+    // Class to help verify that the public key algorithm (and optionally
+    // the signature algorithm) of a certificate matches what we need.
+    private static class KeyType {
+
+        final String keyAlgorithm;
+
+        // In TLS 1.2, the signature algorithm  has been obsoleted by the
+        // supported_signature_algorithms, and the certificate type no longer
+        // restricts the algorithm used to sign the certificate.
+        // However, because we don't support certificate type checking other
+        // than rsa_sign, dss_sign and ecdsa_sign, we don't have to check the
+        // protocol version here.
+        final String sigKeyAlgorithm;
+
+<span class="nc" id="L304">        KeyType(String algorithm) {</span>
+<span class="nc" id="L305">            int k = algorithm.indexOf(&quot;_&quot;);</span>
+<span class="nc bnc" id="L306" title="All 2 branches missed.">            if (k == -1) {</span>
+<span class="nc" id="L307">                keyAlgorithm = algorithm;</span>
+<span class="nc" id="L308">                sigKeyAlgorithm = null;</span>
+            } else {
+<span class="nc" id="L310">                keyAlgorithm = algorithm.substring(0, k);</span>
+<span class="nc" id="L311">                sigKeyAlgorithm = algorithm.substring(k + 1);</span>
+            }
+<span class="nc" id="L313">        }</span>
+
+        boolean matches(Certificate[] chain) {
+<span class="nc bnc" id="L316" title="All 2 branches missed.">            if (!chain[0].getPublicKey().getAlgorithm().equals(keyAlgorithm)) {</span>
+<span class="nc" id="L317">                return false;</span>
+            }
+<span class="nc bnc" id="L319" title="All 2 branches missed.">            if (sigKeyAlgorithm == null) {</span>
+<span class="nc" id="L320">                return true;</span>
+            }
+<span class="nc bnc" id="L322" title="All 2 branches missed.">            if (chain.length &gt; 1) {</span>
+                // if possible, check the public key in the issuer cert
+<span class="nc" id="L324">                return sigKeyAlgorithm.equals(</span>
+<span class="nc" id="L325">                        chain[1].getPublicKey().getAlgorithm());</span>
+            } else {
+                // Check the signature algorithm of the certificate itself.
+                // Look for the &quot;withRSA&quot; in &quot;SHA1withRSA&quot;, etc.
+<span class="nc" id="L329">                X509Certificate issuer = (X509Certificate)chain[0];</span>
+<span class="nc" id="L330">                String sigAlgName = issuer.getSigAlgName().toUpperCase(ENGLISH);</span>
+<span class="nc" id="L331">                String pattern = &quot;WITH&quot; + sigKeyAlgorithm.toUpperCase(ENGLISH);</span>
+<span class="nc" id="L332">                return sigAlgName.contains(pattern);</span>
+            }
+        }
+    }
+
+    private static List&lt;KeyType&gt; getKeyTypes(String ... keyTypes) {
+<span class="nc bnc" id="L338" title="All 6 branches missed.">        if ((keyTypes == null) ||</span>
+                (keyTypes.length == 0) || (keyTypes[0] == null)) {
+<span class="nc" id="L340">            return null;</span>
+        }
+<span class="nc" id="L342">        List&lt;KeyType&gt; list = new ArrayList&lt;&gt;(keyTypes.length);</span>
+<span class="nc bnc" id="L343" title="All 2 branches missed.">        for (String keyType : keyTypes) {</span>
+<span class="nc" id="L344">            list.add(new KeyType(keyType));</span>
+        }
+<span class="nc" id="L346">        return list;</span>
+    }
+
+    /*
+     * Return the best alias that fits the given parameters.
+     * The algorithm we use is:
+     *   . scan through all the aliases in all builders in order
+     *   . as soon as we find a perfect match, return
+     *     (i.e. a match with a cert that has appropriate key usage,
+     *      qualified endpoint identity, and is not expired).
+     *   . if we do not find a perfect match, keep looping and remember
+     *     the imperfect matches
+     *   . at the end, sort the imperfect matches. we prefer expired certs
+     *     with appropriate key usage to certs with the wrong key usage.
+     *     return the first one of them.
+     */
+    private String chooseAlias(List&lt;KeyType&gt; keyTypeList, Principal[] issuers,
+            CheckType checkType, AlgorithmConstraints constraints) {
+
+<span class="nc" id="L365">        return chooseAlias(keyTypeList, issuers,</span>
+                                    checkType, constraints, null, null);
+    }
+
+    private String chooseAlias(List&lt;KeyType&gt; keyTypeList, Principal[] issuers,
+            CheckType checkType, AlgorithmConstraints constraints,
+            List&lt;SNIServerName&gt; requestedServerNames, String idAlgorithm) {
+
+<span class="nc bnc" id="L373" title="All 4 branches missed.">        if (keyTypeList == null || keyTypeList.isEmpty()) {</span>
+<span class="nc" id="L374">            return null;</span>
+        }
+
+<span class="nc" id="L377">        Set&lt;Principal&gt; issuerSet = getIssuerSet(issuers);</span>
+<span class="nc" id="L378">        List&lt;EntryStatus&gt; allResults = null;</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">        for (int i = 0, n = builders.size(); i &lt; n; i++) {</span>
+            try {
+<span class="nc" id="L381">                List&lt;EntryStatus&gt; results = getAliases(i, keyTypeList,</span>
+                            issuerSet, false, checkType, constraints,
+                            requestedServerNames, idAlgorithm);
+<span class="nc bnc" id="L384" title="All 2 branches missed.">                if (results != null) {</span>
+                    // the results will either be a single perfect match
+                    // or 1 or more imperfect matches
+                    // if it's a perfect match, return immediately
+<span class="nc" id="L388">                    EntryStatus status = results.get(0);</span>
+<span class="nc bnc" id="L389" title="All 2 branches missed.">                    if (status.checkResult == CheckResult.OK) {</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">                        if (useDebug) {</span>
+<span class="nc" id="L391">                            debug.println(&quot;KeyMgr: choosing key: &quot; + status);</span>
+                        }
+<span class="nc" id="L393">                        return makeAlias(status);</span>
+                    }
+<span class="nc bnc" id="L395" title="All 2 branches missed.">                    if (allResults == null) {</span>
+<span class="nc" id="L396">                        allResults = new ArrayList&lt;EntryStatus&gt;();</span>
+                    }
+<span class="nc" id="L398">                    allResults.addAll(results);</span>
+                }
+<span class="nc" id="L400">            } catch (Exception e) {</span>
+                // ignore
+<span class="nc" id="L402">            }</span>
+        }
+<span class="nc bnc" id="L404" title="All 2 branches missed.">        if (allResults == null) {</span>
+<span class="nc bnc" id="L405" title="All 2 branches missed.">            if (useDebug) {</span>
+<span class="nc" id="L406">                debug.println(&quot;KeyMgr: no matching key found&quot;);</span>
+            }
+<span class="nc" id="L408">            return null;</span>
+        }
+<span class="nc" id="L410">        Collections.sort(allResults);</span>
+<span class="nc bnc" id="L411" title="All 2 branches missed.">        if (useDebug) {</span>
+<span class="nc" id="L412">            debug.println(&quot;KeyMgr: no good matching key found, &quot;</span>
+                        + &quot;returning best match out of:&quot;);
+<span class="nc" id="L414">            debug.println(allResults.toString());</span>
+        }
+<span class="nc" id="L416">        return makeAlias(allResults.get(0));</span>
+    }
+
+    /*
+     * Return all aliases that (approximately) fit the parameters.
+     * These are perfect matches plus imperfect matches (expired certificates
+     * and certificates with the wrong extensions).
+     * The perfect matches will be first in the array.
+     */
+    public String[] getAliases(String keyType, Principal[] issuers,
+            CheckType checkType, AlgorithmConstraints constraints) {
+<span class="nc bnc" id="L427" title="All 2 branches missed.">        if (keyType == null) {</span>
+<span class="nc" id="L428">            return null;</span>
+        }
+
+<span class="nc" id="L431">        Set&lt;Principal&gt; issuerSet = getIssuerSet(issuers);</span>
+<span class="nc" id="L432">        List&lt;KeyType&gt; keyTypeList = getKeyTypes(keyType);</span>
+<span class="nc" id="L433">        List&lt;EntryStatus&gt; allResults = null;</span>
+<span class="nc bnc" id="L434" title="All 2 branches missed.">        for (int i = 0, n = builders.size(); i &lt; n; i++) {</span>
+            try {
+<span class="nc" id="L436">                List&lt;EntryStatus&gt; results = getAliases(i, keyTypeList,</span>
+                                    issuerSet, true, checkType, constraints,
+                                    null, null);
+<span class="nc bnc" id="L439" title="All 2 branches missed.">                if (results != null) {</span>
+<span class="nc bnc" id="L440" title="All 2 branches missed.">                    if (allResults == null) {</span>
+<span class="nc" id="L441">                        allResults = new ArrayList&lt;EntryStatus&gt;();</span>
+                    }
+<span class="nc" id="L443">                    allResults.addAll(results);</span>
+                }
+<span class="nc" id="L445">            } catch (Exception e) {</span>
+                // ignore
+<span class="nc" id="L447">            }</span>
+        }
+<span class="nc bnc" id="L449" title="All 4 branches missed.">        if (allResults == null || allResults.isEmpty()) {</span>
+<span class="nc bnc" id="L450" title="All 2 branches missed.">            if (useDebug) {</span>
+<span class="nc" id="L451">                debug.println(&quot;KeyMgr: no matching alias found&quot;);</span>
+            }
+<span class="nc" id="L453">            return null;</span>
+        }
+<span class="nc" id="L455">        Collections.sort(allResults);</span>
+<span class="nc bnc" id="L456" title="All 2 branches missed.">        if (useDebug) {</span>
+<span class="nc" id="L457">            debug.println(&quot;KeyMgr: getting aliases: &quot; + allResults);</span>
+        }
+<span class="nc" id="L459">        return toAliases(allResults);</span>
+    }
+
+    // turn candidate entries into unique aliases we can return to JSSE
+    private String[] toAliases(List&lt;EntryStatus&gt; results) {
+<span class="nc" id="L464">        String[] s = new String[results.size()];</span>
+<span class="nc" id="L465">        int i = 0;</span>
+<span class="nc bnc" id="L466" title="All 2 branches missed.">        for (EntryStatus result : results) {</span>
+<span class="nc" id="L467">            s[i++] = makeAlias(result);</span>
+<span class="nc" id="L468">        }</span>
+<span class="nc" id="L469">        return s;</span>
+    }
+
+    // make a Set out of the array
+    private Set&lt;Principal&gt; getIssuerSet(Principal[] issuers) {
+<span class="nc bnc" id="L474" title="All 4 branches missed.">        if ((issuers != null) &amp;&amp; (issuers.length != 0)) {</span>
+<span class="nc" id="L475">            return new HashSet&lt;&gt;(Arrays.asList(issuers));</span>
+        } else {
+<span class="nc" id="L477">            return null;</span>
+        }
+    }
+
+    // a candidate match
+    // identifies the entry by builder and alias
+    // and includes the result of the certificate check
+    private static class EntryStatus implements Comparable&lt;EntryStatus&gt; {
+
+        final int builderIndex;
+        final int keyIndex;
+        final String alias;
+        final CheckResult checkResult;
+
+        EntryStatus(int builderIndex, int keyIndex, String alias,
+<span class="nc" id="L492">                Certificate[] chain, CheckResult checkResult) {</span>
+<span class="nc" id="L493">            this.builderIndex = builderIndex;</span>
+<span class="nc" id="L494">            this.keyIndex = keyIndex;</span>
+<span class="nc" id="L495">            this.alias = alias;</span>
+<span class="nc" id="L496">            this.checkResult = checkResult;</span>
+<span class="nc" id="L497">        }</span>
+
+        @Override
+        public int compareTo(EntryStatus other) {
+<span class="nc" id="L501">            int result = this.checkResult.compareTo(other.checkResult);</span>
+<span class="nc bnc" id="L502" title="All 2 branches missed.">            return (result == 0) ? (this.keyIndex - other.keyIndex) : result;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L507">            String s = alias + &quot; (verified: &quot; + checkResult + &quot;)&quot;;</span>
+<span class="nc bnc" id="L508" title="All 2 branches missed.">            if (builderIndex == 0) {</span>
+<span class="nc" id="L509">                return s;</span>
+            } else {
+<span class="nc" id="L511">                return &quot;Builder #&quot; + builderIndex + &quot;, alias: &quot; + s;</span>
+            }
+        }
+    }
+
+    // enum for the type of certificate check we want to perform
+    // (client or server)
+    // also includes the check code itself
+<span class="nc" id="L519">    private static enum CheckType {</span>
+
+        // enum constant for &quot;no check&quot; (currently not used)
+<span class="nc" id="L522">        NONE(Collections.&lt;String&gt;emptySet()),</span>
+
+        // enum constant for &quot;tls client&quot; check
+        // valid EKU for TLS client: any, tls_client
+<span class="nc" id="L526">        CLIENT(new HashSet&lt;String&gt;(Arrays.asList(new String[] {</span>
+            &quot;2.5.29.37.0&quot;, &quot;1.3.6.1.5.5.7.3.2&quot; }))),
+
+        // enum constant for &quot;tls server&quot; check
+        // valid EKU for TLS server: any, tls_server, ns_sgc, ms_sgc
+<span class="nc" id="L531">        SERVER(new HashSet&lt;String&gt;(Arrays.asList(new String[] {</span>
+            &quot;2.5.29.37.0&quot;, &quot;1.3.6.1.5.5.7.3.1&quot;, &quot;2.16.840.1.113730.4.1&quot;,
+            &quot;1.3.6.1.4.1.311.10.3.3&quot; })));
+
+        // set of valid EKU values for this type
+        final Set&lt;String&gt; validEku;
+
+<span class="nc" id="L538">        CheckType(Set&lt;String&gt; validEku) {</span>
+<span class="nc" id="L539">            this.validEku = validEku;</span>
+<span class="nc" id="L540">        }</span>
+
+        private static boolean getBit(boolean[] keyUsage, int bit) {
+<span class="nc bnc" id="L543" title="All 4 branches missed.">            return (bit &lt; keyUsage.length) &amp;&amp; keyUsage[bit];</span>
+        }
+
+        // check if this certificate is appropriate for this type of use
+        // first check extensions, if they match, check expiration
+        // note: we may want to move this code into the sun.security.validator
+        // package
+        CheckResult check(X509Certificate cert, Date date,
+                List&lt;SNIServerName&gt; serverNames, String idAlgorithm) {
+
+<span class="nc bnc" id="L553" title="All 2 branches missed.">            if (this == NONE) {</span>
+<span class="nc" id="L554">                return CheckResult.OK;</span>
+            }
+
+            // check extensions
+            try {
+                // check extended key usage
+<span class="nc" id="L560">                List&lt;String&gt; certEku = cert.getExtendedKeyUsage();</span>
+<span class="nc bnc" id="L561" title="All 2 branches missed.">                if ((certEku != null) &amp;&amp;</span>
+<span class="nc bnc" id="L562" title="All 2 branches missed.">                        Collections.disjoint(validEku, certEku)) {</span>
+                    // if extension present and it does not contain any of
+                    // the valid EKU OIDs, return extension_mismatch
+<span class="nc" id="L565">                    return CheckResult.EXTENSION_MISMATCH;</span>
+                }
+
+                // check key usage
+<span class="nc" id="L569">                boolean[] ku = cert.getKeyUsage();</span>
+<span class="nc bnc" id="L570" title="All 2 branches missed.">                if (ku != null) {</span>
+<span class="nc" id="L571">                    String algorithm = cert.getPublicKey().getAlgorithm();</span>
+<span class="nc" id="L572">                    boolean kuSignature = getBit(ku, 0);</span>
+<span class="nc bnc" id="L573" title="All 18 branches missed.">                    switch (algorithm) {</span>
+                        case &quot;RSA&quot;:
+                            // require either signature bit
+                            // or if server also allow key encipherment bit
+<span class="nc bnc" id="L577" title="All 2 branches missed.">                            if (kuSignature == false) {</span>
+<span class="nc bnc" id="L578" title="All 4 branches missed.">                                if ((this == CLIENT) || (getBit(ku, 2) == false)) {</span>
+<span class="nc" id="L579">                                    return CheckResult.EXTENSION_MISMATCH;</span>
+                                }
+                            }
+                            break;
+                        case &quot;DSA&quot;:
+                            // require signature bit
+<span class="nc bnc" id="L585" title="All 2 branches missed.">                            if (kuSignature == false) {</span>
+<span class="nc" id="L586">                                return CheckResult.EXTENSION_MISMATCH;</span>
+                            }
+                            break;
+                        case &quot;DH&quot;:
+                            // require keyagreement bit
+<span class="nc bnc" id="L591" title="All 2 branches missed.">                            if (getBit(ku, 4) == false) {</span>
+<span class="nc" id="L592">                                return CheckResult.EXTENSION_MISMATCH;</span>
+                            }
+                            break;
+                        case &quot;EC&quot;:
+                            // require signature bit
+<span class="nc bnc" id="L597" title="All 2 branches missed.">                            if (kuSignature == false) {</span>
+<span class="nc" id="L598">                                return CheckResult.EXTENSION_MISMATCH;</span>
+                            }
+                            // For servers, also require key agreement.
+                            // This is not totally accurate as the keyAgreement
+                            // bit is only necessary for static ECDH key
+                            // exchange and not ephemeral ECDH. We leave it in
+                            // for now until there are signs that this check
+                            // causes problems for real world EC certificates.
+<span class="nc bnc" id="L606" title="All 4 branches missed.">                            if ((this == SERVER) &amp;&amp; (getBit(ku, 4) == false)) {</span>
+<span class="nc" id="L607">                                return CheckResult.EXTENSION_MISMATCH;</span>
+                            }
+                            break;
+                    }
+                }
+<span class="nc" id="L612">            } catch (CertificateException e) {</span>
+                // extensions unparseable, return failure
+<span class="nc" id="L614">                return CheckResult.EXTENSION_MISMATCH;</span>
+<span class="nc" id="L615">            }</span>
+
+            try {
+<span class="nc" id="L618">                cert.checkValidity(date);</span>
+<span class="nc" id="L619">            } catch (CertificateException e) {</span>
+<span class="nc" id="L620">                return CheckResult.EXPIRED;</span>
+<span class="nc" id="L621">            }</span>
+
+<span class="nc bnc" id="L623" title="All 4 branches missed.">            if (serverNames != null &amp;&amp; !serverNames.isEmpty()) {</span>
+<span class="nc bnc" id="L624" title="All 2 branches missed.">                for (SNIServerName serverName : serverNames) {</span>
+<span class="nc bnc" id="L625" title="All 2 branches missed.">                    if (serverName.getType() ==</span>
+                                StandardConstants.SNI_HOST_NAME) {
+<span class="nc bnc" id="L627" title="All 2 branches missed.">                        if (!(serverName instanceof SNIHostName)) {</span>
+                            try {
+<span class="nc" id="L629">                                serverName =</span>
+<span class="nc" id="L630">                                    new SNIHostName(serverName.getEncoded());</span>
+<span class="nc" id="L631">                            } catch (IllegalArgumentException iae) {</span>
+                                // unlikely to happen, just in case ...
+<span class="nc bnc" id="L633" title="All 2 branches missed.">                                if (useDebug) {</span>
+<span class="nc" id="L634">                                    debug.println(</span>
+                                       &quot;Illegal server name: &quot; + serverName);
+                                }
+
+<span class="nc" id="L638">                                return CheckResult.INSENSITIVE;</span>
+<span class="nc" id="L639">                            }</span>
+                        }
+<span class="nc" id="L641">                        String hostname =</span>
+<span class="nc" id="L642">                                ((SNIHostName)serverName).getAsciiName();</span>
+
+                        try {
+<span class="nc" id="L645">                            X509TrustManagerImpl.checkIdentity(hostname,</span>
+                                                        cert, idAlgorithm);
+<span class="nc" id="L647">                        } catch (CertificateException e) {</span>
+<span class="nc bnc" id="L648" title="All 2 branches missed.">                            if (useDebug) {</span>
+<span class="nc" id="L649">                                debug.println(</span>
+                                   &quot;Certificate identity does not match &quot; +
+                                   &quot;Server Name Inidication (SNI): &quot; +
+                                   hostname);
+                            }
+<span class="nc" id="L654">                            return CheckResult.INSENSITIVE;</span>
+<span class="nc" id="L655">                        }</span>
+
+                        break;
+                    }
+<span class="nc" id="L659">                }</span>
+            }
+
+<span class="nc" id="L662">            return CheckResult.OK;</span>
+        }
+    }
+
+    // enum for the result of the extension check
+    // NOTE: the order of the constants is important as they are used
+    // for sorting, i.e. OK is best, followed by EXPIRED and EXTENSION_MISMATCH
+<span class="nc" id="L669">    private static enum CheckResult {</span>
+<span class="nc" id="L670">        OK,                     // ok or not checked</span>
+<span class="nc" id="L671">        INSENSITIVE,            // server name indication insensitive</span>
+<span class="nc" id="L672">        EXPIRED,                // extensions valid but cert expired</span>
+<span class="nc" id="L673">        EXTENSION_MISMATCH,     // extensions invalid (expiration not checked)</span>
+    }
+
+    /*
+     * Return a List of all candidate matches in the specified builder
+     * that fit the parameters.
+     * We exclude entries in the KeyStore if they are not:
+     *  . private key entries
+     *  . the certificates are not X509 certificates
+     *  . the algorithm of the key in the EE cert doesn't match one of keyTypes
+     *  . none of the certs is issued by a Principal in issuerSet
+     * Using those entries would not be possible or they would almost
+     * certainly be rejected by the peer.
+     *
+     * In addition to those checks, we also check the extensions in the EE
+     * cert and its expiration. Even if there is a mismatch, we include
+     * such certificates because they technically work and might be accepted
+     * by the peer. This leads to more graceful failure and better error
+     * messages if the cert expires from one day to the next.
+     *
+     * The return values are:
+     *   . null, if there are no matching entries at all
+     *   . if 'findAll' is 'false' and there is a perfect match, a List
+     *     with a single element (early return)
+     *   . if 'findAll' is 'false' and there is NO perfect match, a List
+     *     with all the imperfect matches (expired, wrong extensions)
+     *   . if 'findAll' is 'true', a List with all perfect and imperfect
+     *     matches
+     */
+    private List&lt;EntryStatus&gt; getAliases(int builderIndex,
+            List&lt;KeyType&gt; keyTypes, Set&lt;Principal&gt; issuerSet,
+            boolean findAll, CheckType checkType,
+            AlgorithmConstraints constraints,
+            List&lt;SNIServerName&gt; requestedServerNames,
+            String idAlgorithm) throws Exception {
+
+<span class="nc" id="L709">        Builder builder = builders.get(builderIndex);</span>
+<span class="nc" id="L710">        KeyStore ks = builder.getKeyStore();</span>
+<span class="nc" id="L711">        List&lt;EntryStatus&gt; results = null;</span>
+<span class="nc" id="L712">        Date date = verificationDate;</span>
+<span class="nc" id="L713">        boolean preferred = false;</span>
+<span class="nc bnc" id="L714" title="All 2 branches missed.">        for (Enumeration&lt;String&gt; e = ks.aliases(); e.hasMoreElements(); ) {</span>
+<span class="nc" id="L715">            String alias = e.nextElement();</span>
+            // check if it is a key entry (private key or secret key)
+<span class="nc bnc" id="L717" title="All 2 branches missed.">            if (ks.isKeyEntry(alias) == false) {</span>
+<span class="nc" id="L718">                continue;</span>
+            }
+
+<span class="nc" id="L721">            Certificate[] chain = ks.getCertificateChain(alias);</span>
+<span class="nc bnc" id="L722" title="All 4 branches missed.">            if ((chain == null) || (chain.length == 0)) {</span>
+                // must be secret key entry, ignore
+<span class="nc" id="L724">                continue;</span>
+            }
+
+<span class="nc" id="L727">            boolean incompatible = false;</span>
+<span class="nc bnc" id="L728" title="All 2 branches missed.">            for (Certificate cert : chain) {</span>
+<span class="nc bnc" id="L729" title="All 2 branches missed.">                if (cert instanceof X509Certificate == false) {</span>
+                    // not an X509Certificate, ignore this alias
+<span class="nc" id="L731">                    incompatible = true;</span>
+<span class="nc" id="L732">                    break;</span>
+                }
+            }
+<span class="nc bnc" id="L735" title="All 2 branches missed.">            if (incompatible) {</span>
+<span class="nc" id="L736">                continue;</span>
+            }
+
+            // check keytype
+<span class="nc" id="L740">            int keyIndex = -1;</span>
+<span class="nc" id="L741">            int j = 0;</span>
+<span class="nc bnc" id="L742" title="All 2 branches missed.">            for (KeyType keyType : keyTypes) {</span>
+<span class="nc bnc" id="L743" title="All 2 branches missed.">                if (keyType.matches(chain)) {</span>
+<span class="nc" id="L744">                    keyIndex = j;</span>
+<span class="nc" id="L745">                    break;</span>
+                }
+<span class="nc" id="L747">                j++;</span>
+<span class="nc" id="L748">            }</span>
+<span class="nc bnc" id="L749" title="All 2 branches missed.">            if (keyIndex == -1) {</span>
+<span class="nc bnc" id="L750" title="All 2 branches missed.">                if (useDebug) {</span>
+<span class="nc" id="L751">                    debug.println(&quot;Ignoring alias &quot; + alias</span>
+                                + &quot;: key algorithm does not match&quot;);
+                }
+                continue;
+            }
+            // check issuers
+<span class="nc bnc" id="L757" title="All 2 branches missed.">            if (issuerSet != null) {</span>
+<span class="nc" id="L758">                boolean found = false;</span>
+<span class="nc bnc" id="L759" title="All 2 branches missed.">                for (Certificate cert : chain) {</span>
+<span class="nc" id="L760">                    X509Certificate xcert = (X509Certificate)cert;</span>
+<span class="nc bnc" id="L761" title="All 2 branches missed.">                    if (issuerSet.contains(xcert.getIssuerX500Principal())) {</span>
+<span class="nc" id="L762">                        found = true;</span>
+<span class="nc" id="L763">                        break;</span>
+                    }
+                }
+<span class="nc bnc" id="L766" title="All 2 branches missed.">                if (found == false) {</span>
+<span class="nc bnc" id="L767" title="All 2 branches missed.">                    if (useDebug) {</span>
+<span class="nc" id="L768">                        debug.println(&quot;Ignoring alias &quot; + alias</span>
+                                    + &quot;: issuers do not match&quot;);
+                    }
+                    continue;
+                }
+            }
+
+            // check the algorithm constraints
+<span class="nc bnc" id="L776" title="All 2 branches missed.">            if (constraints != null &amp;&amp;</span>
+<span class="nc bnc" id="L777" title="All 2 branches missed.">                    !conformsToAlgorithmConstraints(constraints, chain)) {</span>
+
+<span class="nc bnc" id="L779" title="All 2 branches missed.">                if (useDebug) {</span>
+<span class="nc" id="L780">                    debug.println(&quot;Ignoring alias &quot; + alias +</span>
+                            &quot;: certificate list does not conform to &quot; +
+                            &quot;algorithm constraints&quot;);
+                }
+                continue;
+            }
+
+<span class="nc bnc" id="L787" title="All 2 branches missed.">            if (date == null) {</span>
+<span class="nc" id="L788">                date = new Date();</span>
+            }
+<span class="nc" id="L790">            CheckResult checkResult =</span>
+<span class="nc" id="L791">                    checkType.check((X509Certificate)chain[0], date,</span>
+                                    requestedServerNames, idAlgorithm);
+<span class="nc" id="L793">            EntryStatus status =</span>
+                    new EntryStatus(builderIndex, keyIndex,
+                                        alias, chain, checkResult);
+<span class="nc bnc" id="L796" title="All 6 branches missed.">            if (!preferred &amp;&amp; checkResult == CheckResult.OK &amp;&amp; keyIndex == 0) {</span>
+<span class="nc" id="L797">                preferred = true;</span>
+            }
+<span class="nc bnc" id="L799" title="All 4 branches missed.">            if (preferred &amp;&amp; (findAll == false)) {</span>
+                // if we have a good match and do not need all matches,
+                // return immediately
+<span class="nc" id="L802">                return Collections.singletonList(status);</span>
+            } else {
+<span class="nc bnc" id="L804" title="All 2 branches missed.">                if (results == null) {</span>
+<span class="nc" id="L805">                    results = new ArrayList&lt;EntryStatus&gt;();</span>
+                }
+<span class="nc" id="L807">                results.add(status);</span>
+            }
+<span class="nc" id="L809">        }</span>
+<span class="nc" id="L810">        return results;</span>
+    }
+
+    private static boolean conformsToAlgorithmConstraints(
+            AlgorithmConstraints constraints, Certificate[] chain) {
+
+<span class="nc" id="L816">        AlgorithmChecker checker = new AlgorithmChecker(constraints);</span>
+        try {
+<span class="nc" id="L818">            checker.init(false);</span>
+<span class="nc" id="L819">        } catch (CertPathValidatorException cpve) {</span>
+            // unlikely to happen
+<span class="nc" id="L821">            return false;</span>
+<span class="nc" id="L822">        }</span>
+
+        // It is a forward checker, so we need to check from trust to target.
+<span class="nc bnc" id="L825" title="All 2 branches missed.">        for (int i = chain.length - 1; i &gt;= 0; i--) {</span>
+<span class="nc" id="L826">            Certificate cert = chain[i];</span>
+            try {
+                // We don't care about the unresolved critical extensions.
+<span class="nc" id="L829">                checker.check(cert, Collections.&lt;String&gt;emptySet());</span>
+<span class="nc" id="L830">            } catch (CertPathValidatorException cpve) {</span>
+<span class="nc" id="L831">                return false;</span>
+<span class="nc" id="L832">            }</span>
+        }
+
+<span class="nc" id="L835">        return true;</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

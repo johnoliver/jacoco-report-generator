@@ -1,0 +1,571 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>UnicastServerRef.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.rmi.server</a> &gt; <span class="el_source">UnicastServerRef.java</span></div><h1>UnicastServerRef.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1996, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.rmi.server;
+
+import java.io.IOException;
+import java.io.ObjectInput;
+import java.io.ObjectOutput;
+import java.io.PrintStream;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.rmi.MarshalException;
+import java.rmi.Remote;
+import java.rmi.RemoteException;
+import java.rmi.ServerError;
+import java.rmi.ServerException;
+import java.rmi.UnmarshalException;
+import java.rmi.server.ExportException;
+import java.rmi.server.RemoteCall;
+import java.rmi.server.RemoteRef;
+import java.rmi.server.RemoteStub;
+import java.rmi.server.ServerNotActiveException;
+import java.rmi.server.ServerRef;
+import java.rmi.server.Skeleton;
+import java.rmi.server.SkeletonNotFoundException;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.WeakHashMap;
+import sun.rmi.runtime.Log;
+import sun.rmi.transport.LiveRef;
+import sun.rmi.transport.Target;
+import sun.rmi.transport.tcp.TCPTransport;
+import sun.security.action.GetBooleanAction;
+
+/**
+ * UnicastServerRef implements the remote reference layer server-side
+ * behavior for remote objects exported with the &quot;UnicastRef&quot; reference
+ * type.
+ *
+ * @author  Ann Wollrath
+ * @author  Roger Riggs
+ * @author  Peter Jones
+ */
+@SuppressWarnings(&quot;deprecation&quot;)
+public class UnicastServerRef extends UnicastRef
+    implements ServerRef, Dispatcher
+{
+    /** value of server call log property */
+<span class="fc" id="L75">    public static final boolean logCalls = AccessController.doPrivileged(</span>
+        new GetBooleanAction(&quot;java.rmi.server.logCalls&quot;));
+
+    /** server call log */
+<span class="fc" id="L79">    public static final Log callLog =</span>
+<span class="fc" id="L80">        Log.getLog(&quot;sun.rmi.server.call&quot;, &quot;RMI&quot;, logCalls);</span>
+
+    // use serialVersionUID from JDK 1.2.2 for interoperability
+    private static final long serialVersionUID = -7384275867073752268L;
+
+    /** flag to enable writing exceptions to System.err */
+<span class="fc" id="L86">    private static final boolean wantExceptionLog =</span>
+<span class="fc" id="L87">        AccessController.doPrivileged(</span>
+            new GetBooleanAction(&quot;sun.rmi.server.exceptionTrace&quot;));
+
+<span class="fc" id="L90">    private boolean forceStubUse = false;</span>
+
+    /**
+     * flag to remove server-side stack traces before marshalling
+     * exceptions thrown by remote invocations to this VM
+     */
+<span class="fc" id="L96">    private static final boolean suppressStackTraces =</span>
+<span class="fc" id="L97">        AccessController.doPrivileged(</span>
+            new GetBooleanAction(
+                &quot;sun.rmi.server.suppressStackTraces&quot;));
+
+    /**
+     * skeleton to dispatch remote calls through, for 1.1 stub protocol
+     * (may be null if stub class only uses 1.2 stub protocol)
+     */
+    private transient Skeleton skel;
+
+    /** maps method hash to Method object for each remote method */
+<span class="fc" id="L108">    private transient Map&lt;Long,Method&gt; hashToMethod_Map = null;</span>
+
+    /**
+     * A weak hash map, mapping classes to hash maps that map method
+     * hashes to method objects.
+     **/
+<span class="fc" id="L114">    private static final WeakClassHashMap&lt;Map&lt;Long,Method&gt;&gt; hashToMethod_Maps =</span>
+        new HashToMethod_Maps();
+
+    /** cache of impl classes that have no corresponding skeleton class */
+<span class="fc" id="L118">    private static final Map&lt;Class&lt;?&gt;,?&gt; withoutSkeletons =</span>
+<span class="fc" id="L119">        Collections.synchronizedMap(new WeakHashMap&lt;Class&lt;?&gt;,Void&gt;());</span>
+
+    /**
+     * Create a new (empty) Unicast server remote reference.
+     */
+<span class="fc" id="L124">    public UnicastServerRef() {</span>
+<span class="fc" id="L125">    }</span>
+
+    /**
+     * Construct a Unicast server remote reference for a specified
+     * liveRef.
+     */
+    public UnicastServerRef(LiveRef ref) {
+<span class="fc" id="L132">        super(ref);</span>
+<span class="fc" id="L133">    }</span>
+
+    /**
+     * Construct a Unicast server remote reference to be exported
+     * on the specified port.
+     */
+    public UnicastServerRef(int port) {
+<span class="fc" id="L140">        super(new LiveRef(port));</span>
+<span class="fc" id="L141">    }</span>
+
+    /**
+     * Constructs a UnicastServerRef to be exported on an
+     * anonymous port (i.e., 0) and that uses a pregenerated stub class
+     * (NOT a dynamic proxy instance) if 'forceStubUse' is 'true'.
+     *
+     * This constructor is only called by the method
+     * UnicastRemoteObject.exportObject(Remote) passing 'true' for
+     * 'forceStubUse'.  The UnicastRemoteObject.exportObject(Remote) method
+     * returns RemoteStub, so it must ensure that the stub for the
+     * exported object is an instance of a pregenerated stub class that
+     * extends RemoteStub (instead of an instance of a dynamic proxy class
+     * which is not an instance of RemoteStub).
+     **/
+    public UnicastServerRef(boolean forceStubUse) {
+<span class="fc" id="L157">        this(0);</span>
+<span class="fc" id="L158">        this.forceStubUse = forceStubUse;</span>
+<span class="fc" id="L159">    }</span>
+
+    /**
+     * With the addition of support for dynamic proxies as stubs, this
+     * method is obsolete because it returns RemoteStub instead of the more
+     * general Remote.  It should not be called.  It sets the
+     * 'forceStubUse' flag to true so that the stub for the exported object
+     * is forced to be an instance of the pregenerated stub class, which
+     * extends RemoteStub.
+     *
+     * Export this object, create the skeleton and stubs for this
+     * dispatcher.  Create a stub based on the type of the impl,
+     * initialize it with the appropriate remote reference. Create the
+     * target defined by the impl, dispatcher (this) and stub.
+     * Export that target via the Ref.
+     **/
+    public RemoteStub exportObject(Remote impl, Object data)
+        throws RemoteException
+    {
+<span class="fc" id="L178">        forceStubUse = true;</span>
+<span class="fc" id="L179">        return (RemoteStub) exportObject(impl, data, false);</span>
+    }
+
+    /**
+     * Export this object, create the skeleton and stubs for this
+     * dispatcher.  Create a stub based on the type of the impl,
+     * initialize it with the appropriate remote reference. Create the
+     * target defined by the impl, dispatcher (this) and stub.
+     * Export that target via the Ref.
+     */
+    public Remote exportObject(Remote impl, Object data,
+                               boolean permanent)
+        throws RemoteException
+    {
+<span class="fc" id="L193">        Class&lt;?&gt; implClass = impl.getClass();</span>
+        Remote stub;
+
+        try {
+<span class="fc" id="L197">            stub = Util.createProxy(implClass, getClientRef(), forceStubUse);</span>
+<span class="nc" id="L198">        } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L199">            throw new ExportException(</span>
+                &quot;remote object implements illegal remote interface&quot;, e);
+<span class="fc" id="L201">        }</span>
+<span class="fc bfc" id="L202" title="All 2 branches covered.">        if (stub instanceof RemoteStub) {</span>
+<span class="fc" id="L203">            setSkeleton(impl);</span>
+        }
+
+<span class="fc" id="L206">        Target target =</span>
+<span class="fc" id="L207">            new Target(impl, this, stub, ref.getObjID(), permanent);</span>
+<span class="fc" id="L208">        ref.exportObject(target);</span>
+<span class="fc" id="L209">        hashToMethod_Map = hashToMethod_Maps.get(implClass);</span>
+<span class="fc" id="L210">        return stub;</span>
+    }
+
+    /**
+     * Return the hostname of the current client.  When called from a
+     * thread actively handling a remote method invocation the
+     * hostname of the client is returned.
+     * @exception ServerNotActiveException If called outside of servicing
+     * a remote method invocation.
+     */
+    public String getClientHost() throws ServerNotActiveException {
+<span class="fc" id="L221">        return TCPTransport.getClientHost();</span>
+    }
+
+    /**
+     * Discovers and sets the appropriate skeleton for the impl.
+     */
+    public void setSkeleton(Remote impl) throws RemoteException {
+<span class="fc bfc" id="L228" title="All 2 branches covered.">        if (!withoutSkeletons.containsKey(impl.getClass())) {</span>
+            try {
+<span class="fc" id="L230">                skel = Util.createSkeleton(impl);</span>
+<span class="fc" id="L231">            } catch (SkeletonNotFoundException e) {</span>
+                /*
+                 * Ignore exception for skeleton class not found, because a
+                 * skeleton class is not necessary with the 1.2 stub protocol.
+                 * Remember that this impl's class does not have a skeleton
+                 * class so we don't waste time searching for it again.
+                 */
+<span class="fc" id="L238">                withoutSkeletons.put(impl.getClass(), null);</span>
+<span class="fc" id="L239">            }</span>
+        }
+<span class="fc" id="L241">    }</span>
+
+    /**
+     * Call to dispatch to the remote object (on the server side).
+     * The up-call to the server and the marshalling of return result
+     * (or exception) should be handled before returning from this
+     * method.
+     * @param obj the target remote object for the call
+     * @param call the &quot;remote call&quot; from which operation and
+     * method arguments can be obtained.
+     * @exception IOException If unable to marshal return result or
+     * release input or output streams
+     */
+    public void dispatch(Remote obj, RemoteCall call) throws IOException {
+        // positive operation number in 1.1 stubs;
+        // negative version number in 1.2 stubs and beyond...
+        int num;
+        long op;
+
+        try {
+            // read remote call header
+            ObjectInput in;
+            try {
+<span class="fc" id="L264">                in = call.getInputStream();</span>
+<span class="fc" id="L265">                num = in.readInt();</span>
+<span class="fc bfc" id="L266" title="All 2 branches covered.">                if (num &gt;= 0) {</span>
+<span class="pc bpc" id="L267" title="1 of 2 branches missed.">                    if (skel != null) {</span>
+<span class="fc" id="L268">                        oldDispatch(obj, call, num);</span>
+<span class="fc" id="L269">                        return;</span>
+                    } else {
+<span class="nc" id="L271">                        throw new UnmarshalException(</span>
+                            &quot;skeleton class not found but required &quot; +
+                            &quot;for client version&quot;);
+                    }
+                }
+<span class="fc" id="L276">                op = in.readLong();</span>
+<span class="nc" id="L277">            } catch (Exception readEx) {</span>
+<span class="nc" id="L278">                throw new UnmarshalException(&quot;error unmarshalling call header&quot;,</span>
+                                             readEx);
+<span class="fc" id="L280">            }</span>
+
+            /*
+             * Since only system classes (with null class loaders) will be on
+             * the execution stack during parameter unmarshalling for the 1.2
+             * stub protocol, tell the MarshalInputStream not to bother trying
+             * to resolve classes using its superclasses's default method of
+             * consulting the first non-null class loader on the stack.
+             */
+<span class="fc" id="L289">            MarshalInputStream marshalStream = (MarshalInputStream) in;</span>
+<span class="fc" id="L290">            marshalStream.skipDefaultResolveClass();</span>
+
+<span class="fc" id="L292">            Method method = hashToMethod_Map.get(op);</span>
+<span class="pc bpc" id="L293" title="1 of 2 branches missed.">            if (method == null) {</span>
+<span class="nc" id="L294">                throw new UnmarshalException(&quot;unrecognized method hash: &quot; +</span>
+                    &quot;method not supported by remote object&quot;);
+            }
+
+            // if calls are being logged, write out object id and operation
+<span class="fc" id="L299">            logCall(obj, method);</span>
+
+            // unmarshal parameters
+<span class="fc" id="L302">            Class&lt;?&gt;[] types = method.getParameterTypes();</span>
+<span class="fc" id="L303">            Object[] params = new Object[types.length];</span>
+
+            try {
+<span class="fc" id="L306">                unmarshalCustomCallData(in);</span>
+<span class="fc bfc" id="L307" title="All 2 branches covered.">                for (int i = 0; i &lt; types.length; i++) {</span>
+<span class="fc" id="L308">                    params[i] = unmarshalValue(types[i], in);</span>
+                }
+<span class="nc" id="L310">            } catch (java.io.IOException e) {</span>
+<span class="nc" id="L311">                throw new UnmarshalException(</span>
+                    &quot;error unmarshalling arguments&quot;, e);
+<span class="fc" id="L313">            } catch (ClassNotFoundException e) {</span>
+<span class="fc" id="L314">                throw new UnmarshalException(</span>
+                    &quot;error unmarshalling arguments&quot;, e);
+            } finally {
+<span class="fc" id="L317">                call.releaseInputStream();</span>
+<span class="fc" id="L318">            }</span>
+
+            // make upcall on remote object
+            Object result;
+            try {
+<span class="fc" id="L323">                result = method.invoke(obj, params);</span>
+<span class="fc" id="L324">            } catch (InvocationTargetException e) {</span>
+<span class="fc" id="L325">                throw e.getTargetException();</span>
+<span class="fc" id="L326">            }</span>
+
+            // marshal return value
+            try {
+<span class="fc" id="L330">                ObjectOutput out = call.getResultStream(true);</span>
+<span class="fc" id="L331">                Class&lt;?&gt; rtype = method.getReturnType();</span>
+<span class="fc bfc" id="L332" title="All 2 branches covered.">                if (rtype != void.class) {</span>
+<span class="fc" id="L333">                    marshalValue(rtype, result, out);</span>
+                }
+<span class="nc" id="L335">            } catch (IOException ex) {</span>
+<span class="nc" id="L336">                throw new MarshalException(&quot;error marshalling return&quot;, ex);</span>
+                /*
+                 * This throw is problematic because when it is caught below,
+                 * we attempt to marshal it back to the client, but at this
+                 * point, a &quot;normal return&quot; has already been indicated,
+                 * so marshalling an exception will corrupt the stream.
+                 * This was the case with skeletons as well; there is no
+                 * immediately obvious solution without a protocol change.
+                 */
+<span class="fc" id="L345">            }</span>
+<span class="fc" id="L346">        } catch (Throwable e) {</span>
+<span class="fc" id="L347">            logCallException(e);</span>
+
+<span class="fc" id="L349">            ObjectOutput out = call.getResultStream(false);</span>
+<span class="pc bpc" id="L350" title="1 of 2 branches missed.">            if (e instanceof Error) {</span>
+<span class="nc" id="L351">                e = new ServerError(</span>
+                    &quot;Error occurred in server thread&quot;, (Error) e);
+<span class="fc bfc" id="L353" title="All 2 branches covered.">            } else if (e instanceof RemoteException) {</span>
+<span class="fc" id="L354">                e = new ServerException(</span>
+                    &quot;RemoteException occurred in server thread&quot;,
+                    (Exception) e);
+            }
+<span class="fc bfc" id="L358" title="All 2 branches covered.">            if (suppressStackTraces) {</span>
+<span class="fc" id="L359">                clearStackTraces(e);</span>
+            }
+<span class="fc" id="L361">            out.writeObject(e);</span>
+        } finally {
+<span class="pc" id="L363">            call.releaseInputStream(); // in case skeleton doesn't</span>
+<span class="pc" id="L364">            call.releaseOutputStream();</span>
+<span class="fc" id="L365">        }</span>
+<span class="fc" id="L366">    }</span>
+
+    protected void unmarshalCustomCallData(ObjectInput in)
+        throws IOException, ClassNotFoundException
+<span class="fc" id="L370">    {}</span>
+
+    /**
+     * Handle server-side dispatch using the RMI 1.1 stub/skeleton
+     * protocol, given a non-negative operation number that has
+     * already been read from the call stream.
+     *
+     * @param obj the target remote object for the call
+     * @param call the &quot;remote call&quot; from which operation and
+     * method arguments can be obtained.
+     * @param op the operation number
+     * @exception IOException if unable to marshal return result or
+     * release input or output streams
+     */
+    public void oldDispatch(Remote obj, RemoteCall call, int op)
+        throws IOException
+    {
+        long hash;              // hash for matching stub with skeleton
+
+        try {
+            // read remote call header
+            ObjectInput in;
+            try {
+<span class="fc" id="L393">                in = call.getInputStream();</span>
+                try {
+<span class="fc" id="L395">                    Class&lt;?&gt; clazz = Class.forName(&quot;sun.rmi.transport.DGCImpl_Skel&quot;);</span>
+<span class="fc bfc" id="L396" title="All 2 branches covered.">                    if (clazz.isAssignableFrom(skel.getClass())) {</span>
+<span class="fc" id="L397">                        ((MarshalInputStream)in).useCodebaseOnly();</span>
+                    }
+<span class="pc" id="L399">                } catch (ClassNotFoundException ignore) { }</span>
+<span class="fc" id="L400">                hash = in.readLong();</span>
+<span class="nc" id="L401">            } catch (Exception readEx) {</span>
+<span class="nc" id="L402">                throw new UnmarshalException(&quot;error unmarshalling call header&quot;,</span>
+                                             readEx);
+<span class="fc" id="L404">            }</span>
+
+            // if calls are being logged, write out object id and operation
+<span class="fc" id="L407">            logCall(obj, skel.getOperations()[op]);</span>
+<span class="fc" id="L408">            unmarshalCustomCallData(in);</span>
+            // dispatch to skeleton for remote object
+<span class="fc" id="L410">            skel.dispatch(obj, call, op, hash);</span>
+
+<span class="fc" id="L412">        } catch (Throwable e) {</span>
+<span class="fc" id="L413">            logCallException(e);</span>
+
+<span class="fc" id="L415">            ObjectOutput out = call.getResultStream(false);</span>
+<span class="pc bpc" id="L416" title="1 of 2 branches missed.">            if (e instanceof Error) {</span>
+<span class="nc" id="L417">                e = new ServerError(</span>
+                    &quot;Error occurred in server thread&quot;, (Error) e);
+<span class="fc bfc" id="L419" title="All 2 branches covered.">            } else if (e instanceof RemoteException) {</span>
+<span class="fc" id="L420">                e = new ServerException(</span>
+                    &quot;RemoteException occurred in server thread&quot;,
+                    (Exception) e);
+            }
+<span class="fc bfc" id="L424" title="All 2 branches covered.">            if (suppressStackTraces) {</span>
+<span class="fc" id="L425">                clearStackTraces(e);</span>
+            }
+<span class="fc" id="L427">            out.writeObject(e);</span>
+        } finally {
+<span class="pc" id="L429">            call.releaseInputStream(); // in case skeleton doesn't</span>
+<span class="pc" id="L430">            call.releaseOutputStream();</span>
+<span class="fc" id="L431">        }</span>
+<span class="fc" id="L432">    }</span>
+
+    /**
+     * Clear the stack trace of the given Throwable by replacing it with
+     * an empty StackTraceElement array, and do the same for all of its
+     * chained causative exceptions.
+     */
+    public static void clearStackTraces(Throwable t) {
+<span class="fc" id="L440">        StackTraceElement[] empty = new StackTraceElement[0];</span>
+<span class="fc bfc" id="L441" title="All 2 branches covered.">        while (t != null) {</span>
+<span class="fc" id="L442">            t.setStackTrace(empty);</span>
+<span class="fc" id="L443">            t = t.getCause();</span>
+        }
+<span class="fc" id="L445">    }</span>
+
+    /**
+     * Log the details of an incoming call.  The method parameter is either of
+     * type java.lang.reflect.Method or java.rmi.server.Operation.
+     */
+    private void logCall(Remote obj, Object method) {
+<span class="fc bfc" id="L452" title="All 2 branches covered.">        if (callLog.isLoggable(Log.VERBOSE)) {</span>
+            String clientHost;
+            try {
+<span class="fc" id="L455">                clientHost = getClientHost();</span>
+<span class="nc" id="L456">            } catch (ServerNotActiveException snae) {</span>
+<span class="nc" id="L457">                clientHost = &quot;(local)&quot;; // shouldn't happen</span>
+<span class="fc" id="L458">            }</span>
+<span class="fc" id="L459">            callLog.log(Log.VERBOSE, &quot;[&quot; + clientHost + &quot;: &quot; +</span>
+<span class="fc" id="L460">                              obj.getClass().getName() +</span>
+<span class="fc" id="L461">                              ref.getObjID().toString() + &quot;: &quot; +</span>
+                              method + &quot;]&quot;);
+        }
+<span class="fc" id="L464">    }</span>
+
+    /**
+     * Log the exception detail of an incoming call.
+     */
+    private void logCallException(Throwable e) {
+        // if calls are being logged, log them
+<span class="fc bfc" id="L471" title="All 2 branches covered.">        if (callLog.isLoggable(Log.BRIEF)) {</span>
+<span class="fc" id="L472">            String clientHost = &quot;&quot;;</span>
+            try {
+<span class="fc" id="L474">                clientHost = &quot;[&quot; + getClientHost() + &quot;] &quot;;</span>
+<span class="nc" id="L475">            } catch (ServerNotActiveException snae) {</span>
+<span class="fc" id="L476">            }</span>
+<span class="fc" id="L477">            callLog.log(Log.BRIEF, clientHost + &quot;exception: &quot;, e);</span>
+        }
+
+        // write exceptions (only) to System.err if desired
+<span class="pc bpc" id="L481" title="1 of 2 branches missed.">        if (wantExceptionLog) {</span>
+<span class="nc" id="L482">            java.io.PrintStream log = System.err;</span>
+<span class="nc" id="L483">            synchronized (log) {</span>
+<span class="nc" id="L484">                log.println();</span>
+<span class="nc" id="L485">                log.println(&quot;Exception dispatching call to &quot; +</span>
+<span class="nc" id="L486">                            ref.getObjID() + &quot; in thread \&quot;&quot; +</span>
+<span class="nc" id="L487">                            Thread.currentThread().getName() +</span>
+                            &quot;\&quot; at &quot; + (new Date()) + &quot;:&quot;);
+<span class="nc" id="L489">                e.printStackTrace(log);</span>
+<span class="nc" id="L490">            }</span>
+        }
+<span class="fc" id="L492">    }</span>
+
+    /**
+     * Returns the class of the ref type to be serialized.
+     */
+    public String getRefClass(ObjectOutput out) {
+<span class="fc" id="L498">        return &quot;UnicastServerRef&quot;;</span>
+    }
+
+    /**
+     * Return the client remote reference for this remoteRef.
+     * In the case of a client RemoteRef &quot;this&quot; is the answer.
+     * For a server remote reference, a client side one will have to
+     * found or created.
+     */
+    protected RemoteRef getClientRef() {
+<span class="fc" id="L508">        return new UnicastRef(ref);</span>
+    }
+
+    /**
+     * Write out external representation for remote ref.
+     */
+    public void writeExternal(ObjectOutput out) throws IOException {
+<span class="fc" id="L515">    }</span>
+
+    /**
+     * Read in external representation for remote ref.
+     * @exception ClassNotFoundException If the class for an object
+     * being restored cannot be found.
+     */
+    public void readExternal(ObjectInput in)
+        throws IOException, ClassNotFoundException
+    {
+        // object is re-exported elsewhere (e.g., by UnicastRemoteObject)
+<span class="fc" id="L526">        ref = null;</span>
+<span class="fc" id="L527">        skel = null;</span>
+<span class="fc" id="L528">    }</span>
+
+
+    /**
+     * A weak hash map, mapping classes to hash maps that map method
+     * hashes to method objects.
+     **/
+    private static class HashToMethod_Maps
+        extends WeakClassHashMap&lt;Map&lt;Long,Method&gt;&gt;
+    {
+<span class="fc" id="L538">        HashToMethod_Maps() {}</span>
+
+        protected Map&lt;Long,Method&gt; computeValue(Class&lt;?&gt; remoteClass) {
+<span class="fc" id="L541">            Map&lt;Long,Method&gt; map = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L542">            for (Class&lt;?&gt; cl = remoteClass;</span>
+<span class="fc bfc" id="L543" title="All 2 branches covered.">                 cl != null;</span>
+<span class="fc" id="L544">                 cl = cl.getSuperclass())</span>
+            {
+<span class="fc bfc" id="L546" title="All 2 branches covered.">                for (Class&lt;?&gt; intf : cl.getInterfaces()) {</span>
+<span class="fc bfc" id="L547" title="All 2 branches covered.">                    if (Remote.class.isAssignableFrom(intf)) {</span>
+<span class="fc bfc" id="L548" title="All 2 branches covered.">                        for (Method method : intf.getMethods()) {</span>
+<span class="fc" id="L549">                            final Method m = method;</span>
+                            /*
+                             * Set this Method object to override language
+                             * access checks so that the dispatcher can invoke
+                             * methods from non-public remote interfaces.
+                             */
+<span class="fc" id="L555">                            AccessController.doPrivileged(</span>
+<span class="fc" id="L556">                                new PrivilegedAction&lt;Void&gt;() {</span>
+                                public Void run() {
+<span class="fc" id="L558">                                    m.setAccessible(true);</span>
+<span class="fc" id="L559">                                    return null;</span>
+                                }
+                            });
+<span class="fc" id="L562">                            map.put(Util.computeMethodHash(m), m);</span>
+                        }
+                    }
+                }
+            }
+<span class="fc" id="L567">            return map;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

@@ -1,0 +1,1937 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>StandardGlyphVector.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.font</a> &gt; <span class="el_source">StandardGlyphVector.java</span></div><h1>StandardGlyphVector.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1998, 2005, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.font;
+
+import java.awt.Font;
+import java.awt.Graphics2D;
+import java.awt.Point;
+import java.awt.Rectangle;
+import static java.awt.RenderingHints.*;
+import java.awt.Shape;
+import java.awt.font.FontRenderContext;
+import java.awt.font.GlyphMetrics;
+import java.awt.font.GlyphJustificationInfo;
+import java.awt.font.GlyphVector;
+import java.awt.font.LineMetrics;
+import java.awt.font.TextAttribute;
+import java.awt.geom.AffineTransform;
+import java.awt.geom.GeneralPath;
+import java.awt.geom.NoninvertibleTransformException;
+import java.awt.geom.PathIterator;
+import java.awt.geom.Point2D;
+import java.awt.geom.Rectangle2D;
+import java.lang.ref.SoftReference;
+import java.text.CharacterIterator;
+
+import sun.awt.SunHints;
+import sun.java2d.loops.FontInfo;
+
+/**
+ * Standard implementation of GlyphVector used by Font, GlyphList, and
+ * SunGraphics2D.
+ *
+ * The main issues involve the semantics of the various transforms
+ * (font, glyph, device) and their effect on rendering and metrics.
+ *
+ * Very, very unfortunately, the translation component of the font
+ * transform affects where the text gets rendered.  It offsets the
+ * rendering origin.  None of the other metrics of the glyphvector
+ * are affected, making them inconsistent with the rendering behavior.
+ * I think the translation component of the font would be better
+ * interpreted as the translation component of a per-glyph transform,
+ * but I don't know if this is possible to change.
+ *
+ * After the font transform is applied, the glyph transform is
+ * applied.  This makes glyph transforms relative to font transforms,
+ * if the font transform changes, the glyph transform will have the
+ * same (relative) effect on the outline of the glyph.  The outline
+ * and logical bounds are passed through the glyph transform before
+ * being returned.  The glyph metrics ignore the glyph transform, but
+ * provide the outline bounds and the advance vector of the glyph (the
+ * latter will be rotated if the font is rotated).  The default layout
+ * places each glyph at the end of the advance vector of the previous
+ * glyph, and since the glyph transform translates the advance vector,
+ * this means a glyph transform affects the positions of all
+ * subsequent glyphs if defaultLayout is called after setting a glyph
+ * transform.  In the glyph info array, the bounds are the outline
+ * bounds including the glyph transform, and the positions are as
+ * computed, and the advances are the deltas between the positions.
+ *
+ * (There's a bug in the logical bounds of a rotated glyph for
+ * composite fonts, it's not to spec (in 1.4.0, 1.4.1, 1.4.2).  The
+ * problem is that the rotated composite doesn't handle the multiple
+ * ascents and descents properly in both x and y.  You end up with
+ * a rotated advance vector but an unrotated ascent and descent.)
+ *
+ * Finally, the whole thing is transformed by the device transform to
+ * position it on the page.
+ *
+ * Another bug: The glyph outline seems to ignore fractional point
+ * size information, but the images (and advances) don't ignore it.
+ *
+ * Small fonts drawn at large magnification have odd advances when
+ * fractional metrics is off-- that's because the advances depend on
+ * the frc.  When the frc is scaled appropriately, the advances are
+ * fine.  FM or a large frc (high numbers) make the advances right.
+ *
+ * The buffer aa flag doesn't affect rendering, the glyph vector
+ * renders as AA if aa is set in its frc, and as non-aa if aa is not
+ * set in its frc.
+ *
+ * font rotation, baseline, vertical etc.
+ *
+ * Font rotation and baseline Line metrics should be measured along a
+ * unit vector pi/4 cc from the baseline vector.  For 'horizontal'
+ * fonts the baseline vector is the x vector passed through the font
+ * transform (ignoring translation), for 'vertical' it is the y
+ * vector.  This definition makes ascent, descent, etc independent of
+ * shear, so shearing can be used to simulate italic. This means no
+ * fonts have 'negative ascents' or 'zero ascents' etc.
+ *
+ * Having a coordinate system with orthogonal axes where one is
+ * parallel to the baseline means we could use rectangles and interpret
+ * them in terms of this coordinate system.  Unfortunately there
+ * is support for rotated fonts in the jdk already so maintaining
+ * the semantics of existing code (getlogical bounds, etc) might
+ * be difficult.
+ *
+ * A font transform transforms both the baseline and all the glyphs
+ * in the font, so it does not rotate the glyph w.r.t the baseline.
+ * If you do want to rotate individual glyphs, you need to apply a
+ * glyph transform.  If performDefaultLayout is called after this,
+ * the transformed glyph advances will affect the glyph positions.
+ *
+ * useful additions
+ * - select vertical metrics - glyphs are rotated pi/4 cc and vertical
+ * metrics are used to align them to the baseline.
+ * - define baseline for font (glyph rotation not linked to baseline)
+ * - define extra space (delta between each glyph along baseline)
+ * - define offset (delta from 'true' baseline, impacts ascent and
+ * descent as these are still computed from true basline and pinned
+ * to zero, used in superscript).
+ */
+<span class="nc bnc" id="L136" title="All 2 branches missed.">public class StandardGlyphVector extends GlyphVector {</span>
+    private Font font;
+    private FontRenderContext frc;
+    private int[] glyphs; // always
+    private int[] userGlyphs; // used to return glyphs to the client.
+    private float[] positions; // only if not default advances
+    private int[] charIndices;  // only if interesting
+    private int flags; // indicates whether positions, charIndices is interesting
+
+    private static final int UNINITIALIZED_FLAGS = -1;
+
+    // transforms information
+    private GlyphTransformInfo gti; // information about per-glyph transforms
+
+    // !!! can we get rid of any of this extra stuff?
+    private AffineTransform ftx;   // font transform without translation
+    private AffineTransform dtx;   // device transform used for strike calculations, no translation
+    private AffineTransform invdtx; // inverse of dtx or null if dtx is identity
+    private AffineTransform frctx; // font render context transform, wish we could just share it
+    private Font2D font2D;         // basic strike-independent stuff
+    private SoftReference fsref;   // font strike reference for glyphs with no per-glyph transform
+
+    /////////////////////////////
+    // Constructors and Factory methods
+    /////////////////////////////
+
+<span class="nc" id="L162">    public StandardGlyphVector(Font font, String str, FontRenderContext frc) {</span>
+<span class="nc" id="L163">        init(font, str.toCharArray(), 0, str.length(), frc, UNINITIALIZED_FLAGS);</span>
+<span class="nc" id="L164">    }</span>
+
+<span class="nc" id="L166">    public StandardGlyphVector(Font font, char[] text, FontRenderContext frc) {</span>
+<span class="nc" id="L167">        init(font, text, 0, text.length, frc, UNINITIALIZED_FLAGS);</span>
+<span class="nc" id="L168">    }</span>
+
+    public StandardGlyphVector(Font font, char[] text, int start, int count,
+<span class="nc" id="L171">                               FontRenderContext frc) {</span>
+<span class="nc" id="L172">        init(font, text, start, count, frc, UNINITIALIZED_FLAGS);</span>
+<span class="nc" id="L173">    }</span>
+
+    private float getTracking(Font font) {
+<span class="nc bnc" id="L176" title="All 2 branches missed.">        if (font.hasLayoutAttributes()) {</span>
+<span class="nc" id="L177">            AttributeValues values = ((AttributeMap)font.getAttributes()).getValues();</span>
+<span class="nc" id="L178">            return values.getTracking();</span>
+        }
+<span class="nc" id="L180">        return 0;</span>
+    }
+
+     // used by GlyphLayout to construct a glyphvector
+    public StandardGlyphVector(Font font, FontRenderContext frc, int[] glyphs, float[] positions,
+<span class="nc" id="L185">                               int[] indices, int flags) {</span>
+<span class="nc" id="L186">        initGlyphVector(font, frc, glyphs, positions, indices, flags);</span>
+
+        // this code should go into layout
+<span class="nc" id="L189">        float track = getTracking(font);</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">        if (track != 0) {</span>
+<span class="nc" id="L191">            track *= font.getSize2D();</span>
+<span class="nc" id="L192">            Point2D.Float trackPt = new Point2D.Float(track, 0); // advance delta</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">            if (font.isTransformed()) {</span>
+<span class="nc" id="L194">                AffineTransform at = font.getTransform();</span>
+<span class="nc" id="L195">                at.deltaTransform(trackPt, trackPt);</span>
+            }
+
+            // how do we know its a base glyph
+            // for now, it is if the natural advance of the glyph is non-zero
+<span class="nc" id="L200">            Font2D f2d = FontUtilities.getFont2D(font);</span>
+<span class="nc" id="L201">            FontStrike strike = f2d.getStrike(font, frc);</span>
+
+<span class="nc" id="L203">            float[] deltas = { trackPt.x, trackPt.y };</span>
+<span class="nc bnc" id="L204" title="All 2 branches missed.">            for (int j = 0; j &lt; deltas.length; ++j) {</span>
+<span class="nc" id="L205">                float inc = deltas[j];</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">                if (inc != 0) {</span>
+<span class="nc" id="L207">                    float delta = 0;</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">                    for (int i = j, n = 0; n &lt; glyphs.length; i += 2) {</span>
+<span class="nc bnc" id="L209" title="All 2 branches missed.">                        if (strike.getGlyphAdvance(glyphs[n++]) != 0) { // might be an inadequate test</span>
+<span class="nc" id="L210">                            positions[i] += delta;</span>
+<span class="nc" id="L211">                            delta += inc;</span>
+                        }
+                    }
+<span class="nc" id="L214">                    positions[positions.length-2+j] += delta;</span>
+                }
+            }
+        }
+<span class="nc" id="L218">    }</span>
+
+    public void initGlyphVector(Font font, FontRenderContext frc, int[] glyphs, float[] positions,
+                                int[] indices, int flags) {
+<span class="nc" id="L222">        this.font = font;</span>
+<span class="nc" id="L223">        this.frc = frc;</span>
+<span class="nc" id="L224">        this.glyphs = glyphs;</span>
+<span class="nc" id="L225">        this.userGlyphs = glyphs; // no need to check</span>
+<span class="nc" id="L226">        this.positions = positions;</span>
+<span class="nc" id="L227">        this.charIndices = indices;</span>
+<span class="nc" id="L228">        this.flags = flags;</span>
+
+<span class="nc" id="L230">        initFontData();</span>
+<span class="nc" id="L231">    }</span>
+
+<span class="nc" id="L233">    public StandardGlyphVector(Font font, CharacterIterator iter, FontRenderContext frc) {</span>
+<span class="nc" id="L234">        int offset = iter.getBeginIndex();</span>
+<span class="nc" id="L235">        char[] text = new char [iter.getEndIndex() - offset];</span>
+<span class="nc" id="L236">        for(char c = iter.first();</span>
+<span class="nc bnc" id="L237" title="All 2 branches missed.">            c != CharacterIterator.DONE;</span>
+<span class="nc" id="L238">            c = iter.next()) {</span>
+<span class="nc" id="L239">            text[iter.getIndex() - offset] = c;</span>
+        }
+<span class="nc" id="L241">        init(font, text, 0, text.length, frc, UNINITIALIZED_FLAGS);</span>
+<span class="nc" id="L242">    }</span>
+
+<span class="nc" id="L244">    public StandardGlyphVector(Font font, int[] glyphs, FontRenderContext frc) {</span>
+        // !!! find callers of this
+        // should be able to fully init from raw data, e.g. charmap, flags too.
+<span class="nc" id="L247">        this.font = font;</span>
+<span class="nc" id="L248">        this.frc = frc;</span>
+<span class="nc" id="L249">        this.flags = UNINITIALIZED_FLAGS;</span>
+
+<span class="nc" id="L251">        initFontData();</span>
+<span class="nc" id="L252">        this.userGlyphs = glyphs;</span>
+<span class="nc" id="L253">        this.glyphs = getValidatedGlyphs(this.userGlyphs);</span>
+<span class="nc" id="L254">    }</span>
+
+    /* This is called from the rendering loop. FontInfo is supplied
+     * because a GV caches a strike and glyph images suitable for its FRC.
+     * LCD text isn't currently supported on all surfaces, in which case
+     * standard AA must be used. This is most likely to occur when LCD text
+     * is requested and the surface is some non-standard type or hardward
+     * surface for which there are no accelerated loops.
+     * We can detect this as being AA==&quot;ON&quot; in the FontInfo and AA!=&quot;ON&quot;
+     * and AA!=&quot;GASP&quot; in the FRC - since this only occurs for LCD text we don't
+     * need to check any more precisely what value is in the FRC.
+     */
+    public static StandardGlyphVector getStandardGV(GlyphVector gv,
+                                                    FontInfo info) {
+<span class="nc bnc" id="L268" title="All 2 branches missed.">        if (info.aaHint == SunHints.INTVAL_TEXT_ANTIALIAS_ON) {</span>
+<span class="nc" id="L269">            Object aaHint = gv.getFontRenderContext().getAntiAliasingHint();</span>
+<span class="nc bnc" id="L270" title="All 4 branches missed.">            if (aaHint != VALUE_TEXT_ANTIALIAS_ON &amp;&amp;</span>
+                aaHint != VALUE_TEXT_ANTIALIAS_GASP) {
+                /* We need to create a new GV with AA==ON for rendering */
+<span class="nc" id="L273">                FontRenderContext frc = gv.getFontRenderContext();</span>
+<span class="nc" id="L274">                frc = new FontRenderContext(frc.getTransform(),</span>
+                                            VALUE_TEXT_ANTIALIAS_ON,
+<span class="nc" id="L276">                                            frc.getFractionalMetricsHint());</span>
+<span class="nc" id="L277">                return new StandardGlyphVector(gv, frc);</span>
+            }
+        }
+<span class="nc bnc" id="L280" title="All 2 branches missed.">        if (gv instanceof StandardGlyphVector) {</span>
+<span class="nc" id="L281">            return (StandardGlyphVector)gv;</span>
+        }
+<span class="nc" id="L283">        return new StandardGlyphVector(gv, gv.getFontRenderContext());</span>
+    }
+
+    /////////////////////////////
+    // GlyphVector API
+    /////////////////////////////
+
+    public Font getFont() {
+<span class="nc" id="L291">        return this.font;</span>
+    }
+
+    public FontRenderContext getFontRenderContext() {
+<span class="nc" id="L295">        return this.frc;</span>
+    }
+
+    public void performDefaultLayout() {
+<span class="nc" id="L299">        positions = null;</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">        if (getTracking(font) == 0) {</span>
+<span class="nc" id="L301">            clearFlags(FLAG_HAS_POSITION_ADJUSTMENTS);</span>
+        }
+<span class="nc" id="L303">    }</span>
+
+    public int getNumGlyphs() {
+<span class="nc" id="L306">        return glyphs.length;</span>
+    }
+
+    public int getGlyphCode(int glyphIndex) {
+<span class="nc" id="L310">        return userGlyphs[glyphIndex];</span>
+    }
+
+    public int[] getGlyphCodes(int start, int count, int[] result) {
+<span class="nc bnc" id="L314" title="All 2 branches missed.">        if (count &lt; 0) {</span>
+<span class="nc" id="L315">            throw new IllegalArgumentException(&quot;count = &quot; + count);</span>
+        }
+<span class="nc bnc" id="L317" title="All 2 branches missed.">        if (start &lt; 0) {</span>
+<span class="nc" id="L318">            throw new IndexOutOfBoundsException(&quot;start = &quot; + start);</span>
+        }
+<span class="nc bnc" id="L320" title="All 2 branches missed.">        if (start &gt; glyphs.length - count) { // watch out for overflow if index + count overlarge</span>
+<span class="nc" id="L321">            throw new IndexOutOfBoundsException(&quot;start + count = &quot; + (start + count));</span>
+        }
+
+<span class="nc bnc" id="L324" title="All 2 branches missed.">        if (result == null) {</span>
+<span class="nc" id="L325">            result = new int[count];</span>
+        }
+
+        // if arraycopy were faster, we wouldn't code this
+<span class="nc bnc" id="L329" title="All 2 branches missed.">        for (int i = 0; i &lt; count; ++i) {</span>
+<span class="nc" id="L330">            result[i] = userGlyphs[i + start];</span>
+        }
+
+<span class="nc" id="L333">        return result;</span>
+    }
+
+    public int getGlyphCharIndex(int ix) {
+<span class="nc bnc" id="L337" title="All 4 branches missed.">        if (ix &lt; 0 &amp;&amp; ix &gt;= glyphs.length) {</span>
+<span class="nc" id="L338">            throw new IndexOutOfBoundsException(&quot;&quot; + ix);</span>
+        }
+<span class="nc bnc" id="L340" title="All 2 branches missed.">        if (charIndices == null) {</span>
+<span class="nc bnc" id="L341" title="All 2 branches missed.">            if ((getLayoutFlags() &amp; FLAG_RUN_RTL) != 0) {</span>
+<span class="nc" id="L342">                return glyphs.length - 1 - ix;</span>
+            }
+<span class="nc" id="L344">            return ix;</span>
+        }
+<span class="nc" id="L346">        return charIndices[ix];</span>
+    }
+
+    public int[] getGlyphCharIndices(int start, int count, int[] result) {
+<span class="nc bnc" id="L350" title="All 6 branches missed.">        if (start &lt; 0 || count &lt; 0 || (count &gt; glyphs.length - start)) {</span>
+<span class="nc" id="L351">            throw new IndexOutOfBoundsException(&quot;&quot; + start + &quot;, &quot; + count);</span>
+        }
+<span class="nc bnc" id="L353" title="All 2 branches missed.">        if (result == null) {</span>
+<span class="nc" id="L354">            result = new int[count];</span>
+        }
+<span class="nc bnc" id="L356" title="All 2 branches missed.">        if (charIndices == null) {</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">            if ((getLayoutFlags() &amp; FLAG_RUN_RTL) != 0) {</span>
+<span class="nc" id="L358">                for (int i = 0, n = glyphs.length - 1 - start;</span>
+<span class="nc bnc" id="L359" title="All 2 branches missed.">                     i &lt; count; ++i, --n) {</span>
+<span class="nc" id="L360">                         result[i] = n;</span>
+                     }
+            } else {
+<span class="nc bnc" id="L363" title="All 2 branches missed.">                for (int i = 0, n = start; i &lt; count; ++i, ++n) {</span>
+<span class="nc" id="L364">                    result[i] = n;</span>
+                }
+            }
+        } else {
+<span class="nc bnc" id="L368" title="All 2 branches missed.">            for (int i = 0; i &lt; count; ++i) {</span>
+<span class="nc" id="L369">                result[i] = charIndices[i + start];</span>
+            }
+        }
+<span class="nc" id="L372">        return result;</span>
+    }
+
+    // !!! not cached, assume TextLayout will cache if necessary
+    // !!! reexamine for per-glyph-transforms
+    // !!! revisit for text-on-a-path, vertical
+    public Rectangle2D getLogicalBounds() {
+<span class="nc" id="L379">        setFRCTX();</span>
+<span class="nc" id="L380">        initPositions();</span>
+
+<span class="nc" id="L382">        LineMetrics lm = font.getLineMetrics(&quot;&quot;, frc);</span>
+
+        float minX, minY, maxX, maxY;
+        // horiz only for now...
+<span class="nc" id="L386">        minX = 0;</span>
+<span class="nc" id="L387">        minY = -lm.getAscent();</span>
+<span class="nc" id="L388">        maxX = 0;</span>
+<span class="nc" id="L389">        maxY = lm.getDescent() + lm.getLeading();</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">        if (glyphs.length &gt; 0) {</span>
+<span class="nc" id="L391">            maxX = positions[positions.length - 2];</span>
+        }
+
+<span class="nc" id="L394">        return new Rectangle2D.Float(minX, minY, maxX - minX, maxY - minY);</span>
+    }
+
+    // !!! not cached, assume TextLayout will cache if necessary
+    public Rectangle2D getVisualBounds() {
+<span class="nc" id="L399">        Rectangle2D result = null;</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">        for (int i = 0; i &lt; glyphs.length; ++i) {</span>
+<span class="nc" id="L401">            Rectangle2D glyphVB = getGlyphVisualBounds(i).getBounds2D();</span>
+<span class="nc bnc" id="L402" title="All 2 branches missed.">            if (!glyphVB.isEmpty()) {</span>
+<span class="nc bnc" id="L403" title="All 2 branches missed.">                if (result == null) {</span>
+<span class="nc" id="L404">                    result = glyphVB;</span>
+                } else {
+<span class="nc" id="L406">                    Rectangle2D.union(result, glyphVB, result);</span>
+                }
+            }
+        }
+<span class="nc bnc" id="L410" title="All 2 branches missed.">        if (result == null) {</span>
+<span class="nc" id="L411">            result = new Rectangle2D.Float(0, 0, 0, 0);</span>
+        }
+<span class="nc" id="L413">        return result;</span>
+    }
+
+    // !!! not cached, assume TextLayout will cache if necessary
+    // !!! fontStrike needs a method for this
+    public Rectangle getPixelBounds(FontRenderContext renderFRC, float x, float y) {
+<span class="nc" id="L419">      return getGlyphsPixelBounds(renderFRC, x, y, 0, glyphs.length);</span>
+    }
+
+    public Shape getOutline() {
+<span class="nc" id="L423">        return getGlyphsOutline(0, glyphs.length, 0, 0);</span>
+    }
+
+    public Shape getOutline(float x, float y) {
+<span class="nc" id="L427">        return getGlyphsOutline(0, glyphs.length, x, y);</span>
+    }
+
+    // relative to gv origin
+    public Shape getGlyphOutline(int ix) {
+<span class="nc" id="L432">        return getGlyphsOutline(ix, 1, 0, 0);</span>
+    }
+
+    // relative to gv origin offset by x, y
+    public Shape getGlyphOutline(int ix, float x, float y) {
+<span class="nc" id="L437">        return getGlyphsOutline(ix, 1, x, y);</span>
+    }
+
+    public Point2D getGlyphPosition(int ix) {
+<span class="nc" id="L441">        initPositions();</span>
+
+<span class="nc" id="L443">        ix *= 2;</span>
+<span class="nc" id="L444">        return new Point2D.Float(positions[ix], positions[ix + 1]);</span>
+    }
+
+    public void setGlyphPosition(int ix, Point2D pos) {
+<span class="nc" id="L448">        initPositions();</span>
+
+<span class="nc" id="L450">        int ix2 = ix &lt;&lt; 1;</span>
+<span class="nc" id="L451">        positions[ix2] = (float)pos.getX();</span>
+<span class="nc" id="L452">        positions[ix2 + 1] = (float)pos.getY();</span>
+
+<span class="nc" id="L454">        clearCaches(ix);</span>
+<span class="nc" id="L455">        addFlags(FLAG_HAS_POSITION_ADJUSTMENTS);</span>
+<span class="nc" id="L456">    }</span>
+
+    public AffineTransform getGlyphTransform(int ix) {
+<span class="nc bnc" id="L459" title="All 4 branches missed.">        if (ix &lt; 0 || ix &gt;= glyphs.length) {</span>
+<span class="nc" id="L460">            throw new IndexOutOfBoundsException(&quot;ix = &quot; + ix);</span>
+        }
+<span class="nc bnc" id="L462" title="All 2 branches missed.">        if (gti != null) {</span>
+<span class="nc" id="L463">            return gti.getGlyphTransform(ix);</span>
+        }
+<span class="nc" id="L465">        return null; // spec'd as returning null</span>
+    }
+
+    public void setGlyphTransform(int ix, AffineTransform newTX) {
+<span class="nc bnc" id="L469" title="All 4 branches missed.">        if (ix &lt; 0 || ix &gt;= glyphs.length) {</span>
+<span class="nc" id="L470">            throw new IndexOutOfBoundsException(&quot;ix = &quot; + ix);</span>
+        }
+
+<span class="nc bnc" id="L473" title="All 2 branches missed.">        if (gti == null) {</span>
+<span class="nc bnc" id="L474" title="All 4 branches missed.">            if (newTX == null || newTX.isIdentity()) {</span>
+<span class="nc" id="L475">                return;</span>
+            }
+<span class="nc" id="L477">            gti = new GlyphTransformInfo(this);</span>
+        }
+<span class="nc" id="L479">        gti.setGlyphTransform(ix, newTX); // sets flags</span>
+<span class="nc bnc" id="L480" title="All 2 branches missed.">        if (gti.transformCount() == 0) {</span>
+<span class="nc" id="L481">            gti = null;</span>
+        }
+<span class="nc" id="L483">    }</span>
+
+    public int getLayoutFlags() {
+<span class="nc bnc" id="L486" title="All 2 branches missed.">        if (flags == UNINITIALIZED_FLAGS) {</span>
+<span class="nc" id="L487">            flags = 0;</span>
+
+<span class="nc bnc" id="L489" title="All 4 branches missed.">            if (charIndices != null &amp;&amp; glyphs.length &gt; 1) {</span>
+<span class="nc" id="L490">                boolean ltr = true;</span>
+<span class="nc" id="L491">                boolean rtl = true;</span>
+
+<span class="nc" id="L493">                int rtlix = charIndices.length; // rtl index</span>
+<span class="nc bnc" id="L494" title="All 6 branches missed.">                for (int i = 0; i &lt; charIndices.length &amp;&amp; (ltr || rtl); ++i) {</span>
+<span class="nc" id="L495">                    int cx = charIndices[i];</span>
+
+<span class="nc bnc" id="L497" title="All 4 branches missed.">                    ltr = ltr &amp;&amp; (cx == i);</span>
+<span class="nc bnc" id="L498" title="All 4 branches missed.">                    rtl = rtl &amp;&amp; (cx == --rtlix);</span>
+                }
+
+<span class="nc bnc" id="L501" title="All 2 branches missed.">                if (rtl) flags |= FLAG_RUN_RTL;</span>
+<span class="nc bnc" id="L502" title="All 4 branches missed.">                if (!rtl &amp;&amp; !ltr) flags |= FLAG_COMPLEX_GLYPHS;</span>
+            }
+        }
+
+<span class="nc" id="L506">        return flags;</span>
+    }
+
+    public float[] getGlyphPositions(int start, int count, float[] result) {
+<span class="nc bnc" id="L510" title="All 2 branches missed.">        if (count &lt; 0) {</span>
+<span class="nc" id="L511">            throw new IllegalArgumentException(&quot;count = &quot; + count);</span>
+        }
+<span class="nc bnc" id="L513" title="All 2 branches missed.">        if (start &lt; 0) {</span>
+<span class="nc" id="L514">            throw new IndexOutOfBoundsException(&quot;start = &quot; + start);</span>
+        }
+<span class="nc bnc" id="L516" title="All 2 branches missed.">        if (start &gt; glyphs.length + 1 - count) { // watch for overflow</span>
+<span class="nc" id="L517">            throw new IndexOutOfBoundsException(&quot;start + count = &quot; + (start + count));</span>
+        }
+
+<span class="nc" id="L520">        return internalGetGlyphPositions(start, count, 0, result);</span>
+    }
+
+    public Shape getGlyphLogicalBounds(int ix) {
+<span class="nc bnc" id="L524" title="All 4 branches missed.">        if (ix &lt; 0 || ix &gt;= glyphs.length) {</span>
+<span class="nc" id="L525">            throw new IndexOutOfBoundsException(&quot;ix = &quot; + ix);</span>
+        }
+
+        Shape[] lbcache;
+<span class="nc bnc" id="L529" title="All 4 branches missed.">        if (lbcacheRef == null || (lbcache = (Shape[])lbcacheRef.get()) == null) {</span>
+<span class="nc" id="L530">            lbcache = new Shape[glyphs.length];</span>
+<span class="nc" id="L531">            lbcacheRef = new SoftReference(lbcache);</span>
+        }
+
+<span class="nc" id="L534">        Shape result = lbcache[ix];</span>
+<span class="nc bnc" id="L535" title="All 2 branches missed.">        if (result == null) {</span>
+<span class="nc" id="L536">            setFRCTX();</span>
+<span class="nc" id="L537">            initPositions();</span>
+
+            // !!! ought to return a rectangle2d for simple cases, though the following works for all
+
+            // get the position, the tx offset, and the x,y advance and x,y adl.  The
+            // shape is the box formed by adv (width) and adl (height) offset by
+            // the position plus the tx offset minus the ascent.
+
+<span class="nc" id="L545">            ADL adl = new ADL();</span>
+<span class="nc" id="L546">            GlyphStrike gs = getGlyphStrike(ix);</span>
+<span class="nc" id="L547">            gs.getADL(adl);</span>
+
+<span class="nc" id="L549">            Point2D.Float adv = gs.strike.getGlyphMetrics(glyphs[ix]);</span>
+
+<span class="nc" id="L551">            float wx = adv.x;</span>
+<span class="nc" id="L552">            float wy = adv.y;</span>
+<span class="nc" id="L553">            float hx = adl.descentX + adl.leadingX + adl.ascentX;</span>
+<span class="nc" id="L554">            float hy = adl.descentY + adl.leadingY + adl.ascentY;</span>
+<span class="nc" id="L555">            float x = positions[ix*2] + gs.dx - adl.ascentX;</span>
+<span class="nc" id="L556">            float y = positions[ix*2+1] + gs.dy - adl.ascentY;</span>
+
+<span class="nc" id="L558">            GeneralPath gp = new GeneralPath();</span>
+<span class="nc" id="L559">            gp.moveTo(x, y);</span>
+<span class="nc" id="L560">            gp.lineTo(x + wx, y + wy);</span>
+<span class="nc" id="L561">            gp.lineTo(x + wx + hx, y + wy + hy);</span>
+<span class="nc" id="L562">            gp.lineTo(x + hx, y + hy);</span>
+<span class="nc" id="L563">            gp.closePath();</span>
+
+<span class="nc" id="L565">            result = new DelegatingShape(gp);</span>
+<span class="nc" id="L566">            lbcache[ix] = result;</span>
+        }
+
+<span class="nc" id="L569">        return result;</span>
+    }
+    private SoftReference lbcacheRef;
+
+    public Shape getGlyphVisualBounds(int ix) {
+<span class="nc bnc" id="L574" title="All 4 branches missed.">        if (ix &lt; 0 || ix &gt;= glyphs.length) {</span>
+<span class="nc" id="L575">            throw new IndexOutOfBoundsException(&quot;ix = &quot; + ix);</span>
+        }
+
+        Shape[] vbcache;
+<span class="nc bnc" id="L579" title="All 4 branches missed.">        if (vbcacheRef == null || (vbcache = (Shape[])vbcacheRef.get()) == null) {</span>
+<span class="nc" id="L580">            vbcache = new Shape[glyphs.length];</span>
+<span class="nc" id="L581">            vbcacheRef = new SoftReference(vbcache);</span>
+        }
+
+<span class="nc" id="L584">        Shape result = vbcache[ix];</span>
+<span class="nc bnc" id="L585" title="All 2 branches missed.">        if (result == null) {</span>
+<span class="nc" id="L586">            result = new DelegatingShape(getGlyphOutlineBounds(ix));</span>
+<span class="nc" id="L587">            vbcache[ix] = result;</span>
+        }
+
+<span class="nc" id="L590">        return result;</span>
+    }
+    private SoftReference vbcacheRef;
+
+    public Rectangle getGlyphPixelBounds(int index, FontRenderContext renderFRC, float x, float y) {
+<span class="nc" id="L595">      return getGlyphsPixelBounds(renderFRC, x, y, index, 1);</span>
+    }
+
+    public GlyphMetrics getGlyphMetrics(int ix) {
+<span class="nc bnc" id="L599" title="All 4 branches missed.">        if (ix &lt; 0 || ix &gt;= glyphs.length) {</span>
+<span class="nc" id="L600">            throw new IndexOutOfBoundsException(&quot;ix = &quot; + ix);</span>
+        }
+
+<span class="nc" id="L603">        Rectangle2D vb = getGlyphVisualBounds(ix).getBounds2D();</span>
+<span class="nc" id="L604">        Point2D pt = getGlyphPosition(ix);</span>
+<span class="nc" id="L605">        vb.setRect(vb.getMinX() - pt.getX(),</span>
+<span class="nc" id="L606">                   vb.getMinY() - pt.getY(),</span>
+<span class="nc" id="L607">                   vb.getWidth(),</span>
+<span class="nc" id="L608">                   vb.getHeight());</span>
+<span class="nc" id="L609">        Point2D.Float adv =</span>
+<span class="nc" id="L610">            getGlyphStrike(ix).strike.getGlyphMetrics(glyphs[ix]);</span>
+<span class="nc" id="L611">        GlyphMetrics gm = new GlyphMetrics(true, adv.x, adv.y,</span>
+                                           vb,
+                                           GlyphMetrics.STANDARD);
+<span class="nc" id="L614">        return gm;</span>
+    }
+
+    public GlyphJustificationInfo getGlyphJustificationInfo(int ix) {
+<span class="nc bnc" id="L618" title="All 4 branches missed.">        if (ix &lt; 0 || ix &gt;= glyphs.length) {</span>
+<span class="nc" id="L619">            throw new IndexOutOfBoundsException(&quot;ix = &quot; + ix);</span>
+        }
+
+        // currently we don't have enough information to do this right.  should
+        // get info from the font and use real OT/GX justification.  Right now
+        // sun/font/ExtendedTextSourceLabel assigns one of three infos
+        // based on whether the char is kanji, space, or other.
+
+<span class="nc" id="L627">        return null;</span>
+    }
+
+    public boolean equals(GlyphVector rhs) {
+<span class="nc bnc" id="L631" title="All 2 branches missed.">        if (this == rhs) {</span>
+<span class="nc" id="L632">            return true;</span>
+        }
+<span class="nc bnc" id="L634" title="All 2 branches missed.">        if (rhs == null) {</span>
+<span class="nc" id="L635">            return false;</span>
+        }
+
+        try {
+<span class="nc" id="L639">            StandardGlyphVector other = (StandardGlyphVector)rhs;</span>
+
+<span class="nc bnc" id="L641" title="All 2 branches missed.">            if (glyphs.length != other.glyphs.length) {</span>
+<span class="nc" id="L642">                return false;</span>
+            }
+
+<span class="nc bnc" id="L645" title="All 2 branches missed.">            for (int i = 0; i &lt; glyphs.length; ++i) {</span>
+<span class="nc bnc" id="L646" title="All 2 branches missed.">                if (glyphs[i] != other.glyphs[i]) {</span>
+<span class="nc" id="L647">                    return false;</span>
+                }
+            }
+
+<span class="nc bnc" id="L651" title="All 2 branches missed.">            if (!font.equals(other.font)) {</span>
+<span class="nc" id="L652">                return false;</span>
+            }
+
+<span class="nc bnc" id="L655" title="All 2 branches missed.">            if (!frc.equals(other.frc)) {</span>
+<span class="nc" id="L656">                return false;</span>
+            }
+
+<span class="nc bnc" id="L659" title="All 6 branches missed.">            if ((other.positions == null) != (positions == null)) {</span>
+<span class="nc bnc" id="L660" title="All 2 branches missed.">                if (positions == null) {</span>
+<span class="nc" id="L661">                    initPositions();</span>
+                } else {
+<span class="nc" id="L663">                    other.initPositions();</span>
+                }
+            }
+
+<span class="nc bnc" id="L667" title="All 2 branches missed.">            if (positions != null) {</span>
+<span class="nc bnc" id="L668" title="All 2 branches missed.">                for (int i = 0; i &lt; positions.length; ++i) {</span>
+<span class="nc bnc" id="L669" title="All 2 branches missed.">                    if (positions[i] != other.positions[i]) {</span>
+<span class="nc" id="L670">                        return false;</span>
+                    }
+                }
+            }
+
+<span class="nc bnc" id="L675" title="All 2 branches missed.">            if (gti == null) {</span>
+<span class="nc bnc" id="L676" title="All 2 branches missed.">                return other.gti == null;</span>
+            } else {
+<span class="nc" id="L678">                return gti.equals(other.gti);</span>
+            }
+        }
+<span class="nc" id="L681">        catch (ClassCastException e) {</span>
+            // assume they are different simply by virtue of the class difference
+
+<span class="nc" id="L684">            return false;</span>
+        }
+    }
+
+    /**
+     * As a concrete subclass of Object that implements equality, this must
+     * implement hashCode.
+     */
+    public int hashCode() {
+<span class="nc" id="L693">        return font.hashCode() ^ glyphs.length;</span>
+    }
+
+    /**
+     * Since we implement equality comparisons for GlyphVector, we implement
+     * the inherited Object.equals(Object) as well.  GlyphVector should do
+     * this, and define two glyphvectors as not equal if the classes differ.
+     */
+    public boolean equals(Object rhs) {
+        try {
+<span class="nc" id="L703">            return equals((GlyphVector)rhs);</span>
+        }
+<span class="nc" id="L705">        catch (ClassCastException e) {</span>
+<span class="nc" id="L706">            return false;</span>
+        }
+    }
+
+    /**
+     * Sometimes I wish java had covariant return types...
+     */
+    public StandardGlyphVector copy() {
+<span class="nc" id="L714">        return (StandardGlyphVector)clone();</span>
+    }
+
+    /**
+     * As a concrete subclass of GlyphVector, this must implement clone.
+     */
+    public Object clone() {
+        // positions, gti are mutable so we have to clone them
+        // font2d can be shared
+        // fsref is a cache and can be shared
+        try {
+<span class="nc" id="L725">            StandardGlyphVector result = (StandardGlyphVector)super.clone();</span>
+
+<span class="nc" id="L727">            result.clearCaches();</span>
+
+<span class="nc bnc" id="L729" title="All 2 branches missed.">            if (positions != null) {</span>
+<span class="nc" id="L730">                result.positions = (float[])positions.clone();</span>
+            }
+
+<span class="nc bnc" id="L733" title="All 2 branches missed.">            if (gti != null) {</span>
+<span class="nc" id="L734">                result.gti = new GlyphTransformInfo(result, gti);</span>
+            }
+
+<span class="nc" id="L737">            return result;</span>
+        }
+<span class="nc" id="L739">        catch (CloneNotSupportedException e) {</span>
+        }
+
+<span class="nc" id="L742">        return this;</span>
+    }
+
+    //////////////////////
+    // StandardGlyphVector new public methods
+    /////////////////////
+
+    /*
+     * Set a multiple glyph positions at one time.  GlyphVector only
+     * provides API to set a single glyph at a time.
+     */
+    public void setGlyphPositions(float[] srcPositions, int srcStart,
+                                  int start, int count) {
+<span class="nc bnc" id="L755" title="All 2 branches missed.">        if (count &lt; 0) {</span>
+<span class="nc" id="L756">            throw new IllegalArgumentException(&quot;count = &quot; + count);</span>
+        }
+
+<span class="nc" id="L759">        initPositions();</span>
+<span class="nc bnc" id="L760" title="All 2 branches missed.">        for (int i = start * 2, e = i + count * 2, p = srcStart; i &lt; e; ++i, ++p) {</span>
+<span class="nc" id="L761">            positions[i] = srcPositions[p];</span>
+        }
+
+<span class="nc" id="L764">        clearCaches();</span>
+<span class="nc" id="L765">        addFlags(FLAG_HAS_POSITION_ADJUSTMENTS);</span>
+<span class="nc" id="L766">    }</span>
+
+    /**
+     * Set all the glyph positions, including the 'after last glyph' position.
+     * The srcPositions array must be of length (numGlyphs + 1) * 2.
+     */
+    public void setGlyphPositions(float[] srcPositions) {
+<span class="nc" id="L773">        int requiredLength = glyphs.length * 2 + 2;</span>
+<span class="nc bnc" id="L774" title="All 2 branches missed.">        if (srcPositions.length != requiredLength) {</span>
+<span class="nc" id="L775">            throw new IllegalArgumentException(&quot;srcPositions.length != &quot; + requiredLength);</span>
+        }
+
+<span class="nc" id="L778">        positions = (float[])srcPositions.clone();</span>
+
+<span class="nc" id="L780">        clearCaches();</span>
+<span class="nc" id="L781">        addFlags(FLAG_HAS_POSITION_ADJUSTMENTS);</span>
+<span class="nc" id="L782">    }</span>
+
+    /**
+     * This is a convenience overload that gets all the glyph positions, which
+     * is what you usually want to do if you're getting more than one.
+     * !!! should I bother taking result parameter?
+     */
+    public float[] getGlyphPositions(float[] result) {
+<span class="nc" id="L790">        return internalGetGlyphPositions(0, glyphs.length + 1, 0, result);</span>
+    }
+
+    /**
+     * Get transform information for the requested range of glyphs.
+     * If no glyphs have a transform, return null.
+     * If a glyph has no transform (or is the identity transform) its entry in the result array will be null.
+     * If the passed-in result is null an array will be allocated for the caller.
+     * Each transform instance in the result array will unique, and independent of the GlyphVector's transform.
+     */
+    public AffineTransform[] getGlyphTransforms(int start, int count, AffineTransform[] result) {
+<span class="nc bnc" id="L801" title="All 6 branches missed.">        if (start &lt; 0 || count &lt; 0 || start + count &gt; glyphs.length) {</span>
+<span class="nc" id="L802">            throw new IllegalArgumentException(&quot;start: &quot; + start + &quot; count: &quot; + count);</span>
+        }
+
+<span class="nc bnc" id="L805" title="All 2 branches missed.">        if (gti == null) {</span>
+<span class="nc" id="L806">            return null;</span>
+        }
+
+<span class="nc bnc" id="L809" title="All 2 branches missed.">        if (result == null) {</span>
+<span class="nc" id="L810">            result = new AffineTransform[count];</span>
+        }
+
+<span class="nc bnc" id="L813" title="All 2 branches missed.">        for (int i = 0; i &lt; count; ++i, ++start) {</span>
+<span class="nc" id="L814">            result[i] = gti.getGlyphTransform(start);</span>
+        }
+
+<span class="nc" id="L817">        return result;</span>
+    }
+
+    /**
+     * Convenience overload for getGlyphTransforms(int, int, AffineTransform[], int);
+     */
+    public AffineTransform[] getGlyphTransforms() {
+<span class="nc" id="L824">        return getGlyphTransforms(0, glyphs.length, null);</span>
+    }
+
+    /**
+     * Set a number of glyph transforms.
+     * Original transforms are unchanged.  The array may contain nulls, and also may
+     * contain multiple references to the same transform instance.
+     */
+    public void setGlyphTransforms(AffineTransform[] srcTransforms, int srcStart, int start, int count) {
+<span class="nc bnc" id="L833" title="All 2 branches missed.">        for (int i = start, e = start + count; i &lt; e; ++i) {</span>
+<span class="nc" id="L834">            setGlyphTransform(i, srcTransforms[srcStart + i]);</span>
+        }
+<span class="nc" id="L836">    }</span>
+
+    /**
+     * Convenience overload of setGlyphTransforms(AffineTransform[], int, int, int).
+     */
+    public void setGlyphTransforms(AffineTransform[] srcTransforms) {
+<span class="nc" id="L842">        setGlyphTransforms(srcTransforms, 0, 0, glyphs.length);</span>
+<span class="nc" id="L843">    }</span>
+
+    /**
+     * For each glyph return posx, posy, advx, advy, visx, visy, visw, vish.
+     */
+    public float[] getGlyphInfo() {
+<span class="nc" id="L849">        setFRCTX();</span>
+<span class="nc" id="L850">        initPositions();</span>
+<span class="nc" id="L851">        float[] result = new float[glyphs.length * 8];</span>
+<span class="nc bnc" id="L852" title="All 2 branches missed.">        for (int i = 0, n = 0; i &lt; glyphs.length; ++i, n += 8) {</span>
+<span class="nc" id="L853">            float x = positions[i*2];</span>
+<span class="nc" id="L854">            float y = positions[i*2+1];</span>
+<span class="nc" id="L855">            result[n] = x;</span>
+<span class="nc" id="L856">            result[n+1] = y;</span>
+
+<span class="nc" id="L858">            int glyphID = glyphs[i];</span>
+<span class="nc" id="L859">            GlyphStrike s = getGlyphStrike(i);</span>
+<span class="nc" id="L860">            Point2D.Float adv = s.strike.getGlyphMetrics(glyphID);</span>
+<span class="nc" id="L861">            result[n+2] = adv.x;</span>
+<span class="nc" id="L862">            result[n+3] = adv.y;</span>
+
+<span class="nc" id="L864">            Rectangle2D vb = getGlyphVisualBounds(i).getBounds2D();</span>
+<span class="nc" id="L865">            result[n+4] = (float)(vb.getMinX());</span>
+<span class="nc" id="L866">            result[n+5] = (float)(vb.getMinY());</span>
+<span class="nc" id="L867">            result[n+6] = (float)(vb.getWidth());</span>
+<span class="nc" id="L868">            result[n+7] = (float)(vb.getHeight());</span>
+        }
+<span class="nc" id="L870">        return result;</span>
+    }
+
+    /**
+     * !!! not used currently, but might be by getPixelbounds?
+     */
+    public void pixellate(FontRenderContext renderFRC, Point2D loc, Point pxResult) {
+<span class="nc bnc" id="L877" title="All 2 branches missed.">        if (renderFRC == null) {</span>
+<span class="nc" id="L878">            renderFRC = frc;</span>
+        }
+
+        // it is a total pain that you have to copy the transform.
+
+<span class="nc" id="L883">        AffineTransform at = renderFRC.getTransform();</span>
+<span class="nc" id="L884">        at.transform(loc, loc);</span>
+<span class="nc" id="L885">        pxResult.x = (int)loc.getX(); // but must not behave oddly around zero</span>
+<span class="nc" id="L886">        pxResult.y = (int)loc.getY();</span>
+<span class="nc" id="L887">        loc.setLocation(pxResult.x, pxResult.y);</span>
+        try {
+<span class="nc" id="L889">            at.inverseTransform(loc, loc);</span>
+        }
+<span class="nc" id="L891">        catch (NoninvertibleTransformException e) {</span>
+<span class="nc" id="L892">            throw new IllegalArgumentException(&quot;must be able to invert frc transform&quot;);</span>
+<span class="nc" id="L893">        }</span>
+<span class="nc" id="L894">    }</span>
+
+    //////////////////////
+    // StandardGlyphVector package private methods
+    /////////////////////
+
+    // used by glyphlist to determine if it needs to allocate/size positions array
+    // gti always uses positions because the gtx might have translation.  We also
+    // need positions if the rendering dtx is different from the frctx.
+
+    boolean needsPositions(double[] devTX) {
+<span class="nc bnc" id="L905" title="All 2 branches missed.">        return gti != null ||</span>
+<span class="nc bnc" id="L906" title="All 2 branches missed.">            (getLayoutFlags() &amp; FLAG_HAS_POSITION_ADJUSTMENTS) != 0 ||</span>
+<span class="nc bnc" id="L907" title="All 2 branches missed.">            !matchTX(devTX, frctx);</span>
+    }
+
+    // used by glyphList to get strong refs to font strikes for duration of rendering call
+    // if devTX matches current devTX, we're ready to go
+    // if we don't have multiple transforms, we're already ok
+
+    // !!! I'm not sure fontInfo works so well for glyphvector, since we have to be able to handle
+    // the multiple-strikes case
+
+    /*
+     * GlyphList calls this to set up its images data.  First it calls needsPositions,
+     * passing the devTX, to see if it should provide us a positions array to fill.
+     * It only doesn't need them if we're a simple glyph vector whose frctx matches the
+     * devtx.
+     * Then it calls setupGlyphImages.  If we need positions, we make sure we have our
+     * default positions based on the frctx first. Then we set the devTX, and use
+     * strikes based on it to generate the images.  Finally, we fill in the positions
+     * array.
+     * If we have transforms, we delegate to gti.  It depends on our having first
+     * initialized the positions and devTX.
+     */
+    Object setupGlyphImages(long[] images, float[] positions, double[] devTX) {
+<span class="nc" id="L930">        initPositions(); // FIRST ensure we have positions based on our frctx</span>
+<span class="nc" id="L931">        setRenderTransform(devTX); // THEN make sure we are using the desired devTX</span>
+
+<span class="nc bnc" id="L933" title="All 2 branches missed.">        if (gti != null) {</span>
+<span class="nc" id="L934">            return gti.setupGlyphImages(images, positions, dtx);</span>
+        }
+
+<span class="nc" id="L937">        GlyphStrike gs = getDefaultStrike();</span>
+<span class="nc" id="L938">        gs.strike.getGlyphImagePtrs(glyphs, images, glyphs.length);</span>
+
+<span class="nc bnc" id="L940" title="All 2 branches missed.">        if (positions != null) {</span>
+<span class="nc bnc" id="L941" title="All 2 branches missed.">            if (dtx.isIdentity()) {</span>
+<span class="nc" id="L942">                System.arraycopy(this.positions, 0, positions, 0, glyphs.length * 2);</span>
+            } else {
+<span class="nc" id="L944">                dtx.transform(this.positions, 0, positions, 0, glyphs.length);</span>
+            }
+        }
+
+<span class="nc" id="L948">        return gs;</span>
+    }
+
+    //////////////////////
+    // StandardGlyphVector private methods
+    /////////////////////
+
+    // We keep translation in our frctx since getPixelBounds uses it.  But
+    // GlyphList pulls out the translation and applies it separately, so
+    // we strip it out when we set the dtx.  Basically nothing uses the
+    // translation except getPixelBounds.
+
+    // called by needsPositions, setRenderTransform
+    private static boolean matchTX(double[] lhs, AffineTransform rhs) {
+<span class="nc" id="L962">        return</span>
+<span class="nc bnc" id="L963" title="All 2 branches missed.">            lhs[0] == rhs.getScaleX() &amp;&amp;</span>
+<span class="nc bnc" id="L964" title="All 2 branches missed.">            lhs[1] == rhs.getShearY() &amp;&amp;</span>
+<span class="nc bnc" id="L965" title="All 2 branches missed.">            lhs[2] == rhs.getShearX() &amp;&amp;</span>
+<span class="nc bnc" id="L966" title="All 2 branches missed.">            lhs[3] == rhs.getScaleY();</span>
+    }
+
+    // returns new tx if old one has translation, otherwise returns old one
+    private static AffineTransform getNonTranslateTX(AffineTransform tx) {
+<span class="nc bnc" id="L971" title="All 4 branches missed.">        if (tx.getTranslateX() != 0 || tx.getTranslateY() != 0) {</span>
+<span class="nc" id="L972">            tx = new AffineTransform(tx.getScaleX(), tx.getShearY(),</span>
+<span class="nc" id="L973">                                     tx.getShearX(), tx.getScaleY(),</span>
+                                     0, 0);
+        }
+<span class="nc" id="L976">        return tx;</span>
+    }
+
+    private static boolean equalNonTranslateTX(AffineTransform lhs, AffineTransform rhs) {
+<span class="nc bnc" id="L980" title="All 2 branches missed.">        return lhs.getScaleX() == rhs.getScaleX() &amp;&amp;</span>
+<span class="nc bnc" id="L981" title="All 2 branches missed.">            lhs.getShearY() == rhs.getShearY() &amp;&amp;</span>
+<span class="nc bnc" id="L982" title="All 2 branches missed.">            lhs.getShearX() == rhs.getShearX() &amp;&amp;</span>
+<span class="nc bnc" id="L983" title="All 2 branches missed.">            lhs.getScaleY() == rhs.getScaleY();</span>
+    }
+
+    // called by setupGlyphImages (after needsPositions, so redundant match check?)
+    private void setRenderTransform(double[] devTX) {
+<span class="nc bnc" id="L988" title="All 4 branches missed.">        assert(devTX.length == 4);</span>
+<span class="nc bnc" id="L989" title="All 2 branches missed.">        if (!matchTX(devTX, dtx)) {</span>
+<span class="nc" id="L990">            resetDTX(new AffineTransform(devTX)); // no translation since devTX len == 4.</span>
+        }
+<span class="nc" id="L992">    }</span>
+
+    // called by getGlyphsPixelBounds
+    private final void setDTX(AffineTransform tx) {
+<span class="nc bnc" id="L996" title="All 2 branches missed.">        if (!equalNonTranslateTX(dtx, tx)) {</span>
+<span class="nc" id="L997">            resetDTX(getNonTranslateTX(tx));</span>
+        }
+<span class="nc" id="L999">    }</span>
+
+    // called by most functions
+    private final void setFRCTX() {
+<span class="nc bnc" id="L1003" title="All 2 branches missed.">        if (!equalNonTranslateTX(frctx, dtx)) {</span>
+<span class="nc" id="L1004">            resetDTX(getNonTranslateTX(frctx));</span>
+        }
+<span class="nc" id="L1006">    }</span>
+
+    /**
+     * Change the dtx for the strike refs we use.  Keeps a reference to the at.  At
+     * must not contain translation.
+     * Called by setRenderTransform, setDTX, initFontData.
+     */
+    private final void resetDTX(AffineTransform at) {
+<span class="nc" id="L1014">        fsref = null;</span>
+<span class="nc" id="L1015">        dtx = at;</span>
+<span class="nc" id="L1016">        invdtx = null;</span>
+<span class="nc bnc" id="L1017" title="All 2 branches missed.">        if (!dtx.isIdentity()) {</span>
+            try {
+<span class="nc" id="L1019">                invdtx = dtx.createInverse();</span>
+            }
+<span class="nc" id="L1021">            catch (NoninvertibleTransformException e) {</span>
+                // we needn't care for rendering
+<span class="nc" id="L1023">            }</span>
+        }
+<span class="nc bnc" id="L1025" title="All 2 branches missed.">        if (gti != null) {</span>
+<span class="nc" id="L1026">            gti.strikesRef = null;</span>
+        }
+<span class="nc" id="L1028">    }</span>
+
+    /**
+     * Utility used by getStandardGV.
+     * Constructs a StandardGlyphVector from a generic glyph vector.
+     * Do not call this from new contexts without considering the comment
+     * about &quot;userGlyphs&quot;.
+     */
+<span class="nc" id="L1036">    private StandardGlyphVector(GlyphVector gv, FontRenderContext frc) {</span>
+<span class="nc" id="L1037">        this.font = gv.getFont();</span>
+<span class="nc" id="L1038">        this.frc = frc;</span>
+<span class="nc" id="L1039">        initFontData();</span>
+
+<span class="nc" id="L1041">        int nGlyphs = gv.getNumGlyphs();</span>
+<span class="nc" id="L1042">        this.userGlyphs = gv.getGlyphCodes(0, nGlyphs, null);</span>
+<span class="nc bnc" id="L1043" title="All 2 branches missed.">        if (gv instanceof StandardGlyphVector) {</span>
+            /* userGlyphs will be OK because this is a private constructor
+             * and the returned instance is used only for rendering.
+             * It's not constructable by user code, nor returned to the
+             * application. So we know &quot;userGlyphs&quot; are valid as having
+             * been either already validated or are the result of layout.
+             */
+<span class="nc" id="L1050">            this.glyphs = userGlyphs;</span>
+        } else {
+<span class="nc" id="L1052">            this.glyphs = getValidatedGlyphs(this.userGlyphs);</span>
+        }
+<span class="nc" id="L1054">        this.flags = gv.getLayoutFlags() &amp; FLAG_MASK;</span>
+
+<span class="nc bnc" id="L1056" title="All 2 branches missed.">        if ((flags &amp; FLAG_HAS_POSITION_ADJUSTMENTS) != 0) {</span>
+<span class="nc" id="L1057">            this.positions = gv.getGlyphPositions(0, nGlyphs + 1, null);</span>
+        }
+
+<span class="nc bnc" id="L1060" title="All 2 branches missed.">        if ((flags &amp; FLAG_COMPLEX_GLYPHS) != 0) {</span>
+<span class="nc" id="L1061">            this.charIndices = gv.getGlyphCharIndices(0, nGlyphs, null);</span>
+        }
+
+<span class="nc bnc" id="L1064" title="All 2 branches missed.">        if ((flags &amp; FLAG_HAS_TRANSFORMS) != 0) {</span>
+<span class="nc" id="L1065">            AffineTransform[] txs = new AffineTransform[nGlyphs]; // worst case</span>
+<span class="nc bnc" id="L1066" title="All 2 branches missed.">            for (int i = 0; i &lt; nGlyphs; ++i) {</span>
+<span class="nc" id="L1067">                txs[i] = gv.getGlyphTransform(i); // gv doesn't have getGlyphsTransforms</span>
+            }
+
+<span class="nc" id="L1070">            setGlyphTransforms(txs);</span>
+        }
+<span class="nc" id="L1072">    }</span>
+
+    /* Before asking the Font we see if the glyph code is
+     * FFFE or FFFF which are special values that we should be internally
+     * ready to handle as meaning invisible glyphs. The Font would report
+     * those as the missing glyph.
+     */
+    int[] getValidatedGlyphs(int[] oglyphs) {
+<span class="nc" id="L1080">        int len = oglyphs.length;</span>
+<span class="nc" id="L1081">        int[] vglyphs = new int[len];</span>
+<span class="nc bnc" id="L1082" title="All 2 branches missed.">        for (int i=0; i&lt;len; i++) {</span>
+<span class="nc bnc" id="L1083" title="All 4 branches missed.">            if (oglyphs[i] == 0xFFFE || oglyphs[i] == 0xFFFF) {</span>
+<span class="nc" id="L1084">                vglyphs[i] = oglyphs[i];</span>
+            } else {
+<span class="nc" id="L1086">                vglyphs[i] = font2D.getValidatedGlyphCode(oglyphs[i]);</span>
+            }
+        }
+<span class="nc" id="L1089">        return vglyphs;</span>
+    }
+
+    // utility used by constructors
+    private void init(Font font, char[] text, int start, int count,
+                      FontRenderContext frc, int flags) {
+
+<span class="nc bnc" id="L1096" title="All 6 branches missed.">        if (start &lt; 0 || count &lt; 0 || start + count &gt; text.length) {</span>
+<span class="nc" id="L1097">            throw new ArrayIndexOutOfBoundsException(&quot;start or count out of bounds&quot;);</span>
+        }
+
+<span class="nc" id="L1100">        this.font = font;</span>
+<span class="nc" id="L1101">        this.frc = frc;</span>
+<span class="nc" id="L1102">        this.flags = flags;</span>
+
+<span class="nc bnc" id="L1104" title="All 2 branches missed.">        if (getTracking(font) != 0) {</span>
+<span class="nc" id="L1105">            addFlags(FLAG_HAS_POSITION_ADJUSTMENTS);</span>
+        }
+
+        // !!! change mapper interface?
+<span class="nc bnc" id="L1109" title="All 2 branches missed.">        if (start != 0) {</span>
+<span class="nc" id="L1110">            char[] temp = new char[count];</span>
+<span class="nc" id="L1111">            System.arraycopy(text, start, temp, 0, count);</span>
+<span class="nc" id="L1112">            text = temp;</span>
+        }
+
+<span class="nc" id="L1115">        initFontData(); // sets up font2D</span>
+
+        // !!! no layout for now, should add checks
+        // !!! need to support creating a StandardGlyphVector from a TextMeasurer's info...
+<span class="nc" id="L1119">        glyphs = new int[count]; // hmmm</span>
+        /* Glyphs obtained here are already validated by the font */
+<span class="nc" id="L1121">        userGlyphs = glyphs;</span>
+<span class="nc" id="L1122">        font2D.getMapper().charsToGlyphs(count, text, glyphs);</span>
+<span class="nc" id="L1123">    }</span>
+
+    private void initFontData() {
+<span class="nc" id="L1126">        font2D = FontUtilities.getFont2D(font);</span>
+<span class="nc" id="L1127">        float s = font.getSize2D();</span>
+<span class="nc bnc" id="L1128" title="All 2 branches missed.">        if (font.isTransformed()) {</span>
+<span class="nc" id="L1129">            ftx = font.getTransform();</span>
+<span class="nc bnc" id="L1130" title="All 4 branches missed.">            if (ftx.getTranslateX() != 0 || ftx.getTranslateY() != 0) {</span>
+<span class="nc" id="L1131">                addFlags(FLAG_HAS_POSITION_ADJUSTMENTS);</span>
+            }
+<span class="nc" id="L1133">            ftx.setTransform(ftx.getScaleX(), ftx.getShearY(), ftx.getShearX(), ftx.getScaleY(), 0, 0);</span>
+<span class="nc" id="L1134">            ftx.scale(s, s);</span>
+        } else {
+<span class="nc" id="L1136">            ftx = AffineTransform.getScaleInstance(s, s);</span>
+        }
+
+<span class="nc" id="L1139">        frctx = frc.getTransform();</span>
+<span class="nc" id="L1140">        resetDTX(getNonTranslateTX(frctx));</span>
+<span class="nc" id="L1141">    }</span>
+
+    /**
+     * Copy glyph position data into a result array starting at the indicated
+     * offset in the array.  If the passed-in result array is null, a new
+     * array will be allocated and returned.
+     *
+     * This is an internal method and does no extra argument checking.
+     *
+     * @param start the index of the first glyph to get
+     * @param count the number of glyphs to get
+     * @param offset the offset into result at which to put the data
+     * @param result an array to hold the x,y positions
+     * @return the modified position array
+     */
+    private float[] internalGetGlyphPositions(int start, int count, int offset, float[] result) {
+<span class="nc bnc" id="L1157" title="All 2 branches missed.">        if (result == null) {</span>
+<span class="nc" id="L1158">            result = new float[offset + count * 2];</span>
+        }
+
+<span class="nc" id="L1161">        initPositions();</span>
+
+        // System.arraycopy is slow for stuff like this
+<span class="nc bnc" id="L1164" title="All 2 branches missed.">        for (int i = offset, e = offset + count * 2, p = start * 2; i &lt; e; ++i, ++p) {</span>
+<span class="nc" id="L1165">            result[i] = positions[p];</span>
+        }
+
+<span class="nc" id="L1168">        return result;</span>
+    }
+
+    private Rectangle2D getGlyphOutlineBounds(int ix) {
+<span class="nc" id="L1172">        setFRCTX();</span>
+<span class="nc" id="L1173">        initPositions();</span>
+<span class="nc" id="L1174">        return getGlyphStrike(ix).getGlyphOutlineBounds(glyphs[ix], positions[ix*2], positions[ix*2+1]);</span>
+    }
+
+    /**
+     * Used by getOutline, getGlyphsOutline
+     */
+    private Shape getGlyphsOutline(int start, int count, float x, float y) {
+<span class="nc" id="L1181">        setFRCTX();</span>
+<span class="nc" id="L1182">        initPositions();</span>
+
+<span class="nc" id="L1184">        GeneralPath result = new GeneralPath(GeneralPath.WIND_NON_ZERO);</span>
+<span class="nc bnc" id="L1185" title="All 2 branches missed.">        for (int i = start, e = start + count, n = start * 2; i &lt; e; ++i, n += 2) {</span>
+<span class="nc" id="L1186">            float px = x + positions[n];</span>
+<span class="nc" id="L1187">            float py = y + positions[n+1];</span>
+
+<span class="nc" id="L1189">            getGlyphStrike(i).appendGlyphOutline(glyphs[i], result, px, py);</span>
+        }
+
+<span class="nc" id="L1192">        return result;</span>
+    }
+
+    private Rectangle getGlyphsPixelBounds(FontRenderContext frc, float x, float y, int start, int count) {
+<span class="nc" id="L1196">        initPositions(); // FIRST ensure we have positions based on our frctx</span>
+
+<span class="nc" id="L1198">        AffineTransform tx = null;</span>
+<span class="nc bnc" id="L1199" title="All 4 branches missed.">        if (frc == null || frc.equals(this.frc)) {</span>
+<span class="nc" id="L1200">            tx = frctx;</span>
+        } else {
+<span class="nc" id="L1202">            tx = frc.getTransform();</span>
+        }
+<span class="nc" id="L1204">        setDTX(tx); // need to get the right strikes, but we use tx itself to translate the points</span>
+
+<span class="nc bnc" id="L1206" title="All 2 branches missed.">        if (gti != null) {</span>
+<span class="nc" id="L1207">            return gti.getGlyphsPixelBounds(tx, x, y, start, count);</span>
+        }
+
+<span class="nc" id="L1210">        FontStrike fs = getDefaultStrike().strike;</span>
+<span class="nc" id="L1211">        Rectangle result = null;</span>
+<span class="nc" id="L1212">        Rectangle r = new Rectangle();</span>
+<span class="nc" id="L1213">        Point2D.Float pt = new Point.Float();</span>
+<span class="nc" id="L1214">        int n = start * 2;</span>
+<span class="nc bnc" id="L1215" title="All 2 branches missed.">        while (--count &gt;= 0) {</span>
+<span class="nc" id="L1216">            pt.x = x + positions[n++];</span>
+<span class="nc" id="L1217">            pt.y = y + positions[n++];</span>
+<span class="nc" id="L1218">            tx.transform(pt, pt);</span>
+<span class="nc" id="L1219">            fs.getGlyphImageBounds(glyphs[start++], pt, r);</span>
+<span class="nc bnc" id="L1220" title="All 2 branches missed.">            if (!r.isEmpty()) {</span>
+<span class="nc bnc" id="L1221" title="All 2 branches missed.">                if (result == null) {</span>
+<span class="nc" id="L1222">                    result = new Rectangle(r);</span>
+                } else {
+<span class="nc" id="L1224">                    result.add(r);</span>
+                }
+            }
+        }
+<span class="nc bnc" id="L1228" title="All 2 branches missed.">        return result != null ? result : r;</span>
+    }
+
+    private void clearCaches(int ix) {
+<span class="nc bnc" id="L1232" title="All 2 branches missed.">        if (lbcacheRef != null) {</span>
+<span class="nc" id="L1233">            Shape[] lbcache = (Shape[])lbcacheRef.get();</span>
+<span class="nc bnc" id="L1234" title="All 2 branches missed.">            if (lbcache != null) {</span>
+<span class="nc" id="L1235">                lbcache[ix] = null;</span>
+            }
+        }
+
+<span class="nc bnc" id="L1239" title="All 2 branches missed.">        if (vbcacheRef != null) {</span>
+<span class="nc" id="L1240">            Shape[] vbcache = (Shape[])vbcacheRef.get();</span>
+<span class="nc bnc" id="L1241" title="All 2 branches missed.">            if (vbcache != null) {</span>
+<span class="nc" id="L1242">                vbcache[ix] = null;</span>
+            }
+        }
+<span class="nc" id="L1245">    }</span>
+
+    private void clearCaches() {
+<span class="nc" id="L1248">        lbcacheRef = null;</span>
+<span class="nc" id="L1249">        vbcacheRef = null;</span>
+<span class="nc" id="L1250">    }</span>
+
+    // internal use only for possible future extension
+
+    /**
+     * A flag used with getLayoutFlags that indicates whether this &lt;code&gt;GlyphVector&lt;/code&gt; uses
+     * a vertical baseline.
+     */
+    public static final int FLAG_USES_VERTICAL_BASELINE = 128;
+
+    /**
+     * A flag used with getLayoutFlags that indicates whether this &lt;code&gt;GlyphVector&lt;/code&gt; uses
+     * vertical glyph metrics.  A &lt;code&gt;GlyphVector&lt;/code&gt; can use vertical metrics on a
+     * horizontal line, or vice versa.
+     */
+    public static final int FLAG_USES_VERTICAL_METRICS = 256;
+
+    /**
+     * A flag used with getLayoutFlags that indicates whether this &lt;code&gt;GlyphVector&lt;/code&gt; uses
+     * the 'alternate orientation.'  Glyphs have a default orientation given a
+     * particular baseline and metrics orientation, this is the orientation appropriate
+     * for left-to-right text.  For example, the letter 'A' can have four orientations,
+     * with the point at 12, 3, 6, or 9 'o clock.  The following table shows where the
+     * point displays for different values of vertical baseline (vb), vertical
+     * metrics (vm) and alternate orientation (fo):&lt;br&gt;
+     * &lt;blockquote&gt;
+     * vb vm ao
+     * -- -- --  --
+     *  f  f  f  12   ^  horizontal metrics on horizontal lines
+     *  f  f  t   6   v
+     *  f  t  f   9   &lt;  vertical metrics on horizontal lines
+     *  f  t  t   3   &gt;
+     *  t  f  f   3   &gt;  horizontal metrics on vertical lines
+     *  t  f  t   9   &lt;
+     *  t  t  f  12   ^  vertical metrics on vertical lines
+     *  t  t  t   6   v
+     * &lt;/blockquote&gt;
+     */
+    public static final int FLAG_USES_ALTERNATE_ORIENTATION = 512;
+
+
+    /**
+     * Ensure that the positions array exists and holds position data.
+     * If the array is null, this allocates it and sets default positions.
+     */
+    private void initPositions() {
+<span class="nc bnc" id="L1296" title="All 2 branches missed.">        if (positions == null) {</span>
+<span class="nc" id="L1297">            setFRCTX();</span>
+
+<span class="nc" id="L1299">            positions = new float[glyphs.length * 2 + 2];</span>
+
+<span class="nc" id="L1301">            Point2D.Float trackPt = null;</span>
+<span class="nc" id="L1302">            float track = getTracking(font);</span>
+<span class="nc bnc" id="L1303" title="All 2 branches missed.">            if (track != 0) {</span>
+<span class="nc" id="L1304">                track *= font.getSize2D();</span>
+<span class="nc" id="L1305">                trackPt = new Point2D.Float(track, 0); // advance delta</span>
+            }
+
+<span class="nc" id="L1308">            Point2D.Float pt = new Point2D.Float(0, 0);</span>
+<span class="nc bnc" id="L1309" title="All 2 branches missed.">            if (font.isTransformed()) {</span>
+<span class="nc" id="L1310">                AffineTransform at = font.getTransform();</span>
+<span class="nc" id="L1311">                at.transform(pt, pt);</span>
+<span class="nc" id="L1312">                positions[0] = pt.x;</span>
+<span class="nc" id="L1313">                positions[1] = pt.y;</span>
+
+<span class="nc bnc" id="L1315" title="All 2 branches missed.">                if (trackPt != null) {</span>
+<span class="nc" id="L1316">                    at.deltaTransform(trackPt, trackPt);</span>
+                }
+            }
+<span class="nc bnc" id="L1319" title="All 2 branches missed.">            for (int i = 0, n = 2; i &lt; glyphs.length; ++i, n += 2) {</span>
+<span class="nc" id="L1320">                getGlyphStrike(i).addDefaultGlyphAdvance(glyphs[i], pt);</span>
+<span class="nc bnc" id="L1321" title="All 2 branches missed.">                if (trackPt != null) {</span>
+<span class="nc" id="L1322">                    pt.x += trackPt.x;</span>
+<span class="nc" id="L1323">                    pt.y += trackPt.y;</span>
+                }
+<span class="nc" id="L1325">                positions[n] = pt.x;</span>
+<span class="nc" id="L1326">                positions[n+1] = pt.y;</span>
+            }
+        }
+<span class="nc" id="L1329">    }</span>
+
+    /**
+     * OR newFlags with existing flags.  First computes existing flags if needed.
+     */
+    private void addFlags(int newflags) {
+<span class="nc" id="L1335">        flags = getLayoutFlags() | newflags;</span>
+<span class="nc" id="L1336">    }</span>
+
+    /**
+     * AND the complement of clearedFlags with existing flags.  First computes existing flags if needed.
+     */
+    private void clearFlags(int clearedFlags) {
+<span class="nc" id="L1342">        flags = getLayoutFlags() &amp; ~clearedFlags;</span>
+<span class="nc" id="L1343">    }</span>
+
+    // general utility methods
+
+    // encapsulate the test to check whether we have per-glyph transforms
+    private GlyphStrike getGlyphStrike(int ix) {
+<span class="nc bnc" id="L1349" title="All 2 branches missed.">        if (gti == null) {</span>
+<span class="nc" id="L1350">            return getDefaultStrike();</span>
+        } else {
+<span class="nc" id="L1352">            return gti.getStrike(ix);</span>
+        }
+    }
+
+    // encapsulate access to cached default glyph strike
+    private GlyphStrike getDefaultStrike() {
+<span class="nc" id="L1358">        GlyphStrike gs = null;</span>
+<span class="nc bnc" id="L1359" title="All 2 branches missed.">        if (fsref != null) {</span>
+<span class="nc" id="L1360">            gs = (GlyphStrike)fsref.get();</span>
+        }
+<span class="nc bnc" id="L1362" title="All 2 branches missed.">        if (gs == null) {</span>
+<span class="nc" id="L1363">            gs = GlyphStrike.create(this, dtx, null);</span>
+<span class="nc" id="L1364">            fsref = new SoftReference(gs);</span>
+        }
+<span class="nc" id="L1366">        return gs;</span>
+    }
+
+
+    /////////////////////
+    // Internal utility classes
+    /////////////////////
+
+    // !!! I have this as a separate class instead of just inside SGV,
+    // but I previously didn't bother.  Now I'm trying this again.
+    // Probably still not worth it, but I'd like to keep sgv's small in the common case.
+
+    static final class GlyphTransformInfo {
+        StandardGlyphVector sgv;  // reference back to glyph vector - yuck
+        int[] indices;            // index into unique strikes
+        double[] transforms;      // six doubles per unique transform, because AT is a pain to manipulate
+        SoftReference strikesRef; // ref to unique strikes, one per transform
+        boolean haveAllStrikes;   // true if the strike array has been filled by getStrikes().
+
+        // used when first setting a transform
+<span class="nc" id="L1386">        GlyphTransformInfo(StandardGlyphVector sgv) {</span>
+<span class="nc" id="L1387">            this.sgv = sgv;</span>
+<span class="nc" id="L1388">        }</span>
+
+        // used when cloning a glyph vector, need to set back link
+<span class="nc" id="L1391">        GlyphTransformInfo(StandardGlyphVector sgv, GlyphTransformInfo rhs) {</span>
+<span class="nc" id="L1392">            this.sgv = sgv;</span>
+
+<span class="nc bnc" id="L1394" title="All 2 branches missed.">            this.indices = rhs.indices == null ? null : (int[])rhs.indices.clone();</span>
+<span class="nc bnc" id="L1395" title="All 2 branches missed.">            this.transforms = rhs.transforms == null ? null : (double[])rhs.transforms.clone();</span>
+<span class="nc" id="L1396">            this.strikesRef = null; // can't share cache, so rather than clone, we just null out</span>
+<span class="nc" id="L1397">        }</span>
+
+        // used in sgv equality
+        public boolean equals(GlyphTransformInfo rhs) {
+<span class="nc bnc" id="L1401" title="All 2 branches missed.">            if (rhs == null) {</span>
+<span class="nc" id="L1402">                return false;</span>
+            }
+<span class="nc bnc" id="L1404" title="All 2 branches missed.">            if (rhs == this) {</span>
+<span class="nc" id="L1405">                return true;</span>
+            }
+<span class="nc bnc" id="L1407" title="All 2 branches missed.">            if (this.indices.length != rhs.indices.length) {</span>
+<span class="nc" id="L1408">                return false;</span>
+            }
+<span class="nc bnc" id="L1410" title="All 2 branches missed.">            if (this.transforms.length != rhs.transforms.length) {</span>
+<span class="nc" id="L1411">                return false;</span>
+            }
+
+            // slow since we end up processing the same transforms multiple
+            // times, but since transforms can be in any order, we either do
+            // this or create a mapping.  Equality tests aren't common so
+            // leave it like this.
+<span class="nc bnc" id="L1418" title="All 2 branches missed.">            for (int i = 0; i &lt; this.indices.length; ++i) {</span>
+<span class="nc" id="L1419">                int tix = this.indices[i];</span>
+<span class="nc" id="L1420">                int rix = rhs.indices[i];</span>
+<span class="nc bnc" id="L1421" title="All 6 branches missed.">                if ((tix == 0) != (rix == 0)) {</span>
+<span class="nc" id="L1422">                    return false;</span>
+                }
+<span class="nc bnc" id="L1424" title="All 2 branches missed.">                if (tix != 0) {</span>
+<span class="nc" id="L1425">                    tix *= 6;</span>
+<span class="nc" id="L1426">                    rix *= 6;</span>
+<span class="nc bnc" id="L1427" title="All 2 branches missed.">                    for (int j = 6; j &gt; 0; --j) {</span>
+<span class="nc bnc" id="L1428" title="All 2 branches missed.">                        if (this.indices[--tix] != rhs.indices[--rix]) {</span>
+<span class="nc" id="L1429">                            return false;</span>
+                        }
+                    }
+                }
+            }
+<span class="nc" id="L1434">            return true;</span>
+        }
+
+        // implements sgv.setGlyphTransform
+        void setGlyphTransform(int glyphIndex, AffineTransform newTX) {
+
+            // we store all the glyph transforms as a double array, and for each glyph there
+            // is an entry in the txIndices array indicating which transform to use.  0 means
+            // there's no transform, 1 means use the first transform (the 6 doubles at offset
+            // 0), 2 means use the second transform (the 6 doubles at offset 6), etc.
+            //
+            // Since this can be called multiple times, and since the number of transforms
+            // affects the time it takes to construct the glyphs, we try to keep the arrays as
+            // compact as possible, by removing transforms that are no longer used, and reusing
+            // transforms where we already have them.
+
+<span class="nc" id="L1450">            double[] temp = new double[6];</span>
+<span class="nc" id="L1451">            boolean isIdentity = true;</span>
+<span class="nc bnc" id="L1452" title="All 4 branches missed.">            if (newTX == null || newTX.isIdentity()) {</span>
+                // Fill in temp
+<span class="nc" id="L1454">                temp[0] = temp[3] = 1.0;</span>
+            }
+            else {
+<span class="nc" id="L1457">                isIdentity = false;</span>
+<span class="nc" id="L1458">                newTX.getMatrix(temp);</span>
+            }
+
+<span class="nc bnc" id="L1461" title="All 2 branches missed.">            if (indices == null) {</span>
+<span class="nc bnc" id="L1462" title="All 2 branches missed.">                if (isIdentity) { // no change</span>
+<span class="nc" id="L1463">                    return;</span>
+                }
+
+<span class="nc" id="L1466">                indices = new int[sgv.glyphs.length];</span>
+<span class="nc" id="L1467">                indices[glyphIndex] = 1;</span>
+<span class="nc" id="L1468">                transforms = temp;</span>
+            } else {
+<span class="nc" id="L1470">                boolean addSlot = false; // assume we're not growing</span>
+<span class="nc" id="L1471">                int newIndex = -1;</span>
+<span class="nc bnc" id="L1472" title="All 2 branches missed.">                if (isIdentity) {</span>
+<span class="nc" id="L1473">                    newIndex = 0; // might shrink</span>
+                } else {
+<span class="nc" id="L1475">                    addSlot = true; // assume no match</span>
+                    int i;
+                loop:
+<span class="nc bnc" id="L1478" title="All 2 branches missed.">                    for (i = 0; i &lt; transforms.length; i += 6) {</span>
+<span class="nc bnc" id="L1479" title="All 2 branches missed.">                        for (int j = 0; j &lt; 6; ++j) {</span>
+<span class="nc bnc" id="L1480" title="All 2 branches missed.">                            if (transforms[i + j] != temp[j]) {</span>
+<span class="nc" id="L1481">                                continue loop;</span>
+                            }
+                        }
+<span class="nc" id="L1484">                        addSlot = false;</span>
+<span class="nc" id="L1485">                        break;</span>
+                    }
+<span class="nc" id="L1487">                    newIndex = i / 6 + 1; // if no match, end of list</span>
+                }
+
+                // if we're using the same transform, nothing to do
+<span class="nc" id="L1491">                int oldIndex = indices[glyphIndex];</span>
+<span class="nc bnc" id="L1492" title="All 2 branches missed.">                if (newIndex != oldIndex) {</span>
+                    // see if we are removing last use of the old slot
+<span class="nc" id="L1494">                    boolean removeSlot = false;</span>
+<span class="nc bnc" id="L1495" title="All 2 branches missed.">                    if (oldIndex != 0) {</span>
+<span class="nc" id="L1496">                        removeSlot = true;</span>
+<span class="nc bnc" id="L1497" title="All 2 branches missed.">                        for (int i = 0; i &lt; indices.length; ++i) {</span>
+<span class="nc bnc" id="L1498" title="All 4 branches missed.">                            if (indices[i] == oldIndex &amp;&amp; i != glyphIndex) {</span>
+<span class="nc" id="L1499">                                removeSlot = false;</span>
+<span class="nc" id="L1500">                                break;</span>
+                            }
+                        }
+                    }
+
+<span class="nc bnc" id="L1505" title="All 4 branches missed.">                    if (removeSlot &amp;&amp; addSlot) { // reuse old slot with new transform</span>
+<span class="nc" id="L1506">                        newIndex = oldIndex;</span>
+<span class="nc" id="L1507">                        System.arraycopy(temp, 0, transforms, (newIndex - 1) * 6, 6);</span>
+<span class="nc bnc" id="L1508" title="All 2 branches missed.">                    } else if (removeSlot) {</span>
+<span class="nc bnc" id="L1509" title="All 2 branches missed.">                        if (transforms.length == 6) { // removing last one, so clear arrays</span>
+<span class="nc" id="L1510">                            indices = null;</span>
+<span class="nc" id="L1511">                            transforms = null;</span>
+
+<span class="nc" id="L1513">                            sgv.clearCaches(glyphIndex);</span>
+<span class="nc" id="L1514">                            sgv.clearFlags(FLAG_HAS_TRANSFORMS);</span>
+<span class="nc" id="L1515">                            strikesRef = null;</span>
+
+<span class="nc" id="L1517">                            return;</span>
+                        }
+
+<span class="nc" id="L1520">                        double[] ttemp = new double[transforms.length - 6];</span>
+<span class="nc" id="L1521">                        System.arraycopy(transforms, 0, ttemp, 0, (oldIndex - 1) * 6);</span>
+<span class="nc" id="L1522">                        System.arraycopy(transforms, oldIndex * 6, ttemp, (oldIndex - 1) * 6,</span>
+                                         transforms.length - oldIndex * 6);
+<span class="nc" id="L1524">                        transforms = ttemp;</span>
+
+                        // clean up indices
+<span class="nc bnc" id="L1527" title="All 2 branches missed.">                        for (int i = 0; i &lt; indices.length; ++i) {</span>
+<span class="nc bnc" id="L1528" title="All 2 branches missed.">                            if (indices[i] &gt; oldIndex) { // ignore == oldIndex, it's going away</span>
+<span class="nc" id="L1529">                                indices[i] -= 1;</span>
+                            }
+                        }
+<span class="nc bnc" id="L1532" title="All 2 branches missed.">                        if (newIndex &gt; oldIndex) { // don't forget to decrement this too if we need to</span>
+<span class="nc" id="L1533">                            --newIndex;</span>
+                        }
+<span class="nc bnc" id="L1535" title="All 2 branches missed.">                    } else if (addSlot) {</span>
+<span class="nc" id="L1536">                        double[] ttemp = new double[transforms.length + 6];</span>
+<span class="nc" id="L1537">                        System.arraycopy(transforms, 0, ttemp, 0, transforms.length);</span>
+<span class="nc" id="L1538">                        System.arraycopy(temp, 0, ttemp, transforms.length, 6);</span>
+<span class="nc" id="L1539">                        transforms = ttemp;</span>
+                    }
+
+<span class="nc" id="L1542">                    indices[glyphIndex] = newIndex;</span>
+                }
+            }
+
+<span class="nc" id="L1546">            sgv.clearCaches(glyphIndex);</span>
+<span class="nc" id="L1547">            sgv.addFlags(FLAG_HAS_TRANSFORMS);</span>
+<span class="nc" id="L1548">            strikesRef = null;</span>
+<span class="nc" id="L1549">        }</span>
+
+        // implements sgv.getGlyphTransform
+        AffineTransform getGlyphTransform(int ix) {
+<span class="nc" id="L1553">            int index = indices[ix];</span>
+<span class="nc bnc" id="L1554" title="All 2 branches missed.">            if (index == 0) {</span>
+<span class="nc" id="L1555">                return null;</span>
+            }
+
+<span class="nc" id="L1558">            int x = (index - 1) * 6;</span>
+<span class="nc" id="L1559">            return new AffineTransform(transforms[x + 0],</span>
+                                       transforms[x + 1],
+                                       transforms[x + 2],
+                                       transforms[x + 3],
+                                       transforms[x + 4],
+                                       transforms[x + 5]);
+        }
+
+        int transformCount() {
+<span class="nc bnc" id="L1568" title="All 2 branches missed.">            if (transforms == null) {</span>
+<span class="nc" id="L1569">                return 0;</span>
+            }
+<span class="nc" id="L1571">            return transforms.length / 6;</span>
+        }
+
+        /**
+         * The strike cache works like this.
+         *
+         * -Each glyph is thought of as having a transform, usually identity.
+         * -Each request for a strike is based on a device transform, either the
+         * one in the frc or the rendering transform.
+         * -For general info, strikes are held with soft references.
+         * -When rendering, strikes must be held with hard references for the
+         * duration of the rendering call.  GlyphList will have to hold this
+         * info along with the image and position info, but toss the strike info
+         * when done.
+         * -Build the strike cache as needed.  If the dev transform we want to use
+         * has changed from the last time it is built, the cache is flushed by
+         * the caller before these methods are called.
+         *
+         * Use a tx that doesn't include translation components of dst tx.
+         */
+        Object setupGlyphImages(long[] images, float[] positions, AffineTransform tx) {
+<span class="nc" id="L1592">            int len = sgv.glyphs.length;</span>
+
+<span class="nc" id="L1594">            GlyphStrike[] sl = getAllStrikes();</span>
+<span class="nc bnc" id="L1595" title="All 2 branches missed.">            for (int i = 0; i &lt; len; ++i) {</span>
+<span class="nc" id="L1596">                GlyphStrike gs = sl[indices[i]];</span>
+<span class="nc" id="L1597">                int glyphID = sgv.glyphs[i];</span>
+<span class="nc" id="L1598">                images[i] = gs.strike.getGlyphImagePtr(glyphID);</span>
+
+<span class="nc" id="L1600">                gs.getGlyphPosition(glyphID, i*2, sgv.positions, positions);</span>
+            }
+<span class="nc" id="L1602">            tx.transform(positions, 0, positions, 0, len);</span>
+
+<span class="nc" id="L1604">            return sl;</span>
+        }
+
+        Rectangle getGlyphsPixelBounds(AffineTransform tx, float x, float y, int start, int count) {
+<span class="nc" id="L1608">            Rectangle result = null;</span>
+<span class="nc" id="L1609">            Rectangle r = new Rectangle();</span>
+<span class="nc" id="L1610">            Point2D.Float pt = new Point.Float();</span>
+<span class="nc" id="L1611">            int n = start * 2;</span>
+<span class="nc bnc" id="L1612" title="All 2 branches missed.">            while (--count &gt;= 0) {</span>
+<span class="nc" id="L1613">                GlyphStrike gs = getStrike(start);</span>
+<span class="nc" id="L1614">                pt.x = x + sgv.positions[n++] + gs.dx;</span>
+<span class="nc" id="L1615">                pt.y = y + sgv.positions[n++] + gs.dy;</span>
+<span class="nc" id="L1616">                tx.transform(pt, pt);</span>
+<span class="nc" id="L1617">                gs.strike.getGlyphImageBounds(sgv.glyphs[start++], pt, r);</span>
+<span class="nc bnc" id="L1618" title="All 2 branches missed.">                if (!r.isEmpty()) {</span>
+<span class="nc bnc" id="L1619" title="All 2 branches missed.">                    if (result == null) {</span>
+<span class="nc" id="L1620">                        result = new Rectangle(r);</span>
+                    } else {
+<span class="nc" id="L1622">                        result.add(r);</span>
+                    }
+                }
+<span class="nc" id="L1625">            }</span>
+<span class="nc bnc" id="L1626" title="All 2 branches missed.">            return result != null ? result : r;</span>
+        }
+
+        GlyphStrike getStrike(int glyphIndex) {
+<span class="nc bnc" id="L1630" title="All 2 branches missed.">            if (indices != null) {</span>
+<span class="nc" id="L1631">                GlyphStrike[] strikes = getStrikeArray();</span>
+<span class="nc" id="L1632">                return getStrikeAtIndex(strikes, indices[glyphIndex]);</span>
+            }
+<span class="nc" id="L1634">            return sgv.getDefaultStrike();</span>
+        }
+
+        private GlyphStrike[] getAllStrikes() {
+<span class="nc bnc" id="L1638" title="All 2 branches missed.">            if (indices == null) {</span>
+<span class="nc" id="L1639">                return null;</span>
+            }
+
+<span class="nc" id="L1642">            GlyphStrike[] strikes = getStrikeArray();</span>
+<span class="nc bnc" id="L1643" title="All 2 branches missed.">            if (!haveAllStrikes) {</span>
+<span class="nc bnc" id="L1644" title="All 2 branches missed.">                for (int i = 0; i &lt; strikes.length; ++i) {</span>
+<span class="nc" id="L1645">                    getStrikeAtIndex(strikes, i);</span>
+                }
+<span class="nc" id="L1647">                haveAllStrikes = true;</span>
+            }
+
+<span class="nc" id="L1650">            return strikes;</span>
+        }
+
+        private GlyphStrike[] getStrikeArray() {
+<span class="nc" id="L1654">            GlyphStrike[] strikes = null;</span>
+<span class="nc bnc" id="L1655" title="All 2 branches missed.">            if (strikesRef != null) {</span>
+<span class="nc" id="L1656">                strikes = (GlyphStrike[])strikesRef.get();</span>
+            }
+<span class="nc bnc" id="L1658" title="All 2 branches missed.">            if (strikes == null) {</span>
+<span class="nc" id="L1659">                haveAllStrikes = false;</span>
+<span class="nc" id="L1660">                strikes = new GlyphStrike[transformCount() + 1];</span>
+<span class="nc" id="L1661">                strikesRef = new SoftReference(strikes);</span>
+            }
+
+<span class="nc" id="L1664">            return strikes;</span>
+        }
+
+        private GlyphStrike getStrikeAtIndex(GlyphStrike[] strikes, int strikeIndex) {
+<span class="nc" id="L1668">            GlyphStrike strike = strikes[strikeIndex];</span>
+<span class="nc bnc" id="L1669" title="All 2 branches missed.">            if (strike == null) {</span>
+<span class="nc bnc" id="L1670" title="All 2 branches missed.">                if (strikeIndex == 0) {</span>
+<span class="nc" id="L1671">                    strike = sgv.getDefaultStrike();</span>
+                } else {
+<span class="nc" id="L1673">                    int ix = (strikeIndex - 1) * 6;</span>
+<span class="nc" id="L1674">                    AffineTransform gtx = new AffineTransform(transforms[ix],</span>
+                                                              transforms[ix+1],
+                                                              transforms[ix+2],
+                                                              transforms[ix+3],
+                                                              transforms[ix+4],
+                                                              transforms[ix+5]);
+
+<span class="nc" id="L1681">                    strike = GlyphStrike.create(sgv, sgv.dtx, gtx);</span>
+                }
+<span class="nc" id="L1683">                strikes[strikeIndex] = strike;</span>
+            }
+<span class="nc" id="L1685">            return strike;</span>
+        }
+    }
+
+    // This adjusts the metrics by the translation components of the glyph
+    // transform.  It is done here since the translation is not known by the
+    // strike.
+    // It adjusts the position of the image and the advance.
+
+    public static final class GlyphStrike {
+        StandardGlyphVector sgv;
+        FontStrike strike; // hard reference
+        float dx;
+        float dy;
+
+        static GlyphStrike create(StandardGlyphVector sgv, AffineTransform dtx, AffineTransform gtx) {
+<span class="nc" id="L1701">            float dx = 0;</span>
+<span class="nc" id="L1702">            float dy = 0;</span>
+
+<span class="nc" id="L1704">            AffineTransform tx = sgv.ftx;</span>
+<span class="nc bnc" id="L1705" title="All 4 branches missed.">            if (!dtx.isIdentity() || gtx != null) {</span>
+<span class="nc" id="L1706">                tx = new AffineTransform(sgv.ftx);</span>
+<span class="nc bnc" id="L1707" title="All 2 branches missed.">                if (gtx != null) {</span>
+<span class="nc" id="L1708">                    tx.preConcatenate(gtx);</span>
+<span class="nc" id="L1709">                    dx = (float)tx.getTranslateX(); // uses ftx then gtx to get translation</span>
+<span class="nc" id="L1710">                    dy = (float)tx.getTranslateY();</span>
+                }
+<span class="nc bnc" id="L1712" title="All 2 branches missed.">                if (!dtx.isIdentity()) {</span>
+<span class="nc" id="L1713">                    tx.preConcatenate(dtx);</span>
+                }
+            }
+
+<span class="nc" id="L1717">            int ptSize = 1; // only matters for 'gasp' case.</span>
+<span class="nc" id="L1718">            Object aaHint = sgv.frc.getAntiAliasingHint();</span>
+<span class="nc bnc" id="L1719" title="All 2 branches missed.">            if (aaHint == VALUE_TEXT_ANTIALIAS_GASP) {</span>
+                /* Must pass in the calculated point size for rendering.
+                 * If the glyph tx is anything other than identity or a
+                 *  simple translate, calculate the transformed point size.
+                 */
+<span class="nc bnc" id="L1724" title="All 2 branches missed.">                if (!tx.isIdentity() &amp;&amp;</span>
+<span class="nc bnc" id="L1725" title="All 2 branches missed.">                    (tx.getType() &amp; ~AffineTransform.TYPE_TRANSLATION) != 0) {</span>
+<span class="nc" id="L1726">                    double shearx = tx.getShearX();</span>
+<span class="nc bnc" id="L1727" title="All 2 branches missed.">                    if (shearx != 0) {</span>
+<span class="nc" id="L1728">                        double scaley = tx.getScaleY();</span>
+<span class="nc" id="L1729">                        ptSize =</span>
+<span class="nc" id="L1730">                            (int)Math.sqrt(shearx * shearx + scaley * scaley);</span>
+<span class="nc" id="L1731">                    } else {</span>
+<span class="nc" id="L1732">                        ptSize = (int)(Math.abs(tx.getScaleY()));</span>
+                    }
+                }
+            }
+<span class="nc" id="L1736">            int aa = FontStrikeDesc.getAAHintIntVal(aaHint,sgv.font2D, ptSize);</span>
+<span class="nc" id="L1737">            int fm = FontStrikeDesc.getFMHintIntVal</span>
+<span class="nc" id="L1738">                (sgv.frc.getFractionalMetricsHint());</span>
+<span class="nc" id="L1739">            FontStrikeDesc desc = new FontStrikeDesc(dtx,</span>
+                                                     tx,
+<span class="nc" id="L1741">                                                     sgv.font.getStyle(),</span>
+                                                     aa, fm);
+            // Get the strike via the handle. Shouldn't matter
+            // if we've invalidated the font but its an extra precaution.
+<span class="nc" id="L1745">            FontStrike strike = sgv.font2D.handle.font2D.getStrike(desc);  // !!! getStrike(desc, false)</span>
+
+<span class="nc" id="L1747">            return new GlyphStrike(sgv, strike, dx, dy);</span>
+        }
+
+<span class="nc" id="L1750">        private GlyphStrike(StandardGlyphVector sgv, FontStrike strike, float dx, float dy) {</span>
+<span class="nc" id="L1751">            this.sgv = sgv;</span>
+<span class="nc" id="L1752">            this.strike = strike;</span>
+<span class="nc" id="L1753">            this.dx = dx;</span>
+<span class="nc" id="L1754">            this.dy = dy;</span>
+<span class="nc" id="L1755">        }</span>
+
+        void getADL(ADL result) {
+<span class="nc" id="L1758">            StrikeMetrics sm = strike.getFontMetrics();</span>
+<span class="nc" id="L1759">            Point2D.Float delta = null;</span>
+<span class="nc bnc" id="L1760" title="All 2 branches missed.">            if (sgv.font.isTransformed()) {</span>
+<span class="nc" id="L1761">                delta = new Point2D.Float();</span>
+<span class="nc" id="L1762">                delta.x = (float)sgv.font.getTransform().getTranslateX();</span>
+<span class="nc" id="L1763">                delta.y = (float)sgv.font.getTransform().getTranslateY();</span>
+            }
+
+<span class="nc" id="L1766">            result.ascentX = -sm.ascentX;</span>
+<span class="nc" id="L1767">            result.ascentY = -sm.ascentY;</span>
+<span class="nc" id="L1768">            result.descentX = sm.descentX;</span>
+<span class="nc" id="L1769">            result.descentY = sm.descentY;</span>
+<span class="nc" id="L1770">            result.leadingX = sm.leadingX;</span>
+<span class="nc" id="L1771">            result.leadingY = sm.leadingY;</span>
+<span class="nc" id="L1772">        }</span>
+
+        void getGlyphPosition(int glyphID, int ix, float[] positions, float[] result) {
+<span class="nc" id="L1775">            result[ix] = positions[ix] + dx;</span>
+<span class="nc" id="L1776">            ++ix;</span>
+<span class="nc" id="L1777">            result[ix] = positions[ix] + dy;</span>
+<span class="nc" id="L1778">        }</span>
+
+        void addDefaultGlyphAdvance(int glyphID, Point2D.Float result) {
+            // !!! change this API?  Creates unnecessary garbage.  Also the name doesn't quite fit.
+            // strike.addGlyphAdvance(Point2D.Float adv);  // hey, whaddya know, matches my api :-)
+<span class="nc" id="L1783">            Point2D.Float adv = strike.getGlyphMetrics(glyphID);</span>
+<span class="nc" id="L1784">            result.x += adv.x + dx;</span>
+<span class="nc" id="L1785">            result.y += adv.y + dy;</span>
+<span class="nc" id="L1786">        }</span>
+
+        Rectangle2D getGlyphOutlineBounds(int glyphID, float x, float y) {
+<span class="nc" id="L1789">            Rectangle2D result = null;</span>
+<span class="nc bnc" id="L1790" title="All 2 branches missed.">            if (sgv.invdtx == null) {</span>
+<span class="nc" id="L1791">                result = new Rectangle2D.Float();</span>
+<span class="nc" id="L1792">                result.setRect(strike.getGlyphOutlineBounds(glyphID)); // don't mutate cached rect</span>
+            } else {
+<span class="nc" id="L1794">                GeneralPath gp = strike.getGlyphOutline(glyphID, 0, 0);</span>
+<span class="nc" id="L1795">                gp.transform(sgv.invdtx);</span>
+<span class="nc" id="L1796">                result = gp.getBounds2D();</span>
+            }
+            /* Since x is the logical advance of the glyph to this point.
+             * Because of the way that Rectangle.union is specified, this
+             * means that subsequent unioning of a rect including that
+             * will be affected, even if the glyph is empty. So skip such
+             * cases. This alone isn't a complete solution since x==0
+             * may also not be what is wanted. The code that does the
+             * unioning also needs to be aware to ignore empty glyphs.
+             */
+<span class="nc bnc" id="L1806" title="All 2 branches missed.">            if (!result.isEmpty()) {</span>
+<span class="nc" id="L1807">                result.setRect(result.getMinX() + x + dx,</span>
+<span class="nc" id="L1808">                               result.getMinY() + y + dy,</span>
+<span class="nc" id="L1809">                               result.getWidth(), result.getHeight());</span>
+            }
+<span class="nc" id="L1811">            return result;</span>
+        }
+
+        void appendGlyphOutline(int glyphID, GeneralPath result, float x, float y) {
+            // !!! fontStrike needs a method for this.  For that matter, GeneralPath does.
+<span class="nc" id="L1816">            GeneralPath gp = null;</span>
+<span class="nc bnc" id="L1817" title="All 2 branches missed.">            if (sgv.invdtx == null) {</span>
+<span class="nc" id="L1818">                gp = strike.getGlyphOutline(glyphID, x + dx, y + dy);</span>
+            } else {
+<span class="nc" id="L1820">                gp = strike.getGlyphOutline(glyphID, 0, 0);</span>
+<span class="nc" id="L1821">                gp.transform(sgv.invdtx);</span>
+<span class="nc" id="L1822">                gp.transform(AffineTransform.getTranslateInstance(x + dx, y + dy));</span>
+            }
+<span class="nc" id="L1824">            PathIterator iterator = gp.getPathIterator(null);</span>
+<span class="nc" id="L1825">            result.append(iterator, false);</span>
+<span class="nc" id="L1826">        }</span>
+    }
+
+    public String toString() {
+<span class="nc" id="L1830">        return appendString(null).toString();</span>
+    }
+
+    StringBuffer appendString(StringBuffer buf) {
+<span class="nc bnc" id="L1834" title="All 2 branches missed.">        if (buf == null) {</span>
+<span class="nc" id="L1835">            buf = new StringBuffer();</span>
+        }
+        try {
+<span class="nc" id="L1838">            buf.append(&quot;SGV{font: &quot;);</span>
+<span class="nc" id="L1839">            buf.append(font.toString());</span>
+<span class="nc" id="L1840">            buf.append(&quot;, frc: &quot;);</span>
+<span class="nc" id="L1841">            buf.append(frc.toString());</span>
+<span class="nc" id="L1842">            buf.append(&quot;, glyphs: (&quot;);</span>
+<span class="nc" id="L1843">            buf.append(glyphs.length);</span>
+<span class="nc" id="L1844">            buf.append(&quot;)[&quot;);</span>
+<span class="nc bnc" id="L1845" title="All 2 branches missed.">            for (int i = 0; i &lt; glyphs.length; ++i) {</span>
+<span class="nc bnc" id="L1846" title="All 2 branches missed.">                if (i &gt; 0) {</span>
+<span class="nc" id="L1847">                    buf.append(&quot;, &quot;);</span>
+                }
+<span class="nc" id="L1849">                buf.append(Integer.toHexString(glyphs[i]));</span>
+            }
+<span class="nc" id="L1851">            buf.append(&quot;]&quot;);</span>
+<span class="nc bnc" id="L1852" title="All 2 branches missed.">            if (positions != null) {</span>
+<span class="nc" id="L1853">                buf.append(&quot;, positions: (&quot;);</span>
+<span class="nc" id="L1854">                buf.append(positions.length);</span>
+<span class="nc" id="L1855">                buf.append(&quot;)[&quot;);</span>
+<span class="nc bnc" id="L1856" title="All 2 branches missed.">                for (int i = 0; i &lt; positions.length; i += 2) {</span>
+<span class="nc bnc" id="L1857" title="All 2 branches missed.">                    if (i &gt; 0) {</span>
+<span class="nc" id="L1858">                        buf.append(&quot;, &quot;);</span>
+                    }
+<span class="nc" id="L1860">                    buf.append(positions[i]);</span>
+<span class="nc" id="L1861">                    buf.append(&quot;@&quot;);</span>
+<span class="nc" id="L1862">                    buf.append(positions[i+1]);</span>
+                }
+<span class="nc" id="L1864">                buf.append(&quot;]&quot;);</span>
+            }
+<span class="nc bnc" id="L1866" title="All 2 branches missed.">            if (charIndices != null) {</span>
+<span class="nc" id="L1867">                buf.append(&quot;, indices: (&quot;);</span>
+<span class="nc" id="L1868">                buf.append(charIndices.length);</span>
+<span class="nc" id="L1869">                buf.append(&quot;)[&quot;);</span>
+<span class="nc bnc" id="L1870" title="All 2 branches missed.">                for (int i = 0; i &lt; charIndices.length; ++i) {</span>
+<span class="nc bnc" id="L1871" title="All 2 branches missed.">                    if (i &gt; 0) {</span>
+<span class="nc" id="L1872">                        buf.append(&quot;, &quot;);</span>
+                    }
+<span class="nc" id="L1874">                    buf.append(charIndices[i]);</span>
+                }
+<span class="nc" id="L1876">                buf.append(&quot;]&quot;);</span>
+            }
+<span class="nc" id="L1878">            buf.append(&quot;, flags:&quot;);</span>
+<span class="nc bnc" id="L1879" title="All 2 branches missed.">            if (getLayoutFlags() == 0) {</span>
+<span class="nc" id="L1880">                buf.append(&quot; default&quot;);</span>
+            } else {
+<span class="nc bnc" id="L1882" title="All 2 branches missed.">                if ((flags &amp; FLAG_HAS_TRANSFORMS) != 0) {</span>
+<span class="nc" id="L1883">                    buf.append(&quot; tx&quot;);</span>
+                }
+<span class="nc bnc" id="L1885" title="All 2 branches missed.">                if ((flags &amp; FLAG_HAS_POSITION_ADJUSTMENTS) != 0) {</span>
+<span class="nc" id="L1886">                    buf.append(&quot; pos&quot;);</span>
+                }
+<span class="nc bnc" id="L1888" title="All 2 branches missed.">                if ((flags &amp; FLAG_RUN_RTL) != 0) {</span>
+<span class="nc" id="L1889">                    buf.append(&quot; rtl&quot;);</span>
+                }
+<span class="nc bnc" id="L1891" title="All 2 branches missed.">                if ((flags &amp; FLAG_COMPLEX_GLYPHS) != 0) {</span>
+<span class="nc" id="L1892">                    buf.append(&quot; complex&quot;);</span>
+                }
+            }
+        }
+<span class="nc" id="L1896">        catch(Exception e) {</span>
+<span class="nc" id="L1897">            buf.append(&quot; &quot; + e.getMessage());</span>
+<span class="nc" id="L1898">        }</span>
+<span class="nc" id="L1899">        buf.append(&quot;}&quot;);</span>
+
+<span class="nc" id="L1901">        return buf;</span>
+    }
+
+<span class="nc" id="L1904">    static class ADL {</span>
+        public float ascentX;
+        public float ascentY;
+        public float descentX;
+        public float descentY;
+        public float leadingX;
+        public float leadingY;
+
+        public String toString() {
+<span class="nc" id="L1913">            return toStringBuffer(null).toString();</span>
+        }
+
+        protected StringBuffer toStringBuffer(StringBuffer result) {
+<span class="nc bnc" id="L1917" title="All 2 branches missed.">            if (result == null) {</span>
+<span class="nc" id="L1918">                result = new StringBuffer();</span>
+            }
+<span class="nc" id="L1920">            result.append(&quot;ax: &quot;);</span>
+<span class="nc" id="L1921">            result.append(ascentX);</span>
+<span class="nc" id="L1922">            result.append(&quot; ay: &quot;);</span>
+<span class="nc" id="L1923">            result.append(ascentY);</span>
+<span class="nc" id="L1924">            result.append(&quot; dx: &quot;);</span>
+<span class="nc" id="L1925">            result.append(descentX);</span>
+<span class="nc" id="L1926">            result.append(&quot; dy: &quot;);</span>
+<span class="nc" id="L1927">            result.append(descentY);</span>
+<span class="nc" id="L1928">            result.append(&quot; lx: &quot;);</span>
+<span class="nc" id="L1929">            result.append(leadingX);</span>
+<span class="nc" id="L1930">            result.append(&quot; ly: &quot;);</span>
+<span class="nc" id="L1931">            result.append(leadingY);</span>
+
+<span class="nc" id="L1933">            return result;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

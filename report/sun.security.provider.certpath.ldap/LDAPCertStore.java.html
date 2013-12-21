@@ -1,0 +1,1067 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>LDAPCertStore.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.provider.certpath.ldap</a> &gt; <span class="el_source">LDAPCertStore.java</span></div><h1>LDAPCertStore.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2000, 2011, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.security.provider.certpath.ldap;
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.math.BigInteger;
+import java.net.URI;
+import java.util.*;
+import javax.naming.Context;
+import javax.naming.NamingEnumeration;
+import javax.naming.NamingException;
+import javax.naming.NameNotFoundException;
+import javax.naming.directory.Attribute;
+import javax.naming.directory.Attributes;
+import javax.naming.directory.BasicAttributes;
+import javax.naming.directory.DirContext;
+import javax.naming.directory.InitialDirContext;
+
+import java.security.*;
+import java.security.cert.Certificate;
+import java.security.cert.*;
+import javax.security.auth.x500.X500Principal;
+
+import sun.misc.HexDumpEncoder;
+import sun.security.provider.certpath.X509CertificatePair;
+import sun.security.util.Cache;
+import sun.security.util.Debug;
+import sun.security.x509.X500Name;
+import sun.security.action.GetPropertyAction;
+
+/**
+ * A &lt;code&gt;CertStore&lt;/code&gt; that retrieves &lt;code&gt;Certificates&lt;/code&gt; and
+ * &lt;code&gt;CRL&lt;/code&gt;s from an LDAP directory, using the PKIX LDAP V2 Schema
+ * (RFC 2587):
+ * &lt;a href=&quot;http://www.ietf.org/rfc/rfc2587.txt&quot;&gt;
+ * http://www.ietf.org/rfc/rfc2587.txt&lt;/a&gt;.
+ * &lt;p&gt;
+ * Before calling the {@link #engineGetCertificates engineGetCertificates} or
+ * {@link #engineGetCRLs engineGetCRLs} methods, the
+ * {@link #LDAPCertStore(CertStoreParameters)
+ * LDAPCertStore(CertStoreParameters)} constructor is called to create the
+ * &lt;code&gt;CertStore&lt;/code&gt; and establish the DNS name and port of the LDAP
+ * server from which &lt;code&gt;Certificate&lt;/code&gt;s and &lt;code&gt;CRL&lt;/code&gt;s will be
+ * retrieved.
+ * &lt;p&gt;
+ * &lt;b&gt;Concurrent Access&lt;/b&gt;
+ * &lt;p&gt;
+ * As described in the javadoc for &lt;code&gt;CertStoreSpi&lt;/code&gt;, the
+ * &lt;code&gt;engineGetCertificates&lt;/code&gt; and &lt;code&gt;engineGetCRLs&lt;/code&gt; methods
+ * must be thread-safe. That is, multiple threads may concurrently
+ * invoke these methods on a single &lt;code&gt;LDAPCertStore&lt;/code&gt; object
+ * (or more than one) with no ill effects. This allows a
+ * &lt;code&gt;CertPathBuilder&lt;/code&gt; to search for a CRL while simultaneously
+ * searching for further certificates, for instance.
+ * &lt;p&gt;
+ * This is achieved by adding the &lt;code&gt;synchronized&lt;/code&gt; keyword to the
+ * &lt;code&gt;engineGetCertificates&lt;/code&gt; and &lt;code&gt;engineGetCRLs&lt;/code&gt; methods.
+ * &lt;p&gt;
+ * This classes uses caching and requests multiple attributes at once to
+ * minimize LDAP round trips. The cache is associated with the CertStore
+ * instance. It uses soft references to hold the values to minimize impact
+ * on footprint and currently has a maximum size of 750 attributes and a
+ * 30 second default lifetime.
+ * &lt;p&gt;
+ * We always request CA certificates, cross certificate pairs, and ARLs in
+ * a single LDAP request when any one of them is needed. The reason is that
+ * we typically need all of them anyway and requesting them in one go can
+ * reduce the number of requests to a third. Even if we don't need them,
+ * these attributes are typically small enough not to cause a noticeable
+ * overhead. In addition, when the prefetchCRLs flag is true, we also request
+ * the full CRLs. It is currently false initially but set to true once any
+ * request for an ARL to the server returns an null value. The reason is
+ * that CRLs could be rather large but are rarely used. This implementation
+ * should improve performance in most cases.
+ *
+ * @see java.security.cert.CertStore
+ *
+ * @since       1.4
+ * @author      Steve Hanna
+ * @author      Andreas Sterbenz
+ */
+public final class LDAPCertStore extends CertStoreSpi {
+
+<span class="nc" id="L108">    private static final Debug debug = Debug.getInstance(&quot;certpath&quot;);</span>
+
+    private final static boolean DEBUG = false;
+
+    /**
+     * LDAP attribute identifiers.
+     */
+    private static final String USER_CERT = &quot;userCertificate;binary&quot;;
+    private static final String CA_CERT = &quot;cACertificate;binary&quot;;
+    private static final String CROSS_CERT = &quot;crossCertificatePair;binary&quot;;
+    private static final String CRL = &quot;certificateRevocationList;binary&quot;;
+    private static final String ARL = &quot;authorityRevocationList;binary&quot;;
+    private static final String DELTA_CRL = &quot;deltaRevocationList;binary&quot;;
+
+    // Constants for various empty values
+<span class="nc" id="L123">    private final static String[] STRING0 = new String[0];</span>
+
+<span class="nc" id="L125">    private final static byte[][] BB0 = new byte[0][];</span>
+
+<span class="nc" id="L127">    private final static Attributes EMPTY_ATTRIBUTES = new BasicAttributes();</span>
+
+    // cache related constants
+    private final static int DEFAULT_CACHE_SIZE = 750;
+    private final static int DEFAULT_CACHE_LIFETIME = 30;
+
+    private final static int LIFETIME;
+
+    private final static String PROP_LIFETIME =
+                            &quot;sun.security.certpath.ldap.cache.lifetime&quot;;
+
+    static {
+<span class="nc" id="L139">        String s = AccessController.doPrivileged(</span>
+                                new GetPropertyAction(PROP_LIFETIME));
+<span class="nc bnc" id="L141" title="All 2 branches missed.">        if (s != null) {</span>
+<span class="nc" id="L142">            LIFETIME = Integer.parseInt(s); // throws NumberFormatException</span>
+        } else {
+<span class="nc" id="L144">            LIFETIME = DEFAULT_CACHE_LIFETIME;</span>
+        }
+    }
+
+    /**
+     * The CertificateFactory used to decode certificates from
+     * their binary stored form.
+     */
+    private CertificateFactory cf;
+    /**
+     * The JNDI directory context.
+     */
+    private DirContext ctx;
+
+    /**
+     * Flag indicating whether we should prefetch CRLs.
+     */
+<span class="nc" id="L161">    private boolean prefetchCRLs = false;</span>
+
+    private final Cache&lt;String, byte[][]&gt; valueCache;
+
+<span class="nc" id="L165">    private int cacheHits = 0;</span>
+<span class="nc" id="L166">    private int cacheMisses = 0;</span>
+<span class="nc" id="L167">    private int requests = 0;</span>
+
+    /**
+     * Creates a &lt;code&gt;CertStore&lt;/code&gt; with the specified parameters.
+     * For this class, the parameters object must be an instance of
+     * &lt;code&gt;LDAPCertStoreParameters&lt;/code&gt;.
+     *
+     * @param params the algorithm parameters
+     * @exception InvalidAlgorithmParameterException if params is not an
+     *   instance of &lt;code&gt;LDAPCertStoreParameters&lt;/code&gt;
+     */
+    public LDAPCertStore(CertStoreParameters params)
+            throws InvalidAlgorithmParameterException {
+<span class="nc" id="L180">        super(params);</span>
+<span class="nc bnc" id="L181" title="All 2 branches missed.">        if (!(params instanceof LDAPCertStoreParameters))</span>
+<span class="nc" id="L182">          throw new InvalidAlgorithmParameterException(</span>
+            &quot;parameters must be LDAPCertStoreParameters&quot;);
+
+<span class="nc" id="L185">        LDAPCertStoreParameters lparams = (LDAPCertStoreParameters) params;</span>
+
+        // Create InitialDirContext needed to communicate with the server
+<span class="nc" id="L188">        createInitialDirContext(lparams.getServerName(), lparams.getPort());</span>
+
+        // Create CertificateFactory for use later on
+        try {
+<span class="nc" id="L192">            cf = CertificateFactory.getInstance(&quot;X.509&quot;);</span>
+<span class="nc" id="L193">        } catch (CertificateException e) {</span>
+<span class="nc" id="L194">            throw new InvalidAlgorithmParameterException(</span>
+                &quot;unable to create CertificateFactory for X.509&quot;);
+<span class="nc" id="L196">        }</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">        if (LIFETIME == 0) {</span>
+<span class="nc" id="L198">            valueCache = Cache.newNullCache();</span>
+<span class="nc bnc" id="L199" title="All 2 branches missed.">        } else if (LIFETIME &lt; 0) {</span>
+<span class="nc" id="L200">            valueCache = Cache.newSoftMemoryCache(DEFAULT_CACHE_SIZE);</span>
+        } else {
+<span class="nc" id="L202">            valueCache = Cache.newSoftMemoryCache(DEFAULT_CACHE_SIZE, LIFETIME);</span>
+        }
+<span class="nc" id="L204">    }</span>
+
+    /**
+     * Returns an LDAP CertStore. This method consults a cache of
+     * CertStores (shared per JVM) using the LDAP server/port as a key.
+     */
+    private static final Cache&lt;LDAPCertStoreParameters, CertStore&gt;
+<span class="nc" id="L211">        certStoreCache = Cache.newSoftMemoryCache(185);</span>
+    static synchronized CertStore getInstance(LDAPCertStoreParameters params)
+        throws NoSuchAlgorithmException, InvalidAlgorithmParameterException {
+<span class="nc" id="L214">        CertStore lcs = certStoreCache.get(params);</span>
+<span class="nc bnc" id="L215" title="All 2 branches missed.">        if (lcs == null) {</span>
+<span class="nc" id="L216">            lcs = CertStore.getInstance(&quot;LDAP&quot;, params);</span>
+<span class="nc" id="L217">            certStoreCache.put(params, lcs);</span>
+        } else {
+<span class="nc bnc" id="L219" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L220">                debug.println(&quot;LDAPCertStore.getInstance: cache hit&quot;);</span>
+            }
+        }
+<span class="nc" id="L223">        return lcs;</span>
+    }
+
+    /**
+     * Create InitialDirContext.
+     *
+     * @param server Server DNS name hosting LDAP service
+     * @param port   Port at which server listens for requests
+     * @throws InvalidAlgorithmParameterException if creation fails
+     */
+    private void createInitialDirContext(String server, int port)
+            throws InvalidAlgorithmParameterException {
+<span class="nc" id="L235">        String url = &quot;ldap://&quot; + server + &quot;:&quot; + port;</span>
+<span class="nc" id="L236">        Hashtable&lt;String,Object&gt; env = new Hashtable&lt;&gt;();</span>
+<span class="nc" id="L237">        env.put(Context.INITIAL_CONTEXT_FACTORY,</span>
+                &quot;com.sun.jndi.ldap.LdapCtxFactory&quot;);
+<span class="nc" id="L239">        env.put(Context.PROVIDER_URL, url);</span>
+        try {
+<span class="nc" id="L241">            ctx = new InitialDirContext(env);</span>
+            /*
+             * By default, follow referrals unless application has
+             * overridden property in an application resource file.
+             */
+<span class="nc" id="L246">            Hashtable&lt;?,?&gt; currentEnv = ctx.getEnvironment();</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">            if (currentEnv.get(Context.REFERRAL) == null) {</span>
+<span class="nc" id="L248">                ctx.addToEnvironment(Context.REFERRAL, &quot;follow&quot;);</span>
+            }
+<span class="nc" id="L250">        } catch (NamingException e) {</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L252">                debug.println(&quot;LDAPCertStore.engineInit about to throw &quot;</span>
+                    + &quot;InvalidAlgorithmParameterException&quot;);
+<span class="nc" id="L254">                e.printStackTrace();</span>
+            }
+<span class="nc" id="L256">            Exception ee = new InvalidAlgorithmParameterException</span>
+                (&quot;unable to create InitialDirContext using supplied parameters&quot;);
+<span class="nc" id="L258">            ee.initCause(e);</span>
+<span class="nc" id="L259">            throw (InvalidAlgorithmParameterException)ee;</span>
+<span class="nc" id="L260">        }</span>
+<span class="nc" id="L261">    }</span>
+
+    /**
+     * Private class encapsulating the actual LDAP operations and cache
+     * handling. Use:
+     *
+     *   LDAPRequest request = new LDAPRequest(dn);
+     *   request.addRequestedAttribute(CROSS_CERT);
+     *   request.addRequestedAttribute(CA_CERT);
+     *   byte[][] crossValues = request.getValues(CROSS_CERT);
+     *   byte[][] caValues = request.getValues(CA_CERT);
+     *
+     * At most one LDAP request is sent for each instance created. If all
+     * getValues() calls can be satisfied from the cache, no request
+     * is sent at all. If a request is sent, all requested attributes
+     * are always added to the cache irrespective of whether the getValues()
+     * method is called.
+     */
+    private class LDAPRequest {
+
+        private final String name;
+        private Map&lt;String, byte[][]&gt; valueMap;
+        private final List&lt;String&gt; requestedAttributes;
+
+<span class="nc" id="L285">        LDAPRequest(String name) {</span>
+<span class="nc" id="L286">            this.name = name;</span>
+<span class="nc" id="L287">            requestedAttributes = new ArrayList&lt;&gt;(5);</span>
+<span class="nc" id="L288">        }</span>
+
+        String getName() {
+<span class="nc" id="L291">            return name;</span>
+        }
+
+        void addRequestedAttribute(String attrId) {
+<span class="nc bnc" id="L295" title="All 2 branches missed.">            if (valueMap != null) {</span>
+<span class="nc" id="L296">                throw new IllegalStateException(&quot;Request already sent&quot;);</span>
+            }
+<span class="nc" id="L298">            requestedAttributes.add(attrId);</span>
+<span class="nc" id="L299">        }</span>
+
+        /**
+         * Gets one or more binary values from an attribute.
+         *
+         * @param name          the location holding the attribute
+         * @param attrId                the attribute identifier
+         * @return                      an array of binary values (byte arrays)
+         * @throws NamingException      if a naming exception occurs
+         */
+        byte[][] getValues(String attrId) throws NamingException {
+            if (DEBUG &amp;&amp; ((cacheHits + cacheMisses) % 50 == 0)) {
+                System.out.println(&quot;Cache hits: &quot; + cacheHits + &quot;; misses: &quot;
+                        + cacheMisses);
+            }
+<span class="nc" id="L314">            String cacheKey = name + &quot;|&quot; + attrId;</span>
+<span class="nc" id="L315">            byte[][] values = valueCache.get(cacheKey);</span>
+<span class="nc bnc" id="L316" title="All 2 branches missed.">            if (values != null) {</span>
+<span class="nc" id="L317">                cacheHits++;</span>
+<span class="nc" id="L318">                return values;</span>
+            }
+<span class="nc" id="L320">            cacheMisses++;</span>
+<span class="nc" id="L321">            Map&lt;String, byte[][]&gt; attrs = getValueMap();</span>
+<span class="nc" id="L322">            values = attrs.get(attrId);</span>
+<span class="nc" id="L323">            return values;</span>
+        }
+
+        /**
+         * Get a map containing the values for this request. The first time
+         * this method is called on an object, the LDAP request is sent,
+         * the results parsed and added to a private map and also to the
+         * cache of this LDAPCertStore. Subsequent calls return the private
+         * map immediately.
+         *
+         * The map contains an entry for each requested attribute. The
+         * attribute name is the key, values are byte[][]. If there are no
+         * values for that attribute, values are byte[0][].
+         *
+         * @return                      the value Map
+         * @throws NamingException      if a naming exception occurs
+         */
+        private Map&lt;String, byte[][]&gt; getValueMap() throws NamingException {
+<span class="nc bnc" id="L341" title="All 2 branches missed.">            if (valueMap != null) {</span>
+<span class="nc" id="L342">                return valueMap;</span>
+            }
+            if (DEBUG) {
+                System.out.println(&quot;Request: &quot; + name + &quot;:&quot; + requestedAttributes);
+                requests++;
+                if (requests % 5 == 0) {
+                    System.out.println(&quot;LDAP requests: &quot; + requests);
+                }
+            }
+<span class="nc" id="L351">            valueMap = new HashMap&lt;&gt;(8);</span>
+<span class="nc" id="L352">            String[] attrIds = requestedAttributes.toArray(STRING0);</span>
+            Attributes attrs;
+            try {
+<span class="nc" id="L355">                attrs = ctx.getAttributes(name, attrIds);</span>
+<span class="nc" id="L356">            } catch (NameNotFoundException e) {</span>
+                // name does not exist on this LDAP server
+                // treat same as not attributes found
+<span class="nc" id="L359">                attrs = EMPTY_ATTRIBUTES;</span>
+<span class="nc" id="L360">            }</span>
+<span class="nc bnc" id="L361" title="All 2 branches missed.">            for (String attrId : requestedAttributes) {</span>
+<span class="nc" id="L362">                Attribute attr = attrs.get(attrId);</span>
+<span class="nc" id="L363">                byte[][] values = getAttributeValues(attr);</span>
+<span class="nc" id="L364">                cacheAttribute(attrId, values);</span>
+<span class="nc" id="L365">                valueMap.put(attrId, values);</span>
+<span class="nc" id="L366">            }</span>
+<span class="nc" id="L367">            return valueMap;</span>
+        }
+
+        /**
+         * Add the values to the cache.
+         */
+        private void cacheAttribute(String attrId, byte[][] values) {
+<span class="nc" id="L374">            String cacheKey = name + &quot;|&quot; + attrId;</span>
+<span class="nc" id="L375">            valueCache.put(cacheKey, values);</span>
+<span class="nc" id="L376">        }</span>
+
+        /**
+         * Get the values for the given attribute. If the attribute is null
+         * or does not contain any values, a zero length byte array is
+         * returned. NOTE that it is assumed that all values are byte arrays.
+         */
+        private byte[][] getAttributeValues(Attribute attr)
+                throws NamingException {
+            byte[][] values;
+<span class="nc bnc" id="L386" title="All 2 branches missed.">            if (attr == null) {</span>
+<span class="nc" id="L387">                values = BB0;</span>
+            } else {
+<span class="nc" id="L389">                values = new byte[attr.size()][];</span>
+<span class="nc" id="L390">                int i = 0;</span>
+<span class="nc" id="L391">                NamingEnumeration&lt;?&gt; enum_ = attr.getAll();</span>
+<span class="nc bnc" id="L392" title="All 2 branches missed.">                while (enum_.hasMore()) {</span>
+<span class="nc" id="L393">                    Object obj = enum_.next();</span>
+<span class="nc bnc" id="L394" title="All 2 branches missed.">                    if (debug != null) {</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">                        if (obj instanceof String) {</span>
+<span class="nc" id="L396">                            debug.println(&quot;LDAPCertStore.getAttrValues() &quot;</span>
+                                + &quot;enum.next is a string!: &quot; + obj);
+                        }
+                    }
+<span class="nc" id="L400">                    byte[] value = (byte[])obj;</span>
+<span class="nc" id="L401">                    values[i++] = value;</span>
+<span class="nc" id="L402">                }</span>
+            }
+<span class="nc" id="L404">            return values;</span>
+        }
+
+    }
+
+    /*
+     * Gets certificates from an attribute id and location in the LDAP
+     * directory. Returns a Collection containing only the Certificates that
+     * match the specified CertSelector.
+     *
+     * @param name the location holding the attribute
+     * @param id the attribute identifier
+     * @param sel a CertSelector that the Certificates must match
+     * @return a Collection of Certificates found
+     * @throws CertStoreException       if an exception occurs
+     */
+    private Collection&lt;X509Certificate&gt; getCertificates(LDAPRequest request,
+        String id, X509CertSelector sel) throws CertStoreException {
+
+        /* fetch encoded certs from storage */
+        byte[][] encodedCert;
+        try {
+<span class="nc" id="L426">            encodedCert = request.getValues(id);</span>
+<span class="nc" id="L427">        } catch (NamingException namingEx) {</span>
+<span class="nc" id="L428">            throw new CertStoreException(namingEx);</span>
+<span class="nc" id="L429">        }</span>
+
+<span class="nc" id="L431">        int n = encodedCert.length;</span>
+<span class="nc bnc" id="L432" title="All 2 branches missed.">        if (n == 0) {</span>
+<span class="nc" id="L433">            return Collections.emptySet();</span>
+        }
+
+<span class="nc" id="L436">        List&lt;X509Certificate&gt; certs = new ArrayList&lt;&gt;(n);</span>
+        /* decode certs and check if they satisfy selector */
+<span class="nc bnc" id="L438" title="All 2 branches missed.">        for (int i = 0; i &lt; n; i++) {</span>
+<span class="nc" id="L439">            ByteArrayInputStream bais = new ByteArrayInputStream(encodedCert[i]);</span>
+            try {
+<span class="nc" id="L441">                Certificate cert = cf.generateCertificate(bais);</span>
+<span class="nc bnc" id="L442" title="All 2 branches missed.">                if (sel.match(cert)) {</span>
+<span class="nc" id="L443">                  certs.add((X509Certificate)cert);</span>
+                }
+<span class="nc" id="L445">            } catch (CertificateException e) {</span>
+<span class="nc bnc" id="L446" title="All 2 branches missed.">                if (debug != null) {</span>
+<span class="nc" id="L447">                    debug.println(&quot;LDAPCertStore.getCertificates() encountered &quot;</span>
+                        + &quot;exception while parsing cert, skipping the bad data: &quot;);
+<span class="nc" id="L449">                    HexDumpEncoder encoder = new HexDumpEncoder();</span>
+<span class="nc" id="L450">                    debug.println(</span>
+<span class="nc" id="L451">                        &quot;[ &quot; + encoder.encodeBuffer(encodedCert[i]) + &quot; ]&quot;);</span>
+                }
+<span class="nc" id="L453">            }</span>
+        }
+
+<span class="nc" id="L456">        return certs;</span>
+    }
+
+    /*
+     * Gets certificate pairs from an attribute id and location in the LDAP
+     * directory.
+     *
+     * @param name the location holding the attribute
+     * @param id the attribute identifier
+     * @return a Collection of X509CertificatePairs found
+     * @throws CertStoreException       if an exception occurs
+     */
+    private Collection&lt;X509CertificatePair&gt; getCertPairs(
+        LDAPRequest request, String id) throws CertStoreException {
+
+        /* fetch the encoded cert pairs from storage */
+        byte[][] encodedCertPair;
+        try {
+<span class="nc" id="L474">            encodedCertPair = request.getValues(id);</span>
+<span class="nc" id="L475">        } catch (NamingException namingEx) {</span>
+<span class="nc" id="L476">            throw new CertStoreException(namingEx);</span>
+<span class="nc" id="L477">        }</span>
+
+<span class="nc" id="L479">        int n = encodedCertPair.length;</span>
+<span class="nc bnc" id="L480" title="All 2 branches missed.">        if (n == 0) {</span>
+<span class="nc" id="L481">            return Collections.emptySet();</span>
+        }
+
+<span class="nc" id="L484">        List&lt;X509CertificatePair&gt; certPairs = new ArrayList&lt;&gt;(n);</span>
+        /* decode each cert pair and add it to the Collection */
+<span class="nc bnc" id="L486" title="All 2 branches missed.">        for (int i = 0; i &lt; n; i++) {</span>
+            try {
+<span class="nc" id="L488">                X509CertificatePair certPair =</span>
+<span class="nc" id="L489">                    X509CertificatePair.generateCertificatePair(encodedCertPair[i]);</span>
+<span class="nc" id="L490">                certPairs.add(certPair);</span>
+<span class="nc" id="L491">            } catch (CertificateException e) {</span>
+<span class="nc bnc" id="L492" title="All 2 branches missed.">                if (debug != null) {</span>
+<span class="nc" id="L493">                    debug.println(</span>
+                        &quot;LDAPCertStore.getCertPairs() encountered exception &quot;
+                        + &quot;while parsing cert, skipping the bad data: &quot;);
+<span class="nc" id="L496">                    HexDumpEncoder encoder = new HexDumpEncoder();</span>
+<span class="nc" id="L497">                    debug.println(</span>
+<span class="nc" id="L498">                        &quot;[ &quot; + encoder.encodeBuffer(encodedCertPair[i]) + &quot; ]&quot;);</span>
+                }
+<span class="nc" id="L500">            }</span>
+        }
+
+<span class="nc" id="L503">        return certPairs;</span>
+    }
+
+    /*
+     * Looks at certificate pairs stored in the crossCertificatePair attribute
+     * at the specified location in the LDAP directory. Returns a Collection
+     * containing all Certificates stored in the forward component that match
+     * the forward CertSelector and all Certificates stored in the reverse
+     * component that match the reverse CertSelector.
+     * &lt;p&gt;
+     * If either forward or reverse is null, all certificates from the
+     * corresponding component will be rejected.
+     *
+     * @param name the location to look in
+     * @param forward the forward CertSelector (or null)
+     * @param reverse the reverse CertSelector (or null)
+     * @return a Collection of Certificates found
+     * @throws CertStoreException       if an exception occurs
+     */
+    private Collection&lt;X509Certificate&gt; getMatchingCrossCerts(
+            LDAPRequest request, X509CertSelector forward,
+            X509CertSelector reverse)
+            throws CertStoreException {
+        // Get the cert pairs
+<span class="nc" id="L527">        Collection&lt;X509CertificatePair&gt; certPairs =</span>
+<span class="nc" id="L528">                                getCertPairs(request, CROSS_CERT);</span>
+
+        // Find Certificates that match and put them in a list
+<span class="nc" id="L531">        ArrayList&lt;X509Certificate&gt; matchingCerts = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L532" title="All 2 branches missed.">        for (X509CertificatePair certPair : certPairs) {</span>
+            X509Certificate cert;
+<span class="nc bnc" id="L534" title="All 2 branches missed.">            if (forward != null) {</span>
+<span class="nc" id="L535">                cert = certPair.getForward();</span>
+<span class="nc bnc" id="L536" title="All 4 branches missed.">                if ((cert != null) &amp;&amp; forward.match(cert)) {</span>
+<span class="nc" id="L537">                    matchingCerts.add(cert);</span>
+                }
+            }
+<span class="nc bnc" id="L540" title="All 2 branches missed.">            if (reverse != null) {</span>
+<span class="nc" id="L541">                cert = certPair.getReverse();</span>
+<span class="nc bnc" id="L542" title="All 4 branches missed.">                if ((cert != null) &amp;&amp; reverse.match(cert)) {</span>
+<span class="nc" id="L543">                    matchingCerts.add(cert);</span>
+                }
+            }
+<span class="nc" id="L546">        }</span>
+<span class="nc" id="L547">        return matchingCerts;</span>
+    }
+
+    /**
+     * Returns a &lt;code&gt;Collection&lt;/code&gt; of &lt;code&gt;Certificate&lt;/code&gt;s that
+     * match the specified selector. If no &lt;code&gt;Certificate&lt;/code&gt;s
+     * match the selector, an empty &lt;code&gt;Collection&lt;/code&gt; will be returned.
+     * &lt;p&gt;
+     * It is not practical to search every entry in the LDAP database for
+     * matching &lt;code&gt;Certificate&lt;/code&gt;s. Instead, the &lt;code&gt;CertSelector&lt;/code&gt;
+     * is examined in order to determine where matching &lt;code&gt;Certificate&lt;/code&gt;s
+     * are likely to be found (according to the PKIX LDAPv2 schema, RFC 2587).
+     * If the subject is specified, its directory entry is searched. If the
+     * issuer is specified, its directory entry is searched. If neither the
+     * subject nor the issuer are specified (or the selector is not an
+     * &lt;code&gt;X509CertSelector&lt;/code&gt;), a &lt;code&gt;CertStoreException&lt;/code&gt; is
+     * thrown.
+     *
+     * @param selector a &lt;code&gt;CertSelector&lt;/code&gt; used to select which
+     *  &lt;code&gt;Certificate&lt;/code&gt;s should be returned.
+     * @return a &lt;code&gt;Collection&lt;/code&gt; of &lt;code&gt;Certificate&lt;/code&gt;s that
+     *         match the specified selector
+     * @throws CertStoreException if an exception occurs
+     */
+    public synchronized Collection&lt;X509Certificate&gt; engineGetCertificates
+            (CertSelector selector) throws CertStoreException {
+<span class="nc bnc" id="L573" title="All 2 branches missed.">        if (debug != null) {</span>
+<span class="nc" id="L574">            debug.println(&quot;LDAPCertStore.engineGetCertificates() selector: &quot;</span>
+<span class="nc" id="L575">                + String.valueOf(selector));</span>
+        }
+
+<span class="nc bnc" id="L578" title="All 2 branches missed.">        if (selector == null) {</span>
+<span class="nc" id="L579">            selector = new X509CertSelector();</span>
+        }
+<span class="nc bnc" id="L581" title="All 2 branches missed.">        if (!(selector instanceof X509CertSelector)) {</span>
+<span class="nc" id="L582">            throw new CertStoreException(&quot;LDAPCertStore needs an X509CertSelector &quot; +</span>
+                                         &quot;to find certs&quot;);
+        }
+<span class="nc" id="L585">        X509CertSelector xsel = (X509CertSelector) selector;</span>
+<span class="nc" id="L586">        int basicConstraints = xsel.getBasicConstraints();</span>
+<span class="nc" id="L587">        String subject = xsel.getSubjectAsString();</span>
+<span class="nc" id="L588">        String issuer = xsel.getIssuerAsString();</span>
+<span class="nc" id="L589">        HashSet&lt;X509Certificate&gt; certs = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L590" title="All 2 branches missed.">        if (debug != null) {</span>
+<span class="nc" id="L591">            debug.println(&quot;LDAPCertStore.engineGetCertificates() basicConstraints: &quot;</span>
+                + basicConstraints);
+        }
+
+        // basicConstraints:
+        // -2: only EE certs accepted
+        // -1: no check is done
+        //  0: any CA certificate accepted
+        // &gt;1: certificate's basicConstraints extension pathlen must match
+<span class="nc bnc" id="L600" title="All 2 branches missed.">        if (subject != null) {</span>
+<span class="nc bnc" id="L601" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L602">                debug.println(&quot;LDAPCertStore.engineGetCertificates() &quot;</span>
+                    + &quot;subject is not null&quot;);
+            }
+<span class="nc" id="L605">            LDAPRequest request = new LDAPRequest(subject);</span>
+<span class="nc bnc" id="L606" title="All 2 branches missed.">            if (basicConstraints &gt; -2) {</span>
+<span class="nc" id="L607">                request.addRequestedAttribute(CROSS_CERT);</span>
+<span class="nc" id="L608">                request.addRequestedAttribute(CA_CERT);</span>
+<span class="nc" id="L609">                request.addRequestedAttribute(ARL);</span>
+<span class="nc bnc" id="L610" title="All 2 branches missed.">                if (prefetchCRLs) {</span>
+<span class="nc" id="L611">                    request.addRequestedAttribute(CRL);</span>
+                }
+            }
+<span class="nc bnc" id="L614" title="All 2 branches missed.">            if (basicConstraints &lt; 0) {</span>
+<span class="nc" id="L615">                request.addRequestedAttribute(USER_CERT);</span>
+            }
+
+<span class="nc bnc" id="L618" title="All 2 branches missed.">            if (basicConstraints &gt; -2) {</span>
+<span class="nc" id="L619">                certs.addAll(getMatchingCrossCerts(request, xsel, null));</span>
+<span class="nc bnc" id="L620" title="All 2 branches missed.">                if (debug != null) {</span>
+<span class="nc" id="L621">                    debug.println(&quot;LDAPCertStore.engineGetCertificates() after &quot;</span>
+                        + &quot;getMatchingCrossCerts(subject,xsel,null),certs.size(): &quot;
+<span class="nc" id="L623">                        + certs.size());</span>
+                }
+<span class="nc" id="L625">                certs.addAll(getCertificates(request, CA_CERT, xsel));</span>
+<span class="nc bnc" id="L626" title="All 2 branches missed.">                if (debug != null) {</span>
+<span class="nc" id="L627">                    debug.println(&quot;LDAPCertStore.engineGetCertificates() after &quot;</span>
+                        + &quot;getCertificates(subject,CA_CERT,xsel),certs.size(): &quot;
+<span class="nc" id="L629">                        + certs.size());</span>
+                }
+            }
+<span class="nc bnc" id="L632" title="All 2 branches missed.">            if (basicConstraints &lt; 0) {</span>
+<span class="nc" id="L633">                certs.addAll(getCertificates(request, USER_CERT, xsel));</span>
+<span class="nc bnc" id="L634" title="All 2 branches missed.">                if (debug != null) {</span>
+<span class="nc" id="L635">                    debug.println(&quot;LDAPCertStore.engineGetCertificates() after &quot;</span>
+                        + &quot;getCertificates(subject,USER_CERT, xsel),certs.size(): &quot;
+<span class="nc" id="L637">                        + certs.size());</span>
+                }
+            }
+<span class="nc" id="L640">        } else {</span>
+<span class="nc bnc" id="L641" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L642">                debug.println</span>
+<span class="nc" id="L643">                    (&quot;LDAPCertStore.engineGetCertificates() subject is null&quot;);</span>
+            }
+<span class="nc bnc" id="L645" title="All 2 branches missed.">            if (basicConstraints == -2) {</span>
+<span class="nc" id="L646">                throw new CertStoreException(&quot;need subject to find EE certs&quot;);</span>
+            }
+<span class="nc bnc" id="L648" title="All 2 branches missed.">            if (issuer == null) {</span>
+<span class="nc" id="L649">                throw new CertStoreException(&quot;need subject or issuer to find certs&quot;);</span>
+            }
+        }
+<span class="nc bnc" id="L652" title="All 2 branches missed.">        if (debug != null) {</span>
+<span class="nc" id="L653">            debug.println(&quot;LDAPCertStore.engineGetCertificates() about to &quot;</span>
+                + &quot;getMatchingCrossCerts...&quot;);
+        }
+<span class="nc bnc" id="L656" title="All 4 branches missed.">        if ((issuer != null) &amp;&amp; (basicConstraints &gt; -2)) {</span>
+<span class="nc" id="L657">            LDAPRequest request = new LDAPRequest(issuer);</span>
+<span class="nc" id="L658">            request.addRequestedAttribute(CROSS_CERT);</span>
+<span class="nc" id="L659">            request.addRequestedAttribute(CA_CERT);</span>
+<span class="nc" id="L660">            request.addRequestedAttribute(ARL);</span>
+<span class="nc bnc" id="L661" title="All 2 branches missed.">            if (prefetchCRLs) {</span>
+<span class="nc" id="L662">                request.addRequestedAttribute(CRL);</span>
+            }
+
+<span class="nc" id="L665">            certs.addAll(getMatchingCrossCerts(request, null, xsel));</span>
+<span class="nc bnc" id="L666" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L667">                debug.println(&quot;LDAPCertStore.engineGetCertificates() after &quot;</span>
+                    + &quot;getMatchingCrossCerts(issuer,null,xsel),certs.size(): &quot;
+<span class="nc" id="L669">                    + certs.size());</span>
+            }
+<span class="nc" id="L671">            certs.addAll(getCertificates(request, CA_CERT, xsel));</span>
+<span class="nc bnc" id="L672" title="All 2 branches missed.">            if (debug != null) {</span>
+<span class="nc" id="L673">                debug.println(&quot;LDAPCertStore.engineGetCertificates() after &quot;</span>
+                    + &quot;getCertificates(issuer,CA_CERT,xsel),certs.size(): &quot;
+<span class="nc" id="L675">                    + certs.size());</span>
+            }
+        }
+<span class="nc bnc" id="L678" title="All 2 branches missed.">        if (debug != null) {</span>
+<span class="nc" id="L679">            debug.println(&quot;LDAPCertStore.engineGetCertificates() returning certs&quot;);</span>
+        }
+<span class="nc" id="L681">        return certs;</span>
+    }
+
+    /*
+     * Gets CRLs from an attribute id and location in the LDAP directory.
+     * Returns a Collection containing only the CRLs that match the
+     * specified CRLSelector.
+     *
+     * @param name the location holding the attribute
+     * @param id the attribute identifier
+     * @param sel a CRLSelector that the CRLs must match
+     * @return a Collection of CRLs found
+     * @throws CertStoreException       if an exception occurs
+     */
+    private Collection&lt;X509CRL&gt; getCRLs(LDAPRequest request, String id,
+            X509CRLSelector sel) throws CertStoreException {
+
+        /* fetch the encoded crls from storage */
+        byte[][] encodedCRL;
+        try {
+<span class="nc" id="L701">            encodedCRL = request.getValues(id);</span>
+<span class="nc" id="L702">        } catch (NamingException namingEx) {</span>
+<span class="nc" id="L703">            throw new CertStoreException(namingEx);</span>
+<span class="nc" id="L704">        }</span>
+
+<span class="nc" id="L706">        int n = encodedCRL.length;</span>
+<span class="nc bnc" id="L707" title="All 2 branches missed.">        if (n == 0) {</span>
+<span class="nc" id="L708">            return Collections.emptySet();</span>
+        }
+
+<span class="nc" id="L711">        List&lt;X509CRL&gt; crls = new ArrayList&lt;&gt;(n);</span>
+        /* decode each crl and check if it matches selector */
+<span class="nc bnc" id="L713" title="All 2 branches missed.">        for (int i = 0; i &lt; n; i++) {</span>
+            try {
+<span class="nc" id="L715">                CRL crl = cf.generateCRL(new ByteArrayInputStream(encodedCRL[i]));</span>
+<span class="nc bnc" id="L716" title="All 2 branches missed.">                if (sel.match(crl)) {</span>
+<span class="nc" id="L717">                    crls.add((X509CRL)crl);</span>
+                }
+<span class="nc" id="L719">            } catch (CRLException e) {</span>
+<span class="nc bnc" id="L720" title="All 2 branches missed.">                if (debug != null) {</span>
+<span class="nc" id="L721">                    debug.println(&quot;LDAPCertStore.getCRLs() encountered exception&quot;</span>
+                        + &quot; while parsing CRL, skipping the bad data: &quot;);
+<span class="nc" id="L723">                    HexDumpEncoder encoder = new HexDumpEncoder();</span>
+<span class="nc" id="L724">                    debug.println(&quot;[ &quot; + encoder.encodeBuffer(encodedCRL[i]) + &quot; ]&quot;);</span>
+                }
+<span class="nc" id="L726">            }</span>
+        }
+
+<span class="nc" id="L729">        return crls;</span>
+    }
+
+    /**
+     * Returns a &lt;code&gt;Collection&lt;/code&gt; of &lt;code&gt;CRL&lt;/code&gt;s that
+     * match the specified selector. If no &lt;code&gt;CRL&lt;/code&gt;s
+     * match the selector, an empty &lt;code&gt;Collection&lt;/code&gt; will be returned.
+     * &lt;p&gt;
+     * It is not practical to search every entry in the LDAP database for
+     * matching &lt;code&gt;CRL&lt;/code&gt;s. Instead, the &lt;code&gt;CRLSelector&lt;/code&gt;
+     * is examined in order to determine where matching &lt;code&gt;CRL&lt;/code&gt;s
+     * are likely to be found (according to the PKIX LDAPv2 schema, RFC 2587).
+     * If issuerNames or certChecking are specified, the issuer's directory
+     * entry is searched. If neither issuerNames or certChecking are specified
+     * (or the selector is not an &lt;code&gt;X509CRLSelector&lt;/code&gt;), a
+     * &lt;code&gt;CertStoreException&lt;/code&gt; is thrown.
+     *
+     * @param selector A &lt;code&gt;CRLSelector&lt;/code&gt; used to select which
+     *  &lt;code&gt;CRL&lt;/code&gt;s should be returned. Specify &lt;code&gt;null&lt;/code&gt;
+     *  to return all &lt;code&gt;CRL&lt;/code&gt;s.
+     * @return A &lt;code&gt;Collection&lt;/code&gt; of &lt;code&gt;CRL&lt;/code&gt;s that
+     *         match the specified selector
+     * @throws CertStoreException if an exception occurs
+     */
+    public synchronized Collection&lt;X509CRL&gt; engineGetCRLs(CRLSelector selector)
+            throws CertStoreException {
+<span class="nc bnc" id="L755" title="All 2 branches missed.">        if (debug != null) {</span>
+<span class="nc" id="L756">            debug.println(&quot;LDAPCertStore.engineGetCRLs() selector: &quot;</span>
+                + selector);
+        }
+        // Set up selector and collection to hold CRLs
+<span class="nc bnc" id="L760" title="All 2 branches missed.">        if (selector == null) {</span>
+<span class="nc" id="L761">            selector = new X509CRLSelector();</span>
+        }
+<span class="nc bnc" id="L763" title="All 2 branches missed.">        if (!(selector instanceof X509CRLSelector)) {</span>
+<span class="nc" id="L764">            throw new CertStoreException(&quot;need X509CRLSelector to find CRLs&quot;);</span>
+        }
+<span class="nc" id="L766">        X509CRLSelector xsel = (X509CRLSelector) selector;</span>
+<span class="nc" id="L767">        HashSet&lt;X509CRL&gt; crls = new HashSet&lt;&gt;();</span>
+
+        // Look in directory entry for issuer of cert we're checking.
+        Collection&lt;Object&gt; issuerNames;
+<span class="nc" id="L771">        X509Certificate certChecking = xsel.getCertificateChecking();</span>
+<span class="nc bnc" id="L772" title="All 2 branches missed.">        if (certChecking != null) {</span>
+<span class="nc" id="L773">            issuerNames = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L774">            X500Principal issuer = certChecking.getIssuerX500Principal();</span>
+<span class="nc" id="L775">            issuerNames.add(issuer.getName(X500Principal.RFC2253));</span>
+<span class="nc" id="L776">        } else {</span>
+            // But if we don't know which cert we're checking, try the directory
+            // entries of all acceptable CRL issuers
+<span class="nc" id="L779">            issuerNames = xsel.getIssuerNames();</span>
+<span class="nc bnc" id="L780" title="All 2 branches missed.">            if (issuerNames == null) {</span>
+<span class="nc" id="L781">                throw new CertStoreException(&quot;need issuerNames or certChecking to &quot;</span>
+                    + &quot;find CRLs&quot;);
+            }
+        }
+<span class="nc bnc" id="L785" title="All 2 branches missed.">        for (Object nameObject : issuerNames) {</span>
+            String issuerName;
+<span class="nc bnc" id="L787" title="All 2 branches missed.">            if (nameObject instanceof byte[]) {</span>
+                try {
+<span class="nc" id="L789">                    X500Principal issuer = new X500Principal((byte[])nameObject);</span>
+<span class="nc" id="L790">                    issuerName = issuer.getName(X500Principal.RFC2253);</span>
+<span class="nc" id="L791">                } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L792">                    continue;</span>
+<span class="nc" id="L793">                }</span>
+            } else {
+<span class="nc" id="L795">                issuerName = (String)nameObject;</span>
+            }
+            // If all we want is CA certs, try to get the (probably shorter) ARL
+<span class="nc" id="L798">            Collection&lt;X509CRL&gt; entryCRLs = Collections.emptySet();</span>
+<span class="nc bnc" id="L799" title="All 4 branches missed.">            if (certChecking == null || certChecking.getBasicConstraints() != -1) {</span>
+<span class="nc" id="L800">                LDAPRequest request = new LDAPRequest(issuerName);</span>
+<span class="nc" id="L801">                request.addRequestedAttribute(CROSS_CERT);</span>
+<span class="nc" id="L802">                request.addRequestedAttribute(CA_CERT);</span>
+<span class="nc" id="L803">                request.addRequestedAttribute(ARL);</span>
+<span class="nc bnc" id="L804" title="All 2 branches missed.">                if (prefetchCRLs) {</span>
+<span class="nc" id="L805">                    request.addRequestedAttribute(CRL);</span>
+                }
+                try {
+<span class="nc" id="L808">                    entryCRLs = getCRLs(request, ARL, xsel);</span>
+<span class="nc bnc" id="L809" title="All 2 branches missed.">                    if (entryCRLs.isEmpty()) {</span>
+                        // no ARLs found. We assume that means that there are
+                        // no ARLs on this server at all and prefetch the CRLs.
+<span class="nc" id="L812">                        prefetchCRLs = true;</span>
+                    } else {
+<span class="nc" id="L814">                        crls.addAll(entryCRLs);</span>
+                    }
+<span class="nc" id="L816">                } catch (CertStoreException e) {</span>
+<span class="nc bnc" id="L817" title="All 2 branches missed.">                    if (debug != null) {</span>
+<span class="nc" id="L818">                        debug.println(&quot;LDAPCertStore.engineGetCRLs non-fatal error &quot;</span>
+                            + &quot;retrieving ARLs:&quot; + e);
+<span class="nc" id="L820">                        e.printStackTrace();</span>
+                    }
+<span class="nc" id="L822">                }</span>
+            }
+            // Otherwise, get the CRL
+            // if certChecking is null, we don't know if we should look in ARL or CRL
+            // attribute, so check both for matching CRLs.
+<span class="nc bnc" id="L827" title="All 4 branches missed.">            if (entryCRLs.isEmpty() || certChecking == null) {</span>
+<span class="nc" id="L828">                LDAPRequest request = new LDAPRequest(issuerName);</span>
+<span class="nc" id="L829">                request.addRequestedAttribute(CRL);</span>
+<span class="nc" id="L830">                entryCRLs = getCRLs(request, CRL, xsel);</span>
+<span class="nc" id="L831">                crls.addAll(entryCRLs);</span>
+            }
+<span class="nc" id="L833">        }</span>
+<span class="nc" id="L834">        return crls;</span>
+    }
+
+    // converts an LDAP URI into LDAPCertStoreParameters
+    static LDAPCertStoreParameters getParameters(URI uri) {
+<span class="nc" id="L839">        String host = uri.getHost();</span>
+<span class="nc bnc" id="L840" title="All 2 branches missed.">        if (host == null) {</span>
+<span class="nc" id="L841">            return new SunLDAPCertStoreParameters();</span>
+        } else {
+<span class="nc" id="L843">            int port = uri.getPort();</span>
+<span class="nc bnc" id="L844" title="All 2 branches missed.">            return (port == -1</span>
+                    ? new SunLDAPCertStoreParameters(host)
+                    : new SunLDAPCertStoreParameters(host, port));
+        }
+    }
+
+    /*
+     * Subclass of LDAPCertStoreParameters with overridden equals/hashCode
+     * methods. This is necessary because the parameters are used as
+     * keys in the LDAPCertStore cache.
+     */
+    private static class SunLDAPCertStoreParameters
+        extends LDAPCertStoreParameters {
+
+<span class="nc" id="L858">        private volatile int hashCode = 0;</span>
+
+        SunLDAPCertStoreParameters(String serverName, int port) {
+<span class="nc" id="L861">            super(serverName, port);</span>
+<span class="nc" id="L862">        }</span>
+        SunLDAPCertStoreParameters(String serverName) {
+<span class="nc" id="L864">            super(serverName);</span>
+<span class="nc" id="L865">        }</span>
+        SunLDAPCertStoreParameters() {
+<span class="nc" id="L867">            super();</span>
+<span class="nc" id="L868">        }</span>
+        public boolean equals(Object obj) {
+<span class="nc bnc" id="L870" title="All 2 branches missed.">            if (!(obj instanceof LDAPCertStoreParameters)) {</span>
+<span class="nc" id="L871">                return false;</span>
+            }
+<span class="nc" id="L873">            LDAPCertStoreParameters params = (LDAPCertStoreParameters) obj;</span>
+<span class="nc bnc" id="L874" title="All 2 branches missed.">            return (getPort() == params.getPort() &amp;&amp;</span>
+<span class="nc bnc" id="L875" title="All 2 branches missed.">                    getServerName().equalsIgnoreCase(params.getServerName()));</span>
+        }
+        public int hashCode() {
+<span class="nc bnc" id="L878" title="All 2 branches missed.">            if (hashCode == 0) {</span>
+<span class="nc" id="L879">                int result = 17;</span>
+<span class="nc" id="L880">                result = 37*result + getPort();</span>
+<span class="nc" id="L881">                result = 37*result +</span>
+<span class="nc" id="L882">                    getServerName().toLowerCase(Locale.ENGLISH).hashCode();</span>
+<span class="nc" id="L883">                hashCode = result;</span>
+            }
+<span class="nc" id="L885">            return hashCode;</span>
+        }
+    }
+
+    /*
+     * This inner class wraps an existing X509CertSelector and adds
+     * additional criteria to match on when the certificate's subject is
+     * different than the LDAP Distinguished Name entry. The LDAPCertStore
+     * implementation uses the subject DN as the directory entry for
+     * looking up certificates. This can be problematic if the certificates
+     * that you want to fetch have a different subject DN than the entry
+     * where they are stored. You could set the selector's subject to the
+     * LDAP DN entry, but then the resulting match would fail to find the
+     * desired certificates because the subject DNs would not match. This
+     * class avoids that problem by introducing a certSubject which should
+     * be set to the certificate's subject DN when it is different than
+     * the LDAP DN.
+     */
+    static class LDAPCertSelector extends X509CertSelector {
+
+        private X500Principal certSubject;
+        private X509CertSelector selector;
+        private X500Principal subject;
+
+        /**
+         * Creates an LDAPCertSelector.
+         *
+         * @param selector the X509CertSelector to wrap
+         * @param certSubject the subject DN of the certificate that you want
+         *      to retrieve via LDAP
+         * @param ldapDN the LDAP DN where the certificate is stored
+         */
+        LDAPCertSelector(X509CertSelector selector, X500Principal certSubject,
+<span class="nc" id="L918">            String ldapDN) throws IOException {</span>
+<span class="nc bnc" id="L919" title="All 2 branches missed.">            this.selector = selector == null ? new X509CertSelector() : selector;</span>
+<span class="nc" id="L920">            this.certSubject = certSubject;</span>
+<span class="nc" id="L921">            this.subject = new X500Name(ldapDN).asX500Principal();</span>
+<span class="nc" id="L922">        }</span>
+
+        // we only override the get (accessor methods) since the set methods
+        // will not be invoked by the code that uses this LDAPCertSelector.
+        public X509Certificate getCertificate() {
+<span class="nc" id="L927">            return selector.getCertificate();</span>
+        }
+        public BigInteger getSerialNumber() {
+<span class="nc" id="L930">            return selector.getSerialNumber();</span>
+        }
+        public X500Principal getIssuer() {
+<span class="nc" id="L933">            return selector.getIssuer();</span>
+        }
+        public String getIssuerAsString() {
+<span class="nc" id="L936">            return selector.getIssuerAsString();</span>
+        }
+        public byte[] getIssuerAsBytes() throws IOException {
+<span class="nc" id="L939">            return selector.getIssuerAsBytes();</span>
+        }
+        public X500Principal getSubject() {
+            // return the ldap DN
+<span class="nc" id="L943">            return subject;</span>
+        }
+        public String getSubjectAsString() {
+            // return the ldap DN
+<span class="nc" id="L947">            return subject.getName();</span>
+        }
+        public byte[] getSubjectAsBytes() throws IOException {
+            // return the encoded ldap DN
+<span class="nc" id="L951">            return subject.getEncoded();</span>
+        }
+        public byte[] getSubjectKeyIdentifier() {
+<span class="nc" id="L954">            return selector.getSubjectKeyIdentifier();</span>
+        }
+        public byte[] getAuthorityKeyIdentifier() {
+<span class="nc" id="L957">            return selector.getAuthorityKeyIdentifier();</span>
+        }
+        public Date getCertificateValid() {
+<span class="nc" id="L960">            return selector.getCertificateValid();</span>
+        }
+        public Date getPrivateKeyValid() {
+<span class="nc" id="L963">            return selector.getPrivateKeyValid();</span>
+        }
+        public String getSubjectPublicKeyAlgID() {
+<span class="nc" id="L966">            return selector.getSubjectPublicKeyAlgID();</span>
+        }
+        public PublicKey getSubjectPublicKey() {
+<span class="nc" id="L969">            return selector.getSubjectPublicKey();</span>
+        }
+        public boolean[] getKeyUsage() {
+<span class="nc" id="L972">            return selector.getKeyUsage();</span>
+        }
+        public Set&lt;String&gt; getExtendedKeyUsage() {
+<span class="nc" id="L975">            return selector.getExtendedKeyUsage();</span>
+        }
+        public boolean getMatchAllSubjectAltNames() {
+<span class="nc" id="L978">            return selector.getMatchAllSubjectAltNames();</span>
+        }
+        public Collection&lt;List&lt;?&gt;&gt; getSubjectAlternativeNames() {
+<span class="nc" id="L981">            return selector.getSubjectAlternativeNames();</span>
+        }
+        public byte[] getNameConstraints() {
+<span class="nc" id="L984">            return selector.getNameConstraints();</span>
+        }
+        public int getBasicConstraints() {
+<span class="nc" id="L987">            return selector.getBasicConstraints();</span>
+        }
+        public Set&lt;String&gt; getPolicy() {
+<span class="nc" id="L990">            return selector.getPolicy();</span>
+        }
+        public Collection&lt;List&lt;?&gt;&gt; getPathToNames() {
+<span class="nc" id="L993">            return selector.getPathToNames();</span>
+        }
+
+        public boolean match(Certificate cert) {
+            // temporarily set the subject criterion to the certSubject
+            // so that match will not reject the desired certificates
+<span class="nc" id="L999">            selector.setSubject(certSubject);</span>
+<span class="nc" id="L1000">            boolean match = selector.match(cert);</span>
+<span class="nc" id="L1001">            selector.setSubject(subject);</span>
+<span class="nc" id="L1002">            return match;</span>
+        }
+    }
+
+    /**
+     * This class has the same purpose as LDAPCertSelector except it is for
+     * X.509 CRLs.
+     */
+    static class LDAPCRLSelector extends X509CRLSelector {
+
+        private X509CRLSelector selector;
+        private Collection&lt;X500Principal&gt; certIssuers;
+        private Collection&lt;X500Principal&gt; issuers;
+        private HashSet&lt;Object&gt; issuerNames;
+
+        /**
+         * Creates an LDAPCRLSelector.
+         *
+         * @param selector the X509CRLSelector to wrap
+         * @param certIssuers the issuer DNs of the CRLs that you want
+         *      to retrieve via LDAP
+         * @param ldapDN the LDAP DN where the CRL is stored
+         */
+        LDAPCRLSelector(X509CRLSelector selector,
+            Collection&lt;X500Principal&gt; certIssuers, String ldapDN)
+<span class="nc" id="L1027">            throws IOException {</span>
+<span class="nc bnc" id="L1028" title="All 2 branches missed.">            this.selector = selector == null ? new X509CRLSelector() : selector;</span>
+<span class="nc" id="L1029">            this.certIssuers = certIssuers;</span>
+<span class="nc" id="L1030">            issuerNames = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L1031">            issuerNames.add(ldapDN);</span>
+<span class="nc" id="L1032">            issuers = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L1033">            issuers.add(new X500Name(ldapDN).asX500Principal());</span>
+<span class="nc" id="L1034">        }</span>
+        // we only override the get (accessor methods) since the set methods
+        // will not be invoked by the code that uses this LDAPCRLSelector.
+        public Collection&lt;X500Principal&gt; getIssuers() {
+            // return the ldap DN
+<span class="nc" id="L1039">            return Collections.unmodifiableCollection(issuers);</span>
+        }
+        public Collection&lt;Object&gt; getIssuerNames() {
+            // return the ldap DN
+<span class="nc" id="L1043">            return Collections.unmodifiableCollection(issuerNames);</span>
+        }
+        public BigInteger getMinCRL() {
+<span class="nc" id="L1046">            return selector.getMinCRL();</span>
+        }
+        public BigInteger getMaxCRL() {
+<span class="nc" id="L1049">            return selector.getMaxCRL();</span>
+        }
+        public Date getDateAndTime() {
+<span class="nc" id="L1052">            return selector.getDateAndTime();</span>
+        }
+        public X509Certificate getCertificateChecking() {
+<span class="nc" id="L1055">            return selector.getCertificateChecking();</span>
+        }
+        public boolean match(CRL crl) {
+            // temporarily set the issuer criterion to the certIssuers
+            // so that match will not reject the desired CRL
+<span class="nc" id="L1060">            selector.setIssuers(certIssuers);</span>
+<span class="nc" id="L1061">            boolean match = selector.match(crl);</span>
+<span class="nc" id="L1062">            selector.setIssuers(issuers);</span>
+<span class="nc" id="L1063">            return match;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

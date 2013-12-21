@@ -1,0 +1,1359 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>X509CRLImpl.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.security.x509</a> &gt; <span class="el_source">X509CRLImpl.java</span></div><h1>X509CRLImpl.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1997, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.security.x509;
+
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.IOException;
+import java.math.BigInteger;
+import java.security.Principal;
+import java.security.PublicKey;
+import java.security.PrivateKey;
+import java.security.Provider;
+import java.security.Signature;
+import java.security.NoSuchAlgorithmException;
+import java.security.InvalidKeyException;
+import java.security.NoSuchProviderException;
+import java.security.SignatureException;
+import java.security.cert.Certificate;
+import java.security.cert.X509CRL;
+import java.security.cert.X509Certificate;
+import java.security.cert.X509CRLEntry;
+import java.security.cert.CRLException;
+import java.util.*;
+
+import javax.security.auth.x500.X500Principal;
+
+import sun.security.provider.X509Factory;
+import sun.security.util.*;
+import sun.misc.HexDumpEncoder;
+
+/**
+ * &lt;p&gt;
+ * An implementation for X509 CRL (Certificate Revocation List).
+ * &lt;p&gt;
+ * The X.509 v2 CRL format is described below in ASN.1:
+ * &lt;pre&gt;
+ * CertificateList  ::=  SEQUENCE  {
+ *     tbsCertList          TBSCertList,
+ *     signatureAlgorithm   AlgorithmIdentifier,
+ *     signature            BIT STRING  }
+ * &lt;/pre&gt;
+ * More information can be found in
+ * &lt;a href=&quot;http://www.ietf.org/rfc/rfc3280.txt&quot;&gt;RFC 3280: Internet X.509
+ * Public Key Infrastructure Certificate and CRL Profile&lt;/a&gt;.
+ * &lt;p&gt;
+ * The ASN.1 definition of &lt;code&gt;tbsCertList&lt;/code&gt; is:
+ * &lt;pre&gt;
+ * TBSCertList  ::=  SEQUENCE  {
+ *     version                 Version OPTIONAL,
+ *                             -- if present, must be v2
+ *     signature               AlgorithmIdentifier,
+ *     issuer                  Name,
+ *     thisUpdate              ChoiceOfTime,
+ *     nextUpdate              ChoiceOfTime OPTIONAL,
+ *     revokedCertificates     SEQUENCE OF SEQUENCE  {
+ *         userCertificate         CertificateSerialNumber,
+ *         revocationDate          ChoiceOfTime,
+ *         crlEntryExtensions      Extensions OPTIONAL
+ *                                 -- if present, must be v2
+ *         }  OPTIONAL,
+ *     crlExtensions           [0]  EXPLICIT Extensions OPTIONAL
+ *                                  -- if present, must be v2
+ *     }
+ * &lt;/pre&gt;
+ *
+ * @author Hemma Prafullchandra
+ * @see X509CRL
+ */
+public class X509CRLImpl extends X509CRL implements DerEncoder {
+
+    // CRL data, and its envelope
+<span class="pc" id="L95">    private byte[]      signedCRL = null; // DER encoded crl</span>
+<span class="pc" id="L96">    private byte[]      signature = null; // raw signature bits</span>
+<span class="pc" id="L97">    private byte[]      tbsCertList = null; // DER encoded &quot;to-be-signed&quot; CRL</span>
+<span class="pc" id="L98">    private AlgorithmId sigAlgId = null; // sig alg in CRL</span>
+
+    // crl information
+    private int              version;
+    private AlgorithmId      infoSigAlgId; // sig alg in &quot;to-be-signed&quot; crl
+<span class="pc" id="L103">    private X500Name         issuer = null;</span>
+<span class="pc" id="L104">    private X500Principal    issuerPrincipal = null;</span>
+<span class="pc" id="L105">    private Date             thisUpdate = null;</span>
+<span class="pc" id="L106">    private Date             nextUpdate = null;</span>
+<span class="pc" id="L107">    private Map&lt;X509IssuerSerial,X509CRLEntry&gt; revokedMap = new TreeMap&lt;&gt;();</span>
+<span class="pc" id="L108">    private List&lt;X509CRLEntry&gt; revokedList = new LinkedList&lt;&gt;();</span>
+<span class="pc" id="L109">    private CRLExtensions    extensions = null;</span>
+    private final static boolean isExplicit = true;
+    private static final long YR_2050 = 2524636800000L;
+
+<span class="pc" id="L113">    private boolean readOnly = false;</span>
+
+    /**
+     * PublicKey that has previously been used to successfully verify
+     * the signature of this CRL. Null if the CRL has not
+     * yet been verified (successfully).
+     */
+    private PublicKey verifiedPublicKey;
+    /**
+     * If verifiedPublicKey is not null, name of the provider used to
+     * successfully verify the signature of this CRL, or the
+     * empty String if no provider was explicitly specified.
+     */
+    private String verifiedProvider;
+
+    /**
+     * Not to be used. As it would lead to cases of uninitialized
+     * CRL objects.
+     */
+<span class="nc" id="L132">    private X509CRLImpl() { }</span>
+
+    /**
+     * Unmarshals an X.509 CRL from its encoded form, parsing the encoded
+     * bytes.  This form of constructor is used by agents which
+     * need to examine and use CRL contents. Note that the buffer
+     * must include only one CRL, and no &quot;garbage&quot; may be left at
+     * the end.
+     *
+     * @param crlData the encoded bytes, with no trailing padding.
+     * @exception CRLException on parsing errors.
+     */
+<span class="fc" id="L144">    public X509CRLImpl(byte[] crlData) throws CRLException {</span>
+        try {
+<span class="fc" id="L146">            parse(new DerValue(crlData));</span>
+<span class="nc" id="L147">        } catch (IOException e) {</span>
+<span class="nc" id="L148">            signedCRL = null;</span>
+<span class="nc" id="L149">            throw new CRLException(&quot;Parsing error: &quot; + e.getMessage());</span>
+<span class="fc" id="L150">        }</span>
+<span class="fc" id="L151">    }</span>
+
+    /**
+     * Unmarshals an X.509 CRL from an DER value.
+     *
+     * @param val a DER value holding at least one CRL
+     * @exception CRLException on parsing errors.
+     */
+<span class="nc" id="L159">    public X509CRLImpl(DerValue val) throws CRLException {</span>
+        try {
+<span class="nc" id="L161">            parse(val);</span>
+<span class="nc" id="L162">        } catch (IOException e) {</span>
+<span class="nc" id="L163">            signedCRL = null;</span>
+<span class="nc" id="L164">            throw new CRLException(&quot;Parsing error: &quot; + e.getMessage());</span>
+<span class="nc" id="L165">        }</span>
+<span class="nc" id="L166">    }</span>
+
+    /**
+     * Unmarshals an X.509 CRL from an input stream. Only one CRL
+     * is expected at the end of the input stream.
+     *
+     * @param inStrm an input stream holding at least one CRL
+     * @exception CRLException on parsing errors.
+     */
+<span class="nc" id="L175">    public X509CRLImpl(InputStream inStrm) throws CRLException {</span>
+        try {
+<span class="nc" id="L177">            parse(new DerValue(inStrm));</span>
+<span class="nc" id="L178">        } catch (IOException e) {</span>
+<span class="nc" id="L179">            signedCRL = null;</span>
+<span class="nc" id="L180">            throw new CRLException(&quot;Parsing error: &quot; + e.getMessage());</span>
+<span class="nc" id="L181">        }</span>
+<span class="nc" id="L182">    }</span>
+
+    /**
+     * Initial CRL constructor, no revoked certs, and no extensions.
+     *
+     * @param issuer the name of the CA issuing this CRL.
+     * @param thisUpdate the Date of this issue.
+     * @param nextUpdate the Date of the next CRL.
+     */
+<span class="nc" id="L191">    public X509CRLImpl(X500Name issuer, Date thisDate, Date nextDate) {</span>
+<span class="nc" id="L192">        this.issuer = issuer;</span>
+<span class="nc" id="L193">        this.thisUpdate = thisDate;</span>
+<span class="nc" id="L194">        this.nextUpdate = nextDate;</span>
+<span class="nc" id="L195">    }</span>
+
+    /**
+     * CRL constructor, revoked certs, no extensions.
+     *
+     * @param issuer the name of the CA issuing this CRL.
+     * @param thisUpdate the Date of this issue.
+     * @param nextUpdate the Date of the next CRL.
+     * @param badCerts the array of CRL entries.
+     *
+     * @exception CRLException on parsing/construction errors.
+     */
+    public X509CRLImpl(X500Name issuer, Date thisDate, Date nextDate,
+                       X509CRLEntry[] badCerts)
+        throws CRLException
+<span class="fc" id="L210">    {</span>
+<span class="fc" id="L211">        this.issuer = issuer;</span>
+<span class="fc" id="L212">        this.thisUpdate = thisDate;</span>
+<span class="fc" id="L213">        this.nextUpdate = nextDate;</span>
+<span class="pc bpc" id="L214" title="1 of 2 branches missed.">        if (badCerts != null) {</span>
+<span class="fc" id="L215">            X500Principal crlIssuer = getIssuerX500Principal();</span>
+<span class="fc" id="L216">            X500Principal badCertIssuer = crlIssuer;</span>
+<span class="fc bfc" id="L217" title="All 2 branches covered.">            for (int i = 0; i &lt; badCerts.length; i++) {</span>
+<span class="fc" id="L218">                X509CRLEntryImpl badCert = (X509CRLEntryImpl)badCerts[i];</span>
+                try {
+<span class="fc" id="L220">                    badCertIssuer = getCertIssuer(badCert, badCertIssuer);</span>
+<span class="nc" id="L221">                } catch (IOException ioe) {</span>
+<span class="nc" id="L222">                    throw new CRLException(ioe);</span>
+<span class="fc" id="L223">                }</span>
+<span class="fc" id="L224">                badCert.setCertificateIssuer(crlIssuer, badCertIssuer);</span>
+<span class="fc" id="L225">                X509IssuerSerial issuerSerial = new X509IssuerSerial</span>
+<span class="fc" id="L226">                    (badCertIssuer, badCert.getSerialNumber());</span>
+<span class="fc" id="L227">                this.revokedMap.put(issuerSerial, badCert);</span>
+<span class="fc" id="L228">                this.revokedList.add(badCert);</span>
+<span class="pc bpc" id="L229" title="1 of 2 branches missed.">                if (badCert.hasExtensions()) {</span>
+<span class="fc" id="L230">                    this.version = 1;</span>
+                }
+            }
+        }
+<span class="fc" id="L234">    }</span>
+
+    /**
+     * CRL constructor, revoked certs and extensions.
+     *
+     * @param issuer the name of the CA issuing this CRL.
+     * @param thisUpdate the Date of this issue.
+     * @param nextUpdate the Date of the next CRL.
+     * @param badCerts the array of CRL entries.
+     * @param crlExts the CRL extensions.
+     *
+     * @exception CRLException on parsing/construction errors.
+     */
+    public X509CRLImpl(X500Name issuer, Date thisDate, Date nextDate,
+               X509CRLEntry[] badCerts, CRLExtensions crlExts)
+        throws CRLException
+    {
+<span class="nc" id="L251">        this(issuer, thisDate, nextDate, badCerts);</span>
+<span class="nc bnc" id="L252" title="All 2 branches missed.">        if (crlExts != null) {</span>
+<span class="nc" id="L253">            this.extensions = crlExts;</span>
+<span class="nc" id="L254">            this.version = 1;</span>
+        }
+<span class="nc" id="L256">    }</span>
+
+    /**
+     * Returned the encoding as an uncloned byte array. Callers must
+     * guarantee that they neither modify it nor expose it to untrusted
+     * code.
+     */
+    public byte[] getEncodedInternal() throws CRLException {
+<span class="pc bpc" id="L264" title="1 of 2 branches missed.">        if (signedCRL == null) {</span>
+<span class="nc" id="L265">            throw new CRLException(&quot;Null CRL to encode&quot;);</span>
+        }
+<span class="fc" id="L267">        return signedCRL;</span>
+    }
+
+    /**
+     * Returns the ASN.1 DER encoded form of this CRL.
+     *
+     * @exception CRLException if an encoding error occurs.
+     */
+    public byte[] getEncoded() throws CRLException {
+<span class="nc" id="L276">        return getEncodedInternal().clone();</span>
+    }
+
+    /**
+     * Encodes the &quot;to-be-signed&quot; CRL to the OutputStream.
+     *
+     * @param out the OutputStream to write to.
+     * @exception CRLException on encoding errors.
+     */
+    public void encodeInfo(OutputStream out) throws CRLException {
+        try {
+<span class="fc" id="L287">            DerOutputStream tmp = new DerOutputStream();</span>
+<span class="fc" id="L288">            DerOutputStream rCerts = new DerOutputStream();</span>
+<span class="fc" id="L289">            DerOutputStream seq = new DerOutputStream();</span>
+
+<span class="pc bpc" id="L291" title="1 of 2 branches missed.">            if (version != 0) // v2 crl encode version</span>
+<span class="fc" id="L292">                tmp.putInteger(version);</span>
+<span class="fc" id="L293">            infoSigAlgId.encode(tmp);</span>
+<span class="pc bpc" id="L294" title="3 of 4 branches missed.">            if ((version == 0) &amp;&amp; (issuer.toString() == null))</span>
+<span class="nc" id="L295">                throw new CRLException(&quot;Null Issuer DN not allowed in v1 CRL&quot;);</span>
+<span class="fc" id="L296">            issuer.encode(tmp);</span>
+
+<span class="pc bpc" id="L298" title="1 of 2 branches missed.">            if (thisUpdate.getTime() &lt; YR_2050)</span>
+<span class="fc" id="L299">                tmp.putUTCTime(thisUpdate);</span>
+            else
+<span class="nc" id="L301">                tmp.putGeneralizedTime(thisUpdate);</span>
+
+<span class="pc bpc" id="L303" title="1 of 2 branches missed.">            if (nextUpdate != null) {</span>
+<span class="pc bpc" id="L304" title="1 of 2 branches missed.">                if (nextUpdate.getTime() &lt; YR_2050)</span>
+<span class="fc" id="L305">                    tmp.putUTCTime(nextUpdate);</span>
+                else
+<span class="nc" id="L307">                    tmp.putGeneralizedTime(nextUpdate);</span>
+            }
+
+<span class="pc bpc" id="L310" title="1 of 2 branches missed.">            if (!revokedList.isEmpty()) {</span>
+<span class="fc bfc" id="L311" title="All 2 branches covered.">                for (X509CRLEntry entry : revokedList) {</span>
+<span class="fc" id="L312">                    ((X509CRLEntryImpl)entry).encode(rCerts);</span>
+<span class="fc" id="L313">                }</span>
+<span class="fc" id="L314">                tmp.write(DerValue.tag_Sequence, rCerts);</span>
+            }
+
+<span class="pc bpc" id="L317" title="1 of 2 branches missed.">            if (extensions != null)</span>
+<span class="nc" id="L318">                extensions.encode(tmp, isExplicit);</span>
+
+<span class="fc" id="L320">            seq.write(DerValue.tag_Sequence, tmp);</span>
+
+<span class="fc" id="L322">            tbsCertList = seq.toByteArray();</span>
+<span class="fc" id="L323">            out.write(tbsCertList);</span>
+<span class="nc" id="L324">        } catch (IOException e) {</span>
+<span class="nc" id="L325">             throw new CRLException(&quot;Encoding error: &quot; + e.getMessage());</span>
+<span class="fc" id="L326">        }</span>
+<span class="fc" id="L327">    }</span>
+
+    /**
+     * Verifies that this CRL was signed using the
+     * private key that corresponds to the given public key.
+     *
+     * @param key the PublicKey used to carry out the verification.
+     *
+     * @exception NoSuchAlgorithmException on unsupported signature
+     * algorithms.
+     * @exception InvalidKeyException on incorrect key.
+     * @exception NoSuchProviderException if there's no default provider.
+     * @exception SignatureException on signature errors.
+     * @exception CRLException on encoding errors.
+     */
+    public void verify(PublicKey key)
+    throws CRLException, NoSuchAlgorithmException, InvalidKeyException,
+           NoSuchProviderException, SignatureException {
+<span class="nc" id="L345">        verify(key, &quot;&quot;);</span>
+<span class="nc" id="L346">    }</span>
+
+    /**
+     * Verifies that this CRL was signed using the
+     * private key that corresponds to the given public key,
+     * and that the signature verification was computed by
+     * the given provider.
+     *
+     * @param key the PublicKey used to carry out the verification.
+     * @param sigProvider the name of the signature provider.
+     *
+     * @exception NoSuchAlgorithmException on unsupported signature
+     * algorithms.
+     * @exception InvalidKeyException on incorrect key.
+     * @exception NoSuchProviderException on incorrect provider.
+     * @exception SignatureException on signature errors.
+     * @exception CRLException on encoding errors.
+     */
+    public synchronized void verify(PublicKey key, String sigProvider)
+            throws CRLException, NoSuchAlgorithmException, InvalidKeyException,
+            NoSuchProviderException, SignatureException {
+
+<span class="pc bpc" id="L368" title="1 of 2 branches missed.">        if (sigProvider == null) {</span>
+<span class="fc" id="L369">            sigProvider = &quot;&quot;;</span>
+        }
+<span class="fc bfc" id="L371" title="All 4 branches covered.">        if ((verifiedPublicKey != null) &amp;&amp; verifiedPublicKey.equals(key)) {</span>
+            // this CRL has already been successfully verified using
+            // this public key. Make sure providers match, too.
+<span class="pc bpc" id="L374" title="1 of 2 branches missed.">            if (sigProvider.equals(verifiedProvider)) {</span>
+<span class="fc" id="L375">                return;</span>
+            }
+        }
+<span class="pc bpc" id="L378" title="1 of 2 branches missed.">        if (signedCRL == null) {</span>
+<span class="nc" id="L379">            throw new CRLException(&quot;Uninitialized CRL&quot;);</span>
+        }
+<span class="fc" id="L381">        Signature   sigVerf = null;</span>
+<span class="pc bpc" id="L382" title="1 of 2 branches missed.">        if (sigProvider.length() == 0) {</span>
+<span class="fc" id="L383">            sigVerf = Signature.getInstance(sigAlgId.getName());</span>
+        } else {
+<span class="nc" id="L385">            sigVerf = Signature.getInstance(sigAlgId.getName(), sigProvider);</span>
+        }
+<span class="fc" id="L387">        sigVerf.initVerify(key);</span>
+
+<span class="pc bpc" id="L389" title="1 of 2 branches missed.">        if (tbsCertList == null) {</span>
+<span class="nc" id="L390">            throw new CRLException(&quot;Uninitialized CRL&quot;);</span>
+        }
+
+<span class="fc" id="L393">        sigVerf.update(tbsCertList, 0, tbsCertList.length);</span>
+
+<span class="fc bfc" id="L395" title="All 2 branches covered.">        if (!sigVerf.verify(signature)) {</span>
+<span class="fc" id="L396">            throw new SignatureException(&quot;Signature does not match.&quot;);</span>
+        }
+<span class="fc" id="L398">        verifiedPublicKey = key;</span>
+<span class="fc" id="L399">        verifiedProvider = sigProvider;</span>
+<span class="fc" id="L400">    }</span>
+
+    /**
+     * Verifies that this CRL was signed using the
+     * private key that corresponds to the given public key,
+     * and that the signature verification was computed by
+     * the given provider. Note that the specified Provider object
+     * does not have to be registered in the provider list.
+     *
+     * @param key the PublicKey used to carry out the verification.
+     * @param sigProvider the signature provider.
+     *
+     * @exception NoSuchAlgorithmException on unsupported signature
+     * algorithms.
+     * @exception InvalidKeyException on incorrect key.
+     * @exception SignatureException on signature errors.
+     * @exception CRLException on encoding errors.
+     */
+    public synchronized void verify(PublicKey key, Provider sigProvider)
+            throws CRLException, NoSuchAlgorithmException, InvalidKeyException,
+            SignatureException {
+
+<span class="nc bnc" id="L422" title="All 2 branches missed.">        if (signedCRL == null) {</span>
+<span class="nc" id="L423">            throw new CRLException(&quot;Uninitialized CRL&quot;);</span>
+        }
+<span class="nc" id="L425">        Signature sigVerf = null;</span>
+<span class="nc bnc" id="L426" title="All 2 branches missed.">        if (sigProvider == null) {</span>
+<span class="nc" id="L427">            sigVerf = Signature.getInstance(sigAlgId.getName());</span>
+        } else {
+<span class="nc" id="L429">            sigVerf = Signature.getInstance(sigAlgId.getName(), sigProvider);</span>
+        }
+<span class="nc" id="L431">        sigVerf.initVerify(key);</span>
+
+<span class="nc bnc" id="L433" title="All 2 branches missed.">        if (tbsCertList == null) {</span>
+<span class="nc" id="L434">            throw new CRLException(&quot;Uninitialized CRL&quot;);</span>
+        }
+
+<span class="nc" id="L437">        sigVerf.update(tbsCertList, 0, tbsCertList.length);</span>
+
+<span class="nc bnc" id="L439" title="All 2 branches missed.">        if (!sigVerf.verify(signature)) {</span>
+<span class="nc" id="L440">            throw new SignatureException(&quot;Signature does not match.&quot;);</span>
+        }
+<span class="nc" id="L442">        verifiedPublicKey = key;</span>
+<span class="nc" id="L443">    }</span>
+
+    /**
+     * This static method is the default implementation of the
+     * verify(PublicKey key, Provider sigProvider) method in X509CRL.
+     * Called from java.security.cert.X509CRL.verify(PublicKey key,
+     * Provider sigProvider)
+     */
+    public static void verify(X509CRL crl, PublicKey key,
+            Provider sigProvider) throws CRLException,
+            NoSuchAlgorithmException, InvalidKeyException, SignatureException {
+<span class="nc" id="L454">        crl.verify(key, sigProvider);</span>
+<span class="nc" id="L455">    }</span>
+
+    /**
+     * Encodes an X.509 CRL, and signs it using the given key.
+     *
+     * @param key the private key used for signing.
+     * @param algorithm the name of the signature algorithm used.
+     *
+     * @exception NoSuchAlgorithmException on unsupported signature
+     * algorithms.
+     * @exception InvalidKeyException on incorrect key.
+     * @exception NoSuchProviderException on incorrect provider.
+     * @exception SignatureException on signature errors.
+     * @exception CRLException if any mandatory data was omitted.
+     */
+    public void sign(PrivateKey key, String algorithm)
+    throws CRLException, NoSuchAlgorithmException, InvalidKeyException,
+        NoSuchProviderException, SignatureException {
+<span class="fc" id="L473">        sign(key, algorithm, null);</span>
+<span class="fc" id="L474">    }</span>
+
+    /**
+     * Encodes an X.509 CRL, and signs it using the given key.
+     *
+     * @param key the private key used for signing.
+     * @param algorithm the name of the signature algorithm used.
+     * @param provider the name of the provider.
+     *
+     * @exception NoSuchAlgorithmException on unsupported signature
+     * algorithms.
+     * @exception InvalidKeyException on incorrect key.
+     * @exception NoSuchProviderException on incorrect provider.
+     * @exception SignatureException on signature errors.
+     * @exception CRLException if any mandatory data was omitted.
+     */
+    public void sign(PrivateKey key, String algorithm, String provider)
+    throws CRLException, NoSuchAlgorithmException, InvalidKeyException,
+        NoSuchProviderException, SignatureException {
+        try {
+<span class="pc bpc" id="L494" title="1 of 2 branches missed.">            if (readOnly)</span>
+<span class="nc" id="L495">                throw new CRLException(&quot;cannot over-write existing CRL&quot;);</span>
+<span class="fc" id="L496">            Signature sigEngine = null;</span>
+<span class="pc bpc" id="L497" title="3 of 4 branches missed.">            if ((provider == null) || (provider.length() == 0))</span>
+<span class="fc" id="L498">                sigEngine = Signature.getInstance(algorithm);</span>
+            else
+<span class="nc" id="L500">                sigEngine = Signature.getInstance(algorithm, provider);</span>
+
+<span class="fc" id="L502">            sigEngine.initSign(key);</span>
+
+                                // in case the name is reset
+<span class="fc" id="L505">            sigAlgId = AlgorithmId.get(sigEngine.getAlgorithm());</span>
+<span class="fc" id="L506">            infoSigAlgId = sigAlgId;</span>
+
+<span class="fc" id="L508">            DerOutputStream out = new DerOutputStream();</span>
+<span class="fc" id="L509">            DerOutputStream tmp = new DerOutputStream();</span>
+
+            // encode crl info
+<span class="fc" id="L512">            encodeInfo(tmp);</span>
+
+            // encode algorithm identifier
+<span class="fc" id="L515">            sigAlgId.encode(tmp);</span>
+
+            // Create and encode the signature itself.
+<span class="fc" id="L518">            sigEngine.update(tbsCertList, 0, tbsCertList.length);</span>
+<span class="fc" id="L519">            signature = sigEngine.sign();</span>
+<span class="fc" id="L520">            tmp.putBitString(signature);</span>
+
+            // Wrap the signed data in a SEQUENCE { data, algorithm, sig }
+<span class="fc" id="L523">            out.write(DerValue.tag_Sequence, tmp);</span>
+<span class="fc" id="L524">            signedCRL = out.toByteArray();</span>
+<span class="fc" id="L525">            readOnly = true;</span>
+
+<span class="nc" id="L527">        } catch (IOException e) {</span>
+<span class="nc" id="L528">            throw new CRLException(&quot;Error while encoding data: &quot; +</span>
+<span class="nc" id="L529">                                   e.getMessage());</span>
+<span class="fc" id="L530">        }</span>
+<span class="fc" id="L531">    }</span>
+
+    /**
+     * Returns a printable string of this CRL.
+     *
+     * @return value of this CRL in a printable form.
+     */
+    public String toString() {
+<span class="nc" id="L539">        StringBuffer sb = new StringBuffer();</span>
+<span class="nc" id="L540">        sb.append(&quot;X.509 CRL v&quot; + (version+1) + &quot;\n&quot;);</span>
+<span class="nc bnc" id="L541" title="All 2 branches missed.">        if (sigAlgId != null)</span>
+<span class="nc" id="L542">            sb.append(&quot;Signature Algorithm: &quot; + sigAlgId.toString() +</span>
+<span class="nc" id="L543">                  &quot;, OID=&quot; + (sigAlgId.getOID()).toString() + &quot;\n&quot;);</span>
+<span class="nc bnc" id="L544" title="All 2 branches missed.">        if (issuer != null)</span>
+<span class="nc" id="L545">            sb.append(&quot;Issuer: &quot; + issuer.toString() + &quot;\n&quot;);</span>
+<span class="nc bnc" id="L546" title="All 2 branches missed.">        if (thisUpdate != null)</span>
+<span class="nc" id="L547">            sb.append(&quot;\nThis Update: &quot; + thisUpdate.toString() + &quot;\n&quot;);</span>
+<span class="nc bnc" id="L548" title="All 2 branches missed.">        if (nextUpdate != null)</span>
+<span class="nc" id="L549">            sb.append(&quot;Next Update: &quot; + nextUpdate.toString() + &quot;\n&quot;);</span>
+<span class="nc bnc" id="L550" title="All 2 branches missed.">        if (revokedList.isEmpty())</span>
+<span class="nc" id="L551">            sb.append(&quot;\nNO certificates have been revoked\n&quot;);</span>
+        else {
+<span class="nc" id="L553">            sb.append(&quot;\nRevoked Certificates: &quot; + revokedList.size());</span>
+<span class="nc" id="L554">            int i = 1;</span>
+<span class="nc bnc" id="L555" title="All 2 branches missed.">            for (X509CRLEntry entry: revokedList) {</span>
+<span class="nc" id="L556">                sb.append(&quot;\n[&quot; + i++ + &quot;] &quot; + entry.toString());</span>
+<span class="nc" id="L557">            }</span>
+        }
+<span class="nc bnc" id="L559" title="All 2 branches missed.">        if (extensions != null) {</span>
+<span class="nc" id="L560">            Collection&lt;Extension&gt; allExts = extensions.getAllExtensions();</span>
+<span class="nc" id="L561">            Object[] objs = allExts.toArray();</span>
+<span class="nc" id="L562">            sb.append(&quot;\nCRL Extensions: &quot; + objs.length);</span>
+<span class="nc bnc" id="L563" title="All 2 branches missed.">            for (int i = 0; i &lt; objs.length; i++) {</span>
+<span class="nc" id="L564">                sb.append(&quot;\n[&quot; + (i+1) + &quot;]: &quot;);</span>
+<span class="nc" id="L565">                Extension ext = (Extension)objs[i];</span>
+                try {
+<span class="nc bnc" id="L567" title="All 2 branches missed.">                   if (OIDMap.getClass(ext.getExtensionId()) == null) {</span>
+<span class="nc" id="L568">                       sb.append(ext.toString());</span>
+<span class="nc" id="L569">                       byte[] extValue = ext.getExtensionValue();</span>
+<span class="nc bnc" id="L570" title="All 2 branches missed.">                       if (extValue != null) {</span>
+<span class="nc" id="L571">                           DerOutputStream out = new DerOutputStream();</span>
+<span class="nc" id="L572">                           out.putOctetString(extValue);</span>
+<span class="nc" id="L573">                           extValue = out.toByteArray();</span>
+<span class="nc" id="L574">                           HexDumpEncoder enc = new HexDumpEncoder();</span>
+<span class="nc" id="L575">                           sb.append(&quot;Extension unknown: &quot;</span>
+                                     + &quot;DER encoded OCTET string =\n&quot;
+<span class="nc" id="L577">                                     + enc.encodeBuffer(extValue) + &quot;\n&quot;);</span>
+                      }
+<span class="nc" id="L579">                   } else</span>
+<span class="nc" id="L580">                       sb.append(ext.toString()); // sub-class exists</span>
+<span class="nc" id="L581">                } catch (Exception e) {</span>
+<span class="nc" id="L582">                    sb.append(&quot;, Error parsing this extension&quot;);</span>
+<span class="nc" id="L583">                }</span>
+            }
+        }
+<span class="nc bnc" id="L586" title="All 2 branches missed.">        if (signature != null) {</span>
+<span class="nc" id="L587">            HexDumpEncoder encoder = new HexDumpEncoder();</span>
+<span class="nc" id="L588">            sb.append(&quot;\nSignature:\n&quot; + encoder.encodeBuffer(signature)</span>
+                      + &quot;\n&quot;);
+<span class="nc" id="L590">        } else</span>
+<span class="nc" id="L591">            sb.append(&quot;NOT signed yet\n&quot;);</span>
+<span class="nc" id="L592">        return sb.toString();</span>
+    }
+
+    /**
+     * Checks whether the given certificate is on this CRL.
+     *
+     * @param cert the certificate to check for.
+     * @return true if the given certificate is on this CRL,
+     * false otherwise.
+     */
+    public boolean isRevoked(Certificate cert) {
+<span class="nc bnc" id="L603" title="All 4 branches missed.">        if (revokedMap.isEmpty() || (!(cert instanceof X509Certificate))) {</span>
+<span class="nc" id="L604">            return false;</span>
+        }
+<span class="nc" id="L606">        X509Certificate xcert = (X509Certificate) cert;</span>
+<span class="nc" id="L607">        X509IssuerSerial issuerSerial = new X509IssuerSerial(xcert);</span>
+<span class="nc" id="L608">        return revokedMap.containsKey(issuerSerial);</span>
+    }
+
+    /**
+     * Gets the version number from this CRL.
+     * The ASN.1 definition for this is:
+     * &lt;pre&gt;
+     * Version  ::=  INTEGER  {  v1(0), v2(1), v3(2)  }
+     *             -- v3 does not apply to CRLs but appears for consistency
+     *             -- with definition of Version for certs
+     * &lt;/pre&gt;
+     * @return the version number, i.e. 1 or 2.
+     */
+    public int getVersion() {
+<span class="nc" id="L622">        return version+1;</span>
+    }
+
+    /**
+     * Gets the issuer distinguished name from this CRL.
+     * The issuer name identifies the entity who has signed (and
+     * issued the CRL). The issuer name field contains an
+     * X.500 distinguished name (DN).
+     * The ASN.1 definition for this is:
+     * &lt;pre&gt;
+     * issuer    Name
+     *
+     * Name ::= CHOICE { RDNSequence }
+     * RDNSequence ::= SEQUENCE OF RelativeDistinguishedName
+     * RelativeDistinguishedName ::=
+     *     SET OF AttributeValueAssertion
+     *
+     * AttributeValueAssertion ::= SEQUENCE {
+     *                               AttributeType,
+     *                               AttributeValue }
+     * AttributeType ::= OBJECT IDENTIFIER
+     * AttributeValue ::= ANY
+     * &lt;/pre&gt;
+     * The Name describes a hierarchical name composed of attributes,
+     * such as country name, and corresponding values, such as US.
+     * The type of the component AttributeValue is determined by the
+     * AttributeType; in general it will be a directoryString.
+     * A directoryString is usually one of PrintableString,
+     * TeletexString or UniversalString.
+     * @return the issuer name.
+     */
+    public Principal getIssuerDN() {
+<span class="fc" id="L654">        return (Principal)issuer;</span>
+    }
+
+    /**
+     * Return the issuer as X500Principal. Overrides method in X509CRL
+     * to provide a slightly more efficient version.
+     */
+    public X500Principal getIssuerX500Principal() {
+<span class="fc bfc" id="L662" title="All 2 branches covered.">        if (issuerPrincipal == null) {</span>
+<span class="fc" id="L663">            issuerPrincipal = issuer.asX500Principal();</span>
+        }
+<span class="fc" id="L665">        return issuerPrincipal;</span>
+    }
+
+    /**
+     * Gets the thisUpdate date from the CRL.
+     * The ASN.1 definition for this is:
+     *
+     * @return the thisUpdate date from the CRL.
+     */
+    public Date getThisUpdate() {
+<span class="fc" id="L675">        return (new Date(thisUpdate.getTime()));</span>
+    }
+
+    /**
+     * Gets the nextUpdate date from the CRL.
+     *
+     * @return the nextUpdate date from the CRL, or null if
+     * not present.
+     */
+    public Date getNextUpdate() {
+<span class="pc bpc" id="L685" title="1 of 2 branches missed.">        if (nextUpdate == null)</span>
+<span class="nc" id="L686">            return null;</span>
+<span class="fc" id="L687">        return (new Date(nextUpdate.getTime()));</span>
+    }
+
+    /**
+     * Gets the CRL entry with the given serial number from this CRL.
+     *
+     * @return the entry with the given serial number, or &lt;code&gt;null&lt;/code&gt; if
+     * no such entry exists in the CRL.
+     * @see X509CRLEntry
+     */
+    public X509CRLEntry getRevokedCertificate(BigInteger serialNumber) {
+<span class="nc bnc" id="L698" title="All 2 branches missed.">        if (revokedMap.isEmpty()) {</span>
+<span class="nc" id="L699">            return null;</span>
+        }
+        // assume this is a direct CRL entry (cert and CRL issuer are the same)
+<span class="nc" id="L702">        X509IssuerSerial issuerSerial = new X509IssuerSerial</span>
+<span class="nc" id="L703">            (getIssuerX500Principal(), serialNumber);</span>
+<span class="nc" id="L704">        return revokedMap.get(issuerSerial);</span>
+    }
+
+    /**
+     * Gets the CRL entry for the given certificate.
+     */
+    public X509CRLEntry getRevokedCertificate(X509Certificate cert) {
+<span class="pc bpc" id="L711" title="1 of 2 branches missed.">        if (revokedMap.isEmpty()) {</span>
+<span class="nc" id="L712">            return null;</span>
+        }
+<span class="fc" id="L714">        X509IssuerSerial issuerSerial = new X509IssuerSerial(cert);</span>
+<span class="fc" id="L715">        return revokedMap.get(issuerSerial);</span>
+    }
+
+    /**
+     * Gets all the revoked certificates from the CRL.
+     * A Set of X509CRLEntry.
+     *
+     * @return all the revoked certificates or &lt;code&gt;null&lt;/code&gt; if there are
+     * none.
+     * @see X509CRLEntry
+     */
+    public Set&lt;X509CRLEntry&gt; getRevokedCertificates() {
+<span class="nc bnc" id="L727" title="All 2 branches missed.">        if (revokedList.isEmpty()) {</span>
+<span class="nc" id="L728">            return null;</span>
+        } else {
+<span class="nc" id="L730">            return new TreeSet&lt;X509CRLEntry&gt;(revokedList);</span>
+        }
+    }
+
+    /**
+     * Gets the DER encoded CRL information, the
+     * &lt;code&gt;tbsCertList&lt;/code&gt; from this CRL.
+     * This can be used to verify the signature independently.
+     *
+     * @return the DER encoded CRL information.
+     * @exception CRLException on encoding errors.
+     */
+    public byte[] getTBSCertList() throws CRLException {
+<span class="nc bnc" id="L743" title="All 2 branches missed.">        if (tbsCertList == null)</span>
+<span class="nc" id="L744">            throw new CRLException(&quot;Uninitialized CRL&quot;);</span>
+<span class="nc" id="L745">        byte[] dup = new byte[tbsCertList.length];</span>
+<span class="nc" id="L746">        System.arraycopy(tbsCertList, 0, dup, 0, dup.length);</span>
+<span class="nc" id="L747">        return dup;</span>
+    }
+
+    /**
+     * Gets the raw Signature bits from the CRL.
+     *
+     * @return the signature.
+     */
+    public byte[] getSignature() {
+<span class="nc bnc" id="L756" title="All 2 branches missed.">        if (signature == null)</span>
+<span class="nc" id="L757">            return null;</span>
+<span class="nc" id="L758">        byte[] dup = new byte[signature.length];</span>
+<span class="nc" id="L759">        System.arraycopy(signature, 0, dup, 0, dup.length);</span>
+<span class="nc" id="L760">        return dup;</span>
+    }
+
+    /**
+     * Gets the signature algorithm name for the CRL
+     * signature algorithm. For example, the string &quot;SHA1withDSA&quot;.
+     * The ASN.1 definition for this is:
+     * &lt;pre&gt;
+     * AlgorithmIdentifier  ::=  SEQUENCE  {
+     *     algorithm               OBJECT IDENTIFIER,
+     *     parameters              ANY DEFINED BY algorithm OPTIONAL  }
+     *                             -- contains a value of the type
+     *                             -- registered for use with the
+     *                             -- algorithm object identifier value
+     * &lt;/pre&gt;
+     *
+     * @return the signature algorithm name.
+     */
+    public String getSigAlgName() {
+<span class="nc bnc" id="L779" title="All 2 branches missed.">        if (sigAlgId == null)</span>
+<span class="nc" id="L780">            return null;</span>
+<span class="nc" id="L781">        return sigAlgId.getName();</span>
+    }
+
+    /**
+     * Gets the signature algorithm OID string from the CRL.
+     * An OID is represented by a set of positive whole number separated
+     * by &quot;.&quot;, that means,&lt;br&gt;
+     * &amp;lt;positive whole number&amp;gt;.&amp;lt;positive whole number&amp;gt;.&amp;lt;...&amp;gt;
+     * For example, the string &quot;1.2.840.10040.4.3&quot; identifies the SHA-1
+     * with DSA signature algorithm defined in
+     * &lt;a href=&quot;http://www.ietf.org/rfc/rfc3279.txt&quot;&gt;RFC 3279: Algorithms and
+     * Identifiers for the Internet X.509 Public Key Infrastructure Certificate
+     * and CRL Profile&lt;/a&gt;.
+     *
+     * @return the signature algorithm oid string.
+     */
+    public String getSigAlgOID() {
+<span class="nc bnc" id="L798" title="All 2 branches missed.">        if (sigAlgId == null)</span>
+<span class="nc" id="L799">            return null;</span>
+<span class="nc" id="L800">        ObjectIdentifier oid = sigAlgId.getOID();</span>
+<span class="nc" id="L801">        return oid.toString();</span>
+    }
+
+    /**
+     * Gets the DER encoded signature algorithm parameters from this
+     * CRL's signature algorithm. In most cases, the signature
+     * algorithm parameters are null, the parameters are usually
+     * supplied with the Public Key.
+     *
+     * @return the DER encoded signature algorithm parameters, or
+     *         null if no parameters are present.
+     */
+    public byte[] getSigAlgParams() {
+<span class="nc bnc" id="L814" title="All 2 branches missed.">        if (sigAlgId == null)</span>
+<span class="nc" id="L815">            return null;</span>
+        try {
+<span class="nc" id="L817">            return sigAlgId.getEncodedParams();</span>
+<span class="nc" id="L818">        } catch (IOException e) {</span>
+<span class="nc" id="L819">            return null;</span>
+        }
+    }
+
+    /**
+     * Gets the signature AlgorithmId from the CRL.
+     *
+     * @return the signature AlgorithmId
+     */
+    public AlgorithmId getSigAlgId() {
+<span class="fc" id="L829">        return sigAlgId;</span>
+    }
+
+    /**
+     * return the AuthorityKeyIdentifier, if any.
+     *
+     * @returns AuthorityKeyIdentifier or null
+     *          (if no AuthorityKeyIdentifierExtension)
+     * @throws IOException on error
+     */
+    public KeyIdentifier getAuthKeyId() throws IOException {
+<span class="fc" id="L840">        AuthorityKeyIdentifierExtension aki = getAuthKeyIdExtension();</span>
+<span class="pc bpc" id="L841" title="1 of 2 branches missed.">        if (aki != null) {</span>
+<span class="nc" id="L842">            KeyIdentifier keyId = (KeyIdentifier)aki.get(</span>
+                    AuthorityKeyIdentifierExtension.KEY_ID);
+<span class="nc" id="L844">            return keyId;</span>
+        } else {
+<span class="fc" id="L846">            return null;</span>
+        }
+    }
+
+    /**
+     * return the AuthorityKeyIdentifierExtension, if any.
+     *
+     * @returns AuthorityKeyIdentifierExtension or null (if no such extension)
+     * @throws IOException on error
+     */
+    public AuthorityKeyIdentifierExtension getAuthKeyIdExtension()
+        throws IOException {
+<span class="fc" id="L858">        Object obj = getExtension(PKIXExtensions.AuthorityKey_Id);</span>
+<span class="fc" id="L859">        return (AuthorityKeyIdentifierExtension)obj;</span>
+    }
+
+    /**
+     * return the CRLNumberExtension, if any.
+     *
+     * @returns CRLNumberExtension or null (if no such extension)
+     * @throws IOException on error
+     */
+    public CRLNumberExtension getCRLNumberExtension() throws IOException {
+<span class="nc" id="L869">        Object obj = getExtension(PKIXExtensions.CRLNumber_Id);</span>
+<span class="nc" id="L870">        return (CRLNumberExtension)obj;</span>
+    }
+
+    /**
+     * return the CRL number from the CRLNumberExtension, if any.
+     *
+     * @returns number or null (if no such extension)
+     * @throws IOException on error
+     */
+    public BigInteger getCRLNumber() throws IOException {
+<span class="nc" id="L880">        CRLNumberExtension numExt = getCRLNumberExtension();</span>
+<span class="nc bnc" id="L881" title="All 2 branches missed.">        if (numExt != null) {</span>
+<span class="nc" id="L882">            BigInteger num = numExt.get(CRLNumberExtension.NUMBER);</span>
+<span class="nc" id="L883">            return num;</span>
+        } else {
+<span class="nc" id="L885">            return null;</span>
+        }
+    }
+
+    /**
+     * return the DeltaCRLIndicatorExtension, if any.
+     *
+     * @returns DeltaCRLIndicatorExtension or null (if no such extension)
+     * @throws IOException on error
+     */
+    public DeltaCRLIndicatorExtension getDeltaCRLIndicatorExtension()
+        throws IOException {
+
+<span class="nc" id="L898">        Object obj = getExtension(PKIXExtensions.DeltaCRLIndicator_Id);</span>
+<span class="nc" id="L899">        return (DeltaCRLIndicatorExtension)obj;</span>
+    }
+
+    /**
+     * return the base CRL number from the DeltaCRLIndicatorExtension, if any.
+     *
+     * @returns number or null (if no such extension)
+     * @throws IOException on error
+     */
+    public BigInteger getBaseCRLNumber() throws IOException {
+<span class="nc" id="L909">        DeltaCRLIndicatorExtension dciExt = getDeltaCRLIndicatorExtension();</span>
+<span class="nc bnc" id="L910" title="All 2 branches missed.">        if (dciExt != null) {</span>
+<span class="nc" id="L911">            BigInteger num = dciExt.get(DeltaCRLIndicatorExtension.NUMBER);</span>
+<span class="nc" id="L912">            return num;</span>
+        } else {
+<span class="nc" id="L914">            return null;</span>
+        }
+    }
+
+    /**
+     * return the IssuerAlternativeNameExtension, if any.
+     *
+     * @returns IssuerAlternativeNameExtension or null (if no such extension)
+     * @throws IOException on error
+     */
+    public IssuerAlternativeNameExtension getIssuerAltNameExtension()
+        throws IOException {
+<span class="nc" id="L926">        Object obj = getExtension(PKIXExtensions.IssuerAlternativeName_Id);</span>
+<span class="nc" id="L927">        return (IssuerAlternativeNameExtension)obj;</span>
+    }
+
+    /**
+     * return the IssuingDistributionPointExtension, if any.
+     *
+     * @returns IssuingDistributionPointExtension or null
+     *          (if no such extension)
+     * @throws IOException on error
+     */
+    public IssuingDistributionPointExtension
+        getIssuingDistributionPointExtension() throws IOException {
+
+<span class="fc" id="L940">        Object obj = getExtension(PKIXExtensions.IssuingDistributionPoint_Id);</span>
+<span class="fc" id="L941">        return (IssuingDistributionPointExtension) obj;</span>
+    }
+
+    /**
+     * Return true if a critical extension is found that is
+     * not supported, otherwise return false.
+     */
+    public boolean hasUnsupportedCriticalExtension() {
+<span class="nc bnc" id="L949" title="All 2 branches missed.">        if (extensions == null)</span>
+<span class="nc" id="L950">            return false;</span>
+<span class="nc" id="L951">        return extensions.hasUnsupportedCriticalExtension();</span>
+    }
+
+    /**
+     * Gets a Set of the extension(s) marked CRITICAL in the
+     * CRL. In the returned set, each extension is represented by
+     * its OID string.
+     *
+     * @return a set of the extension oid strings in the
+     * CRL that are marked critical.
+     */
+    public Set&lt;String&gt; getCriticalExtensionOIDs() {
+<span class="pc bpc" id="L963" title="1 of 2 branches missed.">        if (extensions == null) {</span>
+<span class="nc" id="L964">            return null;</span>
+        }
+<span class="fc" id="L966">        Set&lt;String&gt; extSet = new TreeSet&lt;&gt;();</span>
+<span class="fc bfc" id="L967" title="All 2 branches covered.">        for (Extension ex : extensions.getAllExtensions()) {</span>
+<span class="pc bpc" id="L968" title="1 of 2 branches missed.">            if (ex.isCritical()) {</span>
+<span class="nc" id="L969">                extSet.add(ex.getExtensionId().toString());</span>
+            }
+<span class="fc" id="L971">        }</span>
+<span class="fc" id="L972">        return extSet;</span>
+    }
+
+    /**
+     * Gets a Set of the extension(s) marked NON-CRITICAL in the
+     * CRL. In the returned set, each extension is represented by
+     * its OID string.
+     *
+     * @return a set of the extension oid strings in the
+     * CRL that are NOT marked critical.
+     */
+    public Set&lt;String&gt; getNonCriticalExtensionOIDs() {
+<span class="nc bnc" id="L984" title="All 2 branches missed.">        if (extensions == null) {</span>
+<span class="nc" id="L985">            return null;</span>
+        }
+<span class="nc" id="L987">        Set&lt;String&gt; extSet = new TreeSet&lt;&gt;();</span>
+<span class="nc bnc" id="L988" title="All 2 branches missed.">        for (Extension ex : extensions.getAllExtensions()) {</span>
+<span class="nc bnc" id="L989" title="All 2 branches missed.">            if (!ex.isCritical()) {</span>
+<span class="nc" id="L990">                extSet.add(ex.getExtensionId().toString());</span>
+            }
+<span class="nc" id="L992">        }</span>
+<span class="nc" id="L993">        return extSet;</span>
+    }
+
+    /**
+     * Gets the DER encoded OCTET string for the extension value
+     * (&lt;code&gt;extnValue&lt;/code&gt;) identified by the passed in oid String.
+     * The &lt;code&gt;oid&lt;/code&gt; string is
+     * represented by a set of positive whole number separated
+     * by &quot;.&quot;, that means,&lt;br&gt;
+     * &amp;lt;positive whole number&amp;gt;.&amp;lt;positive whole number&amp;gt;.&amp;lt;...&amp;gt;
+     *
+     * @param oid the Object Identifier value for the extension.
+     * @return the der encoded octet string of the extension value.
+     */
+    public byte[] getExtensionValue(String oid) {
+<span class="nc bnc" id="L1008" title="All 2 branches missed.">        if (extensions == null)</span>
+<span class="nc" id="L1009">            return null;</span>
+        try {
+<span class="nc" id="L1011">            String extAlias = OIDMap.getName(new ObjectIdentifier(oid));</span>
+<span class="nc" id="L1012">            Extension crlExt = null;</span>
+
+<span class="nc bnc" id="L1014" title="All 2 branches missed.">            if (extAlias == null) { // may be unknown</span>
+<span class="nc" id="L1015">                ObjectIdentifier findOID = new ObjectIdentifier(oid);</span>
+<span class="nc" id="L1016">                Extension ex = null;</span>
+                ObjectIdentifier inCertOID;
+<span class="nc" id="L1018">                for (Enumeration&lt;Extension&gt; e = extensions.getElements();</span>
+<span class="nc bnc" id="L1019" title="All 2 branches missed.">                                                 e.hasMoreElements();) {</span>
+<span class="nc" id="L1020">                    ex = e.nextElement();</span>
+<span class="nc" id="L1021">                    inCertOID = ex.getExtensionId();</span>
+<span class="nc bnc" id="L1022" title="All 2 branches missed.">                    if (inCertOID.equals((Object)findOID)) {</span>
+<span class="nc" id="L1023">                        crlExt = ex;</span>
+<span class="nc" id="L1024">                        break;</span>
+                    }
+                }
+<span class="nc" id="L1027">            } else</span>
+<span class="nc" id="L1028">                crlExt = extensions.get(extAlias);</span>
+<span class="nc bnc" id="L1029" title="All 2 branches missed.">            if (crlExt == null)</span>
+<span class="nc" id="L1030">                return null;</span>
+<span class="nc" id="L1031">            byte[] extData = crlExt.getExtensionValue();</span>
+<span class="nc bnc" id="L1032" title="All 2 branches missed.">            if (extData == null)</span>
+<span class="nc" id="L1033">                return null;</span>
+<span class="nc" id="L1034">            DerOutputStream out = new DerOutputStream();</span>
+<span class="nc" id="L1035">            out.putOctetString(extData);</span>
+<span class="nc" id="L1036">            return out.toByteArray();</span>
+<span class="nc" id="L1037">        } catch (Exception e) {</span>
+<span class="nc" id="L1038">            return null;</span>
+        }
+    }
+
+    /**
+     * get an extension
+     *
+     * @param oid ObjectIdentifier of extension desired
+     * @returns Object of type &lt;extension&gt; or null, if not found
+     * @throws IOException on error
+     */
+    public Object getExtension(ObjectIdentifier oid) {
+<span class="pc bpc" id="L1050" title="1 of 2 branches missed.">        if (extensions == null)</span>
+<span class="nc" id="L1051">            return null;</span>
+
+        // XXX Consider cloning this
+<span class="fc" id="L1054">        return extensions.get(OIDMap.getName(oid));</span>
+    }
+
+    /*
+     * Parses an X.509 CRL, should be used only by constructors.
+     */
+    private void parse(DerValue val) throws CRLException, IOException {
+        // check if can over write the certificate
+<span class="pc bpc" id="L1062" title="1 of 2 branches missed.">        if (readOnly)</span>
+<span class="nc" id="L1063">            throw new CRLException(&quot;cannot over-write existing CRL&quot;);</span>
+
+<span class="pc bpc" id="L1065" title="2 of 4 branches missed.">        if ( val.getData() == null || val.tag != DerValue.tag_Sequence)</span>
+<span class="nc" id="L1066">            throw new CRLException(&quot;Invalid DER-encoded CRL data&quot;);</span>
+
+<span class="fc" id="L1068">        signedCRL = val.toByteArray();</span>
+<span class="fc" id="L1069">        DerValue seq[] = new DerValue[3];</span>
+
+<span class="fc" id="L1071">        seq[0] = val.data.getDerValue();</span>
+<span class="fc" id="L1072">        seq[1] = val.data.getDerValue();</span>
+<span class="fc" id="L1073">        seq[2] = val.data.getDerValue();</span>
+
+<span class="pc bpc" id="L1075" title="1 of 2 branches missed.">        if (val.data.available() != 0)</span>
+<span class="nc" id="L1076">            throw new CRLException(&quot;signed overrun, bytes = &quot;</span>
+<span class="nc" id="L1077">                                     + val.data.available());</span>
+
+<span class="pc bpc" id="L1079" title="1 of 2 branches missed.">        if (seq[0].tag != DerValue.tag_Sequence)</span>
+<span class="nc" id="L1080">            throw new CRLException(&quot;signed CRL fields invalid&quot;);</span>
+
+<span class="fc" id="L1082">        sigAlgId = AlgorithmId.parse(seq[1]);</span>
+<span class="fc" id="L1083">        signature = seq[2].getBitString();</span>
+
+<span class="pc bpc" id="L1085" title="1 of 2 branches missed.">        if (seq[1].data.available() != 0)</span>
+<span class="nc" id="L1086">            throw new CRLException(&quot;AlgorithmId field overrun&quot;);</span>
+
+<span class="pc bpc" id="L1088" title="1 of 2 branches missed.">        if (seq[2].data.available() != 0)</span>
+<span class="nc" id="L1089">            throw new CRLException(&quot;Signature field overrun&quot;);</span>
+
+        // the tbsCertsList
+<span class="fc" id="L1092">        tbsCertList = seq[0].toByteArray();</span>
+
+        // parse the information
+<span class="fc" id="L1095">        DerInputStream derStrm = seq[0].data;</span>
+        DerValue       tmp;
+        byte           nextByte;
+
+        // version (optional if v1)
+<span class="fc" id="L1100">        version = 0;   // by default, version = v1 == 0</span>
+<span class="fc" id="L1101">        nextByte = (byte)derStrm.peekByte();</span>
+<span class="pc bpc" id="L1102" title="1 of 2 branches missed.">        if (nextByte == DerValue.tag_Integer) {</span>
+<span class="fc" id="L1103">            version = derStrm.getInteger();</span>
+<span class="pc bpc" id="L1104" title="1 of 2 branches missed.">            if (version != 1)  // i.e. v2</span>
+<span class="nc" id="L1105">                throw new CRLException(&quot;Invalid version&quot;);</span>
+        }
+<span class="fc" id="L1107">        tmp = derStrm.getDerValue();</span>
+
+        // signature
+<span class="fc" id="L1110">        AlgorithmId tmpId = AlgorithmId.parse(tmp);</span>
+
+        // the &quot;inner&quot; and &quot;outer&quot; signature algorithms must match
+<span class="pc bpc" id="L1113" title="1 of 2 branches missed.">        if (! tmpId.equals(sigAlgId))</span>
+<span class="nc" id="L1114">            throw new CRLException(&quot;Signature algorithm mismatch&quot;);</span>
+<span class="fc" id="L1115">        infoSigAlgId = tmpId;</span>
+
+        // issuer
+<span class="fc" id="L1118">        issuer = new X500Name(derStrm);</span>
+<span class="pc bpc" id="L1119" title="1 of 2 branches missed.">        if (issuer.isEmpty()) {</span>
+<span class="nc" id="L1120">            throw new CRLException(&quot;Empty issuer DN not allowed in X509CRLs&quot;);</span>
+        }
+
+        // thisUpdate
+        // check if UTCTime encoded or GeneralizedTime
+
+<span class="fc" id="L1126">        nextByte = (byte)derStrm.peekByte();</span>
+<span class="pc bpc" id="L1127" title="1 of 2 branches missed.">        if (nextByte == DerValue.tag_UtcTime) {</span>
+<span class="fc" id="L1128">            thisUpdate = derStrm.getUTCTime();</span>
+<span class="nc bnc" id="L1129" title="All 2 branches missed.">        } else if (nextByte == DerValue.tag_GeneralizedTime) {</span>
+<span class="nc" id="L1130">            thisUpdate = derStrm.getGeneralizedTime();</span>
+        } else {
+<span class="nc" id="L1132">            throw new CRLException(&quot;Invalid encoding for thisUpdate&quot;</span>
+                                   + &quot; (tag=&quot; + nextByte + &quot;)&quot;);
+        }
+
+<span class="pc bpc" id="L1136" title="1 of 2 branches missed.">        if (derStrm.available() == 0)</span>
+<span class="nc" id="L1137">           return;     // done parsing no more optional fields present</span>
+
+        // nextUpdate (optional)
+<span class="fc" id="L1140">        nextByte = (byte)derStrm.peekByte();</span>
+<span class="pc bpc" id="L1141" title="1 of 2 branches missed.">        if (nextByte == DerValue.tag_UtcTime) {</span>
+<span class="fc" id="L1142">            nextUpdate = derStrm.getUTCTime();</span>
+<span class="nc bnc" id="L1143" title="All 2 branches missed.">        } else if (nextByte == DerValue.tag_GeneralizedTime) {</span>
+<span class="nc" id="L1144">            nextUpdate = derStrm.getGeneralizedTime();</span>
+        } // else it is not present
+
+<span class="pc bpc" id="L1147" title="1 of 2 branches missed.">        if (derStrm.available() == 0)</span>
+<span class="nc" id="L1148">            return;     // done parsing no more optional fields present</span>
+
+        // revokedCertificates (optional)
+<span class="fc" id="L1151">        nextByte = (byte)derStrm.peekByte();</span>
+<span class="pc bpc" id="L1152" title="2 of 4 branches missed.">        if ((nextByte == DerValue.tag_SequenceOf)</span>
+            &amp;&amp; (! ((nextByte &amp; 0x0c0) == 0x080))) {
+<span class="fc" id="L1154">            DerValue[] badCerts = derStrm.getSequence(4);</span>
+
+<span class="fc" id="L1156">            X500Principal crlIssuer = getIssuerX500Principal();</span>
+<span class="fc" id="L1157">            X500Principal badCertIssuer = crlIssuer;</span>
+<span class="fc bfc" id="L1158" title="All 2 branches covered.">            for (int i = 0; i &lt; badCerts.length; i++) {</span>
+<span class="fc" id="L1159">                X509CRLEntryImpl entry = new X509CRLEntryImpl(badCerts[i]);</span>
+<span class="fc" id="L1160">                badCertIssuer = getCertIssuer(entry, badCertIssuer);</span>
+<span class="fc" id="L1161">                entry.setCertificateIssuer(crlIssuer, badCertIssuer);</span>
+<span class="fc" id="L1162">                X509IssuerSerial issuerSerial = new X509IssuerSerial</span>
+<span class="fc" id="L1163">                    (badCertIssuer, entry.getSerialNumber());</span>
+<span class="fc" id="L1164">                revokedMap.put(issuerSerial, entry);</span>
+<span class="fc" id="L1165">                revokedList.add(entry);</span>
+            }
+        }
+
+<span class="fc bfc" id="L1169" title="All 2 branches covered.">        if (derStrm.available() == 0)</span>
+<span class="fc" id="L1170">            return;     // done parsing no extensions</span>
+
+        // crlExtensions (optional)
+<span class="fc" id="L1173">        tmp = derStrm.getDerValue();</span>
+<span class="pc bpc" id="L1174" title="2 of 4 branches missed.">        if (tmp.isConstructed() &amp;&amp; tmp.isContextSpecific((byte)0)) {</span>
+<span class="fc" id="L1175">            extensions = new CRLExtensions(tmp.data);</span>
+        }
+<span class="fc" id="L1177">        readOnly = true;</span>
+<span class="fc" id="L1178">    }</span>
+
+    /**
+     * Extract the issuer X500Principal from an X509CRL. Parses the encoded
+     * form of the CRL to preserve the principal's ASN.1 encoding.
+     *
+     * Called by java.security.cert.X509CRL.getIssuerX500Principal().
+     */
+    public static X500Principal getIssuerX500Principal(X509CRL crl) {
+        try {
+<span class="nc" id="L1188">            byte[] encoded = crl.getEncoded();</span>
+<span class="nc" id="L1189">            DerInputStream derIn = new DerInputStream(encoded);</span>
+<span class="nc" id="L1190">            DerValue tbsCert = derIn.getSequence(3)[0];</span>
+<span class="nc" id="L1191">            DerInputStream tbsIn = tbsCert.data;</span>
+
+            DerValue tmp;
+            // skip version number if present
+<span class="nc" id="L1195">            byte nextByte = (byte)tbsIn.peekByte();</span>
+<span class="nc bnc" id="L1196" title="All 2 branches missed.">            if (nextByte == DerValue.tag_Integer) {</span>
+<span class="nc" id="L1197">                tmp = tbsIn.getDerValue();</span>
+            }
+
+<span class="nc" id="L1200">            tmp = tbsIn.getDerValue();  // skip signature</span>
+<span class="nc" id="L1201">            tmp = tbsIn.getDerValue();  // issuer</span>
+<span class="nc" id="L1202">            byte[] principalBytes = tmp.toByteArray();</span>
+<span class="nc" id="L1203">            return new X500Principal(principalBytes);</span>
+<span class="nc" id="L1204">        } catch (Exception e) {</span>
+<span class="nc" id="L1205">            throw new RuntimeException(&quot;Could not parse issuer&quot;, e);</span>
+        }
+    }
+
+    /**
+     * Returned the encoding of the given certificate for internal use.
+     * Callers must guarantee that they neither modify it nor expose it
+     * to untrusted code. Uses getEncodedInternal() if the certificate
+     * is instance of X509CertImpl, getEncoded() otherwise.
+     */
+    public static byte[] getEncodedInternal(X509CRL crl) throws CRLException {
+<span class="pc bpc" id="L1216" title="1 of 2 branches missed.">        if (crl instanceof X509CRLImpl) {</span>
+<span class="fc" id="L1217">            return ((X509CRLImpl)crl).getEncodedInternal();</span>
+        } else {
+<span class="nc" id="L1219">            return crl.getEncoded();</span>
+        }
+    }
+
+    /**
+     * Utility method to convert an arbitrary instance of X509CRL
+     * to a X509CRLImpl. Does a cast if possible, otherwise reparses
+     * the encoding.
+     */
+    public static X509CRLImpl toImpl(X509CRL crl)
+            throws CRLException {
+<span class="pc bpc" id="L1230" title="1 of 2 branches missed.">        if (crl instanceof X509CRLImpl) {</span>
+<span class="fc" id="L1231">            return (X509CRLImpl)crl;</span>
+        } else {
+<span class="nc" id="L1233">            return X509Factory.intern(crl);</span>
+        }
+    }
+
+    /**
+     * Returns the X500 certificate issuer DN of a CRL entry.
+     *
+     * @param entry the entry to check
+     * @param prevCertIssuer the previous entry's certificate issuer
+     * @return the X500Principal in a CertificateIssuerExtension, or
+     *   prevCertIssuer if it does not exist
+     */
+    private X500Principal getCertIssuer(X509CRLEntryImpl entry,
+        X500Principal prevCertIssuer) throws IOException {
+
+<span class="fc" id="L1248">        CertificateIssuerExtension ciExt =</span>
+<span class="fc" id="L1249">            entry.getCertificateIssuerExtension();</span>
+<span class="pc bpc" id="L1250" title="1 of 2 branches missed.">        if (ciExt != null) {</span>
+<span class="nc" id="L1251">            GeneralNames names = ciExt.get(CertificateIssuerExtension.ISSUER);</span>
+<span class="nc" id="L1252">            X500Name issuerDN = (X500Name) names.get(0).getName();</span>
+<span class="nc" id="L1253">            return issuerDN.asX500Principal();</span>
+        } else {
+<span class="fc" id="L1255">            return prevCertIssuer;</span>
+        }
+    }
+
+    @Override
+    public void derEncode(OutputStream out) throws IOException {
+<span class="nc bnc" id="L1261" title="All 2 branches missed.">        if (signedCRL == null)</span>
+<span class="nc" id="L1262">            throw new IOException(&quot;Null CRL to encode&quot;);</span>
+<span class="nc" id="L1263">        out.write(signedCRL.clone());</span>
+<span class="nc" id="L1264">    }</span>
+
+    /**
+     * Immutable X.509 Certificate Issuer DN and serial number pair
+     */
+    private final static class X509IssuerSerial
+            implements Comparable&lt;X509IssuerSerial&gt; {
+        final X500Principal issuer;
+        final BigInteger serial;
+<span class="fc" id="L1273">        volatile int hashcode = 0;</span>
+
+        /**
+         * Create an X509IssuerSerial.
+         *
+         * @param issuer the issuer DN
+         * @param serial the serial number
+         */
+<span class="fc" id="L1281">        X509IssuerSerial(X500Principal issuer, BigInteger serial) {</span>
+<span class="fc" id="L1282">            this.issuer = issuer;</span>
+<span class="fc" id="L1283">            this.serial = serial;</span>
+<span class="fc" id="L1284">        }</span>
+
+        /**
+         * Construct an X509IssuerSerial from an X509Certificate.
+         */
+        X509IssuerSerial(X509Certificate cert) {
+<span class="fc" id="L1290">            this(cert.getIssuerX500Principal(), cert.getSerialNumber());</span>
+<span class="fc" id="L1291">        }</span>
+
+        /**
+         * Returns the issuer.
+         *
+         * @return the issuer
+         */
+        X500Principal getIssuer() {
+<span class="nc" id="L1299">            return issuer;</span>
+        }
+
+        /**
+         * Returns the serial number.
+         *
+         * @return the serial number
+         */
+        BigInteger getSerial() {
+<span class="nc" id="L1308">            return serial;</span>
+        }
+
+        /**
+         * Compares this X509Serial with another and returns true if they
+         * are equivalent.
+         *
+         * @param o the other object to compare with
+         * @return true if equal, false otherwise
+         */
+        public boolean equals(Object o) {
+<span class="nc bnc" id="L1319" title="All 2 branches missed.">            if (o == this) {</span>
+<span class="nc" id="L1320">                return true;</span>
+            }
+
+<span class="nc bnc" id="L1323" title="All 2 branches missed.">            if (!(o instanceof X509IssuerSerial)) {</span>
+<span class="nc" id="L1324">                return false;</span>
+            }
+
+<span class="nc" id="L1327">            X509IssuerSerial other = (X509IssuerSerial) o;</span>
+<span class="nc bnc" id="L1328" title="All 2 branches missed.">            if (serial.equals(other.getSerial()) &amp;&amp;</span>
+<span class="nc bnc" id="L1329" title="All 2 branches missed.">                issuer.equals(other.getIssuer())) {</span>
+<span class="nc" id="L1330">                return true;</span>
+            }
+<span class="nc" id="L1332">            return false;</span>
+        }
+
+        /**
+         * Returns a hash code value for this X509IssuerSerial.
+         *
+         * @return the hash code value
+         */
+        public int hashCode() {
+<span class="nc bnc" id="L1341" title="All 2 branches missed.">            if (hashcode == 0) {</span>
+<span class="nc" id="L1342">                int result = 17;</span>
+<span class="nc" id="L1343">                result = 37*result + issuer.hashCode();</span>
+<span class="nc" id="L1344">                result = 37*result + serial.hashCode();</span>
+<span class="nc" id="L1345">                hashcode = result;</span>
+            }
+<span class="nc" id="L1347">            return hashcode;</span>
+        }
+
+        @Override
+        public int compareTo(X509IssuerSerial another) {
+<span class="fc" id="L1352">            int cissuer = issuer.toString()</span>
+<span class="fc" id="L1353">                    .compareTo(another.issuer.toString());</span>
+<span class="pc bpc" id="L1354" title="1 of 2 branches missed.">            if (cissuer != 0) return cissuer;</span>
+<span class="fc" id="L1355">            return this.serial.compareTo(another.serial);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

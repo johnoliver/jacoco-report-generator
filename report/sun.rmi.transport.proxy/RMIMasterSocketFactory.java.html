@@ -1,0 +1,473 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>RMIMasterSocketFactory.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.rmi.transport.proxy</a> &gt; <span class="el_source">RMIMasterSocketFactory.java</span></div><h1>RMIMasterSocketFactory.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1996, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package sun.rmi.transport.proxy;
+
+import java.io.*;
+import java.net.*;
+import java.security.*;
+import java.util.*;
+import java.rmi.server.LogStream;
+import java.rmi.server.RMISocketFactory;
+import sun.rmi.runtime.Log;
+import sun.rmi.runtime.NewThreadAction;
+import sun.security.action.GetBooleanAction;
+import sun.security.action.GetLongAction;
+import sun.security.action.GetPropertyAction;
+
+/**
+ * RMIMasterSocketFactory attempts to create a socket connection to the
+ * specified host using successively less efficient mechanisms
+ * until one succeeds.  If the host is successfully connected to,
+ * the factory for the successful mechanism is stored in an internal
+ * hash table keyed by the host name, so that future attempts to
+ * connect to the same host will automatically use the same
+ * mechanism.
+ */
+@SuppressWarnings(&quot;deprecation&quot;)
+public class RMIMasterSocketFactory extends RMISocketFactory {
+
+    /** &quot;proxy&quot; package log level */
+<span class="fc" id="L52">    static int logLevel = LogStream.parseLevel(getLogLevel());</span>
+
+    private static String getLogLevel() {
+<span class="fc" id="L55">        return java.security.AccessController.doPrivileged(</span>
+            new sun.security.action.GetPropertyAction(&quot;sun.rmi.transport.proxy.logLevel&quot;));
+    }
+
+    /* proxy package log */
+<span class="fc" id="L60">    static final Log proxyLog =</span>
+<span class="fc" id="L61">        Log.getLog(&quot;sun.rmi.transport.tcp.proxy&quot;,</span>
+                   &quot;transport&quot;, RMIMasterSocketFactory.logLevel);
+
+    /** timeout for attemping direct socket connections */
+<span class="fc" id="L65">    private static long connectTimeout = getConnectTimeout();</span>
+
+    private static long getConnectTimeout() {
+<span class="fc" id="L68">        return java.security.AccessController.doPrivileged(</span>
+                new GetLongAction(&quot;sun.rmi.transport.proxy.connectTimeout&quot;,
+<span class="fc" id="L70">                              15000)).longValue(); // default: 15 seconds</span>
+    }
+
+    /** whether to fallback to HTTP on general connect failures */
+<span class="fc" id="L74">    private static final boolean eagerHttpFallback =</span>
+<span class="fc" id="L75">        java.security.AccessController.doPrivileged(new GetBooleanAction(</span>
+<span class="fc" id="L76">            &quot;sun.rmi.transport.proxy.eagerHttpFallback&quot;)).booleanValue();</span>
+
+    /** table of hosts successfully connected to and the factory used */
+<span class="fc" id="L79">    private Hashtable&lt;String, RMISocketFactory&gt; successTable =</span>
+        new Hashtable&lt;&gt;();
+
+    /** maximum number of hosts to remember successful connection to */
+    private static final int MaxRememberedHosts = 64;
+
+    /** list of the hosts in successTable in initial connection order */
+<span class="fc" id="L86">    private Vector&lt;String&gt; hostList = new Vector&lt;&gt;(MaxRememberedHosts);</span>
+
+    /** default factory for initial use for direct socket connection */
+<span class="fc" id="L89">    protected RMISocketFactory initialFactory = new RMIDirectSocketFactory();</span>
+
+    /** ordered list of factories to try as alternate connection
+      * mechanisms if a direct socket connections fails */
+    protected Vector&lt;RMISocketFactory&gt; altFactoryList;
+
+    /**
+     * Create a RMIMasterSocketFactory object.  Establish order of
+     * connection mechanisms to attempt on createSocket, if a direct
+     * socket connection fails.
+     */
+<span class="fc" id="L100">    public RMIMasterSocketFactory() {</span>
+<span class="fc" id="L101">        altFactoryList = new Vector&lt;&gt;(2);</span>
+<span class="fc" id="L102">        boolean setFactories = false;</span>
+
+        try {
+            String proxyHost;
+<span class="fc" id="L106">            proxyHost = java.security.AccessController.doPrivileged(</span>
+                new GetPropertyAction(&quot;http.proxyHost&quot;));
+
+<span class="fc bfc" id="L109" title="All 2 branches covered.">            if (proxyHost == null)</span>
+<span class="fc" id="L110">                proxyHost = java.security.AccessController.doPrivileged(</span>
+                    new GetPropertyAction(&quot;proxyHost&quot;));
+
+<span class="fc" id="L113">            boolean disable = java.security.AccessController.doPrivileged(</span>
+                new GetPropertyAction(&quot;java.rmi.server.disableHttp&quot;, &quot;true&quot;))
+<span class="fc" id="L115">                .equalsIgnoreCase(&quot;true&quot;);</span>
+
+<span class="pc bpc" id="L117" title="2 of 6 branches missed.">            if (!disable &amp;&amp; proxyHost != null &amp;&amp; proxyHost.length() &gt; 0) {</span>
+<span class="fc" id="L118">                setFactories = true;</span>
+            }
+<span class="nc" id="L120">        } catch (Exception e) {</span>
+            // unable to obtain the properties, so use the default behavior.
+<span class="fc" id="L122">        }</span>
+
+<span class="fc bfc" id="L124" title="All 2 branches covered.">        if (setFactories) {</span>
+<span class="fc" id="L125">            altFactoryList.addElement(new RMIHttpToPortSocketFactory());</span>
+<span class="fc" id="L126">            altFactoryList.addElement(new RMIHttpToCGISocketFactory());</span>
+        }
+<span class="fc" id="L128">    }</span>
+
+    /**
+     * Create a new client socket.  If we remember connecting to this host
+     * successfully before, then use the same factory again.  Otherwise,
+     * try using a direct socket connection and then the alternate factories
+     * in the order specified in altFactoryList.
+     */
+    public Socket createSocket(String host, int port)
+        throws IOException
+    {
+<span class="fc bfc" id="L139" title="All 2 branches covered.">        if (proxyLog.isLoggable(Log.BRIEF)) {</span>
+<span class="fc" id="L140">            proxyLog.log(Log.BRIEF, &quot;host: &quot; + host + &quot;, port: &quot; + port);</span>
+        }
+
+        /*
+         * If we don't have any alternate factories to consult, short circuit
+         * the fallback procedure and delegate to the initial factory.
+         */
+<span class="pc bpc" id="L147" title="1 of 2 branches missed.">        if (altFactoryList.size() == 0) {</span>
+<span class="fc" id="L148">            return initialFactory.createSocket(host, port);</span>
+        }
+
+        RMISocketFactory factory;
+
+        /*
+         * If we remember successfully connecting to this host before,
+         * use the same factory.
+         */
+<span class="nc" id="L157">        factory = successTable.get(host);</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">        if (factory != null) {</span>
+<span class="nc bnc" id="L159" title="All 2 branches missed.">            if (proxyLog.isLoggable(Log.BRIEF)) {</span>
+<span class="nc" id="L160">                proxyLog.log(Log.BRIEF,</span>
+                    &quot;previously successful factory found: &quot; + factory);
+            }
+<span class="nc" id="L163">            return factory.createSocket(host, port);</span>
+        }
+
+        /*
+         * Next, try a direct socket connection.  Open socket in another
+         * thread and only wait for specified timeout, in case the socket
+         * would otherwise spend minutes trying an unreachable host.
+         */
+<span class="nc" id="L171">        Socket initialSocket = null;</span>
+<span class="nc" id="L172">        Socket fallbackSocket = null;</span>
+<span class="nc" id="L173">        final AsyncConnector connector =</span>
+            new AsyncConnector(initialFactory, host, port,
+<span class="nc" id="L175">                AccessController.getContext());</span>
+                // connection must be attempted with
+                // this thread's access control context
+<span class="nc" id="L178">        IOException initialFailure = null;</span>
+
+        try {
+<span class="nc" id="L181">            synchronized (connector) {</span>
+
+<span class="nc" id="L183">                Thread t = java.security.AccessController.doPrivileged(</span>
+                    new NewThreadAction(connector, &quot;AsyncConnector&quot;, true));
+<span class="nc" id="L185">                t.start();</span>
+
+                try {
+<span class="nc" id="L188">                    long now = System.currentTimeMillis();</span>
+<span class="nc" id="L189">                    long deadline = now + connectTimeout;</span>
+                    do {
+<span class="nc" id="L191">                        connector.wait(deadline - now);</span>
+<span class="nc" id="L192">                        initialSocket = checkConnector(connector);</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">                        if (initialSocket != null)</span>
+<span class="nc" id="L194">                            break;</span>
+<span class="nc" id="L195">                        now = System.currentTimeMillis();</span>
+<span class="nc bnc" id="L196" title="All 2 branches missed.">                    } while (now &lt; deadline);</span>
+<span class="nc" id="L197">                } catch (InterruptedException e) {</span>
+<span class="nc" id="L198">                    throw new InterruptedIOException(</span>
+                        &quot;interrupted while waiting for connector&quot;);
+<span class="nc" id="L200">                }</span>
+<span class="nc" id="L201">            }</span>
+
+            // assume no route to host (for now) if no connection yet
+<span class="nc bnc" id="L204" title="All 2 branches missed.">            if (initialSocket == null)</span>
+<span class="nc" id="L205">                throw new NoRouteToHostException(</span>
+                    &quot;connect timed out: &quot; + host);
+
+<span class="nc" id="L208">            proxyLog.log(Log.BRIEF, &quot;direct socket connection successful&quot;);</span>
+
+<span class="nc" id="L210">            return initialSocket;</span>
+
+<span class="nc" id="L212">        } catch (UnknownHostException | NoRouteToHostException e) {</span>
+<span class="nc" id="L213">            initialFailure = e;</span>
+<span class="nc" id="L214">        } catch (SocketException e) {</span>
+<span class="nc bnc" id="L215" title="All 2 branches missed.">            if (eagerHttpFallback) {</span>
+<span class="nc" id="L216">                initialFailure = e;</span>
+            } else {
+<span class="nc" id="L218">                throw e;</span>
+            }
+        } finally {
+<span class="nc bnc" id="L221" title="All 8 branches missed.">            if (initialFailure != null) {</span>
+
+<span class="nc bnc" id="L223" title="All 8 branches missed.">                if (proxyLog.isLoggable(Log.BRIEF)) {</span>
+<span class="nc" id="L224">                    proxyLog.log(Log.BRIEF,</span>
+                        &quot;direct socket connection failed: &quot;, initialFailure);
+                }
+
+                // Finally, try any alternate connection mechanisms.
+<span class="nc bnc" id="L229" title="All 8 branches missed.">                for (int i = 0; i &lt; altFactoryList.size(); ++ i) {</span>
+<span class="nc" id="L230">                    factory = altFactoryList.elementAt(i);</span>
+<span class="nc bnc" id="L231" title="All 8 branches missed.">                    if (proxyLog.isLoggable(Log.BRIEF)) {</span>
+<span class="nc" id="L232">                        proxyLog.log(Log.BRIEF,</span>
+                            &quot;trying with factory: &quot; + factory);
+                    }
+<span class="nc" id="L235">                    try (Socket testSocket =</span>
+<span class="nc" id="L236">                            factory.createSocket(host, port)) {</span>
+                        // For HTTP connections, the output (POST request) must
+                        // be sent before we verify a successful connection.
+                        // So, sacrifice a socket for the sake of testing...
+                        // The following sequence should verify a successful
+                        // HTTP connection if no IOException is thrown.
+<span class="nc" id="L242">                        InputStream in = testSocket.getInputStream();</span>
+<span class="nc" id="L243">                        int b = in.read(); // probably -1 for EOF...</span>
+<span class="nc bnc" id="L244" title="All 32 branches missed.">                    } catch (IOException ex) {</span>
+<span class="nc bnc" id="L245" title="All 8 branches missed.">                        if (proxyLog.isLoggable(Log.BRIEF)) {</span>
+<span class="nc" id="L246">                            proxyLog.log(Log.BRIEF, &quot;factory failed: &quot;, ex);</span>
+                        }
+
+<span class="nc" id="L249">                        continue;</span>
+<span class="nc" id="L250">                    }</span>
+<span class="nc" id="L251">                    proxyLog.log(Log.BRIEF, &quot;factory succeeded&quot;);</span>
+
+                    // factory succeeded, open new socket for caller's use
+                    try {
+<span class="nc" id="L255">                        fallbackSocket = factory.createSocket(host, port);</span>
+<span class="nc" id="L256">                    } catch (IOException ex) {  // if it fails 2nd time,</span>
+<span class="nc" id="L257">                    }                           // just give up</span>
+<span class="nc" id="L258">                    break;</span>
+                }
+            }
+        }
+
+<span class="nc" id="L263">        synchronized (successTable) {</span>
+            try {
+                // check once again to see if direct connection succeeded
+<span class="nc" id="L266">                synchronized (connector) {</span>
+<span class="nc" id="L267">                    initialSocket = checkConnector(connector);</span>
+<span class="nc" id="L268">                }</span>
+<span class="nc bnc" id="L269" title="All 2 branches missed.">                if (initialSocket != null) {</span>
+                    // if we had made another one as well, clean it up...
+<span class="nc bnc" id="L271" title="All 2 branches missed.">                    if (fallbackSocket != null)</span>
+<span class="nc" id="L272">                        fallbackSocket.close();</span>
+<span class="nc" id="L273">                    return initialSocket;</span>
+                }
+                // if connector ever does get socket, it won't be used
+<span class="nc" id="L276">                connector.notUsed();</span>
+<span class="nc" id="L277">            } catch (UnknownHostException | NoRouteToHostException e) {</span>
+<span class="nc" id="L278">                initialFailure = e;</span>
+<span class="nc" id="L279">            } catch (SocketException e) {</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">                if (eagerHttpFallback) {</span>
+<span class="nc" id="L281">                    initialFailure = e;</span>
+                } else {
+<span class="nc" id="L283">                    throw e;</span>
+                }
+<span class="nc" id="L285">            }</span>
+            // if we had found an alternate mechanism, go and use it
+<span class="nc bnc" id="L287" title="All 2 branches missed.">            if (fallbackSocket != null) {</span>
+                // remember this successful host/factory pair
+<span class="nc" id="L289">                rememberFactory(host, factory);</span>
+<span class="nc" id="L290">                return fallbackSocket;</span>
+            }
+<span class="nc" id="L292">            throw initialFailure;</span>
+<span class="nc" id="L293">        }</span>
+    }
+
+    /**
+     * Remember a successful factory for connecting to host.
+     * Currently, excess hosts are removed from the remembered list
+     * using a Least Recently Created strategy.
+     */
+    void rememberFactory(String host, RMISocketFactory factory) {
+<span class="nc" id="L302">        synchronized (successTable) {</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">            while (hostList.size() &gt;= MaxRememberedHosts) {</span>
+<span class="nc" id="L304">                successTable.remove(hostList.elementAt(0));</span>
+<span class="nc" id="L305">                hostList.removeElementAt(0);</span>
+            }
+<span class="nc" id="L307">            hostList.addElement(host);</span>
+<span class="nc" id="L308">            successTable.put(host, factory);</span>
+<span class="nc" id="L309">        }</span>
+<span class="nc" id="L310">    }</span>
+
+    /**
+     * Check if an AsyncConnector succeeded.  If not, return socket
+     * given to fall back to.
+     */
+    Socket checkConnector(AsyncConnector connector)
+        throws IOException
+    {
+<span class="nc" id="L319">        Exception e = connector.getException();</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">        if (e != null) {</span>
+<span class="nc" id="L321">            e.fillInStackTrace();</span>
+            /*
+             * The AsyncConnector implementation guaranteed that the exception
+             * will be either an IOException or a RuntimeException, and we can
+             * only throw one of those, so convince that compiler that it must
+             * be one of those.
+             */
+<span class="nc bnc" id="L328" title="All 2 branches missed.">            if (e instanceof IOException) {</span>
+<span class="nc" id="L329">                throw (IOException) e;</span>
+<span class="nc bnc" id="L330" title="All 2 branches missed.">            } else if (e instanceof RuntimeException) {</span>
+<span class="nc" id="L331">                throw (RuntimeException) e;</span>
+            } else {
+<span class="nc" id="L333">                throw new Error(&quot;internal error: &quot; +</span>
+<span class="nc" id="L334">                    &quot;unexpected checked exception: &quot; + e.toString());</span>
+            }
+        }
+<span class="nc" id="L337">        return connector.getSocket();</span>
+    }
+
+    /**
+     * Create a new server socket.
+     */
+    public ServerSocket createServerSocket(int port) throws IOException {
+        //return new HttpAwareServerSocket(port);
+<span class="fc" id="L345">        return initialFactory.createServerSocket(port);</span>
+    }
+
+
+    /**
+     * AsyncConnector is used by RMIMasterSocketFactory to attempt socket
+     * connections on a separate thread.  This allows RMIMasterSocketFactory
+     * to control how long it will wait for the connection to succeed.
+     */
+    private class AsyncConnector implements Runnable {
+
+        /** what factory to use to attempt connection */
+        private RMISocketFactory factory;
+
+        /** the host to connect to */
+        private String host;
+
+        /** the port to connect to */
+        private int port;
+
+        /** access control context to attempt connection within */
+        private AccessControlContext acc;
+
+        /** exception that occurred during connection, if any */
+<span class="nc" id="L369">        private Exception exception = null;</span>
+
+        /** the connected socket, if successful */
+<span class="nc" id="L372">        private Socket socket = null;</span>
+
+        /** socket should be closed after created, if ever */
+<span class="nc" id="L375">        private boolean cleanUp = false;</span>
+
+        /**
+         * Create a new asynchronous connector object.
+         */
+        AsyncConnector(RMISocketFactory factory, String host, int port,
+                       AccessControlContext acc)
+<span class="nc" id="L382">        {</span>
+<span class="nc" id="L383">            this.factory = factory;</span>
+<span class="nc" id="L384">            this.host    = host;</span>
+<span class="nc" id="L385">            this.port    = port;</span>
+<span class="nc" id="L386">            this.acc     = acc;</span>
+<span class="nc" id="L387">            SecurityManager security = System.getSecurityManager();</span>
+<span class="nc bnc" id="L388" title="All 2 branches missed.">            if (security != null) {</span>
+<span class="nc" id="L389">                security.checkConnect(host, port);</span>
+            }
+<span class="nc" id="L391">        }</span>
+
+        /**
+         * Attempt socket connection in separate thread.  If successful,
+         * notify master waiting,
+         */
+        public void run() {
+            try {
+                /*
+                 * Using the privileges of the thread that wants to make the
+                 * connection is tempting, but it will fail with applets with
+                 * the current applet security manager because the applet
+                 * network connection policy is not captured in the permission
+                 * framework of the access control context we have.
+                 *
+                 * java.security.AccessController.beginPrivileged(acc);
+                 */
+                try {
+<span class="nc" id="L409">                    Socket temp = factory.createSocket(host, port);</span>
+<span class="nc" id="L410">                    synchronized (this) {</span>
+<span class="nc" id="L411">                        socket = temp;</span>
+<span class="nc" id="L412">                        notify();</span>
+<span class="nc" id="L413">                    }</span>
+<span class="nc" id="L414">                    rememberFactory(host, factory);</span>
+<span class="nc" id="L415">                    synchronized (this) {</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">                        if (cleanUp)</span>
+                          try {
+<span class="nc" id="L418">                              socket.close();</span>
+<span class="nc" id="L419">                          } catch (IOException e) {</span>
+<span class="nc" id="L420">                          }</span>
+<span class="nc" id="L421">                    }</span>
+<span class="nc" id="L422">                } catch (Exception e) {</span>
+                    /*
+                     * Note that the only exceptions which could actually have
+                     * occurred here are IOException or RuntimeException.
+                     */
+<span class="nc" id="L427">                    synchronized (this) {</span>
+<span class="nc" id="L428">                        exception = e;</span>
+<span class="nc" id="L429">                        notify();</span>
+<span class="nc" id="L430">                    }</span>
+<span class="nc" id="L431">                }</span>
+            } finally {
+                /*
+                 * See above comments for matching beginPrivileged() call that
+                 * is also commented out.
+                 *
+                 * java.security.AccessController.endPrivileged();
+                 */
+            }
+<span class="nc" id="L440">        }</span>
+
+        /**
+         * Get exception that occurred during connection attempt, if any.
+         * In the current implementation, this is guaranteed to be either
+         * an IOException or a RuntimeException.
+         */
+        private synchronized Exception getException() {
+<span class="nc" id="L448">            return exception;</span>
+        }
+
+        /**
+         * Get successful socket, if any.
+         */
+        private synchronized Socket getSocket() {
+<span class="nc" id="L455">            return socket;</span>
+        }
+
+        /**
+         * Note that this connector's socket, if ever successfully created,
+         * will not be used, so it should be cleaned up quickly
+         */
+        synchronized void notUsed() {
+<span class="nc bnc" id="L463" title="All 2 branches missed.">            if (socket != null) {</span>
+                try {
+<span class="nc" id="L465">                    socket.close();</span>
+<span class="nc" id="L466">                } catch (IOException e) {</span>
+<span class="nc" id="L467">                }</span>
+            }
+<span class="nc" id="L469">            cleanUp = true;</span>
+<span class="nc" id="L470">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

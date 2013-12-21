@@ -1,0 +1,1032 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>SocketChannelImpl.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.nio.ch</a> &gt; <span class="el_source">SocketChannelImpl.java</span></div><h1>SocketChannelImpl.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2000, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.nio.ch;
+
+import java.io.FileDescriptor;
+import java.io.IOException;
+import java.net.*;
+import java.nio.ByteBuffer;
+import java.nio.channels.*;
+import java.nio.channels.spi.*;
+import java.util.*;
+import sun.net.NetHooks;
+
+
+/**
+ * An implementation of SocketChannels
+ */
+
+<span class="fc bfc" id="L42" title="All 2 branches covered.">class SocketChannelImpl</span>
+    extends SocketChannel
+    implements SelChImpl
+{
+
+    // Used to make native read and write calls
+    private static NativeDispatcher nd;
+
+    // Our file descriptor object
+    private final FileDescriptor fd;
+
+    // fd value needed for dev/poll. This value will remain valid
+    // even after the value in the file descriptor object has been set to -1
+    private final int fdVal;
+
+    // IDs of native threads doing reads and writes, for signalling
+<span class="pc" id="L58">    private volatile long readerThread = 0;</span>
+<span class="pc" id="L59">    private volatile long writerThread = 0;</span>
+
+    // Lock held by current reading or connecting thread
+<span class="pc" id="L62">    private final Object readLock = new Object();</span>
+
+    // Lock held by current writing or connecting thread
+<span class="pc" id="L65">    private final Object writeLock = new Object();</span>
+
+    // Lock held by any thread that modifies the state fields declared below
+    // DO NOT invoke a blocking I/O operation while holding this lock!
+<span class="pc" id="L69">    private final Object stateLock = new Object();</span>
+
+    // -- The following fields are protected by stateLock
+
+    // set true when exclusive binding is on and SO_REUSEADDR is emulated
+    private boolean isReuseAddress;
+
+    // State, increases monotonically
+    private static final int ST_UNINITIALIZED = -1;
+    private static final int ST_UNCONNECTED = 0;
+    private static final int ST_PENDING = 1;
+    private static final int ST_CONNECTED = 2;
+    private static final int ST_KILLPENDING = 3;
+    private static final int ST_KILLED = 4;
+<span class="pc" id="L83">    private int state = ST_UNINITIALIZED;</span>
+
+    // Binding
+    private InetSocketAddress localAddress;
+    private InetSocketAddress remoteAddress;
+
+    // Input/Output open
+<span class="pc" id="L90">    private boolean isInputOpen = true;</span>
+<span class="pc" id="L91">    private boolean isOutputOpen = true;</span>
+<span class="pc" id="L92">    private boolean readyToConnect = false;</span>
+
+    // Socket adaptor, created on demand
+    private Socket socket;
+
+    // -- End of fields protected by stateLock
+
+
+    // Constructor for normal connecting sockets
+    //
+    SocketChannelImpl(SelectorProvider sp) throws IOException {
+<span class="fc" id="L103">        super(sp);</span>
+<span class="fc" id="L104">        this.fd = Net.socket(true);</span>
+<span class="fc" id="L105">        this.fdVal = IOUtil.fdVal(fd);</span>
+<span class="fc" id="L106">        this.state = ST_UNCONNECTED;</span>
+<span class="fc" id="L107">    }</span>
+
+    SocketChannelImpl(SelectorProvider sp,
+                      FileDescriptor fd,
+                      boolean bound)
+        throws IOException
+    {
+<span class="nc" id="L114">        super(sp);</span>
+<span class="nc" id="L115">        this.fd = fd;</span>
+<span class="nc" id="L116">        this.fdVal = IOUtil.fdVal(fd);</span>
+<span class="nc" id="L117">        this.state = ST_UNCONNECTED;</span>
+<span class="nc bnc" id="L118" title="All 2 branches missed.">        if (bound)</span>
+<span class="nc" id="L119">            this.localAddress = Net.localAddress(fd);</span>
+<span class="nc" id="L120">    }</span>
+
+    // Constructor for sockets obtained from server sockets
+    //
+    SocketChannelImpl(SelectorProvider sp,
+                      FileDescriptor fd, InetSocketAddress remote)
+        throws IOException
+    {
+<span class="fc" id="L128">        super(sp);</span>
+<span class="fc" id="L129">        this.fd = fd;</span>
+<span class="fc" id="L130">        this.fdVal = IOUtil.fdVal(fd);</span>
+<span class="fc" id="L131">        this.state = ST_CONNECTED;</span>
+<span class="fc" id="L132">        this.localAddress = Net.localAddress(fd);</span>
+<span class="fc" id="L133">        this.remoteAddress = remote;</span>
+<span class="fc" id="L134">    }</span>
+
+    public Socket socket() {
+<span class="fc" id="L137">        synchronized (stateLock) {</span>
+<span class="fc bfc" id="L138" title="All 2 branches covered.">            if (socket == null)</span>
+<span class="fc" id="L139">                socket = SocketAdaptor.create(this);</span>
+<span class="fc" id="L140">            return socket;</span>
+<span class="nc" id="L141">        }</span>
+    }
+
+    @Override
+    public SocketAddress getLocalAddress() throws IOException {
+<span class="fc" id="L146">        synchronized (stateLock) {</span>
+<span class="fc bfc" id="L147" title="All 2 branches covered.">            if (!isOpen())</span>
+<span class="fc" id="L148">                throw new ClosedChannelException();</span>
+<span class="fc" id="L149">            return  Net.getRevealedLocalAddress(localAddress);</span>
+<span class="fc" id="L150">        }</span>
+    }
+
+    @Override
+    public SocketAddress getRemoteAddress() throws IOException {
+<span class="fc" id="L155">        synchronized (stateLock) {</span>
+<span class="fc bfc" id="L156" title="All 2 branches covered.">            if (!isOpen())</span>
+<span class="fc" id="L157">                throw new ClosedChannelException();</span>
+<span class="fc" id="L158">            return remoteAddress;</span>
+<span class="fc" id="L159">        }</span>
+    }
+
+    @Override
+    public &lt;T&gt; SocketChannel setOption(SocketOption&lt;T&gt; name, T value)
+        throws IOException
+    {
+<span class="pc bpc" id="L166" title="1 of 2 branches missed.">        if (name == null)</span>
+<span class="nc" id="L167">            throw new NullPointerException();</span>
+<span class="pc bpc" id="L168" title="1 of 2 branches missed.">        if (!supportedOptions().contains(name))</span>
+<span class="nc" id="L169">            throw new UnsupportedOperationException(&quot;'&quot; + name + &quot;' not supported&quot;);</span>
+
+<span class="fc" id="L171">        synchronized (stateLock) {</span>
+<span class="pc bpc" id="L172" title="1 of 2 branches missed.">            if (!isOpen())</span>
+<span class="nc" id="L173">                throw new ClosedChannelException();</span>
+
+            // special handling for IP_TOS: no-op when IPv6
+<span class="pc bpc" id="L176" title="1 of 2 branches missed.">            if (name == StandardSocketOptions.IP_TOS) {</span>
+<span class="nc bnc" id="L177" title="All 2 branches missed.">                if (!Net.isIPv6Available())</span>
+<span class="nc" id="L178">                    Net.setSocketOption(fd, StandardProtocolFamily.INET, name, value);</span>
+<span class="nc" id="L179">                return this;</span>
+<span class="pc bpc" id="L180" title="1 of 2 branches missed.">            } else if (name == StandardSocketOptions.SO_REUSEADDR &amp;&amp;</span>
+<span class="nc bnc" id="L181" title="All 2 branches missed.">                           Net.useExclusiveBind())</span>
+            {
+                // SO_REUSEADDR emulated when using exclusive bind
+<span class="nc" id="L184">                isReuseAddress = (Boolean)value;</span>
+<span class="nc" id="L185">                return this;</span>
+            }
+
+            // no options that require special handling
+<span class="fc" id="L189">            Net.setSocketOption(fd, Net.UNSPEC, name, value);</span>
+<span class="fc" id="L190">            return this;</span>
+<span class="nc" id="L191">        }</span>
+    }
+
+    @Override
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public &lt;T&gt; T getOption(SocketOption&lt;T&gt; name)
+        throws IOException
+    {
+<span class="pc bpc" id="L199" title="1 of 2 branches missed.">        if (name == null)</span>
+<span class="nc" id="L200">            throw new NullPointerException();</span>
+<span class="pc bpc" id="L201" title="1 of 2 branches missed.">        if (!supportedOptions().contains(name))</span>
+<span class="nc" id="L202">            throw new UnsupportedOperationException(&quot;'&quot; + name + &quot;' not supported&quot;);</span>
+
+<span class="fc" id="L204">        synchronized (stateLock) {</span>
+<span class="pc bpc" id="L205" title="1 of 2 branches missed.">            if (!isOpen())</span>
+<span class="nc" id="L206">                throw new ClosedChannelException();</span>
+
+<span class="pc bpc" id="L208" title="1 of 2 branches missed.">            if (name == StandardSocketOptions.SO_REUSEADDR &amp;&amp;</span>
+<span class="nc bnc" id="L209" title="All 2 branches missed.">                    Net.useExclusiveBind())</span>
+            {
+                // SO_REUSEADDR emulated when using exclusive bind
+<span class="nc" id="L212">                return (T)Boolean.valueOf(isReuseAddress);</span>
+            }
+
+            // special handling for IP_TOS: always return 0 when IPv6
+<span class="pc bpc" id="L216" title="1 of 2 branches missed.">            if (name == StandardSocketOptions.IP_TOS) {</span>
+<span class="nc bnc" id="L217" title="All 2 branches missed.">                return (Net.isIPv6Available()) ? (T) Integer.valueOf(0) :</span>
+<span class="nc" id="L218">                    (T) Net.getSocketOption(fd, StandardProtocolFamily.INET, name);</span>
+            }
+
+            // no options that require special handling
+<span class="fc" id="L222">            return (T) Net.getSocketOption(fd, Net.UNSPEC, name);</span>
+<span class="nc" id="L223">        }</span>
+    }
+
+<span class="nc" id="L226">    private static class DefaultOptionsHolder {</span>
+<span class="fc" id="L227">        static final Set&lt;SocketOption&lt;?&gt;&gt; defaultOptions = defaultOptions();</span>
+
+        private static Set&lt;SocketOption&lt;?&gt;&gt; defaultOptions() {
+<span class="fc" id="L230">            HashSet&lt;SocketOption&lt;?&gt;&gt; set = new HashSet&lt;SocketOption&lt;?&gt;&gt;(8);</span>
+<span class="fc" id="L231">            set.add(StandardSocketOptions.SO_SNDBUF);</span>
+<span class="fc" id="L232">            set.add(StandardSocketOptions.SO_RCVBUF);</span>
+<span class="fc" id="L233">            set.add(StandardSocketOptions.SO_KEEPALIVE);</span>
+<span class="fc" id="L234">            set.add(StandardSocketOptions.SO_REUSEADDR);</span>
+<span class="fc" id="L235">            set.add(StandardSocketOptions.SO_LINGER);</span>
+<span class="fc" id="L236">            set.add(StandardSocketOptions.TCP_NODELAY);</span>
+            // additional options required by socket adaptor
+<span class="fc" id="L238">            set.add(StandardSocketOptions.IP_TOS);</span>
+<span class="fc" id="L239">            set.add(ExtendedSocketOption.SO_OOBINLINE);</span>
+<span class="fc" id="L240">            return Collections.unmodifiableSet(set);</span>
+        }
+    }
+
+    @Override
+    public final Set&lt;SocketOption&lt;?&gt;&gt; supportedOptions() {
+<span class="fc" id="L246">        return DefaultOptionsHolder.defaultOptions;</span>
+    }
+
+    private boolean ensureReadOpen() throws ClosedChannelException {
+<span class="fc" id="L250">        synchronized (stateLock) {</span>
+<span class="pc bpc" id="L251" title="1 of 2 branches missed.">            if (!isOpen())</span>
+<span class="nc" id="L252">                throw new ClosedChannelException();</span>
+<span class="fc bfc" id="L253" title="All 2 branches covered.">            if (!isConnected())</span>
+<span class="fc" id="L254">                throw new NotYetConnectedException();</span>
+<span class="pc bpc" id="L255" title="1 of 2 branches missed.">            if (!isInputOpen)</span>
+<span class="nc" id="L256">                return false;</span>
+            else
+<span class="fc" id="L258">                return true;</span>
+<span class="fc" id="L259">        }</span>
+    }
+
+    private void ensureWriteOpen() throws ClosedChannelException {
+<span class="fc" id="L263">        synchronized (stateLock) {</span>
+<span class="fc bfc" id="L264" title="All 2 branches covered.">            if (!isOpen())</span>
+<span class="fc" id="L265">                throw new ClosedChannelException();</span>
+<span class="pc bpc" id="L266" title="1 of 2 branches missed.">            if (!isOutputOpen)</span>
+<span class="nc" id="L267">                throw new ClosedChannelException();</span>
+<span class="fc bfc" id="L268" title="All 2 branches covered.">            if (!isConnected())</span>
+<span class="fc" id="L269">                throw new NotYetConnectedException();</span>
+<span class="fc" id="L270">        }</span>
+<span class="fc" id="L271">    }</span>
+
+    private void readerCleanup() throws IOException {
+<span class="fc" id="L274">        synchronized (stateLock) {</span>
+<span class="fc" id="L275">            readerThread = 0;</span>
+<span class="fc bfc" id="L276" title="All 2 branches covered.">            if (state == ST_KILLPENDING)</span>
+<span class="fc" id="L277">                kill();</span>
+<span class="pc" id="L278">        }</span>
+<span class="fc" id="L279">    }</span>
+
+    private void writerCleanup() throws IOException {
+<span class="fc" id="L282">        synchronized (stateLock) {</span>
+<span class="fc" id="L283">            writerThread = 0;</span>
+<span class="fc bfc" id="L284" title="All 2 branches covered.">            if (state == ST_KILLPENDING)</span>
+<span class="fc" id="L285">                kill();</span>
+<span class="pc" id="L286">        }</span>
+<span class="fc" id="L287">    }</span>
+
+    public int read(ByteBuffer buf) throws IOException {
+
+<span class="pc bpc" id="L291" title="1 of 2 branches missed.">        if (buf == null)</span>
+<span class="nc" id="L292">            throw new NullPointerException();</span>
+
+<span class="fc" id="L294">        synchronized (readLock) {</span>
+<span class="pc bpc" id="L295" title="1 of 2 branches missed.">            if (!ensureReadOpen())</span>
+<span class="nc" id="L296">                return -1;</span>
+<span class="fc" id="L297">            int n = 0;</span>
+            try {
+
+                // Set up the interruption machinery; see
+                // AbstractInterruptibleChannel for details
+                //
+<span class="fc" id="L303">                begin();</span>
+
+<span class="fc" id="L305">                synchronized (stateLock) {</span>
+<span class="fc bfc" id="L306" title="All 2 branches covered.">                    if (!isOpen()) {</span>
+                    // Either the current thread is already interrupted, so
+                    // begin() closed the channel, or another thread closed the
+                    // channel since we checked it a few bytecodes ago.  In
+                    // either case the value returned here is irrelevant since
+                    // the invocation of end() in the finally block will throw
+                    // an appropriate exception.
+                    //
+<span class="fc" id="L314">                        return 0;</span>
+
+                    }
+
+                    // Save this thread so that it can be signalled on those
+                    // platforms that require it
+                    //
+<span class="fc" id="L321">                    readerThread = NativeThread.current();</span>
+<span class="pc" id="L322">                }</span>
+
+                // Between the previous test of isOpen() and the return of the
+                // IOUtil.read invocation below, this channel might be closed
+                // or this thread might be interrupted.  We rely upon the
+                // implicit synchronization point in the kernel read() call to
+                // make sure that the right thing happens.  In either case the
+                // implCloseSelectableChannel method is ultimately invoked in
+                // some other thread, so there are three possibilities:
+                //
+                //   - implCloseSelectableChannel() invokes nd.preClose()
+                //     before this thread invokes read(), in which case the
+                //     read returns immediately with either EOF or an error,
+                //     the latter of which will cause an IOException to be
+                //     thrown.
+                //
+                //   - implCloseSelectableChannel() invokes nd.preClose() after
+                //     this thread is blocked in read().  On some operating
+                //     systems (e.g., Solaris and Windows) this causes the read
+                //     to return immediately with either EOF or an error
+                //     indication.
+                //
+                //   - implCloseSelectableChannel() invokes nd.preClose() after
+                //     this thread is blocked in read() but the operating
+                //     system (e.g., Linux) doesn't support preemptive close,
+                //     so implCloseSelectableChannel() proceeds to signal this
+                //     thread, thereby causing the read to return immediately
+                //     with IOStatus.INTERRUPTED.
+                //
+                // In all three cases the invocation of end() in the finally
+                // clause will notice that the channel has been closed and
+                // throw an appropriate exception (AsynchronousCloseException
+                // or ClosedByInterruptException) if necessary.
+                //
+                // *There is A fourth possibility. implCloseSelectableChannel()
+                // invokes nd.preClose(), signals reader/writer thred and quickly
+                // moves on to nd.close() in kill(), which does a real close.
+                // Then a third thread accepts a new connection, opens file or
+                // whatever that causes the released &quot;fd&quot; to be recycled. All
+                // above happens just between our last isOpen() check and the
+                // next kernel read reached, with the recycled &quot;fd&quot;. The solution
+                // is to postpone the real kill() if there is a reader or/and
+                // writer thread(s) over there &quot;waiting&quot;, leave the cleanup/kill
+                // to the reader or writer thread. (the preClose() still happens
+                // so the connection gets cut off as usual).
+                //
+                // For socket channels there is the additional wrinkle that
+                // asynchronous shutdown works much like asynchronous close,
+                // except that the channel is shutdown rather than completely
+                // closed.  This is analogous to the first two cases above,
+                // except that the shutdown operation plays the role of
+                // nd.preClose().
+                for (;;) {
+<span class="fc" id="L375">                    n = IOUtil.read(fd, buf, -1, nd);</span>
+<span class="pc bpc" id="L376" title="1 of 4 branches missed.">                    if ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen()) {</span>
+                        // The system call was interrupted but the channel
+                        // is still open, so retry
+<span class="nc" id="L379">                        continue;</span>
+                    }
+<span class="fc" id="L381">                    return IOStatus.normalize(n);</span>
+                }
+
+            } finally {
+<span class="fc" id="L385">                readerCleanup();        // Clear reader thread</span>
+                // The end method, which is defined in our superclass
+                // AbstractInterruptibleChannel, resets the interruption
+                // machinery.  If its argument is true then it returns
+                // normally; otherwise it checks the interrupt and open state
+                // of this channel and throws an appropriate exception if
+                // necessary.
+                //
+                // So, if we actually managed to do any I/O in the above try
+                // block then we pass true to the end method.  We also pass
+                // true if the channel was in non-blocking mode when the I/O
+                // operation was initiated but no data could be transferred;
+                // this prevents spurious exceptions from being thrown in the
+                // rare event that a channel is closed or a thread is
+                // interrupted at the exact moment that a non-blocking I/O
+                // request is made.
+                //
+<span class="pc bpc" id="L402" title="4 of 12 branches missed.">                end(n &gt; 0 || (n == IOStatus.UNAVAILABLE));</span>
+
+                // Extra case for socket channels: Asynchronous shutdown
+                //
+<span class="pc" id="L406">                synchronized (stateLock) {</span>
+<span class="pc bpc" id="L407" title="6 of 12 branches missed.">                    if ((n &lt;= 0) &amp;&amp; (!isInputOpen))</span>
+<span class="pc" id="L408">                        return IOStatus.EOF;</span>
+<span class="pc" id="L409">                }</span>
+
+<span class="pc bpc" id="L411" title="7 of 12 branches missed.">                assert IOStatus.check(n);</span>
+
+            }
+<span class="fc" id="L414">        }</span>
+    }
+
+    public long read(ByteBuffer[] dsts, int offset, int length)
+        throws IOException
+    {
+<span class="pc bpc" id="L420" title="3 of 6 branches missed.">        if ((offset &lt; 0) || (length &lt; 0) || (offset &gt; dsts.length - length))</span>
+<span class="nc" id="L421">            throw new IndexOutOfBoundsException();</span>
+<span class="fc" id="L422">        synchronized (readLock) {</span>
+<span class="pc bpc" id="L423" title="1 of 2 branches missed.">            if (!ensureReadOpen())</span>
+<span class="nc" id="L424">                return -1;</span>
+<span class="fc" id="L425">            long n = 0;</span>
+            try {
+<span class="fc" id="L427">                begin();</span>
+<span class="fc" id="L428">                synchronized (stateLock) {</span>
+<span class="fc bfc" id="L429" title="All 2 branches covered.">                    if (!isOpen())</span>
+<span class="fc" id="L430">                        return 0;</span>
+<span class="fc" id="L431">                    readerThread = NativeThread.current();</span>
+<span class="pc" id="L432">                }</span>
+
+                for (;;) {
+<span class="fc" id="L435">                    n = IOUtil.read(fd, dsts, offset, length, nd);</span>
+<span class="pc bpc" id="L436" title="1 of 4 branches missed.">                    if ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen())</span>
+<span class="nc" id="L437">                        continue;</span>
+<span class="fc" id="L438">                    return IOStatus.normalize(n);</span>
+                }
+            } finally {
+<span class="pc" id="L441">                readerCleanup();</span>
+<span class="pc bpc" id="L442" title="7 of 12 branches missed.">                end(n &gt; 0 || (n == IOStatus.UNAVAILABLE));</span>
+<span class="pc" id="L443">                synchronized (stateLock) {</span>
+<span class="pc bpc" id="L444" title="9 of 12 branches missed.">                    if ((n &lt;= 0) &amp;&amp; (!isInputOpen))</span>
+<span class="pc" id="L445">                        return IOStatus.EOF;</span>
+<span class="pc" id="L446">                }</span>
+<span class="pc bpc" id="L447" title="10 of 12 branches missed.">                assert IOStatus.check(n);</span>
+            }
+<span class="fc" id="L449">        }</span>
+    }
+
+    public int write(ByteBuffer buf) throws IOException {
+<span class="pc bpc" id="L453" title="1 of 2 branches missed.">        if (buf == null)</span>
+<span class="nc" id="L454">            throw new NullPointerException();</span>
+<span class="fc" id="L455">        synchronized (writeLock) {</span>
+<span class="fc" id="L456">            ensureWriteOpen();</span>
+<span class="fc" id="L457">            int n = 0;</span>
+            try {
+<span class="fc" id="L459">                begin();</span>
+<span class="fc" id="L460">                synchronized (stateLock) {</span>
+<span class="fc bfc" id="L461" title="All 2 branches covered.">                    if (!isOpen())</span>
+<span class="fc" id="L462">                        return 0;</span>
+<span class="fc" id="L463">                    writerThread = NativeThread.current();</span>
+<span class="pc" id="L464">                }</span>
+                for (;;) {
+<span class="fc" id="L466">                    n = IOUtil.write(fd, buf, -1, nd);</span>
+<span class="pc bpc" id="L467" title="3 of 4 branches missed.">                    if ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen())</span>
+<span class="nc" id="L468">                        continue;</span>
+<span class="fc" id="L469">                    return IOStatus.normalize(n);</span>
+                }
+            } finally {
+<span class="fc" id="L472">                writerCleanup();</span>
+<span class="pc bpc" id="L473" title="5 of 12 branches missed.">                end(n &gt; 0 || (n == IOStatus.UNAVAILABLE));</span>
+<span class="pc" id="L474">                synchronized (stateLock) {</span>
+<span class="pc bpc" id="L475" title="9 of 12 branches missed.">                    if ((n &lt;= 0) &amp;&amp; (!isOutputOpen))</span>
+<span class="nc" id="L476">                        throw new AsynchronousCloseException();</span>
+<span class="pc" id="L477">                }</span>
+<span class="pc bpc" id="L478" title="9 of 12 branches missed.">                assert IOStatus.check(n);</span>
+            }
+<span class="fc" id="L480">        }</span>
+    }
+
+    public long write(ByteBuffer[] srcs, int offset, int length)
+        throws IOException
+    {
+<span class="pc bpc" id="L486" title="3 of 6 branches missed.">        if ((offset &lt; 0) || (length &lt; 0) || (offset &gt; srcs.length - length))</span>
+<span class="nc" id="L487">            throw new IndexOutOfBoundsException();</span>
+<span class="fc" id="L488">        synchronized (writeLock) {</span>
+<span class="fc" id="L489">            ensureWriteOpen();</span>
+<span class="fc" id="L490">            long n = 0;</span>
+            try {
+<span class="fc" id="L492">                begin();</span>
+<span class="fc" id="L493">                synchronized (stateLock) {</span>
+<span class="fc bfc" id="L494" title="All 2 branches covered.">                    if (!isOpen())</span>
+<span class="fc" id="L495">                        return 0;</span>
+<span class="fc" id="L496">                    writerThread = NativeThread.current();</span>
+<span class="pc" id="L497">                }</span>
+                for (;;) {
+<span class="fc" id="L499">                    n = IOUtil.write(fd, srcs, offset, length, nd);</span>
+<span class="pc bpc" id="L500" title="3 of 4 branches missed.">                    if ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen())</span>
+<span class="nc" id="L501">                        continue;</span>
+<span class="fc" id="L502">                    return IOStatus.normalize(n);</span>
+                }
+            } finally {
+<span class="pc" id="L505">                writerCleanup();</span>
+<span class="pc bpc" id="L506" title="7 of 12 branches missed.">                end((n &gt; 0) || (n == IOStatus.UNAVAILABLE));</span>
+<span class="pc" id="L507">                synchronized (stateLock) {</span>
+<span class="pc bpc" id="L508" title="9 of 12 branches missed.">                    if ((n &lt;= 0) &amp;&amp; (!isOutputOpen))</span>
+<span class="nc" id="L509">                        throw new AsynchronousCloseException();</span>
+<span class="pc" id="L510">                }</span>
+<span class="pc bpc" id="L511" title="10 of 12 branches missed.">                assert IOStatus.check(n);</span>
+            }
+<span class="fc" id="L513">        }</span>
+    }
+
+    // package-private
+    int sendOutOfBandData(byte b) throws IOException {
+<span class="fc" id="L518">        synchronized (writeLock) {</span>
+<span class="fc" id="L519">            ensureWriteOpen();</span>
+<span class="fc" id="L520">            int n = 0;</span>
+            try {
+<span class="fc" id="L522">                begin();</span>
+<span class="fc" id="L523">                synchronized (stateLock) {</span>
+<span class="pc bpc" id="L524" title="1 of 2 branches missed.">                    if (!isOpen())</span>
+<span class="nc" id="L525">                        return 0;</span>
+<span class="fc" id="L526">                    writerThread = NativeThread.current();</span>
+<span class="pc" id="L527">                }</span>
+                for (;;) {
+<span class="fc" id="L529">                    n = sendOutOfBandData(fd, b);</span>
+<span class="pc bpc" id="L530" title="3 of 4 branches missed.">                    if ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen())</span>
+<span class="nc" id="L531">                        continue;</span>
+<span class="fc" id="L532">                    return IOStatus.normalize(n);</span>
+                }
+            } finally {
+<span class="pc" id="L535">                writerCleanup();</span>
+<span class="pc bpc" id="L536" title="11 of 12 branches missed.">                end((n &gt; 0) || (n == IOStatus.UNAVAILABLE));</span>
+<span class="pc" id="L537">                synchronized (stateLock) {</span>
+<span class="pc bpc" id="L538" title="11 of 12 branches missed.">                    if ((n &lt;= 0) &amp;&amp; (!isOutputOpen))</span>
+<span class="nc" id="L539">                        throw new AsynchronousCloseException();</span>
+<span class="pc" id="L540">                }</span>
+<span class="pc bpc" id="L541" title="10 of 12 branches missed.">                assert IOStatus.check(n);</span>
+            }
+<span class="nc" id="L543">        }</span>
+    }
+
+    protected void implConfigureBlocking(boolean block) throws IOException {
+<span class="fc" id="L547">        IOUtil.configureBlocking(fd, block);</span>
+<span class="fc" id="L548">    }</span>
+
+    public InetSocketAddress localAddress() {
+<span class="fc" id="L551">        synchronized (stateLock) {</span>
+<span class="fc" id="L552">            return localAddress;</span>
+<span class="nc" id="L553">        }</span>
+    }
+
+    public SocketAddress remoteAddress() {
+<span class="fc" id="L557">        synchronized (stateLock) {</span>
+<span class="fc" id="L558">            return remoteAddress;</span>
+<span class="nc" id="L559">        }</span>
+    }
+
+    @Override
+    public SocketChannel bind(SocketAddress local) throws IOException {
+<span class="fc" id="L564">        synchronized (readLock) {</span>
+<span class="fc" id="L565">            synchronized (writeLock) {</span>
+<span class="fc" id="L566">                synchronized (stateLock) {</span>
+<span class="fc bfc" id="L567" title="All 2 branches covered.">                    if (!isOpen())</span>
+<span class="fc" id="L568">                        throw new ClosedChannelException();</span>
+<span class="pc bpc" id="L569" title="1 of 2 branches missed.">                    if (state == ST_PENDING)</span>
+<span class="nc" id="L570">                        throw new ConnectionPendingException();</span>
+<span class="fc bfc" id="L571" title="All 2 branches covered.">                    if (localAddress != null)</span>
+<span class="fc" id="L572">                        throw new AlreadyBoundException();</span>
+<span class="fc bfc" id="L573" title="All 2 branches covered.">                    InetSocketAddress isa = (local == null) ?</span>
+<span class="fc" id="L574">                        new InetSocketAddress(0) : Net.checkAddress(local);</span>
+<span class="fc" id="L575">                    NetHooks.beforeTcpBind(fd, isa.getAddress(), isa.getPort());</span>
+<span class="fc" id="L576">                    Net.bind(fd, isa.getAddress(), isa.getPort());</span>
+<span class="fc" id="L577">                    localAddress = Net.localAddress(fd);</span>
+<span class="fc" id="L578">                }</span>
+<span class="fc" id="L579">            }</span>
+<span class="fc" id="L580">        }</span>
+<span class="fc" id="L581">        return this;</span>
+    }
+
+    public boolean isConnected() {
+<span class="fc" id="L585">        synchronized (stateLock) {</span>
+<span class="fc bfc" id="L586" title="All 2 branches covered.">            return (state == ST_CONNECTED);</span>
+<span class="nc" id="L587">        }</span>
+    }
+
+    public boolean isConnectionPending() {
+<span class="fc" id="L591">        synchronized (stateLock) {</span>
+<span class="fc bfc" id="L592" title="All 2 branches covered.">            return (state == ST_PENDING);</span>
+<span class="nc" id="L593">        }</span>
+    }
+
+    void ensureOpenAndUnconnected() throws IOException { // package-private
+<span class="fc" id="L597">        synchronized (stateLock) {</span>
+<span class="pc bpc" id="L598" title="1 of 2 branches missed.">            if (!isOpen())</span>
+<span class="nc" id="L599">                throw new ClosedChannelException();</span>
+<span class="fc bfc" id="L600" title="All 2 branches covered.">            if (state == ST_CONNECTED)</span>
+<span class="fc" id="L601">                throw new AlreadyConnectedException();</span>
+<span class="fc bfc" id="L602" title="All 2 branches covered.">            if (state == ST_PENDING)</span>
+<span class="fc" id="L603">                throw new ConnectionPendingException();</span>
+<span class="fc" id="L604">        }</span>
+<span class="fc" id="L605">    }</span>
+
+    public boolean connect(SocketAddress sa) throws IOException {
+<span class="fc" id="L608">        int localPort = 0;</span>
+
+<span class="fc" id="L610">        synchronized (readLock) {</span>
+<span class="fc" id="L611">            synchronized (writeLock) {</span>
+<span class="fc" id="L612">                ensureOpenAndUnconnected();</span>
+<span class="fc" id="L613">                InetSocketAddress isa = Net.checkAddress(sa);</span>
+<span class="fc" id="L614">                SecurityManager sm = System.getSecurityManager();</span>
+<span class="fc bfc" id="L615" title="All 2 branches covered.">                if (sm != null)</span>
+<span class="fc" id="L616">                    sm.checkConnect(isa.getAddress().getHostAddress(),</span>
+<span class="fc" id="L617">                                    isa.getPort());</span>
+<span class="fc" id="L618">                synchronized (blockingLock()) {</span>
+<span class="fc" id="L619">                    int n = 0;</span>
+                    try {
+                        try {
+<span class="fc" id="L622">                            begin();</span>
+<span class="fc" id="L623">                            synchronized (stateLock) {</span>
+<span class="fc bfc" id="L624" title="All 2 branches covered.">                                if (!isOpen()) {</span>
+<span class="fc" id="L625">                                    return false;</span>
+                                }
+                                // notify hook only if unbound
+<span class="pc bpc" id="L628" title="1 of 2 branches missed.">                                if (localAddress == null) {</span>
+<span class="fc" id="L629">                                    NetHooks.beforeTcpConnect(fd,</span>
+<span class="fc" id="L630">                                                           isa.getAddress(),</span>
+<span class="fc" id="L631">                                                           isa.getPort());</span>
+                                }
+<span class="fc" id="L633">                                readerThread = NativeThread.current();</span>
+<span class="pc" id="L634">                            }</span>
+                            for (;;) {
+<span class="fc" id="L636">                                InetAddress ia = isa.getAddress();</span>
+<span class="fc bfc" id="L637" title="All 2 branches covered.">                                if (ia.isAnyLocalAddress())</span>
+<span class="fc" id="L638">                                    ia = InetAddress.getLocalHost();</span>
+<span class="fc" id="L639">                                n = Net.connect(fd,</span>
+                                                ia,
+<span class="fc" id="L641">                                                isa.getPort());</span>
+<span class="fc bfc" id="L642" title="All 2 branches covered.">                                if (  (n == IOStatus.INTERRUPTED)</span>
+<span class="pc bpc" id="L643" title="1 of 2 branches missed.">                                      &amp;&amp; isOpen())</span>
+<span class="nc" id="L644">                                    continue;</span>
+                                break;
+                            }
+
+                        } finally {
+<span class="pc" id="L649">                            readerCleanup();</span>
+<span class="pc bpc" id="L650" title="6 of 12 branches missed.">                            end((n &gt; 0) || (n == IOStatus.UNAVAILABLE));</span>
+<span class="pc bpc" id="L651" title="9 of 12 branches missed.">                            assert IOStatus.check(n);</span>
+                        }
+<span class="fc" id="L653">                    } catch (IOException x) {</span>
+                        // If an exception was thrown, close the channel after
+                        // invoking end() so as to avoid bogus
+                        // AsynchronousCloseExceptions
+<span class="fc" id="L657">                        close();</span>
+<span class="fc" id="L658">                        throw x;</span>
+<span class="fc" id="L659">                    }</span>
+<span class="fc" id="L660">                    synchronized (stateLock) {</span>
+<span class="fc" id="L661">                        remoteAddress = isa;</span>
+<span class="fc bfc" id="L662" title="All 2 branches covered.">                        if (n &gt; 0) {</span>
+
+                            // Connection succeeded; disallow further
+                            // invocation
+<span class="fc" id="L666">                            state = ST_CONNECTED;</span>
+<span class="pc bpc" id="L667" title="1 of 2 branches missed.">                            if (isOpen())</span>
+<span class="fc" id="L668">                                localAddress = Net.localAddress(fd);</span>
+<span class="fc" id="L669">                            return true;</span>
+                        }
+                        // If nonblocking and no exception then connection
+                        // pending; disallow another invocation
+<span class="pc bpc" id="L673" title="1 of 2 branches missed.">                        if (!isBlocking())</span>
+<span class="fc" id="L674">                            state = ST_PENDING;</span>
+                        else
+<span class="nc bnc" id="L676" title="All 2 branches missed.">                            assert false;</span>
+<span class="pc" id="L677">                    }</span>
+<span class="fc" id="L678">                }</span>
+<span class="fc" id="L679">                return false;</span>
+<span class="fc" id="L680">            }</span>
+<span class="fc" id="L681">        }</span>
+    }
+
+    public boolean finishConnect() throws IOException {
+<span class="fc" id="L685">        synchronized (readLock) {</span>
+<span class="fc" id="L686">            synchronized (writeLock) {</span>
+<span class="fc" id="L687">                synchronized (stateLock) {</span>
+<span class="pc bpc" id="L688" title="1 of 2 branches missed.">                    if (!isOpen())</span>
+<span class="nc" id="L689">                        throw new ClosedChannelException();</span>
+<span class="fc bfc" id="L690" title="All 2 branches covered.">                    if (state == ST_CONNECTED)</span>
+<span class="fc" id="L691">                        return true;</span>
+<span class="fc bfc" id="L692" title="All 2 branches covered.">                    if (state != ST_PENDING)</span>
+<span class="fc" id="L693">                        throw new NoConnectionPendingException();</span>
+<span class="fc" id="L694">                }</span>
+<span class="fc" id="L695">                int n = 0;</span>
+                try {
+                    try {
+<span class="fc" id="L698">                        begin();</span>
+<span class="fc" id="L699">                        synchronized (blockingLock()) {</span>
+<span class="fc" id="L700">                            synchronized (stateLock) {</span>
+<span class="pc bpc" id="L701" title="1 of 2 branches missed.">                                if (!isOpen()) {</span>
+<span class="nc" id="L702">                                    return false;</span>
+                                }
+<span class="fc" id="L704">                                readerThread = NativeThread.current();</span>
+<span class="pc" id="L705">                            }</span>
+<span class="fc bfc" id="L706" title="All 2 branches covered.">                            if (!isBlocking()) {</span>
+                                for (;;) {
+<span class="fc" id="L708">                                    n = checkConnect(fd, false,</span>
+                                                     readyToConnect);
+<span class="pc bpc" id="L710" title="1 of 2 branches missed.">                                    if (  (n == IOStatus.INTERRUPTED)</span>
+<span class="nc bnc" id="L711" title="All 2 branches missed.">                                          &amp;&amp; isOpen())</span>
+<span class="nc" id="L712">                                        continue;</span>
+                                    break;
+                                }
+                            } else {
+                                for (;;) {
+<span class="fc" id="L717">                                    n = checkConnect(fd, true,</span>
+                                                     readyToConnect);
+<span class="pc bpc" id="L719" title="1 of 2 branches missed.">                                    if (n == 0) {</span>
+                                        // Loop in case of
+                                        // spurious notifications
+<span class="nc" id="L722">                                        continue;</span>
+                                    }
+<span class="pc bpc" id="L724" title="1 of 2 branches missed.">                                    if (  (n == IOStatus.INTERRUPTED)</span>
+<span class="nc bnc" id="L725" title="All 2 branches missed.">                                          &amp;&amp; isOpen())</span>
+<span class="nc" id="L726">                                        continue;</span>
+                                    break;
+                                }
+                            }
+<span class="fc" id="L730">                        }</span>
+                    } finally {
+<span class="pc" id="L732">                        synchronized (stateLock) {</span>
+<span class="pc" id="L733">                            readerThread = 0;</span>
+<span class="pc bpc" id="L734" title="3 of 6 branches missed.">                            if (state == ST_KILLPENDING) {</span>
+<span class="pc" id="L735">                                kill();</span>
+                                // poll()/getsockopt() does not report
+                                // error (throws exception, with n = 0)
+                                // on Linux platform after dup2 and
+                                // signal-wakeup. Force n to 0 so the
+                                // end() can throw appropriate exception
+<span class="pc" id="L741">                                n = 0;</span>
+                            }
+<span class="pc" id="L743">                        }</span>
+<span class="pc bpc" id="L744" title="6 of 12 branches missed.">                        end((n &gt; 0) || (n == IOStatus.UNAVAILABLE));</span>
+<span class="pc bpc" id="L745" title="8 of 12 branches missed.">                        assert IOStatus.check(n);</span>
+                    }
+<span class="fc" id="L747">                } catch (IOException x) {</span>
+                    // If an exception was thrown, close the channel after
+                    // invoking end() so as to avoid bogus
+                    // AsynchronousCloseExceptions
+<span class="fc" id="L751">                    close();</span>
+<span class="fc" id="L752">                    throw x;</span>
+<span class="fc" id="L753">                }</span>
+<span class="fc bfc" id="L754" title="All 2 branches covered.">                if (n &gt; 0) {</span>
+<span class="fc" id="L755">                    synchronized (stateLock) {</span>
+<span class="fc" id="L756">                        state = ST_CONNECTED;</span>
+<span class="pc bpc" id="L757" title="1 of 2 branches missed.">                        if (isOpen())</span>
+<span class="fc" id="L758">                            localAddress = Net.localAddress(fd);</span>
+<span class="pc" id="L759">                    }</span>
+<span class="fc" id="L760">                    return true;</span>
+                }
+<span class="fc" id="L762">                return false;</span>
+<span class="fc" id="L763">            }</span>
+<span class="fc" id="L764">        }</span>
+    }
+
+    @Override
+    public SocketChannel shutdownInput() throws IOException {
+<span class="fc" id="L769">        synchronized (stateLock) {</span>
+<span class="pc bpc" id="L770" title="1 of 2 branches missed.">            if (!isOpen())</span>
+<span class="nc" id="L771">                throw new ClosedChannelException();</span>
+<span class="pc bpc" id="L772" title="1 of 2 branches missed.">            if (!isConnected())</span>
+<span class="nc" id="L773">                throw new NotYetConnectedException();</span>
+<span class="pc bpc" id="L774" title="1 of 2 branches missed.">            if (isInputOpen) {</span>
+<span class="fc" id="L775">                Net.shutdown(fd, Net.SHUT_RD);</span>
+<span class="pc bpc" id="L776" title="1 of 2 branches missed.">                if (readerThread != 0)</span>
+<span class="fc" id="L777">                    NativeThread.signal(readerThread);</span>
+<span class="fc" id="L778">                isInputOpen = false;</span>
+            }
+<span class="fc" id="L780">            return this;</span>
+<span class="nc" id="L781">        }</span>
+    }
+
+    @Override
+    public SocketChannel shutdownOutput() throws IOException {
+<span class="fc" id="L786">        synchronized (stateLock) {</span>
+<span class="pc bpc" id="L787" title="1 of 2 branches missed.">            if (!isOpen())</span>
+<span class="nc" id="L788">                throw new ClosedChannelException();</span>
+<span class="pc bpc" id="L789" title="1 of 2 branches missed.">            if (!isConnected())</span>
+<span class="nc" id="L790">                throw new NotYetConnectedException();</span>
+<span class="pc bpc" id="L791" title="1 of 2 branches missed.">            if (isOutputOpen) {</span>
+<span class="fc" id="L792">                Net.shutdown(fd, Net.SHUT_WR);</span>
+<span class="fc bfc" id="L793" title="All 2 branches covered.">                if (writerThread != 0)</span>
+<span class="fc" id="L794">                    NativeThread.signal(writerThread);</span>
+<span class="fc" id="L795">                isOutputOpen = false;</span>
+            }
+<span class="fc" id="L797">            return this;</span>
+<span class="nc" id="L798">        }</span>
+    }
+
+    public boolean isInputOpen() {
+<span class="fc" id="L802">        synchronized (stateLock) {</span>
+<span class="fc" id="L803">            return isInputOpen;</span>
+<span class="nc" id="L804">        }</span>
+    }
+
+    public boolean isOutputOpen() {
+<span class="fc" id="L808">        synchronized (stateLock) {</span>
+<span class="fc" id="L809">            return isOutputOpen;</span>
+<span class="nc" id="L810">        }</span>
+    }
+
+    // AbstractInterruptibleChannel synchronizes invocations of this method
+    // using AbstractInterruptibleChannel.closeLock, and also ensures that this
+    // method is only ever invoked once.  Before we get to this method, isOpen
+    // (which is volatile) will have been set to false.
+    //
+    protected void implCloseSelectableChannel() throws IOException {
+<span class="fc" id="L819">        synchronized (stateLock) {</span>
+<span class="fc" id="L820">            isInputOpen = false;</span>
+<span class="fc" id="L821">            isOutputOpen = false;</span>
+
+            // Close the underlying file descriptor and dup it to a known fd
+            // that's already closed.  This prevents other operations on this
+            // channel from using the old fd, which might be recycled in the
+            // meantime and allocated to an entirely different channel.
+            //
+<span class="pc bpc" id="L828" title="1 of 2 branches missed.">            if (state != ST_KILLED)</span>
+<span class="fc" id="L829">                nd.preClose(fd);</span>
+
+            // Signal native threads, if needed.  If a target thread is not
+            // currently blocked in an I/O operation then no harm is done since
+            // the signal handler doesn't actually do anything.
+            //
+<span class="fc bfc" id="L835" title="All 2 branches covered.">            if (readerThread != 0)</span>
+<span class="fc" id="L836">                NativeThread.signal(readerThread);</span>
+
+<span class="fc bfc" id="L838" title="All 2 branches covered.">            if (writerThread != 0)</span>
+<span class="fc" id="L839">                NativeThread.signal(writerThread);</span>
+
+            // If this channel is not registered then it's safe to close the fd
+            // immediately since we know at this point that no thread is
+            // blocked in an I/O operation upon the channel and, since the
+            // channel is marked closed, no thread will start another such
+            // operation.  If this channel is registered then we don't close
+            // the fd since it might be in use by a selector.  In that case
+            // closing this channel caused its keys to be cancelled, so the
+            // last selector to deregister a key for this channel will invoke
+            // kill() to close the fd.
+            //
+<span class="fc bfc" id="L851" title="All 2 branches covered.">            if (!isRegistered())</span>
+<span class="fc" id="L852">                kill();</span>
+<span class="pc" id="L853">        }</span>
+<span class="fc" id="L854">    }</span>
+
+    public void kill() throws IOException {
+<span class="fc" id="L857">        synchronized (stateLock) {</span>
+<span class="fc bfc" id="L858" title="All 2 branches covered.">            if (state == ST_KILLED)</span>
+<span class="fc" id="L859">                return;</span>
+<span class="pc bpc" id="L860" title="1 of 2 branches missed.">            if (state == ST_UNINITIALIZED) {</span>
+<span class="nc" id="L861">                state = ST_KILLED;</span>
+<span class="nc" id="L862">                return;</span>
+            }
+<span class="pc bpc" id="L864" title="2 of 6 branches missed.">            assert !isOpen() &amp;&amp; !isRegistered();</span>
+
+            // Postpone the kill if there is a waiting reader
+            // or writer thread. See the comments in read() for
+            // more detailed explanation.
+<span class="fc bfc" id="L869" title="All 4 branches covered.">            if (readerThread == 0 &amp;&amp; writerThread == 0) {</span>
+<span class="fc" id="L870">                nd.close(fd);</span>
+<span class="fc" id="L871">                state = ST_KILLED;</span>
+            } else {
+<span class="fc" id="L873">                state = ST_KILLPENDING;</span>
+            }
+<span class="pc" id="L875">        }</span>
+<span class="fc" id="L876">    }</span>
+
+    /**
+     * Translates native poll revent ops into a ready operation ops
+     */
+    public boolean translateReadyOps(int ops, int initialOps,
+                                     SelectionKeyImpl sk) {
+<span class="fc" id="L883">        int intOps = sk.nioInterestOps(); // Do this just once, it synchronizes</span>
+<span class="fc" id="L884">        int oldOps = sk.nioReadyOps();</span>
+<span class="fc" id="L885">        int newOps = initialOps;</span>
+
+<span class="pc bpc" id="L887" title="1 of 2 branches missed.">        if ((ops &amp; PollArrayWrapper.POLLNVAL) != 0) {</span>
+            // This should only happen if this channel is pre-closed while a
+            // selection operation is in progress
+            // ## Throw an error if this channel has not been pre-closed
+<span class="nc" id="L891">            return false;</span>
+        }
+
+<span class="fc bfc" id="L894" title="All 2 branches covered.">        if ((ops &amp; (PollArrayWrapper.POLLERR</span>
+                    | PollArrayWrapper.POLLHUP)) != 0) {
+<span class="fc" id="L896">            newOps = intOps;</span>
+<span class="fc" id="L897">            sk.nioReadyOps(newOps);</span>
+            // No need to poll again in checkConnect,
+            // the error will be detected there
+<span class="fc" id="L900">            readyToConnect = true;</span>
+<span class="fc bfc" id="L901" title="All 2 branches covered.">            return (newOps &amp; ~oldOps) != 0;</span>
+        }
+
+<span class="pc bpc" id="L904" title="2 of 6 branches missed.">        if (((ops &amp; PollArrayWrapper.POLLIN) != 0) &amp;&amp;</span>
+            ((intOps &amp; SelectionKey.OP_READ) != 0) &amp;&amp;
+            (state == ST_CONNECTED))
+<span class="fc" id="L907">            newOps |= SelectionKey.OP_READ;</span>
+
+<span class="pc bpc" id="L909" title="1 of 8 branches missed.">        if (((ops &amp; PollArrayWrapper.POLLCONN) != 0) &amp;&amp;</span>
+            ((intOps &amp; SelectionKey.OP_CONNECT) != 0) &amp;&amp;
+            ((state == ST_UNCONNECTED) || (state == ST_PENDING))) {
+<span class="fc" id="L912">            newOps |= SelectionKey.OP_CONNECT;</span>
+<span class="fc" id="L913">            readyToConnect = true;</span>
+        }
+
+<span class="fc bfc" id="L916" title="All 6 branches covered.">        if (((ops &amp; PollArrayWrapper.POLLOUT) != 0) &amp;&amp;</span>
+            ((intOps &amp; SelectionKey.OP_WRITE) != 0) &amp;&amp;
+            (state == ST_CONNECTED))
+<span class="fc" id="L919">            newOps |= SelectionKey.OP_WRITE;</span>
+
+<span class="fc" id="L921">        sk.nioReadyOps(newOps);</span>
+<span class="fc bfc" id="L922" title="All 2 branches covered.">        return (newOps &amp; ~oldOps) != 0;</span>
+    }
+
+    public boolean translateAndUpdateReadyOps(int ops, SelectionKeyImpl sk) {
+<span class="nc" id="L926">        return translateReadyOps(ops, sk.nioReadyOps(), sk);</span>
+    }
+
+    public boolean translateAndSetReadyOps(int ops, SelectionKeyImpl sk) {
+<span class="fc" id="L930">        return translateReadyOps(ops, 0, sk);</span>
+    }
+
+    // package-private
+    int poll(int events, long timeout) throws IOException {
+<span class="pc bpc" id="L935" title="5 of 6 branches missed.">        assert Thread.holdsLock(blockingLock()) &amp;&amp; !isBlocking();</span>
+
+<span class="fc" id="L937">        synchronized (readLock) {</span>
+<span class="fc" id="L938">            int n = 0;</span>
+            try {
+<span class="fc" id="L940">                begin();</span>
+<span class="fc" id="L941">                synchronized (stateLock) {</span>
+<span class="pc bpc" id="L942" title="1 of 2 branches missed.">                    if (!isOpen())</span>
+<span class="nc" id="L943">                        return 0;</span>
+<span class="fc" id="L944">                    readerThread = NativeThread.current();</span>
+<span class="pc" id="L945">                }</span>
+<span class="fc" id="L946">                n = Net.poll(fd, events, timeout);</span>
+            } finally {
+<span class="pc" id="L948">                readerCleanup();</span>
+<span class="pc bpc" id="L949" title="5 of 6 branches missed.">                end(n &gt; 0);</span>
+<span class="fc" id="L950">            }</span>
+<span class="fc" id="L951">            return n;</span>
+<span class="nc" id="L952">        }</span>
+    }
+
+    /**
+     * Translates an interest operation set into a native poll event set
+     */
+    public void translateAndSetInterestOps(int ops, SelectionKeyImpl sk) {
+<span class="fc" id="L959">        int newOps = 0;</span>
+<span class="fc bfc" id="L960" title="All 2 branches covered.">        if ((ops &amp; SelectionKey.OP_READ) != 0)</span>
+<span class="fc" id="L961">            newOps |= PollArrayWrapper.POLLIN;</span>
+<span class="fc bfc" id="L962" title="All 2 branches covered.">        if ((ops &amp; SelectionKey.OP_WRITE) != 0)</span>
+<span class="fc" id="L963">            newOps |= PollArrayWrapper.POLLOUT;</span>
+<span class="fc bfc" id="L964" title="All 2 branches covered.">        if ((ops &amp; SelectionKey.OP_CONNECT) != 0)</span>
+<span class="fc" id="L965">            newOps |= PollArrayWrapper.POLLCONN;</span>
+<span class="fc" id="L966">        sk.selector.putEventOps(sk, newOps);</span>
+<span class="fc" id="L967">    }</span>
+
+    public FileDescriptor getFD() {
+<span class="nc" id="L970">        return fd;</span>
+    }
+
+    public int getFDVal() {
+<span class="fc" id="L974">        return fdVal;</span>
+    }
+
+    @Override
+    public String toString() {
+<span class="fc" id="L979">        StringBuffer sb = new StringBuffer();</span>
+<span class="fc" id="L980">        sb.append(this.getClass().getSuperclass().getName());</span>
+<span class="fc" id="L981">        sb.append('[');</span>
+<span class="pc bpc" id="L982" title="1 of 2 branches missed.">        if (!isOpen())</span>
+<span class="nc" id="L983">            sb.append(&quot;closed&quot;);</span>
+        else {
+<span class="fc" id="L985">            synchronized (stateLock) {</span>
+<span class="pc bpc" id="L986" title="2 of 4 branches missed.">                switch (state) {</span>
+                case ST_UNCONNECTED:
+<span class="fc" id="L988">                    sb.append(&quot;unconnected&quot;);</span>
+<span class="fc" id="L989">                    break;</span>
+                case ST_PENDING:
+<span class="nc" id="L991">                    sb.append(&quot;connection-pending&quot;);</span>
+<span class="nc" id="L992">                    break;</span>
+                case ST_CONNECTED:
+<span class="fc" id="L994">                    sb.append(&quot;connected&quot;);</span>
+<span class="pc bpc" id="L995" title="1 of 2 branches missed.">                    if (!isInputOpen)</span>
+<span class="nc" id="L996">                        sb.append(&quot; ishut&quot;);</span>
+<span class="fc bfc" id="L997" title="All 2 branches covered.">                    if (!isOutputOpen)</span>
+<span class="fc" id="L998">                        sb.append(&quot; oshut&quot;);</span>
+                    break;
+                }
+<span class="fc" id="L1001">                InetSocketAddress addr = localAddress();</span>
+<span class="fc bfc" id="L1002" title="All 2 branches covered.">                if (addr != null) {</span>
+<span class="fc" id="L1003">                    sb.append(&quot; local=&quot;);</span>
+<span class="fc" id="L1004">                    sb.append(Net.getRevealedLocalAddressAsString(addr));</span>
+                }
+<span class="fc bfc" id="L1006" title="All 2 branches covered.">                if (remoteAddress() != null) {</span>
+<span class="fc" id="L1007">                    sb.append(&quot; remote=&quot;);</span>
+<span class="fc" id="L1008">                    sb.append(remoteAddress().toString());</span>
+                }
+<span class="pc" id="L1010">            }</span>
+        }
+<span class="fc" id="L1012">        sb.append(']');</span>
+<span class="fc" id="L1013">        return sb.toString();</span>
+    }
+
+
+    // -- Native methods --
+
+    private static native int checkConnect(FileDescriptor fd,
+                                           boolean block, boolean ready)
+        throws IOException;
+
+    private static native int sendOutOfBandData(FileDescriptor fd, byte data)
+        throws IOException;
+
+    static {
+<span class="fc" id="L1027">        IOUtil.load();</span>
+<span class="fc" id="L1028">        nd = new SocketDispatcher();</span>
+<span class="fc" id="L1029">    }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

@@ -1,0 +1,342 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>DGCImpl.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.rmi.transport</a> &gt; <span class="el_source">DGCImpl.java</span></div><h1>DGCImpl.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1996, 2013, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+package sun.rmi.transport;
+
+import java.rmi.Remote;
+import java.rmi.RemoteException;
+import java.rmi.dgc.DGC;
+import java.rmi.dgc.Lease;
+import java.rmi.dgc.VMID;
+import java.rmi.server.LogStream;
+import java.rmi.server.ObjID;
+import java.rmi.server.RemoteServer;
+import java.rmi.server.ServerNotActiveException;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import sun.rmi.runtime.Log;
+import sun.rmi.runtime.RuntimeUtil;
+import sun.rmi.server.UnicastRef;
+import sun.rmi.server.UnicastServerRef;
+import sun.rmi.server.Util;
+import sun.security.action.GetLongAction;
+import sun.security.action.GetPropertyAction;
+
+/**
+ * This class implements the guts of the server-side distributed GC
+ * algorithm
+ *
+ * @author Ann Wollrath
+ */
+@SuppressWarnings(&quot;deprecation&quot;)
+final class DGCImpl implements DGC {
+
+    /* dgc system log */
+<span class="fc" id="L66">    static final Log dgcLog = Log.getLog(&quot;sun.rmi.dgc&quot;, &quot;dgc&quot;,</span>
+<span class="fc" id="L67">        LogStream.parseLevel(AccessController.doPrivileged(</span>
+            new GetPropertyAction(&quot;sun.rmi.dgc.logLevel&quot;))));
+
+    /** lease duration to grant to clients */
+<span class="fc" id="L71">    private static final long leaseValue =              // default 10 minutes</span>
+<span class="fc" id="L72">        AccessController.doPrivileged(</span>
+            new GetLongAction(&quot;java.rmi.dgc.leaseValue&quot;, 600000));
+
+    /** lease check interval; default is half of lease grant duration */
+<span class="fc" id="L76">    private static final long leaseCheckInterval =</span>
+<span class="fc" id="L77">        AccessController.doPrivileged(</span>
+            new GetLongAction(&quot;sun.rmi.dgc.checkInterval&quot;, leaseValue / 2));
+
+    /** thread pool for scheduling delayed tasks */
+<span class="fc" id="L81">    private static final ScheduledExecutorService scheduler =</span>
+<span class="fc" id="L82">        AccessController.doPrivileged(</span>
+<span class="fc" id="L83">            new RuntimeUtil.GetInstanceAction()).getScheduler();</span>
+
+    /** remote implementation of DGC interface for this VM */
+    private static DGCImpl dgc;
+    /** table that maps VMID to LeaseInfo */
+<span class="fc" id="L88">    private Map&lt;VMID,LeaseInfo&gt; leaseTable = new HashMap&lt;&gt;();</span>
+    /** checks for lease expiration */
+<span class="fc" id="L90">    private Future&lt;?&gt; checker = null;</span>
+
+    /**
+     * Return the remote implementation of the DGC interface for
+     * this VM.
+     */
+    static DGCImpl getDGCImpl() {
+<span class="fc" id="L97">        return dgc;</span>
+    }
+
+    /**
+     * Construct a new server-side remote object collector at
+     * a particular port. Disallow construction from outside.
+     */
+<span class="fc" id="L104">    private DGCImpl() {}</span>
+
+    /**
+     * The dirty call adds the VMID &quot;vmid&quot; to the set of clients
+     * that hold references to the object associated with the ObjID
+     * id.  The long &quot;sequenceNum&quot; is used to detect late dirty calls.  If
+     * the VMID &quot;vmid&quot; is null, a VMID will be generated on the
+     * server (for use by the client in subsequent calls) and
+     * returned.
+     *
+     * The client must call the &quot;dirty&quot; method to renew the lease
+     * before the &quot;lease&quot; time expires or all references to remote
+     * objects in this VM that the client holds are considered
+     * &quot;unreferenced&quot;.
+     */
+    public Lease dirty(ObjID[] ids, long sequenceNum, Lease lease) {
+<span class="fc" id="L120">        VMID vmid = lease.getVMID();</span>
+        /*
+         * The server specifies the lease value; the client has
+         * no say in the matter.
+         */
+<span class="fc" id="L125">        long duration = leaseValue;</span>
+
+<span class="fc bfc" id="L127" title="All 2 branches covered.">        if (dgcLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="fc" id="L128">            dgcLog.log(Log.VERBOSE, &quot;vmid = &quot; + vmid);</span>
+        }
+
+        // create a VMID if one wasn't supplied
+<span class="pc bpc" id="L132" title="1 of 2 branches missed.">        if (vmid == null) {</span>
+<span class="nc" id="L133">            vmid = new VMID();</span>
+
+<span class="nc bnc" id="L135" title="All 2 branches missed.">            if (dgcLog.isLoggable(Log.BRIEF)) {</span>
+                String clientHost;
+                try {
+<span class="nc" id="L138">                    clientHost = RemoteServer.getClientHost();</span>
+<span class="nc" id="L139">                } catch (ServerNotActiveException e) {</span>
+<span class="nc" id="L140">                    clientHost = &quot;&lt;unknown host&gt;&quot;;</span>
+<span class="nc" id="L141">                }</span>
+<span class="nc" id="L142">                dgcLog.log(Log.BRIEF, &quot; assigning vmid &quot; + vmid +</span>
+                           &quot; to client &quot; + clientHost);
+            }
+        }
+
+<span class="fc" id="L147">        lease = new Lease(vmid, duration);</span>
+        // record lease information
+<span class="fc" id="L149">        synchronized (leaseTable) {</span>
+<span class="fc" id="L150">            LeaseInfo info = leaseTable.get(vmid);</span>
+<span class="fc bfc" id="L151" title="All 2 branches covered.">            if (info == null) {</span>
+<span class="fc" id="L152">                leaseTable.put(vmid, new LeaseInfo(vmid, duration));</span>
+<span class="fc bfc" id="L153" title="All 2 branches covered.">                if (checker == null) {</span>
+<span class="fc" id="L154">                    checker = scheduler.scheduleWithFixedDelay(</span>
+<span class="fc" id="L155">                        new Runnable() {</span>
+                            public void run() {
+<span class="fc" id="L157">                                checkLeases();</span>
+<span class="fc" id="L158">                            }</span>
+                        },
+                        leaseCheckInterval,
+                        leaseCheckInterval, TimeUnit.MILLISECONDS);
+                }
+            } else {
+<span class="fc" id="L164">                info.renew(duration);</span>
+            }
+<span class="pc" id="L166">        }</span>
+
+<span class="fc bfc" id="L168" title="All 2 branches covered.">        for (ObjID id : ids) {</span>
+<span class="fc bfc" id="L169" title="All 2 branches covered.">            if (dgcLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="fc" id="L170">                dgcLog.log(Log.VERBOSE, &quot;id = &quot; + id +</span>
+                           &quot;, vmid = &quot; + vmid + &quot;, duration = &quot; + duration);
+            }
+
+<span class="fc" id="L174">            ObjectTable.referenced(id, sequenceNum, vmid);</span>
+        }
+
+        // return the VMID used
+<span class="fc" id="L178">        return lease;</span>
+    }
+
+    /**
+     * The clean call removes the VMID from the set of clients
+     * that hold references to the object associated with the LiveRef
+     * ref.  The sequence number is used to detect late clean calls.  If the
+     * argument &quot;strong&quot; is true, then the clean call is a result of a
+     * failed &quot;dirty&quot; call, thus the sequence number for the VMID needs
+     * to be remembered until the client goes away.
+     */
+    public void clean(ObjID[] ids, long sequenceNum, VMID vmid, boolean strong)
+    {
+<span class="fc bfc" id="L191" title="All 2 branches covered.">        for (ObjID id : ids) {</span>
+<span class="pc bpc" id="L192" title="1 of 2 branches missed.">            if (dgcLog.isLoggable(Log.VERBOSE)) {</span>
+<span class="nc" id="L193">                dgcLog.log(Log.VERBOSE, &quot;id = &quot; + id +</span>
+                    &quot;, vmid = &quot; + vmid + &quot;, strong = &quot; + strong);
+            }
+
+<span class="fc" id="L197">            ObjectTable.unreferenced(id, sequenceNum, vmid, strong);</span>
+        }
+<span class="fc" id="L199">    }</span>
+
+    /**
+     * Register interest in receiving a callback when this VMID
+     * becomes inaccessible.
+     */
+    void registerTarget(VMID vmid, Target target) {
+<span class="fc" id="L206">        synchronized (leaseTable) {</span>
+<span class="fc" id="L207">            LeaseInfo info = leaseTable.get(vmid);</span>
+<span class="pc bpc" id="L208" title="1 of 2 branches missed.">            if (info == null) {</span>
+<span class="nc" id="L209">                target.vmidDead(vmid);</span>
+            } else {
+<span class="fc" id="L211">                info.notifySet.add(target);</span>
+            }
+<span class="pc" id="L213">        }</span>
+<span class="fc" id="L214">    }</span>
+
+    /**
+     * Remove notification request.
+     */
+    void unregisterTarget(VMID vmid, Target target) {
+<span class="fc" id="L220">        synchronized (leaseTable) {</span>
+<span class="fc" id="L221">            LeaseInfo info = leaseTable.get(vmid);</span>
+<span class="fc bfc" id="L222" title="All 2 branches covered.">            if (info != null) {</span>
+<span class="fc" id="L223">                info.notifySet.remove(target);</span>
+            }
+<span class="pc" id="L225">        }</span>
+<span class="fc" id="L226">    }</span>
+
+    /**
+     * Check if leases have expired.  If a lease has expired, remove
+     * it from the table and notify all interested parties that the
+     * VMID is essentially &quot;dead&quot;.
+     *
+     * @return if true, there are leases outstanding; otherwise leases
+     * no longer need to be checked
+     */
+    private void checkLeases() {
+<span class="fc" id="L237">        long time = System.currentTimeMillis();</span>
+
+        /* List of vmids that need to be removed from the leaseTable */
+<span class="fc" id="L240">        List&lt;LeaseInfo&gt; toUnregister = new ArrayList&lt;&gt;();</span>
+
+        /* Build a list of leaseInfo objects that need to have
+         * targets removed from their notifySet.  Remove expired
+         * leases from leaseTable.
+         */
+<span class="fc" id="L246">        synchronized (leaseTable) {</span>
+<span class="fc" id="L247">            Iterator&lt;LeaseInfo&gt; iter = leaseTable.values().iterator();</span>
+<span class="fc bfc" id="L248" title="All 2 branches covered.">            while (iter.hasNext()) {</span>
+<span class="fc" id="L249">                LeaseInfo info = iter.next();</span>
+<span class="fc bfc" id="L250" title="All 2 branches covered.">                if (info.expired(time)) {</span>
+<span class="fc" id="L251">                    toUnregister.add(info);</span>
+<span class="fc" id="L252">                    iter.remove();</span>
+                }
+<span class="fc" id="L254">            }</span>
+
+<span class="fc bfc" id="L256" title="All 2 branches covered.">            if (leaseTable.isEmpty()) {</span>
+<span class="fc" id="L257">                checker.cancel(false);</span>
+<span class="fc" id="L258">                checker = null;</span>
+            }
+<span class="pc" id="L260">        }</span>
+
+        /* Notify and unegister targets without holding the lock on
+         * the leaseTable so we avoid deadlock.
+         */
+<span class="fc bfc" id="L265" title="All 2 branches covered.">        for (LeaseInfo info : toUnregister) {</span>
+<span class="fc bfc" id="L266" title="All 2 branches covered.">            for (Target target : info.notifySet) {</span>
+<span class="fc" id="L267">                target.vmidDead(info.vmid);</span>
+<span class="fc" id="L268">            }</span>
+<span class="fc" id="L269">        }</span>
+<span class="fc" id="L270">    }</span>
+
+    static {
+        /*
+         * &quot;Export&quot; the singleton DGCImpl in a context isolated from
+         * the arbitrary current thread context.
+         */
+<span class="fc" id="L277">        AccessController.doPrivileged(new PrivilegedAction&lt;Void&gt;() {</span>
+            public Void run() {
+                ClassLoader savedCcl =
+<span class="fc" id="L280">                    Thread.currentThread().getContextClassLoader();</span>
+                try {
+<span class="fc" id="L282">                    Thread.currentThread().setContextClassLoader(</span>
+<span class="fc" id="L283">                        ClassLoader.getSystemClassLoader());</span>
+
+                    /*
+                     * Put remote collector object in table by hand to prevent
+                     * listen on port.  (UnicastServerRef.exportObject would
+                     * cause transport to listen.)
+                     */
+                    try {
+<span class="fc" id="L291">                        dgc = new DGCImpl();</span>
+<span class="fc" id="L292">                        ObjID dgcID = new ObjID(ObjID.DGC_ID);</span>
+<span class="fc" id="L293">                        LiveRef ref = new LiveRef(dgcID, 0);</span>
+<span class="fc" id="L294">                        UnicastServerRef disp = new UnicastServerRef(ref);</span>
+<span class="fc" id="L295">                        Remote stub =</span>
+<span class="fc" id="L296">                            Util.createProxy(DGCImpl.class,</span>
+                                             new UnicastRef(ref), true);
+<span class="fc" id="L298">                        disp.setSkeleton(dgc);</span>
+<span class="fc" id="L299">                        Target target =</span>
+<span class="fc" id="L300">                            new Target(dgc, disp, stub, dgcID, true);</span>
+<span class="fc" id="L301">                        ObjectTable.putTarget(target);</span>
+<span class="nc" id="L302">                    } catch (RemoteException e) {</span>
+<span class="nc" id="L303">                        throw new Error(</span>
+                            &quot;exception initializing server-side DGC&quot;, e);
+<span class="fc" id="L305">                    }</span>
+                } finally {
+<span class="pc" id="L307">                    Thread.currentThread().setContextClassLoader(savedCcl);</span>
+<span class="fc" id="L308">                }</span>
+<span class="fc" id="L309">                return null;</span>
+            }
+        });
+<span class="fc" id="L312">    }</span>
+
+    private static class LeaseInfo {
+        VMID vmid;
+        long expiration;
+<span class="fc" id="L317">        Set&lt;Target&gt; notifySet = new HashSet&lt;&gt;();</span>
+
+<span class="fc" id="L319">        LeaseInfo(VMID vmid, long lease) {</span>
+<span class="fc" id="L320">            this.vmid = vmid;</span>
+<span class="fc" id="L321">            expiration = System.currentTimeMillis() + lease;</span>
+<span class="fc" id="L322">        }</span>
+
+        synchronized void renew(long lease) {
+<span class="fc" id="L325">            long newExpiration = System.currentTimeMillis() + lease;</span>
+<span class="fc bfc" id="L326" title="All 2 branches covered.">            if (newExpiration &gt; expiration)</span>
+<span class="fc" id="L327">                expiration = newExpiration;</span>
+<span class="fc" id="L328">        }</span>
+
+        boolean expired(long time) {
+<span class="fc bfc" id="L331" title="All 2 branches covered.">            if (expiration &lt; time) {</span>
+<span class="pc bpc" id="L332" title="1 of 2 branches missed.">                if (dgcLog.isLoggable(Log.BRIEF)) {</span>
+<span class="nc" id="L333">                    dgcLog.log(Log.BRIEF, vmid.toString());</span>
+                }
+<span class="fc" id="L335">                return true;</span>
+            } else {
+<span class="fc" id="L337">                return false;</span>
+            }
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

@@ -1,0 +1,332 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>NativeUnpack.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">com.sun.java.util.jar.pack</a> &gt; <span class="el_source">NativeUnpack.java</span></div><h1>NativeUnpack.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 2003, 2012, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+
+package com.sun.java.util.jar.pack;
+
+import java.io.BufferedInputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.util.jar.JarOutputStream;
+import java.util.jar.Pack200;
+import java.util.zip.CRC32;
+import java.util.zip.Deflater;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
+
+<span class="nc bnc" id="L42" title="All 2 branches missed.">class NativeUnpack {</span>
+    // Pointer to the native unpacker obj
+    private long unpackerPtr;
+
+    // Input stream.
+    private BufferedInputStream in;
+
+    private static synchronized native void initIDs();
+
+    // Starts processing at the indicated position in the buffer.
+    // If the buffer is null, the readInputFn callback is used to get bytes.
+    // Returns (s&lt;&lt;32|f), the number of following segments and files.
+    private synchronized native long start(ByteBuffer buf, long offset);
+
+    // Returns true if there's another, and fills in the parts.
+    private synchronized native boolean getNextFile(Object[] parts);
+
+    private synchronized native ByteBuffer getUnusedInput();
+
+    // Resets the engine and frees all resources.
+    // Returns total number of bytes consumed by the engine.
+    private synchronized native long finish();
+
+    // Setting state in the unpacker.
+    protected  synchronized native boolean setOption(String opt, String value);
+    protected  synchronized native String getOption(String opt);
+
+    private  int _verbose;
+
+    // State for progress bar:
+    private  long _byteCount;      // bytes read in current segment
+    private  int  _segCount;       // number of segs scanned
+    private  int  _fileCount;      // number of files written
+    private  long _estByteLimit;   // estimate of eventual total
+    private  int  _estSegLimit;    // ditto
+    private  int  _estFileLimit;   // ditto
+<span class="nc" id="L78">    private  int  _prevPercent = -1; // for monotonicity</span>
+
+<span class="nc" id="L80">    private final CRC32   _crc32 = new CRC32();</span>
+<span class="nc" id="L81">    private       byte[]  _buf   = new byte[1&lt;&lt;14];</span>
+
+    private  UnpackerImpl _p200;
+    private  PropMap _props;
+
+    static {
+        // If loading from stand alone build uncomment this.
+        // System.loadLibrary(&quot;unpack&quot;);
+<span class="nc" id="L89">        java.security.AccessController.doPrivileged(</span>
+<span class="nc" id="L90">            new java.security.PrivilegedAction&lt;Void&gt;() {</span>
+                public Void run() {
+<span class="nc" id="L92">                    System.loadLibrary(&quot;unpack&quot;);</span>
+<span class="nc" id="L93">                    return null;</span>
+                }
+            });
+<span class="nc" id="L96">        initIDs();</span>
+<span class="nc" id="L97">    }</span>
+
+    NativeUnpack(UnpackerImpl p200) {
+<span class="nc" id="L100">        super();</span>
+<span class="nc" id="L101">        _p200  = p200;</span>
+<span class="nc" id="L102">        _props = p200.props;</span>
+<span class="nc" id="L103">        p200._nunp = this;</span>
+<span class="nc" id="L104">    }</span>
+
+    // for JNI callbacks
+    static private Object currentInstance() {
+<span class="nc" id="L108">        UnpackerImpl p200 = (UnpackerImpl) Utils.getTLGlobals();</span>
+<span class="nc bnc" id="L109" title="All 2 branches missed.">        return (p200 == null)? null: p200._nunp;</span>
+    }
+
+    private synchronized long getUnpackerPtr() {
+<span class="nc" id="L113">        return unpackerPtr;</span>
+    }
+
+    // Callback from the unpacker engine to get more data.
+    private long readInputFn(ByteBuffer pbuf, long minlen) throws IOException {
+<span class="nc bnc" id="L118" title="All 2 branches missed.">        if (in == null)  return 0;  // nothing is readable</span>
+<span class="nc" id="L119">        long maxlen = pbuf.capacity() - pbuf.position();</span>
+<span class="nc bnc" id="L120" title="All 4 branches missed.">        assert(minlen &lt;= maxlen);  // don't talk nonsense</span>
+<span class="nc" id="L121">        long numread = 0;</span>
+<span class="nc" id="L122">        int steps = 0;</span>
+<span class="nc bnc" id="L123" title="All 2 branches missed.">        while (numread &lt; minlen) {</span>
+<span class="nc" id="L124">            steps++;</span>
+            // read available input, up to buf.length or maxlen
+<span class="nc" id="L126">            int readlen = _buf.length;</span>
+<span class="nc bnc" id="L127" title="All 2 branches missed.">            if (readlen &gt; (maxlen - numread))</span>
+<span class="nc" id="L128">                readlen = (int)(maxlen - numread);</span>
+<span class="nc" id="L129">            int nr = in.read(_buf, 0, readlen);</span>
+<span class="nc bnc" id="L130" title="All 2 branches missed.">            if (nr &lt;= 0)  break;</span>
+<span class="nc" id="L131">            numread += nr;</span>
+<span class="nc bnc" id="L132" title="All 4 branches missed.">            assert(numread &lt;= maxlen);</span>
+            // %%% get rid of this extra copy by using nio?
+<span class="nc" id="L134">            pbuf.put(_buf, 0, nr);</span>
+<span class="nc" id="L135">        }</span>
+<span class="nc bnc" id="L136" title="All 2 branches missed.">        if (_verbose &gt; 1)</span>
+<span class="nc" id="L137">            Utils.log.fine(&quot;readInputFn(&quot;+minlen+&quot;,&quot;+maxlen+&quot;) =&gt; &quot;+numread+&quot; steps=&quot;+steps);</span>
+<span class="nc bnc" id="L138" title="All 2 branches missed.">        if (maxlen &gt; 100) {</span>
+<span class="nc" id="L139">            _estByteLimit = _byteCount + maxlen;</span>
+        } else {
+<span class="nc" id="L141">            _estByteLimit = (_byteCount + numread) * 20;</span>
+        }
+<span class="nc" id="L143">        _byteCount += numread;</span>
+<span class="nc" id="L144">        updateProgress();</span>
+<span class="nc" id="L145">        return numread;</span>
+    }
+
+    private void updateProgress() {
+        // Progress is a combination of segment reading and file writing.
+        final double READ_WT  = 0.33;
+        final double WRITE_WT = 0.67;
+<span class="nc" id="L152">        double readProgress = _segCount;</span>
+<span class="nc bnc" id="L153" title="All 4 branches missed.">        if (_estByteLimit &gt; 0 &amp;&amp; _byteCount &gt; 0)</span>
+<span class="nc" id="L154">            readProgress += (double)_byteCount / _estByteLimit;</span>
+<span class="nc" id="L155">        double writeProgress = _fileCount;</span>
+<span class="nc" id="L156">        double scaledProgress</span>
+<span class="nc" id="L157">            = READ_WT  * readProgress  / Math.max(_estSegLimit,1)</span>
+<span class="nc" id="L158">            + WRITE_WT * writeProgress / Math.max(_estFileLimit,1);</span>
+<span class="nc" id="L159">        int percent = (int) Math.round(100*scaledProgress);</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">        if (percent &gt; 100)  percent = 100;</span>
+<span class="nc bnc" id="L161" title="All 2 branches missed.">        if (percent &gt; _prevPercent) {</span>
+<span class="nc" id="L162">            _prevPercent = percent;</span>
+<span class="nc" id="L163">            _props.setInteger(Pack200.Unpacker.PROGRESS, percent);</span>
+<span class="nc bnc" id="L164" title="All 2 branches missed.">            if (_verbose &gt; 0)</span>
+<span class="nc" id="L165">                Utils.log.info(&quot;progress = &quot;+percent);</span>
+        }
+<span class="nc" id="L167">    }</span>
+
+    private void copyInOption(String opt) {
+<span class="nc" id="L170">        String val = _props.getProperty(opt);</span>
+<span class="nc bnc" id="L171" title="All 2 branches missed.">        if (_verbose &gt; 0)</span>
+<span class="nc" id="L172">            Utils.log.info(&quot;set &quot;+opt+&quot;=&quot;+val);</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">        if (val != null) {</span>
+<span class="nc" id="L174">            boolean set = setOption(opt, val);</span>
+<span class="nc bnc" id="L175" title="All 2 branches missed.">            if (!set)</span>
+<span class="nc" id="L176">                Utils.log.warning(&quot;Invalid option &quot;+opt+&quot;=&quot;+val);</span>
+        }
+<span class="nc" id="L178">    }</span>
+
+    void run(InputStream inRaw, JarOutputStream jstream,
+             ByteBuffer presetInput) throws IOException {
+<span class="nc" id="L182">        BufferedInputStream in0 = new BufferedInputStream(inRaw);</span>
+<span class="nc" id="L183">        this.in = in0;    // for readInputFn to see</span>
+<span class="nc" id="L184">        _verbose = _props.getInteger(Utils.DEBUG_VERBOSE);</span>
+        // Fix for BugId: 4902477, -unpack.modification.time = 1059010598000
+        // TODO eliminate and fix in unpack.cpp
+
+<span class="nc bnc" id="L188" title="All 2 branches missed.">        final int modtime = Pack200.Packer.KEEP.equals(_props.getProperty(Utils.UNPACK_MODIFICATION_TIME, &quot;0&quot;)) ?</span>
+<span class="nc" id="L189">                Constants.NO_MODTIME : _props.getTime(Utils.UNPACK_MODIFICATION_TIME);</span>
+
+<span class="nc" id="L191">        copyInOption(Utils.DEBUG_VERBOSE);</span>
+<span class="nc" id="L192">        copyInOption(Pack200.Unpacker.DEFLATE_HINT);</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">        if (modtime == Constants.NO_MODTIME)  // Don't pass KEEP &amp;&amp; NOW</span>
+<span class="nc" id="L194">            copyInOption(Utils.UNPACK_MODIFICATION_TIME);</span>
+<span class="nc" id="L195">        updateProgress();  // reset progress bar</span>
+        for (;;) {
+            // Read the packed bits.
+<span class="nc" id="L198">            long counts = start(presetInput, 0);</span>
+<span class="nc" id="L199">            _byteCount = _estByteLimit = 0;  // reset partial scan counts</span>
+<span class="nc" id="L200">            ++_segCount;  // just finished scanning a whole segment...</span>
+<span class="nc" id="L201">            int nextSeg  = (int)( counts &gt;&gt;&gt; 32 );</span>
+<span class="nc" id="L202">            int nextFile = (int)( counts &gt;&gt;&gt;  0 );</span>
+
+            // Estimate eventual total number of segments and files.
+<span class="nc" id="L205">            _estSegLimit = _segCount + nextSeg;</span>
+<span class="nc" id="L206">            double filesAfterThisSeg = _fileCount + nextFile;</span>
+<span class="nc" id="L207">            _estFileLimit = (int)( (filesAfterThisSeg *</span>
+                                    _estSegLimit) / _segCount );
+
+            // Write the files.
+<span class="nc" id="L211">            int[] intParts = { 0,0, 0, 0 };</span>
+            //    intParts = {size.hi/lo, mod, defl}
+<span class="nc" id="L213">            Object[] parts = { intParts, null, null, null };</span>
+            //       parts = { {intParts}, name, data0/1 }
+<span class="nc bnc" id="L215" title="All 2 branches missed.">            while (getNextFile(parts)) {</span>
+                //BandStructure.printArrayTo(System.out, intParts, 0, parts.length);
+<span class="nc" id="L217">                String name = (String) parts[1];</span>
+<span class="nc" id="L218">                long   size = ( (long)intParts[0] &lt;&lt; 32)</span>
+                            + (((long)intParts[1] &lt;&lt; 32) &gt;&gt;&gt; 32);
+
+<span class="nc bnc" id="L221" title="All 2 branches missed.">                long   mtime = (modtime != Constants.NO_MODTIME ) ?</span>
+                                modtime : intParts[2] ;
+<span class="nc bnc" id="L223" title="All 2 branches missed.">                boolean deflateHint = (intParts[3] != 0);</span>
+<span class="nc" id="L224">                ByteBuffer data0 = (ByteBuffer) parts[2];</span>
+<span class="nc" id="L225">                ByteBuffer data1 = (ByteBuffer) parts[3];</span>
+<span class="nc" id="L226">                writeEntry(jstream, name, mtime, size, deflateHint,</span>
+                           data0, data1);
+<span class="nc" id="L228">                ++_fileCount;</span>
+<span class="nc" id="L229">                updateProgress();</span>
+<span class="nc" id="L230">            }</span>
+<span class="nc" id="L231">            presetInput = getUnusedInput();</span>
+<span class="nc" id="L232">            long consumed = finish();</span>
+<span class="nc bnc" id="L233" title="All 2 branches missed.">            if (_verbose &gt; 0)</span>
+<span class="nc" id="L234">                Utils.log.info(&quot;bytes consumed = &quot;+consumed);</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">            if (presetInput == null &amp;&amp;</span>
+<span class="nc bnc" id="L236" title="All 2 branches missed.">                !Utils.isPackMagic(Utils.readMagic(in0))) {</span>
+<span class="nc" id="L237">                break;</span>
+            }
+<span class="nc bnc" id="L239" title="All 2 branches missed.">            if (_verbose &gt; 0 ) {</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">                if (presetInput != null)</span>
+<span class="nc" id="L241">                    Utils.log.info(&quot;unused input = &quot;+presetInput);</span>
+            }
+<span class="nc" id="L243">        }</span>
+<span class="nc" id="L244">    }</span>
+
+    void run(InputStream in, JarOutputStream jstream) throws IOException {
+<span class="nc" id="L247">        run(in, jstream, null);</span>
+<span class="nc" id="L248">    }</span>
+
+    void run(File inFile, JarOutputStream jstream) throws IOException {
+        // %%% maybe memory-map the file, and pass it straight into unpacker
+<span class="nc" id="L252">        ByteBuffer mappedFile = null;</span>
+<span class="nc" id="L253">        try (FileInputStream fis = new FileInputStream(inFile)) {</span>
+<span class="nc" id="L254">            run(fis, jstream, mappedFile);</span>
+<span class="nc bnc" id="L255" title="All 8 branches missed.">        }</span>
+        // Note:  caller is responsible to finish with jstream.
+<span class="nc" id="L257">    }</span>
+
+    private void writeEntry(JarOutputStream j, String name,
+                            long mtime, long lsize, boolean deflateHint,
+                            ByteBuffer data0, ByteBuffer data1) throws IOException {
+<span class="nc" id="L262">        int size = (int)lsize;</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">        if (size != lsize)</span>
+<span class="nc" id="L264">            throw new IOException(&quot;file too large: &quot;+lsize);</span>
+
+<span class="nc" id="L266">        CRC32 crc32 = _crc32;</span>
+
+<span class="nc bnc" id="L268" title="All 2 branches missed.">        if (_verbose &gt; 1)</span>
+<span class="nc bnc" id="L269" title="All 2 branches missed.">            Utils.log.fine(&quot;Writing entry: &quot;+name+&quot; size=&quot;+size</span>
+                             +(deflateHint?&quot; deflated&quot;:&quot;&quot;));
+
+<span class="nc bnc" id="L272" title="All 2 branches missed.">        if (_buf.length &lt; size) {</span>
+<span class="nc" id="L273">            int newSize = size;</span>
+<span class="nc bnc" id="L274" title="All 2 branches missed.">            while (newSize &lt; _buf.length) {</span>
+<span class="nc" id="L275">                newSize &lt;&lt;= 1;</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">                if (newSize &lt;= 0) {</span>
+<span class="nc" id="L277">                    newSize = size;</span>
+<span class="nc" id="L278">                    break;</span>
+                }
+            }
+<span class="nc" id="L281">            _buf = new byte[newSize];</span>
+        }
+<span class="nc bnc" id="L283" title="All 4 branches missed.">        assert(_buf.length &gt;= size);</span>
+
+<span class="nc" id="L285">        int fillp = 0;</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">        if (data0 != null) {</span>
+<span class="nc" id="L287">            int size0 = data0.capacity();</span>
+<span class="nc" id="L288">            data0.get(_buf, fillp, size0);</span>
+<span class="nc" id="L289">            fillp += size0;</span>
+        }
+<span class="nc bnc" id="L291" title="All 2 branches missed.">        if (data1 != null) {</span>
+<span class="nc" id="L292">            int size1 = data1.capacity();</span>
+<span class="nc" id="L293">            data1.get(_buf, fillp, size1);</span>
+<span class="nc" id="L294">            fillp += size1;</span>
+        }
+<span class="nc bnc" id="L296" title="All 2 branches missed.">        while (fillp &lt; size) {</span>
+            // Fill in rest of data from the stream itself.
+<span class="nc" id="L298">            int nr = in.read(_buf, fillp, size - fillp);</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">            if (nr &lt;= 0)  throw new IOException(&quot;EOF at end of archive&quot;);</span>
+<span class="nc" id="L300">            fillp += nr;</span>
+<span class="nc" id="L301">        }</span>
+
+<span class="nc" id="L303">        ZipEntry z = new ZipEntry(name);</span>
+<span class="nc" id="L304">        z.setTime(mtime * 1000);</span>
+
+<span class="nc bnc" id="L306" title="All 2 branches missed.">        if (size == 0) {</span>
+<span class="nc" id="L307">            z.setMethod(ZipOutputStream.STORED);</span>
+<span class="nc" id="L308">            z.setSize(0);</span>
+<span class="nc" id="L309">            z.setCrc(0);</span>
+<span class="nc" id="L310">            z.setCompressedSize(0);</span>
+<span class="nc bnc" id="L311" title="All 2 branches missed.">        } else if (!deflateHint) {</span>
+<span class="nc" id="L312">            z.setMethod(ZipOutputStream.STORED);</span>
+<span class="nc" id="L313">            z.setSize(size);</span>
+<span class="nc" id="L314">            z.setCompressedSize(size);</span>
+<span class="nc" id="L315">            crc32.reset();</span>
+<span class="nc" id="L316">            crc32.update(_buf, 0, size);</span>
+<span class="nc" id="L317">            z.setCrc(crc32.getValue());</span>
+        } else {
+<span class="nc" id="L319">            z.setMethod(Deflater.DEFLATED);</span>
+<span class="nc" id="L320">            z.setSize(size);</span>
+        }
+
+<span class="nc" id="L323">        j.putNextEntry(z);</span>
+
+<span class="nc bnc" id="L325" title="All 2 branches missed.">        if (size &gt; 0)</span>
+<span class="nc" id="L326">            j.write(_buf, 0, size);</span>
+
+<span class="nc" id="L328">        j.closeEntry();</span>
+<span class="nc bnc" id="L329" title="All 2 branches missed.">        if (_verbose &gt; 0) Utils.log.info(&quot;Writing &quot; + Utils.zeString(z));</span>
+<span class="nc" id="L330">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

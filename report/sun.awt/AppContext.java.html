@@ -1,0 +1,900 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>AppContext.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">sun.awt</a> &gt; <span class="el_source">AppContext.java</span></div><h1>AppContext.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (c) 1998, 2008, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package sun.awt;
+
+import java.awt.EventQueue;
+import java.awt.Window;
+import java.awt.SystemTray;
+import java.awt.TrayIcon;
+import java.awt.Toolkit;
+import java.awt.GraphicsEnvironment;
+import java.awt.event.InvocationEvent;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.IdentityHashMap;
+import java.util.Map;
+import java.util.Set;
+import java.util.HashSet;
+import java.beans.PropertyChangeSupport;
+import java.beans.PropertyChangeListener;
+import sun.util.logging.PlatformLogger;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * The AppContext is a table referenced by ThreadGroup which stores
+ * application service instances.  (If you are not writing an application
+ * service, or don't know what one is, please do not use this class.)
+ * The AppContext allows applet access to what would otherwise be
+ * potentially dangerous services, such as the ability to peek at
+ * EventQueues or change the look-and-feel of a Swing application.&lt;p&gt;
+ *
+ * Most application services use a singleton object to provide their
+ * services, either as a default (such as getSystemEventQueue or
+ * getDefaultToolkit) or as static methods with class data (System).
+ * The AppContext works with the former method by extending the concept
+ * of &quot;default&quot; to be ThreadGroup-specific.  Application services
+ * lookup their singleton in the AppContext.&lt;p&gt;
+ *
+ * For example, here we have a Foo service, with its pre-AppContext
+ * code:&lt;p&gt;
+ * &lt;code&gt;&lt;pre&gt;
+ *    public class Foo {
+ *        private static Foo defaultFoo = new Foo();
+ *
+ *        public static Foo getDefaultFoo() {
+ *            return defaultFoo;
+ *        }
+ *
+ *    ... Foo service methods
+ *    }&lt;/pre&gt;&lt;/code&gt;&lt;p&gt;
+ *
+ * The problem with the above is that the Foo service is global in scope,
+ * so that applets and other untrusted code can execute methods on the
+ * single, shared Foo instance.  The Foo service therefore either needs
+ * to block its use by untrusted code using a SecurityManager test, or
+ * restrict its capabilities so that it doesn't matter if untrusted code
+ * executes it.&lt;p&gt;
+ *
+ * Here's the Foo class written to use the AppContext:&lt;p&gt;
+ * &lt;code&gt;&lt;pre&gt;
+ *    public class Foo {
+ *        public static Foo getDefaultFoo() {
+ *            Foo foo = (Foo)AppContext.getAppContext().get(Foo.class);
+ *            if (foo == null) {
+ *                foo = new Foo();
+ *                getAppContext().put(Foo.class, foo);
+ *            }
+ *            return foo;
+ *        }
+ *
+ *    ... Foo service methods
+ *    }&lt;/pre&gt;&lt;/code&gt;&lt;p&gt;
+ *
+ * Since a separate AppContext can exist for each ThreadGroup, trusted
+ * and untrusted code have access to different Foo instances.  This allows
+ * untrusted code access to &quot;system-wide&quot; services -- the service remains
+ * within the AppContext &quot;sandbox&quot;.  For example, say a malicious applet
+ * wants to peek all of the key events on the EventQueue to listen for
+ * passwords; if separate EventQueues are used for each ThreadGroup
+ * using AppContexts, the only key events that applet will be able to
+ * listen to are its own.  A more reasonable applet request would be to
+ * change the Swing default look-and-feel; with that default stored in
+ * an AppContext, the applet's look-and-feel will change without
+ * disrupting other applets or potentially the browser itself.&lt;p&gt;
+ *
+ * Because the AppContext is a facility for safely extending application
+ * service support to applets, none of its methods may be blocked by a
+ * a SecurityManager check in a valid Java implementation.  Applets may
+ * therefore safely invoke any of its methods without worry of being
+ * blocked.
+ *
+ * Note: If a SecurityManager is installed which derives from
+ * sun.awt.AWTSecurityManager, it may override the
+ * AWTSecurityManager.getAppContext() method to return the proper
+ * AppContext based on the execution context, in the case where
+ * the default ThreadGroup-based AppContext indexing would return
+ * the main &quot;system&quot; AppContext.  For example, in an applet situation,
+ * if a system thread calls into an applet, rather than returning the
+ * main &quot;system&quot; AppContext (the one corresponding to the system thread),
+ * an installed AWTSecurityManager may return the applet's AppContext
+ * based on the execution context.
+ *
+ * @author  Thomas Ball
+ * @author  Fred Ecks
+ */
+public final class AppContext {
+<span class="fc" id="L134">    private static final PlatformLogger log = PlatformLogger.getLogger(&quot;sun.awt.AppContext&quot;);</span>
+
+    /* Since the contents of an AppContext are unique to each Java
+     * session, this class should never be serialized. */
+
+    /*
+     * The key to put()/get() the Java EventQueue into/from the AppContext.
+     */
+<span class="fc" id="L142">    public static final Object EVENT_QUEUE_KEY = new StringBuffer(&quot;EventQueue&quot;);</span>
+
+    /*
+     * The keys to store EventQueue push/pop lock and condition.
+     */
+<span class="fc" id="L147">    public final static Object EVENT_QUEUE_LOCK_KEY = new StringBuilder(&quot;EventQueue.Lock&quot;);</span>
+<span class="fc" id="L148">    public final static Object EVENT_QUEUE_COND_KEY = new StringBuilder(&quot;EventQueue.Condition&quot;);</span>
+
+    /* A map of AppContexts, referenced by ThreadGroup.
+     */
+<span class="fc" id="L152">    private static final Map&lt;ThreadGroup, AppContext&gt; threadGroup2appContext =</span>
+<span class="fc" id="L153">            Collections.synchronizedMap(new IdentityHashMap&lt;ThreadGroup, AppContext&gt;());</span>
+
+    /**
+     * Returns a set containing all &lt;code&gt;AppContext&lt;/code&gt;s.
+     */
+    public static Set&lt;AppContext&gt; getAppContexts() {
+<span class="nc" id="L159">        synchronized (threadGroup2appContext) {</span>
+<span class="nc" id="L160">            return new HashSet&lt;AppContext&gt;(threadGroup2appContext.values());</span>
+<span class="nc" id="L161">        }</span>
+    }
+
+    /* The main &quot;system&quot; AppContext, used by everything not otherwise
+       contained in another AppContext. It is implicitly created for
+       standalone apps only (i.e. not applets)
+     */
+<span class="fc" id="L168">    private static volatile AppContext mainAppContext = null;</span>
+
+<span class="fc" id="L170">    private static class GetAppContextLock {};</span>
+<span class="fc" id="L171">    private final static Object getAppContextLock = new GetAppContextLock();</span>
+
+    /*
+     * The hash map associated with this AppContext.  A private delegate
+     * is used instead of subclassing HashMap so as to avoid all of
+     * HashMap's potentially risky methods, such as clear(), elements(),
+     * putAll(), etc.
+     */
+<span class="fc" id="L179">    private final Map&lt;Object, Object&gt; table = new HashMap&lt;&gt;();</span>
+
+    private final ThreadGroup threadGroup;
+
+    /**
+     * If any &lt;code&gt;PropertyChangeListeners&lt;/code&gt; have been registered,
+     * the &lt;code&gt;changeSupport&lt;/code&gt; field describes them.
+     *
+     * @see #addPropertyChangeListener
+     * @see #removePropertyChangeListener
+     * @see #firePropertyChange
+     */
+<span class="fc" id="L191">    private PropertyChangeSupport changeSupport = null;</span>
+
+    public static final String DISPOSED_PROPERTY_NAME = &quot;disposed&quot;;
+    public static final String GUI_DISPOSED = &quot;guidisposed&quot;;
+
+<span class="pc" id="L196">    private enum State {</span>
+<span class="fc" id="L197">        VALID,</span>
+<span class="fc" id="L198">        BEING_DISPOSED,</span>
+<span class="fc" id="L199">        DISPOSED</span>
+    };
+
+<span class="fc" id="L202">    private volatile State state = State.VALID;</span>
+
+    public boolean isDisposed() {
+<span class="nc bnc" id="L205" title="All 2 branches missed.">        return state == State.DISPOSED;</span>
+    }
+
+    /*
+     * The total number of AppContexts, system-wide.  This number is
+     * incremented at the beginning of the constructor, and decremented
+     * at the end of dispose().  getAppContext() checks to see if this
+     * number is 1.  If so, it returns the sole AppContext without
+     * checking Thread.currentThread().
+     */
+<span class="fc" id="L215">    private static final AtomicInteger numAppContexts = new AtomicInteger(0);</span>
+
+
+    /*
+     * The context ClassLoader that was used to create this AppContext.
+     */
+    private final ClassLoader contextClassLoader;
+
+    /**
+     * Constructor for AppContext.  This method is &lt;i&gt;not&lt;/i&gt; public,
+     * nor should it ever be used as such.  The proper way to construct
+     * an AppContext is through the use of SunToolkit.createNewAppContext.
+     * A ThreadGroup is created for the new AppContext, a Thread is
+     * created within that ThreadGroup, and that Thread calls
+     * SunToolkit.createNewAppContext before calling anything else.
+     * That creates both the new AppContext and its EventQueue.
+     *
+     * @param   threadGroup     The ThreadGroup for the new AppContext
+     * @see     sun.awt.SunToolkit
+     * @since   1.2
+     */
+<span class="fc" id="L236">    AppContext(ThreadGroup threadGroup) {</span>
+<span class="fc" id="L237">        numAppContexts.incrementAndGet();</span>
+
+<span class="fc" id="L239">        this.threadGroup = threadGroup;</span>
+<span class="fc" id="L240">        threadGroup2appContext.put(threadGroup, this);</span>
+
+<span class="fc" id="L242">        this.contextClassLoader =</span>
+<span class="fc" id="L243">             AccessController.doPrivileged(new PrivilegedAction&lt;ClassLoader&gt;() {</span>
+                    public ClassLoader run() {
+<span class="fc" id="L245">                        return Thread.currentThread().getContextClassLoader();</span>
+                    }
+                });
+
+        // Initialize push/pop lock and its condition to be used by all the
+        // EventQueues within this AppContext
+<span class="fc" id="L251">        Lock eventQueuePushPopLock = new ReentrantLock();</span>
+<span class="fc" id="L252">        put(EVENT_QUEUE_LOCK_KEY, eventQueuePushPopLock);</span>
+<span class="fc" id="L253">        Condition eventQueuePushPopCond = eventQueuePushPopLock.newCondition();</span>
+<span class="fc" id="L254">        put(EVENT_QUEUE_COND_KEY, eventQueuePushPopCond);</span>
+<span class="fc" id="L255">    }</span>
+
+<span class="fc" id="L257">    private static final ThreadLocal&lt;AppContext&gt; threadAppContext =</span>
+            new ThreadLocal&lt;AppContext&gt;();
+
+    private final static void initMainAppContext() {
+        // On the main Thread, we get the ThreadGroup, make a corresponding
+        // AppContext, and instantiate the Java EventQueue.  This way, legacy
+        // code is unaffected by the move to multiple AppContext ability.
+<span class="fc" id="L264">        AccessController.doPrivileged(new PrivilegedAction&lt;Void&gt;() {</span>
+            public Void run() {
+                ThreadGroup currentThreadGroup =
+<span class="fc" id="L267">                        Thread.currentThread().getThreadGroup();</span>
+<span class="fc" id="L268">                ThreadGroup parentThreadGroup = currentThreadGroup.getParent();</span>
+<span class="fc bfc" id="L269" title="All 2 branches covered.">                while (parentThreadGroup != null) {</span>
+                    // Find the root ThreadGroup to construct our main AppContext
+<span class="fc" id="L271">                    currentThreadGroup = parentThreadGroup;</span>
+<span class="fc" id="L272">                    parentThreadGroup = currentThreadGroup.getParent();</span>
+                }
+
+<span class="fc" id="L275">                mainAppContext = SunToolkit.createNewAppContext(currentThreadGroup);</span>
+<span class="fc" id="L276">                return null;</span>
+            }
+        });
+<span class="fc" id="L279">    }</span>
+
+    /**
+     * Returns the appropriate AppContext for the caller,
+     * as determined by its ThreadGroup.  If the main &quot;system&quot; AppContext
+     * would be returned and there's an AWTSecurityManager installed, it
+     * is called to get the proper AppContext based on the execution
+     * context.
+     *
+     * @return  the AppContext for the caller.
+     * @see     java.lang.ThreadGroup
+     * @since   1.2
+     */
+    public final static AppContext getAppContext() {
+        // we are standalone app, return the main app context
+<span class="fc bfc" id="L294" title="All 4 branches covered.">        if (numAppContexts.get() == 1 &amp;&amp; mainAppContext != null) {</span>
+<span class="fc" id="L295">            return mainAppContext;</span>
+        }
+
+<span class="fc" id="L298">        AppContext appContext = threadAppContext.get();</span>
+
+<span class="fc bfc" id="L300" title="All 2 branches covered.">        if (null == appContext) {</span>
+<span class="fc" id="L301">            appContext = AccessController.doPrivileged(new PrivilegedAction&lt;AppContext&gt;()</span>
+<span class="fc" id="L302">            {</span>
+                public AppContext run() {
+                    // Get the current ThreadGroup, and look for it and its
+                    // parents in the hash from ThreadGroup to AppContext --
+                    // it should be found, because we use createNewContext()
+                    // when new AppContext objects are created.
+<span class="fc" id="L308">                    ThreadGroup currentThreadGroup = Thread.currentThread().getThreadGroup();</span>
+<span class="fc" id="L309">                    ThreadGroup threadGroup = currentThreadGroup;</span>
+
+                    // Special case: we implicitly create the main app context
+                    // if no contexts have been created yet. This covers standalone apps
+                    // and excludes applets because by the time applet starts
+                    // a number of contexts have already been created by the plugin.
+<span class="fc" id="L315">                    synchronized (getAppContextLock) {</span>
+<span class="fc bfc" id="L316" title="All 2 branches covered.">                        if (numAppContexts.get() == 0) {</span>
+<span class="pc bpc" id="L317" title="1 of 2 branches missed.">                            if (System.getProperty(&quot;javaplugin.version&quot;) == null &amp;&amp;</span>
+<span class="pc bpc" id="L318" title="1 of 2 branches missed.">                                    System.getProperty(&quot;javawebstart.version&quot;) == null) {</span>
+<span class="fc" id="L319">                                initMainAppContext();</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">                            } else if (System.getProperty(&quot;javafx.version&quot;) != null &amp;&amp;</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">                                    threadGroup.getParent() != null) {</span>
+                                // Swing inside JavaFX case
+<span class="nc" id="L323">                                SunToolkit.createNewAppContext();</span>
+                            }
+                        }
+<span class="pc" id="L326">                    }</span>
+
+<span class="fc" id="L328">                    AppContext context = threadGroup2appContext.get(threadGroup);</span>
+<span class="fc bfc" id="L329" title="All 2 branches covered.">                    while (context == null) {</span>
+<span class="fc" id="L330">                        threadGroup = threadGroup.getParent();</span>
+<span class="pc bpc" id="L331" title="1 of 2 branches missed.">                        if (threadGroup == null) {</span>
+<span class="nc" id="L332">                            return null;</span>
+                        }
+<span class="fc" id="L334">                        context = threadGroup2appContext.get(threadGroup);</span>
+                    }
+
+                    // In case we did anything in the above while loop, we add
+                    // all the intermediate ThreadGroups to threadGroup2appContext
+                    // so we won't spin again.
+<span class="fc bfc" id="L340" title="All 2 branches covered.">                    for (ThreadGroup tg = currentThreadGroup; tg != threadGroup; tg = tg.getParent()) {</span>
+<span class="fc" id="L341">                        threadGroup2appContext.put(tg, context);</span>
+                    }
+
+                    // Now we're done, so we cache the latest key/value pair.
+<span class="fc" id="L345">                    threadAppContext.set(context);</span>
+
+<span class="fc" id="L347">                    return context;</span>
+                }
+            });
+        }
+
+<span class="fc" id="L352">        return appContext;</span>
+    }
+
+    /**
+     * Returns true if the specified AppContext is the main AppContext.
+     *
+     * @param   ctx the context to compare with the main context
+     * @return  true if the specified AppContext is the main AppContext.
+     * @since   1.8
+     */
+    public final static boolean isMainContext(AppContext ctx) {
+<span class="nc bnc" id="L363" title="All 4 branches missed.">        return (ctx != null &amp;&amp; ctx == mainAppContext);</span>
+    }
+
+    private final static AppContext getExecutionAppContext() {
+<span class="fc" id="L367">        SecurityManager securityManager = System.getSecurityManager();</span>
+<span class="pc bpc" id="L368" title="2 of 4 branches missed.">        if ((securityManager != null) &amp;&amp;</span>
+            (securityManager instanceof AWTSecurityManager))
+        {
+<span class="nc" id="L371">            AWTSecurityManager awtSecMgr = (AWTSecurityManager) securityManager;</span>
+<span class="nc" id="L372">            AppContext secAppContext = awtSecMgr.getAppContext();</span>
+<span class="nc" id="L373">            return secAppContext; // Return what we're told</span>
+        }
+<span class="fc" id="L375">        return null;</span>
+    }
+
+<span class="fc" id="L378">    private long DISPOSAL_TIMEOUT = 5000;  // Default to 5-second timeout</span>
+                                           // for disposal of all Frames
+                                           // (we wait for this time twice,
+                                           // once for dispose(), and once
+                                           // to clear the EventQueue).
+
+<span class="fc" id="L384">    private long THREAD_INTERRUPT_TIMEOUT = 1000;</span>
+                            // Default to 1-second timeout for all
+                            // interrupted Threads to exit, and another
+                            // 1 second for all stopped Threads to die.
+
+    /**
+     * Disposes of this AppContext, all of its top-level Frames, and
+     * all Threads and ThreadGroups contained within it.
+     *
+     * This method must be called from a Thread which is not contained
+     * within this AppContext.
+     *
+     * @exception  IllegalThreadStateException  if the current thread is
+     *                                    contained within this AppContext
+     * @since      1.2
+     */
+    public void dispose() throws IllegalThreadStateException {
+        // Check to be sure that the current Thread isn't in this AppContext
+<span class="nc bnc" id="L402" title="All 2 branches missed.">        if (this.threadGroup.parentOf(Thread.currentThread().getThreadGroup())) {</span>
+<span class="nc" id="L403">            throw new IllegalThreadStateException(</span>
+                &quot;Current Thread is contained within AppContext to be disposed.&quot;
+              );
+        }
+
+<span class="nc" id="L408">        synchronized(this) {</span>
+<span class="nc bnc" id="L409" title="All 2 branches missed.">            if (this.state != State.VALID) {</span>
+<span class="nc" id="L410">                return; // If already disposed or being disposed, bail.</span>
+            }
+
+<span class="nc" id="L413">            this.state = State.BEING_DISPOSED;</span>
+<span class="nc" id="L414">        }</span>
+
+<span class="nc" id="L416">        final PropertyChangeSupport changeSupport = this.changeSupport;</span>
+<span class="nc bnc" id="L417" title="All 2 branches missed.">        if (changeSupport != null) {</span>
+<span class="nc" id="L418">            changeSupport.firePropertyChange(DISPOSED_PROPERTY_NAME, false, true);</span>
+        }
+
+        // First, we post an InvocationEvent to be run on the
+        // EventDispatchThread which disposes of all top-level Frames and TrayIcons
+
+<span class="nc" id="L424">        final Object notificationLock = new Object();</span>
+
+<span class="nc" id="L426">        Runnable runnable = new Runnable() {</span>
+            public void run() {
+<span class="nc" id="L428">                Window[] windowsToDispose = Window.getOwnerlessWindows();</span>
+<span class="nc bnc" id="L429" title="All 2 branches missed.">                for (Window w : windowsToDispose) {</span>
+                    try {
+<span class="nc" id="L431">                        w.dispose();</span>
+<span class="nc" id="L432">                    } catch (Throwable t) {</span>
+<span class="nc" id="L433">                        log.finer(&quot;exception occurred while disposing app context&quot;, t);</span>
+<span class="nc" id="L434">                    }</span>
+                }
+<span class="nc" id="L436">                AccessController.doPrivileged(new PrivilegedAction&lt;Void&gt;() {</span>
+                        public Void run() {
+<span class="nc bnc" id="L438" title="All 4 branches missed.">                            if (!GraphicsEnvironment.isHeadless() &amp;&amp; SystemTray.isSupported())</span>
+                            {
+<span class="nc" id="L440">                                SystemTray systemTray = SystemTray.getSystemTray();</span>
+<span class="nc" id="L441">                                TrayIcon[] trayIconsToDispose = systemTray.getTrayIcons();</span>
+<span class="nc bnc" id="L442" title="All 2 branches missed.">                                for (TrayIcon ti : trayIconsToDispose) {</span>
+<span class="nc" id="L443">                                    systemTray.remove(ti);</span>
+                                }
+                            }
+<span class="nc" id="L446">                            return null;</span>
+                        }
+                    });
+                // Alert PropertyChangeListeners that the GUI has been disposed.
+<span class="nc bnc" id="L450" title="All 2 branches missed.">                if (changeSupport != null) {</span>
+<span class="nc" id="L451">                    changeSupport.firePropertyChange(GUI_DISPOSED, false, true);</span>
+                }
+<span class="nc" id="L453">                synchronized(notificationLock) {</span>
+<span class="nc" id="L454">                    notificationLock.notifyAll(); // Notify caller that we're done</span>
+<span class="nc" id="L455">                }</span>
+<span class="nc" id="L456">            }</span>
+        };
+<span class="nc" id="L458">        synchronized(notificationLock) {</span>
+<span class="nc" id="L459">            SunToolkit.postEvent(this,</span>
+<span class="nc" id="L460">                new InvocationEvent(Toolkit.getDefaultToolkit(), runnable));</span>
+            try {
+<span class="nc" id="L462">                notificationLock.wait(DISPOSAL_TIMEOUT);</span>
+<span class="nc" id="L463">            } catch (InterruptedException e) { }</span>
+<span class="nc" id="L464">        }</span>
+
+        // Next, we post another InvocationEvent to the end of the
+        // EventQueue.  When it's executed, we know we've executed all
+        // events in the queue.
+
+<span class="nc" id="L470">        runnable = new Runnable() { public void run() {</span>
+<span class="nc" id="L471">            synchronized(notificationLock) {</span>
+<span class="nc" id="L472">                notificationLock.notifyAll(); // Notify caller that we're done</span>
+<span class="nc" id="L473">            }</span>
+<span class="nc" id="L474">        } };</span>
+<span class="nc" id="L475">        synchronized(notificationLock) {</span>
+<span class="nc" id="L476">            SunToolkit.postEvent(this,</span>
+<span class="nc" id="L477">                new InvocationEvent(Toolkit.getDefaultToolkit(), runnable));</span>
+            try {
+<span class="nc" id="L479">                notificationLock.wait(DISPOSAL_TIMEOUT);</span>
+<span class="nc" id="L480">            } catch (InterruptedException e) { }</span>
+<span class="nc" id="L481">        }</span>
+
+        // We are done with posting events, so change the state to disposed
+<span class="nc" id="L484">        synchronized(this) {</span>
+<span class="nc" id="L485">            this.state = State.DISPOSED;</span>
+<span class="nc" id="L486">        }</span>
+
+        // Next, we interrupt all Threads in the ThreadGroup
+<span class="nc" id="L489">        this.threadGroup.interrupt();</span>
+            // Note, the EventDispatchThread we've interrupted may dump an
+            // InterruptedException to the console here.  This needs to be
+            // fixed in the EventDispatchThread, not here.
+
+        // Next, we sleep 10ms at a time, waiting for all of the active
+        // Threads in the ThreadGroup to exit.
+
+<span class="nc" id="L497">        long startTime = System.currentTimeMillis();</span>
+<span class="nc" id="L498">        long endTime = startTime + THREAD_INTERRUPT_TIMEOUT;</span>
+<span class="nc bnc" id="L499" title="All 2 branches missed.">        while ((this.threadGroup.activeCount() &gt; 0) &amp;&amp;</span>
+<span class="nc bnc" id="L500" title="All 2 branches missed.">               (System.currentTimeMillis() &lt; endTime)) {</span>
+            try {
+<span class="nc" id="L502">                Thread.sleep(10);</span>
+<span class="nc" id="L503">            } catch (InterruptedException e) { }</span>
+        }
+
+        // Then, we stop any remaining Threads
+<span class="nc" id="L507">        this.threadGroup.stop();</span>
+
+        // Next, we sleep 10ms at a time, waiting for all of the active
+        // Threads in the ThreadGroup to die.
+
+<span class="nc" id="L512">        startTime = System.currentTimeMillis();</span>
+<span class="nc" id="L513">        endTime = startTime + THREAD_INTERRUPT_TIMEOUT;</span>
+<span class="nc bnc" id="L514" title="All 2 branches missed.">        while ((this.threadGroup.activeCount() &gt; 0) &amp;&amp;</span>
+<span class="nc bnc" id="L515" title="All 2 branches missed.">               (System.currentTimeMillis() &lt; endTime)) {</span>
+            try {
+<span class="nc" id="L517">                Thread.sleep(10);</span>
+<span class="nc" id="L518">            } catch (InterruptedException e) { }</span>
+        }
+
+        // Next, we remove this and all subThreadGroups from threadGroup2appContext
+<span class="nc" id="L522">        int numSubGroups = this.threadGroup.activeGroupCount();</span>
+<span class="nc bnc" id="L523" title="All 2 branches missed.">        if (numSubGroups &gt; 0) {</span>
+<span class="nc" id="L524">            ThreadGroup [] subGroups = new ThreadGroup[numSubGroups];</span>
+<span class="nc" id="L525">            numSubGroups = this.threadGroup.enumerate(subGroups);</span>
+<span class="nc bnc" id="L526" title="All 2 branches missed.">            for (int subGroup = 0; subGroup &lt; numSubGroups; subGroup++) {</span>
+<span class="nc" id="L527">                threadGroup2appContext.remove(subGroups[subGroup]);</span>
+            }
+        }
+<span class="nc" id="L530">        threadGroup2appContext.remove(this.threadGroup);</span>
+
+<span class="nc" id="L532">        threadAppContext.set(null);</span>
+
+        // Finally, we destroy the ThreadGroup entirely.
+        try {
+<span class="nc" id="L536">            this.threadGroup.destroy();</span>
+<span class="nc" id="L537">        } catch (IllegalThreadStateException e) {</span>
+            // Fired if not all the Threads died, ignore it and proceed
+<span class="nc" id="L539">        }</span>
+
+<span class="nc" id="L541">        synchronized (table) {</span>
+<span class="nc" id="L542">            this.table.clear(); // Clear out the Hashtable to ease garbage collection</span>
+<span class="nc" id="L543">        }</span>
+
+<span class="nc" id="L545">        numAppContexts.decrementAndGet();</span>
+
+<span class="nc" id="L547">        mostRecentKeyValue = null;</span>
+<span class="nc" id="L548">    }</span>
+
+    static final class PostShutdownEventRunnable implements Runnable {
+        private final AppContext appContext;
+
+<span class="nc" id="L553">        public PostShutdownEventRunnable(AppContext ac) {</span>
+<span class="nc" id="L554">            appContext = ac;</span>
+<span class="nc" id="L555">        }</span>
+
+        public void run() {
+<span class="nc" id="L558">            final EventQueue eq = (EventQueue)appContext.get(EVENT_QUEUE_KEY);</span>
+<span class="nc bnc" id="L559" title="All 2 branches missed.">            if (eq != null) {</span>
+<span class="nc" id="L560">                eq.postEvent(AWTAutoShutdown.getShutdownEvent());</span>
+            }
+<span class="nc" id="L562">        }</span>
+    }
+
+    static final class CreateThreadAction implements PrivilegedAction&lt;Thread&gt; {
+        private final AppContext appContext;
+        private final Runnable runnable;
+
+<span class="nc" id="L569">        public CreateThreadAction(AppContext ac, Runnable r) {</span>
+<span class="nc" id="L570">            appContext = ac;</span>
+<span class="nc" id="L571">            runnable = r;</span>
+<span class="nc" id="L572">        }</span>
+
+        public Thread run() {
+<span class="nc" id="L575">            Thread t = new Thread(appContext.getThreadGroup(), runnable);</span>
+<span class="nc" id="L576">            t.setContextClassLoader(appContext.getContextClassLoader());</span>
+<span class="nc" id="L577">            t.setPriority(Thread.NORM_PRIORITY + 1);</span>
+<span class="nc" id="L578">            t.setDaemon(true);</span>
+<span class="nc" id="L579">            return t;</span>
+        }
+    }
+
+    static void stopEventDispatchThreads() {
+<span class="nc bnc" id="L584" title="All 2 branches missed.">        for (AppContext appContext: getAppContexts()) {</span>
+<span class="nc bnc" id="L585" title="All 2 branches missed.">            if (appContext.isDisposed()) {</span>
+<span class="nc" id="L586">                continue;</span>
+            }
+<span class="nc" id="L588">            Runnable r = new PostShutdownEventRunnable(appContext);</span>
+            // For security reasons EventQueue.postEvent should only be called
+            // on a thread that belongs to the corresponding thread group.
+<span class="nc bnc" id="L591" title="All 2 branches missed.">            if (appContext != AppContext.getAppContext()) {</span>
+                // Create a thread that belongs to the thread group associated
+                // with the AppContext and invokes EventQueue.postEvent.
+<span class="nc" id="L594">                PrivilegedAction&lt;Thread&gt; action = new CreateThreadAction(appContext, r);</span>
+<span class="nc" id="L595">                Thread thread = AccessController.doPrivileged(action);</span>
+<span class="nc" id="L596">                thread.start();</span>
+<span class="nc" id="L597">            } else {</span>
+<span class="nc" id="L598">                r.run();</span>
+            }
+<span class="nc" id="L600">        }</span>
+<span class="nc" id="L601">    }</span>
+
+<span class="fc" id="L603">    private MostRecentKeyValue mostRecentKeyValue = null;</span>
+<span class="fc" id="L604">    private MostRecentKeyValue shadowMostRecentKeyValue = null;</span>
+
+    /**
+     * Returns the value to which the specified key is mapped in this context.
+     *
+     * @param   key   a key in the AppContext.
+     * @return  the value to which the key is mapped in this AppContext;
+     *          &lt;code&gt;null&lt;/code&gt; if the key is not mapped to any value.
+     * @see     #put(Object, Object)
+     * @since   1.2
+     */
+    public Object get(Object key) {
+        /*
+         * The most recent reference should be updated inside a synchronized
+         * block to avoid a race when put() and get() are executed in
+         * parallel on different threads.
+         */
+<span class="fc" id="L621">        synchronized (table) {</span>
+            // Note: this most recent key/value caching is thread-hot.
+            // A simple test using SwingSet found that 72% of lookups
+            // were matched using the most recent key/value.  By instantiating
+            // a simple MostRecentKeyValue object on cache misses, the
+            // cache hits can be processed without synchronization.
+
+<span class="fc" id="L628">            MostRecentKeyValue recent = mostRecentKeyValue;</span>
+<span class="fc bfc" id="L629" title="All 4 branches covered.">            if ((recent != null) &amp;&amp; (recent.key == key)) {</span>
+<span class="fc" id="L630">                return recent.value;</span>
+            }
+
+<span class="fc" id="L633">            Object value = table.get(key);</span>
+<span class="fc bfc" id="L634" title="All 2 branches covered.">            if(mostRecentKeyValue == null) {</span>
+<span class="fc" id="L635">                mostRecentKeyValue = new MostRecentKeyValue(key, value);</span>
+<span class="fc" id="L636">                shadowMostRecentKeyValue = new MostRecentKeyValue(key, value);</span>
+            } else {
+<span class="fc" id="L638">                MostRecentKeyValue auxKeyValue = mostRecentKeyValue;</span>
+<span class="fc" id="L639">                shadowMostRecentKeyValue.setPair(key, value);</span>
+<span class="fc" id="L640">                mostRecentKeyValue = shadowMostRecentKeyValue;</span>
+<span class="fc" id="L641">                shadowMostRecentKeyValue = auxKeyValue;</span>
+            }
+<span class="fc" id="L643">            return value;</span>
+<span class="nc" id="L644">        }</span>
+    }
+
+    /**
+     * Maps the specified &lt;code&gt;key&lt;/code&gt; to the specified
+     * &lt;code&gt;value&lt;/code&gt; in this AppContext.  Neither the key nor the
+     * value can be &lt;code&gt;null&lt;/code&gt;.
+     * &lt;p&gt;
+     * The value can be retrieved by calling the &lt;code&gt;get&lt;/code&gt; method
+     * with a key that is equal to the original key.
+     *
+     * @param      key     the AppContext key.
+     * @param      value   the value.
+     * @return     the previous value of the specified key in this
+     *             AppContext, or &lt;code&gt;null&lt;/code&gt; if it did not have one.
+     * @exception  NullPointerException  if the key or value is
+     *               &lt;code&gt;null&lt;/code&gt;.
+     * @see     #get(Object)
+     * @since   1.2
+     */
+    public Object put(Object key, Object value) {
+<span class="fc" id="L665">        synchronized (table) {</span>
+<span class="fc" id="L666">            MostRecentKeyValue recent = mostRecentKeyValue;</span>
+<span class="fc bfc" id="L667" title="All 4 branches covered.">            if ((recent != null) &amp;&amp; (recent.key == key))</span>
+<span class="fc" id="L668">                recent.value = value;</span>
+<span class="fc" id="L669">            return table.put(key, value);</span>
+<span class="nc" id="L670">        }</span>
+    }
+
+    /**
+     * Removes the key (and its corresponding value) from this
+     * AppContext. This method does nothing if the key is not in the
+     * AppContext.
+     *
+     * @param   key   the key that needs to be removed.
+     * @return  the value to which the key had been mapped in this AppContext,
+     *          or &lt;code&gt;null&lt;/code&gt; if the key did not have a mapping.
+     * @since   1.2
+     */
+    public Object remove(Object key) {
+<span class="fc" id="L684">        synchronized (table) {</span>
+<span class="fc" id="L685">            MostRecentKeyValue recent = mostRecentKeyValue;</span>
+<span class="pc bpc" id="L686" title="2 of 4 branches missed.">            if ((recent != null) &amp;&amp; (recent.key == key))</span>
+<span class="nc" id="L687">                recent.value = null;</span>
+<span class="fc" id="L688">            return table.remove(key);</span>
+<span class="nc" id="L689">        }</span>
+    }
+
+    /**
+     * Returns the root ThreadGroup for all Threads contained within
+     * this AppContext.
+     * @since   1.2
+     */
+    public ThreadGroup getThreadGroup() {
+<span class="nc" id="L698">        return threadGroup;</span>
+    }
+
+    /**
+     * Returns the context ClassLoader that was used to create this
+     * AppContext.
+     *
+     * @see java.lang.Thread#getContextClassLoader
+     */
+    public ClassLoader getContextClassLoader() {
+<span class="nc" id="L708">        return contextClassLoader;</span>
+    }
+
+    /**
+     * Returns a string representation of this AppContext.
+     * @since   1.2
+     */
+    @Override
+    public String toString() {
+<span class="nc" id="L717">        return getClass().getName() + &quot;[threadGroup=&quot; + threadGroup.getName() + &quot;]&quot;;</span>
+    }
+
+    /**
+     * Returns an array of all the property change listeners
+     * registered on this component.
+     *
+     * @return all of this component's &lt;code&gt;PropertyChangeListener&lt;/code&gt;s
+     *         or an empty array if no property change
+     *         listeners are currently registered
+     *
+     * @see      #addPropertyChangeListener
+     * @see      #removePropertyChangeListener
+     * @see      #getPropertyChangeListeners(java.lang.String)
+     * @see      java.beans.PropertyChangeSupport#getPropertyChangeListeners
+     * @since    1.4
+     */
+    public synchronized PropertyChangeListener[] getPropertyChangeListeners() {
+<span class="nc bnc" id="L735" title="All 2 branches missed.">        if (changeSupport == null) {</span>
+<span class="nc" id="L736">            return new PropertyChangeListener[0];</span>
+        }
+<span class="nc" id="L738">        return changeSupport.getPropertyChangeListeners();</span>
+    }
+
+    /**
+     * Adds a PropertyChangeListener to the listener list for a specific
+     * property. The specified property may be one of the following:
+     * &lt;ul&gt;
+     *    &lt;li&gt;if this AppContext is disposed (&quot;disposed&quot;)&lt;/li&gt;
+     * &lt;/ul&gt;
+     * &lt;ul&gt;
+     *    &lt;li&gt;if this AppContext's unowned Windows have been disposed
+     *    (&quot;guidisposed&quot;).  Code to cleanup after the GUI is disposed
+     *    (such as LookAndFeel.uninitialize()) should execute in response to
+     *    this property being fired.  Notifications for the &quot;guidisposed&quot;
+     *    property are sent on the event dispatch thread.&lt;/li&gt;
+     * &lt;/ul&gt;
+     * &lt;p&gt;
+     * If listener is null, no exception is thrown and no action is performed.
+     *
+     * @param propertyName one of the property names listed above
+     * @param listener the PropertyChangeListener to be added
+     *
+     * @see #removePropertyChangeListener(java.lang.String, java.beans.PropertyChangeListener)
+     * @see #getPropertyChangeListeners(java.lang.String)
+     * @see #addPropertyChangeListener(java.lang.String, java.beans.PropertyChangeListener)
+     */
+    public synchronized void addPropertyChangeListener(
+                             String propertyName,
+                             PropertyChangeListener listener) {
+<span class="nc bnc" id="L767" title="All 2 branches missed.">        if (listener == null) {</span>
+<span class="nc" id="L768">            return;</span>
+        }
+<span class="nc bnc" id="L770" title="All 2 branches missed.">        if (changeSupport == null) {</span>
+<span class="nc" id="L771">            changeSupport = new PropertyChangeSupport(this);</span>
+        }
+<span class="nc" id="L773">        changeSupport.addPropertyChangeListener(propertyName, listener);</span>
+<span class="nc" id="L774">    }</span>
+
+    /**
+     * Removes a PropertyChangeListener from the listener list for a specific
+     * property. This method should be used to remove PropertyChangeListeners
+     * that were registered for a specific bound property.
+     * &lt;p&gt;
+     * If listener is null, no exception is thrown and no action is performed.
+     *
+     * @param propertyName a valid property name
+     * @param listener the PropertyChangeListener to be removed
+     *
+     * @see #addPropertyChangeListener(java.lang.String, java.beans.PropertyChangeListener)
+     * @see #getPropertyChangeListeners(java.lang.String)
+     * @see #removePropertyChangeListener(java.beans.PropertyChangeListener)
+     */
+    public synchronized void removePropertyChangeListener(
+                             String propertyName,
+                             PropertyChangeListener listener) {
+<span class="nc bnc" id="L793" title="All 4 branches missed.">        if (listener == null || changeSupport == null) {</span>
+<span class="nc" id="L794">            return;</span>
+        }
+<span class="nc" id="L796">        changeSupport.removePropertyChangeListener(propertyName, listener);</span>
+<span class="nc" id="L797">    }</span>
+
+    /**
+     * Returns an array of all the listeners which have been associated
+     * with the named property.
+     *
+     * @return all of the &lt;code&gt;PropertyChangeListeners&lt;/code&gt; associated with
+     *         the named property or an empty array if no listeners have
+     *         been added
+     *
+     * @see #addPropertyChangeListener(java.lang.String, java.beans.PropertyChangeListener)
+     * @see #removePropertyChangeListener(java.lang.String, java.beans.PropertyChangeListener)
+     * @see #getPropertyChangeListeners
+     * @since 1.4
+     */
+    public synchronized PropertyChangeListener[] getPropertyChangeListeners(
+                                                        String propertyName) {
+<span class="nc bnc" id="L814" title="All 2 branches missed.">        if (changeSupport == null) {</span>
+<span class="nc" id="L815">            return new PropertyChangeListener[0];</span>
+        }
+<span class="nc" id="L817">        return changeSupport.getPropertyChangeListeners(propertyName);</span>
+    }
+
+    // Set up JavaAWTAccess in SharedSecrets
+    static {
+<span class="fc" id="L822">        sun.misc.SharedSecrets.setJavaAWTAccess(new sun.misc.JavaAWTAccess() {</span>
+            private boolean hasRootThreadGroup(final AppContext ecx) {
+<span class="fc" id="L824">                return AccessController.doPrivileged(new PrivilegedAction&lt;Boolean&gt;() {</span>
+                    @Override
+                    public Boolean run() {
+<span class="fc bfc" id="L827" title="All 2 branches covered.">                        return ecx.threadGroup.getParent() == null;</span>
+                    }
+                });
+            }
+
+            /**
+             * Returns the AppContext used for applet logging isolation, or null if
+             * the default global context can be used.
+             * If there's no applet, or if the caller is a stand alone application,
+             * or running in the main app context, returns null.
+             * Otherwise, returns the AppContext of the calling applet.
+             * @return null if the global default context can be used,
+             *         an AppContext otherwise.
+             **/
+            public Object getAppletContext() {
+                // There's no AppContext: return null.
+                // No need to call getAppContext() if numAppContext == 0:
+                // it means that no AppContext has been created yet, and
+                // we don't want to trigger the creation of a main app
+                // context since we don't need it.
+<span class="pc bpc" id="L847" title="1 of 2 branches missed.">                if (numAppContexts.get() == 0) return null;</span>
+
+                // Get the context from the security manager
+<span class="fc" id="L850">                AppContext ecx = getExecutionAppContext();</span>
+
+                // Not sure we really need to re-check numAppContexts here.
+                // If all applets have gone away then we could have a
+                // numAppContexts coming back to 0. So we recheck
+                // it here because we don't want to trigger the
+                // creation of a main AppContext in that case.
+                // This is probably not 100% MT-safe but should reduce
+                // the window of opportunity in which that issue could
+                // happen.
+<span class="pc bpc" id="L860" title="1 of 2 branches missed.">                if (numAppContexts.get() &gt; 0) {</span>
+                   // Defaults to thread group caching.
+                   // This is probably not required as we only really need
+                   // isolation in a deployed applet environment, in which
+                   // case ecx will not be null when we reach here
+                   // However it helps emulate the deployed environment,
+                   // in tests for instance.
+<span class="pc bpc" id="L867" title="1 of 2 branches missed.">                   ecx = ecx != null ? ecx : getAppContext();</span>
+                }
+
+                // getAppletContext() may be called when initializing the main
+                // app context - in which case mainAppContext will still be
+                // null. To work around this issue we simply use
+                // AppContext.threadGroup.getParent() == null instead, since
+                // mainAppContext is the only AppContext which should have
+                // the root TG as its thread group.
+                // See: JDK-8023258
+<span class="pc bpc" id="L877" title="1 of 2 branches missed.">                final boolean isMainAppContext = ecx == null</span>
+<span class="fc bfc" id="L878" title="All 2 branches covered.">                    || mainAppContext == ecx</span>
+<span class="pc bpc" id="L879" title="1 of 4 branches missed.">                    || mainAppContext == null &amp;&amp; hasRootThreadGroup(ecx);</span>
+
+<span class="fc bfc" id="L881" title="All 2 branches covered.">                return isMainAppContext ? null : ecx;</span>
+            }
+
+        });
+<span class="fc" id="L885">    }</span>
+}
+
+final class MostRecentKeyValue {
+    Object key;
+    Object value;
+<span class="fc" id="L891">    MostRecentKeyValue(Object k, Object v) {</span>
+<span class="fc" id="L892">        key = k;</span>
+<span class="fc" id="L893">        value = v;</span>
+<span class="fc" id="L894">    }</span>
+    void setPair(Object k, Object v) {
+<span class="fc" id="L896">        key = k;</span>
+<span class="fc" id="L897">        value = v;</span>
+<span class="fc" id="L898">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>

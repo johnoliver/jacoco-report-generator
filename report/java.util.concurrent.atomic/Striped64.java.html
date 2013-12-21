@@ -1,0 +1,414 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>Striped64.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Foo</a> &gt; <a href="index.html" class="el_package">java.util.concurrent.atomic</a> &gt; <span class="el_source">Striped64.java</span></div><h1>Striped64.java</h1><pre class="source lang-java linenums">/*
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the &quot;Classpath&quot; exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+/*
+ * This file is available under and governed by the GNU General Public
+ * License version 2 only, as published by the Free Software Foundation.
+ * However, the following notice accompanied the original version of this
+ * file:
+ *
+ * Written by Doug Lea with assistance from members of JCP JSR-166
+ * Expert Group and released to the public domain, as explained at
+ * http://creativecommons.org/publicdomain/zero/1.0/
+ */
+
+package java.util.concurrent.atomic;
+import java.util.function.LongBinaryOperator;
+import java.util.function.DoubleBinaryOperator;
+import java.util.concurrent.ThreadLocalRandom;
+
+/**
+ * A package-local class holding common representation and mechanics
+ * for classes supporting dynamic striping on 64bit values. The class
+ * extends Number so that concrete subclasses must publicly do so.
+ */
+@SuppressWarnings(&quot;serial&quot;)
+abstract class Striped64 extends Number {
+    /*
+     * This class maintains a lazily-initialized table of atomically
+     * updated variables, plus an extra &quot;base&quot; field. The table size
+     * is a power of two. Indexing uses masked per-thread hash codes.
+     * Nearly all declarations in this class are package-private,
+     * accessed directly by subclasses.
+     *
+     * Table entries are of class Cell; a variant of AtomicLong padded
+     * (via @sun.misc.Contended) to reduce cache contention. Padding
+     * is overkill for most Atomics because they are usually
+     * irregularly scattered in memory and thus don't interfere much
+     * with each other. But Atomic objects residing in arrays will
+     * tend to be placed adjacent to each other, and so will most
+     * often share cache lines (with a huge negative performance
+     * impact) without this precaution.
+     *
+     * In part because Cells are relatively large, we avoid creating
+     * them until they are needed.  When there is no contention, all
+     * updates are made to the base field.  Upon first contention (a
+     * failed CAS on base update), the table is initialized to size 2.
+     * The table size is doubled upon further contention until
+     * reaching the nearest power of two greater than or equal to the
+     * number of CPUS. Table slots remain empty (null) until they are
+     * needed.
+     *
+     * A single spinlock (&quot;cellsBusy&quot;) is used for initializing and
+     * resizing the table, as well as populating slots with new Cells.
+     * There is no need for a blocking lock; when the lock is not
+     * available, threads try other slots (or the base).  During these
+     * retries, there is increased contention and reduced locality,
+     * which is still better than alternatives.
+     *
+     * The Thread probe fields maintained via ThreadLocalRandom serve
+     * as per-thread hash codes. We let them remain uninitialized as
+     * zero (if they come in this way) until they contend at slot
+     * 0. They are then initialized to values that typically do not
+     * often conflict with others.  Contention and/or table collisions
+     * are indicated by failed CASes when performing an update
+     * operation. Upon a collision, if the table size is less than
+     * the capacity, it is doubled in size unless some other thread
+     * holds the lock. If a hashed slot is empty, and lock is
+     * available, a new Cell is created. Otherwise, if the slot
+     * exists, a CAS is tried.  Retries proceed by &quot;double hashing&quot;,
+     * using a secondary hash (Marsaglia XorShift) to try to find a
+     * free slot.
+     *
+     * The table size is capped because, when there are more threads
+     * than CPUs, supposing that each thread were bound to a CPU,
+     * there would exist a perfect hash function mapping threads to
+     * slots that eliminates collisions. When we reach capacity, we
+     * search for this mapping by randomly varying the hash codes of
+     * colliding threads.  Because search is random, and collisions
+     * only become known via CAS failures, convergence can be slow,
+     * and because threads are typically not bound to CPUS forever,
+     * may not occur at all. However, despite these limitations,
+     * observed contention rates are typically low in these cases.
+     *
+     * It is possible for a Cell to become unused when threads that
+     * once hashed to it terminate, as well as in the case where
+     * doubling the table causes no thread to hash to it under
+     * expanded mask.  We do not try to detect or remove such cells,
+     * under the assumption that for long-running instances, observed
+     * contention levels will recur, so the cells will eventually be
+     * needed again; and for short-lived ones, it does not matter.
+     */
+
+    /**
+     * Padded variant of AtomicLong supporting only raw accesses plus CAS.
+     *
+     * JVM intrinsics note: It would be possible to use a release-only
+     * form of CAS here, if it were provided.
+     */
+    @sun.misc.Contended static final class Cell {
+        volatile long value;
+<span class="fc" id="L122">        Cell(long x) { value = x; }</span>
+        final boolean cas(long cmp, long val) {
+<span class="fc" id="L124">            return UNSAFE.compareAndSwapLong(this, valueOffset, cmp, val);</span>
+        }
+
+        // Unsafe mechanics
+        private static final sun.misc.Unsafe UNSAFE;
+        private static final long valueOffset;
+        static {
+            try {
+<span class="fc" id="L132">                UNSAFE = sun.misc.Unsafe.getUnsafe();</span>
+<span class="fc" id="L133">                Class&lt;?&gt; ak = Cell.class;</span>
+<span class="fc" id="L134">                valueOffset = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L135">                    (ak.getDeclaredField(&quot;value&quot;));</span>
+<span class="nc" id="L136">            } catch (Exception e) {</span>
+<span class="nc" id="L137">                throw new Error(e);</span>
+<span class="fc" id="L138">            }</span>
+<span class="fc" id="L139">        }</span>
+    }
+
+    /** Number of CPUS, to place bound on table size */
+<span class="fc" id="L143">    static final int NCPU = Runtime.getRuntime().availableProcessors();</span>
+
+    /**
+     * Table of cells. When non-null, size is a power of 2.
+     */
+    transient volatile Cell[] cells;
+
+    /**
+     * Base value, used mainly when there is no contention, but also as
+     * a fallback during table initialization races. Updated via CAS.
+     */
+    transient volatile long base;
+
+    /**
+     * Spinlock (locked via CAS) used when resizing and/or creating Cells.
+     */
+    transient volatile int cellsBusy;
+
+    /**
+     * Package-private default constructor
+     */
+<span class="fc" id="L164">    Striped64() {</span>
+<span class="fc" id="L165">    }</span>
+
+    /**
+     * CASes the base field.
+     */
+    final boolean casBase(long cmp, long val) {
+<span class="fc" id="L171">        return UNSAFE.compareAndSwapLong(this, BASE, cmp, val);</span>
+    }
+
+    /**
+     * CASes the cellsBusy field from 0 to 1 to acquire lock.
+     */
+    final boolean casCellsBusy() {
+<span class="fc" id="L178">        return UNSAFE.compareAndSwapInt(this, CELLSBUSY, 0, 1);</span>
+    }
+
+    /**
+     * Returns the probe value for the current thread.
+     * Duplicated from ThreadLocalRandom because of packaging restrictions.
+     */
+    static final int getProbe() {
+<span class="fc" id="L186">        return UNSAFE.getInt(Thread.currentThread(), PROBE);</span>
+    }
+
+    /**
+     * Pseudo-randomly advances and records the given probe value for the
+     * given thread.
+     * Duplicated from ThreadLocalRandom because of packaging restrictions.
+     */
+    static final int advanceProbe(int probe) {
+<span class="fc" id="L195">        probe ^= probe &lt;&lt; 13;   // xorshift</span>
+<span class="fc" id="L196">        probe ^= probe &gt;&gt;&gt; 17;</span>
+<span class="fc" id="L197">        probe ^= probe &lt;&lt; 5;</span>
+<span class="fc" id="L198">        UNSAFE.putInt(Thread.currentThread(), PROBE, probe);</span>
+<span class="fc" id="L199">        return probe;</span>
+    }
+
+    /**
+     * Handles cases of updates involving initialization, resizing,
+     * creating new Cells, and/or contention. See above for
+     * explanation. This method suffers the usual non-modularity
+     * problems of optimistic retry code, relying on rechecked sets of
+     * reads.
+     *
+     * @param x the value
+     * @param fn the update function, or null for add (this convention
+     * avoids the need for an extra field or function in LongAdder).
+     * @param wasUncontended false if CAS failed before call
+     */
+    final void longAccumulate(long x, LongBinaryOperator fn,
+                              boolean wasUncontended) {
+        int h;
+<span class="fc bfc" id="L217" title="All 2 branches covered.">        if ((h = getProbe()) == 0) {</span>
+<span class="fc" id="L218">            ThreadLocalRandom.current(); // force initialization</span>
+<span class="fc" id="L219">            h = getProbe();</span>
+<span class="fc" id="L220">            wasUncontended = true;</span>
+        }
+<span class="fc" id="L222">        boolean collide = false;                // True if last slot nonempty</span>
+        for (;;) {
+            Cell[] as; Cell a; int n; long v;
+<span class="pc bpc" id="L225" title="1 of 4 branches missed.">            if ((as = cells) != null &amp;&amp; (n = as.length) &gt; 0) {</span>
+<span class="fc bfc" id="L226" title="All 2 branches covered.">                if ((a = as[(n - 1) &amp; h]) == null) {</span>
+<span class="pc bpc" id="L227" title="1 of 2 branches missed.">                    if (cellsBusy == 0) {       // Try to attach new Cell</span>
+<span class="fc" id="L228">                        Cell r = new Cell(x);   // Optimistically create</span>
+<span class="fc bfc" id="L229" title="All 4 branches covered.">                        if (cellsBusy == 0 &amp;&amp; casCellsBusy()) {</span>
+<span class="fc" id="L230">                            boolean created = false;</span>
+                            try {               // Recheck under lock
+                                Cell[] rs; int m, j;
+<span class="pc bpc" id="L233" title="3 of 6 branches missed.">                                if ((rs = cells) != null &amp;&amp;</span>
+                                    (m = rs.length) &gt; 0 &amp;&amp;
+                                    rs[j = (m - 1) &amp; h] == null) {
+<span class="fc" id="L236">                                    rs[j] = r;</span>
+<span class="fc" id="L237">                                    created = true;</span>
+                                }
+                            } finally {
+<span class="pc" id="L240">                                cellsBusy = 0;</span>
+<span class="fc" id="L241">                            }</span>
+<span class="pc bpc" id="L242" title="1 of 2 branches missed.">                            if (created)</span>
+<span class="fc" id="L243">                                break;</span>
+                            continue;           // Slot is now non-empty
+                        }
+                    }
+<span class="fc" id="L247">                    collide = false;</span>
+                }
+<span class="fc bfc" id="L249" title="All 2 branches covered.">                else if (!wasUncontended)       // CAS already known to fail</span>
+<span class="fc" id="L250">                    wasUncontended = true;      // Continue after rehash</span>
+<span class="pc bpc" id="L251" title="1 of 4 branches missed.">                else if (a.cas(v = a.value, ((fn == null) ? v + x :</span>
+<span class="nc" id="L252">                                             fn.applyAsLong(v, x))))</span>
+<span class="fc" id="L253">                    break;</span>
+<span class="pc bpc" id="L254" title="1 of 4 branches missed.">                else if (n &gt;= NCPU || cells != as)</span>
+<span class="fc" id="L255">                    collide = false;            // At max size or stale</span>
+<span class="fc bfc" id="L256" title="All 2 branches covered.">                else if (!collide)</span>
+<span class="fc" id="L257">                    collide = true;</span>
+<span class="pc bpc" id="L258" title="2 of 4 branches missed.">                else if (cellsBusy == 0 &amp;&amp; casCellsBusy()) {</span>
+                    try {
+<span class="pc bpc" id="L260" title="1 of 2 branches missed.">                        if (cells == as) {      // Expand table unless stale</span>
+<span class="fc" id="L261">                            Cell[] rs = new Cell[n &lt;&lt; 1];</span>
+<span class="fc bfc" id="L262" title="All 2 branches covered.">                            for (int i = 0; i &lt; n; ++i)</span>
+<span class="fc" id="L263">                                rs[i] = as[i];</span>
+<span class="fc" id="L264">                            cells = rs;</span>
+                        }
+                    } finally {
+<span class="pc" id="L267">                        cellsBusy = 0;</span>
+<span class="fc" id="L268">                    }</span>
+<span class="fc" id="L269">                    collide = false;</span>
+<span class="fc" id="L270">                    continue;                   // Retry with expanded table</span>
+                }
+<span class="fc" id="L272">                h = advanceProbe(h);</span>
+            }
+<span class="pc bpc" id="L274" title="2 of 6 branches missed.">            else if (cellsBusy == 0 &amp;&amp; cells == as &amp;&amp; casCellsBusy()) {</span>
+<span class="fc" id="L275">                boolean init = false;</span>
+                try {                           // Initialize table
+<span class="pc bpc" id="L277" title="1 of 2 branches missed.">                    if (cells == as) {</span>
+<span class="fc" id="L278">                        Cell[] rs = new Cell[2];</span>
+<span class="fc" id="L279">                        rs[h &amp; 1] = new Cell(x);</span>
+<span class="fc" id="L280">                        cells = rs;</span>
+<span class="fc" id="L281">                        init = true;</span>
+                    }
+                } finally {
+<span class="pc" id="L284">                    cellsBusy = 0;</span>
+<span class="fc" id="L285">                }</span>
+<span class="pc bpc" id="L286" title="1 of 2 branches missed.">                if (init)</span>
+<span class="fc" id="L287">                    break;</span>
+<span class="nc" id="L288">            }</span>
+<span class="pc bpc" id="L289" title="1 of 4 branches missed.">            else if (casBase(v = base, ((fn == null) ? v + x :</span>
+<span class="nc" id="L290">                                        fn.applyAsLong(v, x))))</span>
+<span class="fc" id="L291">                break;                          // Fall back on using base</span>
+<span class="fc" id="L292">        }</span>
+<span class="fc" id="L293">    }</span>
+
+    /**
+     * Same as longAccumulate, but injecting long/double conversions
+     * in too many places to sensibly merge with long version, given
+     * the low-overhead requirements of this class. So must instead be
+     * maintained by copy/paste/adapt.
+     */
+    final void doubleAccumulate(double x, DoubleBinaryOperator fn,
+                                boolean wasUncontended) {
+        int h;
+<span class="nc bnc" id="L304" title="All 2 branches missed.">        if ((h = getProbe()) == 0) {</span>
+<span class="nc" id="L305">            ThreadLocalRandom.current(); // force initialization</span>
+<span class="nc" id="L306">            h = getProbe();</span>
+<span class="nc" id="L307">            wasUncontended = true;</span>
+        }
+<span class="nc" id="L309">        boolean collide = false;                // True if last slot nonempty</span>
+        for (;;) {
+            Cell[] as; Cell a; int n; long v;
+<span class="nc bnc" id="L312" title="All 4 branches missed.">            if ((as = cells) != null &amp;&amp; (n = as.length) &gt; 0) {</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">                if ((a = as[(n - 1) &amp; h]) == null) {</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">                    if (cellsBusy == 0) {       // Try to attach new Cell</span>
+<span class="nc" id="L315">                        Cell r = new Cell(Double.doubleToRawLongBits(x));</span>
+<span class="nc bnc" id="L316" title="All 4 branches missed.">                        if (cellsBusy == 0 &amp;&amp; casCellsBusy()) {</span>
+<span class="nc" id="L317">                            boolean created = false;</span>
+                            try {               // Recheck under lock
+                                Cell[] rs; int m, j;
+<span class="nc bnc" id="L320" title="All 6 branches missed.">                                if ((rs = cells) != null &amp;&amp;</span>
+                                    (m = rs.length) &gt; 0 &amp;&amp;
+                                    rs[j = (m - 1) &amp; h] == null) {
+<span class="nc" id="L323">                                    rs[j] = r;</span>
+<span class="nc" id="L324">                                    created = true;</span>
+                                }
+                            } finally {
+<span class="nc" id="L327">                                cellsBusy = 0;</span>
+<span class="nc" id="L328">                            }</span>
+<span class="nc bnc" id="L329" title="All 2 branches missed.">                            if (created)</span>
+<span class="nc" id="L330">                                break;</span>
+                            continue;           // Slot is now non-empty
+                        }
+                    }
+<span class="nc" id="L334">                    collide = false;</span>
+                }
+<span class="nc bnc" id="L336" title="All 2 branches missed.">                else if (!wasUncontended)       // CAS already known to fail</span>
+<span class="nc" id="L337">                    wasUncontended = true;      // Continue after rehash</span>
+<span class="nc bnc" id="L338" title="All 4 branches missed.">                else if (a.cas(v = a.value,</span>
+                               ((fn == null) ?
+                                Double.doubleToRawLongBits
+<span class="nc" id="L341">                                (Double.longBitsToDouble(v) + x) :</span>
+                                Double.doubleToRawLongBits
+<span class="nc" id="L343">                                (fn.applyAsDouble</span>
+<span class="nc" id="L344">                                 (Double.longBitsToDouble(v), x)))))</span>
+<span class="nc" id="L345">                    break;</span>
+<span class="nc bnc" id="L346" title="All 4 branches missed.">                else if (n &gt;= NCPU || cells != as)</span>
+<span class="nc" id="L347">                    collide = false;            // At max size or stale</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">                else if (!collide)</span>
+<span class="nc" id="L349">                    collide = true;</span>
+<span class="nc bnc" id="L350" title="All 4 branches missed.">                else if (cellsBusy == 0 &amp;&amp; casCellsBusy()) {</span>
+                    try {
+<span class="nc bnc" id="L352" title="All 2 branches missed.">                        if (cells == as) {      // Expand table unless stale</span>
+<span class="nc" id="L353">                            Cell[] rs = new Cell[n &lt;&lt; 1];</span>
+<span class="nc bnc" id="L354" title="All 2 branches missed.">                            for (int i = 0; i &lt; n; ++i)</span>
+<span class="nc" id="L355">                                rs[i] = as[i];</span>
+<span class="nc" id="L356">                            cells = rs;</span>
+                        }
+                    } finally {
+<span class="nc" id="L359">                        cellsBusy = 0;</span>
+<span class="nc" id="L360">                    }</span>
+<span class="nc" id="L361">                    collide = false;</span>
+<span class="nc" id="L362">                    continue;                   // Retry with expanded table</span>
+                }
+<span class="nc" id="L364">                h = advanceProbe(h);</span>
+            }
+<span class="nc bnc" id="L366" title="All 6 branches missed.">            else if (cellsBusy == 0 &amp;&amp; cells == as &amp;&amp; casCellsBusy()) {</span>
+<span class="nc" id="L367">                boolean init = false;</span>
+                try {                           // Initialize table
+<span class="nc bnc" id="L369" title="All 2 branches missed.">                    if (cells == as) {</span>
+<span class="nc" id="L370">                        Cell[] rs = new Cell[2];</span>
+<span class="nc" id="L371">                        rs[h &amp; 1] = new Cell(Double.doubleToRawLongBits(x));</span>
+<span class="nc" id="L372">                        cells = rs;</span>
+<span class="nc" id="L373">                        init = true;</span>
+                    }
+                } finally {
+<span class="nc" id="L376">                    cellsBusy = 0;</span>
+<span class="nc" id="L377">                }</span>
+<span class="nc bnc" id="L378" title="All 2 branches missed.">                if (init)</span>
+<span class="nc" id="L379">                    break;</span>
+<span class="nc" id="L380">            }</span>
+<span class="nc bnc" id="L381" title="All 4 branches missed.">            else if (casBase(v = base,</span>
+                             ((fn == null) ?
+                              Double.doubleToRawLongBits
+<span class="nc" id="L384">                              (Double.longBitsToDouble(v) + x) :</span>
+                              Double.doubleToRawLongBits
+<span class="nc" id="L386">                              (fn.applyAsDouble</span>
+<span class="nc" id="L387">                               (Double.longBitsToDouble(v), x)))))</span>
+<span class="nc" id="L388">                break;                          // Fall back on using base</span>
+<span class="nc" id="L389">        }</span>
+<span class="nc" id="L390">    }</span>
+
+    // Unsafe mechanics
+    private static final sun.misc.Unsafe UNSAFE;
+    private static final long BASE;
+    private static final long CELLSBUSY;
+    private static final long PROBE;
+    static {
+        try {
+<span class="fc" id="L399">            UNSAFE = sun.misc.Unsafe.getUnsafe();</span>
+<span class="fc" id="L400">            Class&lt;?&gt; sk = Striped64.class;</span>
+<span class="fc" id="L401">            BASE = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L402">                (sk.getDeclaredField(&quot;base&quot;));</span>
+<span class="fc" id="L403">            CELLSBUSY = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L404">                (sk.getDeclaredField(&quot;cellsBusy&quot;));</span>
+<span class="fc" id="L405">            Class&lt;?&gt; tk = Thread.class;</span>
+<span class="fc" id="L406">            PROBE = UNSAFE.objectFieldOffset</span>
+<span class="fc" id="L407">                (tk.getDeclaredField(&quot;threadLocalRandomProbe&quot;));</span>
+<span class="nc" id="L408">        } catch (Exception e) {</span>
+<span class="nc" id="L409">            throw new Error(e);</span>
+<span class="fc" id="L410">        }</span>
+<span class="fc" id="L411">    }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.6.4.201312031056</span></div></body></html>
